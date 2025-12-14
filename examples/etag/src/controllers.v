@@ -1,8 +1,8 @@
 module main
 
 import strings
-import enghitalo.vanilla.http_server
-import enghitalo.vanilla.request_parser
+import http_server
+import request_parser
 import crypto.md5
 
 const not_modified_responsense = 'HTTP/1.1 304 Not Modified\r\n\r\n'.bytes()

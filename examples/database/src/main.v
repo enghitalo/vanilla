@@ -1,7 +1,7 @@
 module main
 
-import enghitalo.vanilla.http_server
-import enghitalo.vanilla.request_parser
+import http_server
+import request_parser
 import db.pg
 
 fn handle_request(req_buffer []u8, client_conn_fd int, mut pool ConnectionPool) ![]u8 {
