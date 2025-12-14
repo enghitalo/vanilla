@@ -1,6 +1,6 @@
 module main
 
-import enghitalo.vanilla.http_server
+import http_server
 
 fn test_handle_request_get_home() {
 	req_buffer := 'GET / HTTP/1.1\r\n\r\n'.bytes()
