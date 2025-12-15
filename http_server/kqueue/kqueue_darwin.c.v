@@ -71,7 +71,7 @@ pub fn remove_fd_from_kqueue(kq int, fd int, filter i16) {
 	C.close(fd)
 }
 
-// Worker event loop for kqueue backend. Processes events for a given kqueue fd using provided callbacks.
+// Worker event loop for kqueue io_multiplexing. Processes events for a given kqueue fd using provided callbacks.
 pub fn process_kqueue_events(event_callbacks KqueueEventCallbacks, kq int) {
 	mut events := [1024]C.kevent{}
 	for {

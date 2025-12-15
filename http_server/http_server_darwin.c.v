@@ -9,12 +9,12 @@ import response
 import request
 
 pub fn run(mut server Server) {
-	match server.backend {
+	match server.io_multiplexing {
 		.kqueue_backend {
 			server.run_kqueue()
 		}
 		else {
-			eprintln('Selected backend is not supported on Darwin/macOS.')
+			eprintln('Selected io_multiplexing is not supported on Darwin/macOS.')
 			exit(1)
 		}
 	}

@@ -9,7 +9,6 @@ import socket
 import response
 import request
 
-
 #include <errno.h>
 #include <sys/epoll.h>
 
@@ -131,7 +130,6 @@ fn process_events(event_callbacks epoll.EpollEventCallbacks, epoll_fd int) {
 // ==================== Epoll Backend ====================
 
 fn (mut server Server) run_epoll() {
-	server.socket_fd = socket.create_server_socket(server.port)
 	if server.socket_fd < 0 {
 		return
 	}
@@ -388,7 +386,7 @@ fn io_uring_worker_loop(worker &io_uring.Worker, handler fn ([]u8, int) ![]u8) {
 }
 
 pub fn (mut server Server) run() {
-	match server.backend {
+	match server.io_multiplexing {
 		.epoll {
 			server.run_epoll()
 		}
@@ -396,7 +394,7 @@ pub fn (mut server Server) run() {
 			server.run_io_uring()
 		}
 		else {
-			eprintln('Selected backend is not supported on Linux.')
+			eprintln('Selected io_multiplexing is not supported on Linux.')
 			exit(1)
 		}
 	}
