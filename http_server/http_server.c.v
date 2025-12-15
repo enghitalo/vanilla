@@ -5,6 +5,7 @@ import epoll
 import socket
 import request
 import response
+import io_uring
 
 const max_thread_pool_size = runtime.nr_cpus()
 
@@ -15,10 +16,19 @@ $if !windows {
 }
 
 fn C.perror(s &u8)
+fn C.sleep(seconds u32) u32
+fn C.close(fd int) int
+
+// Backend selection for I/O multiplexing
+pub enum IOBackend {
+	epoll
+	io_uring_backend
+}
 
 pub struct Server {
 pub:
-	port int = 3000
+	port    int       = 3000
+	backend IOBackend = .epoll
 pub mut:
 	socket_fd       int
 	threads         []thread = []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
@@ -138,6 +148,19 @@ pub fn (mut server Server) run() {
 		exit(1)
 	}
 
+	match server.backend {
+		.epoll {
+			server.run_epoll()
+		}
+		.io_uring_backend {
+			server.run_io_uring()
+		}
+	}
+}
+
+// ==================== Epoll Backend ====================
+
+fn (mut server Server) run_epoll() {
 	server.socket_fd = socket.create_server_socket(server.port)
 	if server.socket_fd < 0 {
 		return
@@ -183,4 +206,171 @@ pub fn (mut server Server) run() {
 
 	println('listening on http://localhost:${server.port}/')
 	handle_accept_loop(server.socket_fd, main_epoll_fd, epoll_fds)
+}
+
+// ==================== IO Uring Backend ====================
+
+fn (mut server Server) run_io_uring() {
+	num_workers := max_thread_pool_size
+
+	for i in 0 .. num_workers {
+		mut worker := &io_uring.Worker{}
+		worker.cpu_id = i
+		worker.listen_fd = -1
+		io_uring.pool_init(mut worker)
+
+		// Initialize io_uring ring
+		mut params := C.io_uring_params{}
+		if C.io_uring_queue_init_params(u32(io_uring.default_ring_entries), &worker.ring,
+			&params) < 0 {
+			eprintln('Failed to initialize io_uring for worker ${i}')
+			exit(1)
+		}
+
+		// Create per-worker listener
+		worker.listen_fd = io_uring.create_listener(server.port)
+		if worker.listen_fd < 0 {
+			eprintln('Failed to create listener for worker ${i}')
+			exit(1)
+		}
+
+		// Spawn worker thread
+		handler := server.request_handler
+		server.threads[i] = spawn io_uring_worker_loop(worker, handler)
+	}
+
+	println('listening on http://localhost:${server.port}/ (io_uring)')
+
+	// Keep main thread alive
+	for {
+		C.sleep(1)
+	}
+}
+
+fn io_uring_worker_loop(worker &io_uring.Worker, handler fn ([]u8, int) ![]u8) {
+	io_uring.prep_accept(&worker.ring, worker.listen_fd)
+	C.io_uring_submit(&worker.ring)
+
+	for {
+		// Wait for at least one completion
+		mut cqe := &C.io_uring_cqe(unsafe { nil })
+		ret := C.io_uring_wait_cqe(&worker.ring, &cqe)
+		if ret == -C.EINTR {
+			continue
+		}
+		if ret < 0 {
+			break
+		}
+
+		// Batch process all available completions
+		mut processed := 0
+		mut batch_cqe := cqe
+		for unsafe { batch_cqe != nil } {
+			// Process current CQE
+			data := C.io_uring_cqe_get_data64(batch_cqe)
+			op := io_uring.unpack_op(data)
+			c_ptr := io_uring.unpack_ptr(data)
+			res := batch_cqe.res
+
+			match op {
+				io_uring.op_accept {
+					if res >= 0 {
+						fd := res
+						io_uring.tune_socket(fd)
+						mut nc := io_uring.pool_acquire_from_ptr(worker, fd)
+						if unsafe { nc != nil } {
+							io_uring.prep_read(&worker.ring, mut *nc)
+						} else {
+							C.close(fd)
+						}
+					}
+					if (batch_cqe.flags & u32(1 << 1)) == 0 {
+						// IORING_CQE_F_MORE not set, re-arm accept
+						io_uring.prep_accept(&worker.ring, worker.listen_fd)
+					}
+				}
+				io_uring.op_read {
+					if res <= 0 {
+						if unsafe { c_ptr != nil } {
+							mut conn := unsafe { &io_uring.Connection(c_ptr) }
+							io_uring.pool_release_from_ptr(worker, mut *conn)
+						}
+					} else if unsafe { c_ptr != nil } {
+						mut conn := unsafe { &io_uring.Connection(c_ptr) }
+						conn.bytes_read = res
+
+						// Process request using request module approach
+						request_data := unsafe { conn.buf[..conn.bytes_read] }
+
+						// Call request handler
+						response_data := handler(request_data, conn.fd) or {
+							// Send error response using response module
+							response.send_bad_request_response(conn.fd)
+							io_uring.pool_release_from_ptr(worker, mut *conn)
+							C.io_uring_cqe_seen(&worker.ring, batch_cqe)
+							processed++
+							// Try to peek for more completions
+							batch_cqe = &C.io_uring_cqe(unsafe { nil })
+							if C.io_uring_peek_cqe(&worker.ring, &batch_cqe) != 0 {
+								batch_cqe = &C.io_uring_cqe(unsafe { nil })
+							}
+							continue
+						}
+
+						// Store response for sending
+						conn.response_buffer = response_data
+						conn.bytes_sent = 0
+
+						// Prepare write operation
+						io_uring.prep_write(&worker.ring, mut *conn, conn.response_buffer.data,
+							usize(conn.response_buffer.len))
+					}
+				}
+				io_uring.op_write {
+					if res >= 0 {
+						if unsafe { c_ptr != nil } {
+							mut conn := unsafe { &io_uring.Connection(c_ptr) }
+							conn.bytes_sent += res
+
+							// Check if we need to send more data
+							if conn.bytes_sent < conn.response_buffer.len {
+								remaining := conn.response_buffer.len - conn.bytes_sent
+								io_uring.prep_write(&worker.ring, mut *conn, unsafe {
+									&u8(u64(conn.response_buffer.data) + u64(conn.bytes_sent))
+								}, usize(remaining))
+							} else {
+								// Response sent completely, read next request (keep-alive)
+								conn.bytes_read = 0
+								unsafe { conn.response_buffer.free() }
+								conn.response_buffer = []u8{}
+								io_uring.prep_read(&worker.ring, mut *conn)
+							}
+						}
+					} else {
+						if unsafe { c_ptr != nil } {
+							mut conn := unsafe { &io_uring.Connection(c_ptr) }
+							io_uring.pool_release_from_ptr(worker, mut *conn)
+						}
+					}
+				}
+				else {}
+			}
+
+			// Mark this CQE as seen
+			C.io_uring_cqe_seen(&worker.ring, batch_cqe)
+			processed++
+
+			// Try to peek for more completions (non-blocking)
+			batch_cqe = &C.io_uring_cqe(unsafe { nil })
+			if C.io_uring_peek_cqe(&worker.ring, &batch_cqe) != 0 {
+				// No more completions ready
+				batch_cqe = &C.io_uring_cqe(unsafe { nil })
+			}
+		}
+
+		// Submit all batched operations at once (single syscall)
+		if processed > 0 {
+			C.io_uring_submit(&worker.ring)
+		}
+	}
 }
