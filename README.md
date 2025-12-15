@@ -1,6 +1,6 @@
-<img src="./logo.png" alt="vanilla_http_server Logo" width="100">
+<img src="./logo.png" alt="vanilla Logo" width="100">
 
-# vanilla_http_server
+# vanilla
 
 - **Fast**: Multi-threaded, non-blocking I/O, lock-free, copy-free, epoll, SO_REUSEPORT.
 - **Thread Affinity**: Work in Progress (W.I.P.).
@@ -21,7 +21,7 @@
 mkdir -p ~/.vmodules/enghitalo/vanilla
 ```
 
-2. Copy the `vanilla_http_server` directory to the target location:
+2. Copy the `vanilla` directory to the target location:
 
 ```bash
 cp -r ./ ~/.vmodules/enghitalo/vanilla
@@ -40,7 +40,7 @@ This sets up the module in your `~/.vmodules` directory for use.
 Install directly from the repository:
 
 ```bash
-v install https://github.com/enghitalo/vanilla_http_server
+v install https://github.com/enghitalo/vanilla
 ```
 
 ## Benchmarking
