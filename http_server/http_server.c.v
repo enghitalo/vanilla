@@ -19,7 +19,7 @@ fn C.perror(s &u8)
 fn C.sleep(seconds u32) u32
 fn C.close(fd int) int
 
-// Backend selection for I/O multiplexing
+// Backend selection: choose epoll or io_uring
 pub enum IOBackend {
 	epoll
 	io_uring_backend
@@ -35,10 +35,9 @@ pub mut:
 	request_handler fn ([]u8, int) ![]u8 @[required]
 }
 
-// Socket and epoll helpers moved to dedicated files: socket.v, epoll.v, response.v, request.v
+// Socket and epoll helpers are implemented in: socket.v, epoll.v, response.v, request.v
 
-// Handles readable client connection: recv, route, and send response.
-// Extracted to simplify the event loop.
+// Handles a readable client connection: receives the request, routes it, and sends the response.
 fn handle_readable_fd(request_handler fn ([]u8, int) ![]u8, epoll_fd int, client_conn_fd int) {
 	request_buffer := request.read_request(client_conn_fd) or {
 		eprintln('Error reading request: ${err}')
@@ -64,11 +63,13 @@ fn handle_readable_fd(request_handler fn ([]u8, int) ![]u8, epoll_fd int, client
 	}
 }
 
+// Accept loop for the main epoll thread. Distributes new client connections to worker threads (round-robin).
 fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int) {
 	mut next_worker := 0
 	mut event := C.epoll_event{}
 
 	for {
+		// Wait for events on the main epoll fd (listening socket)
 		num_events := C.epoll_wait(main_epoll_fd, &event, 1, -1)
 		if num_events < 0 {
 			if C.errno == C.EINTR {
@@ -85,6 +86,7 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int) {
 
 		if event.events & u32(C.EPOLLIN) != 0 {
 			for {
+				// Accept new client connection
 				client_conn_fd := C.accept(socket_fd, C.NULL, C.NULL)
 				if client_conn_fd < 0 {
 					// Check for EAGAIN or EWOULDBLOCK, usually represented by errno 11.
@@ -95,9 +97,9 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int) {
 					C.perror(c'Accept failed')
 					continue
 				}
+				// Set client socket to non-blocking
 				socket.set_blocking(client_conn_fd, false)
-				// Load balance the client connection to the worker threads.
-				// this is a simple round-robin approach.
+				// Distribute client connection to worker threads (round-robin)
 				epoll_fd := epoll_fds[next_worker]
 				next_worker = (next_worker + 1) % max_thread_pool_size
 				if epoll.add_fd_to_epoll(epoll_fd, client_conn_fd, u32(C.EPOLLIN | C.EPOLLET)) < 0 {
@@ -109,11 +111,13 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int) {
 	}
 }
 
+// Worker event loop for epoll backend. Processes events for a given epoll fd using provided callbacks.
 @[direct_array_access; manualfree]
 fn process_events(event_callbacks epoll.EpollEventCallbacks, epoll_fd int) {
 	mut events := [socket.max_connection_size]C.epoll_event{}
 
 	for {
+		// Wait for events on the worker's epoll fd
 		num_events := C.epoll_wait(epoll_fd, &events[0], socket.max_connection_size, -1)
 		if num_events < 0 {
 			if C.errno == C.EINTR {
@@ -126,15 +130,18 @@ fn process_events(event_callbacks epoll.EpollEventCallbacks, epoll_fd int) {
 
 		for i in 0 .. num_events {
 			client_conn_fd := unsafe { events[i].data.fd }
+			// Remove fd if hangup or error
 			if events[i].events & u32(C.EPOLLHUP | C.EPOLLERR) != 0 {
 				epoll.remove_fd_from_epoll(epoll_fd, client_conn_fd)
 				continue
 			}
 
+			// Readable event
 			if events[i].events & u32(C.EPOLLIN) != 0 {
 				event_callbacks.on_read(client_conn_fd)
 			}
 
+			// Writable event
 			if events[i].events & u32(C.EPOLLOUT) != 0 {
 				event_callbacks.on_write(client_conn_fd)
 			}
@@ -219,16 +226,30 @@ fn (mut server Server) run_io_uring() {
 		worker.listen_fd = -1
 		io_uring.pool_init(mut worker)
 
-		// Initialize io_uring ring
+		// Try to initialize io_uring ring with SQPOLL, fall back if it fails
 		mut params := C.io_uring_params{}
+		params.flags |= 1 << 3 // IORING_SETUP_SQPOLL
+		params.sq_thread_cpu = i // Pin SQ thread to worker CPU
+		mut sqpoll_failed := false
 		if C.io_uring_queue_init_params(u32(io_uring.default_ring_entries), &worker.ring,
 			&params) < 0 {
-			eprintln('Failed to initialize io_uring for worker ${i}')
-			exit(1)
+			eprintln('[io_uring] worker ${i}: SQPOLL failed, falling back to normal io_uring')
+			// Try again without SQPOLL
+			params = C.io_uring_params{}
+			if C.io_uring_queue_init_params(u32(io_uring.default_ring_entries), &worker.ring,
+				&params) < 0 {
+				eprintln('Failed to initialize io_uring for worker ${i}')
+				exit(1)
+			}
+			sqpoll_failed = true
 		}
-		// User indicates multishot accept is supported; enable it
-		worker.use_multishot = true
-		eprintln('[io_uring] worker ${i}: forcing multishot accept')
+		// Use single-shot accept for SO_REUSEPORT
+		//    worker.use_multishot = false
+		if sqpoll_failed {
+			eprintln('[io_uring] worker ${i}: single-shot accept enabled (no SQPOLL)')
+		} else {
+			eprintln('[io_uring] worker ${i}: single-shot accept + SQPOLL enabled')
+		}
 
 		// Create per-worker listener
 		worker.listen_fd = io_uring.create_listener(server.port)
@@ -249,139 +270,158 @@ fn (mut server Server) run_io_uring() {
 	}
 }
 
+// --- io_uring CQE Handlers ---
+fn handle_io_uring_accept(worker &io_uring.Worker, cqe &C.io_uring_cqe) {
+	res := cqe.res
+	if res >= 0 {
+		fd := res
+		$if verbose ? {
+			eprintln('[DEBUG] Accept: new fd=${fd}')
+		}
+		io_uring.tune_socket(fd)
+		mut nc := io_uring.pool_acquire_from_ptr(worker, fd)
+		if unsafe { nc != nil } {
+			io_uring.prep_read(&worker.ring, mut *nc)
+		} else {
+			C.close(fd)
+		}
+	}
+	// Re-arm accept if needed
+	if (cqe.flags & u32(1 << 1)) == 0 || res < 0 {
+		$if verbose ? {
+			eprintln('[DEBUG] Re-arming accept (end of multishot or error)')
+		}
+		io_uring.prep_accept(&worker.ring, worker.listen_fd, worker.use_multishot)
+	}
+}
+
+fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn ([]u8, int) ![]u8) {
+	res := cqe.res
+	c_ptr := io_uring.unpack_ptr(C.io_uring_cqe_get_data64(cqe))
+	if res <= 0 {
+		$if verbose ? {
+			eprintln('[DEBUG] Read EOF/error: ${res}')
+		}
+		if unsafe { c_ptr != nil } {
+			mut conn := unsafe { &io_uring.Connection(c_ptr) }
+			io_uring.pool_release_from_ptr(worker, mut *conn)
+		}
+	} else if unsafe { c_ptr != nil } {
+		mut conn := unsafe { &io_uring.Connection(c_ptr) }
+		conn.bytes_read = res
+		$if verbose ? {
+			eprintln('[DEBUG] Read ${res} bytes from fd=${conn.fd}')
+		}
+		request_data := unsafe { conn.buf[..conn.bytes_read] }
+		response_data := handler(request_data, conn.fd) or {
+			response.send_bad_request_response(conn.fd)
+			io_uring.pool_release_from_ptr(worker, mut *conn)
+			C.io_uring_cqe_seen(&worker.ring, cqe)
+			C.io_uring_submit(&worker.ring)
+			return
+		}
+		conn.response_buffer = response_data
+		conn.bytes_sent = 0
+		$if verbose ? {
+			eprintln('[DEBUG] Preparing write of ${conn.response_buffer.len} bytes')
+		}
+		io_uring.prep_write(&worker.ring, mut *conn, conn.response_buffer.data, usize(conn.response_buffer.len))
+	}
+}
+
+fn handle_io_uring_write(worker &io_uring.Worker, cqe &C.io_uring_cqe) {
+	res := cqe.res
+	c_ptr := io_uring.unpack_ptr(C.io_uring_cqe_get_data64(cqe))
+	if res >= 0 {
+		$if verbose ? {
+			eprintln('[DEBUG] Wrote ${res} bytes')
+		}
+		if unsafe { c_ptr != nil } {
+			mut conn := unsafe { &io_uring.Connection(c_ptr) }
+			conn.bytes_sent += res
+			if conn.bytes_sent < conn.response_buffer.len {
+				remaining := conn.response_buffer.len - conn.bytes_sent
+				io_uring.prep_write(&worker.ring, mut *conn, unsafe {
+					&u8(u64(conn.response_buffer.data) + u64(conn.bytes_sent))
+				}, usize(remaining))
+			} else {
+				$if verbose ? {
+					eprintln('[DEBUG] Write complete, keep-alive next read')
+				}
+				conn.bytes_read = 0
+				unsafe { conn.response_buffer.free() }
+				conn.response_buffer = []u8{}
+				io_uring.prep_read(&worker.ring, mut *conn)
+			}
+		}
+	} else {
+		$if verbose ? {
+			eprintln('[DEBUG] Write error: ${res}')
+		}
+		if unsafe { c_ptr != nil } {
+			mut conn := unsafe { &io_uring.Connection(c_ptr) }
+			io_uring.pool_release_from_ptr(worker, mut *conn)
+		}
+	}
+}
+
+// --- io_uring CQE Dispatcher ---
+fn dispatch_io_uring_cqe(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn ([]u8, int) ![]u8) {
+	data := C.io_uring_cqe_get_data64(cqe)
+	op := io_uring.unpack_op(data)
+	match op {
+		io_uring.op_accept { handle_io_uring_accept(worker, cqe) }
+		io_uring.op_read { handle_io_uring_read(worker, cqe, handler) }
+		io_uring.op_write { handle_io_uring_write(worker, cqe) }
+		else {}
+	}
+}
+
+// --- io_uring Worker Loop ---
 fn io_uring_worker_loop(worker &io_uring.Worker, handler fn ([]u8, int) ![]u8) {
-	       io_uring.prep_accept(&worker.ring, worker.listen_fd, worker.use_multishot)
-	       C.io_uring_submit(&worker.ring)
-	       $if verbose ? {
-		       eprintln('[DEBUG] Worker started, listening on fd=${worker.listen_fd}')
-	       }
+	io_uring.prep_accept(&worker.ring, worker.listen_fd, worker.use_multishot)
+	C.io_uring_submit(&worker.ring)
+	$if verbose ? {
+		eprintln('[DEBUG] Worker started, listening on fd=${worker.listen_fd}')
+	}
 
-	       for {
-		       $if verbose ? {
-			       eprintln('[DEBUG] Waiting for CQE...')
-		       }
-		       mut cqe := &C.io_uring_cqe(unsafe { nil })
-		       ret := C.io_uring_wait_cqe(&worker.ring, &cqe)
+	for {
+		$if verbose ? {
+			eprintln('[DEBUG] Waiting for CQE...')
+		}
+		mut cqe := &C.io_uring_cqe(unsafe { nil })
+		ret := C.io_uring_wait_cqe(&worker.ring, &cqe)
+		if ret == -C.EINTR {
+			continue
+		}
+		if ret < 0 {
+			$if verbose ? {
+				eprintln('[DEBUG] wait_cqe error: ${ret}')
+			}
+			break
+		}
+		dispatch_io_uring_cqe(worker, cqe, handler)
+		C.io_uring_cqe_seen(&worker.ring, cqe)
+		submitted := C.io_uring_submit(&worker.ring)
+		$if verbose ? {
+			eprintln('[DEBUG] Submitted ${submitted} SQE(s)\n')
+		}
+	}
 
-		       if ret == -C.EINTR {
-			       continue
-		       }
-		       if ret < 0 {
-			       $if verbose ? {
-				       eprintln('[DEBUG] wait_cqe error: ${ret}')
-			       }
-			       break
-		       }
-
-		       data := C.io_uring_cqe_get_data64(cqe)
-		       op := io_uring.unpack_op(data)
-		       c_ptr := io_uring.unpack_ptr(data)
-		       res := cqe.res
-
-		       $if verbose ? {
-			       eprintln('[DEBUG] CQE: op=${op} res=${res} flags=${cqe.flags}')
-		       }
-
-		       match op {
-			       io_uring.op_accept {
-				       if res >= 0 {
-					       fd := res
-					       $if verbose ? {
-						       eprintln('[DEBUG] Accept: new fd=${fd}')
-					       }
-					       io_uring.tune_socket(fd)
-					       mut nc := io_uring.pool_acquire_from_ptr(worker, fd)
-					       if unsafe { nc != nil } {
-						       io_uring.prep_read(&worker.ring, mut *nc)
-					       } else {
-						       C.close(fd)
-					       }
-				       }
-				       if (cqe.flags & u32(1 << 1)) == 0 {
-					       $if verbose ? {
-						       eprintln('[DEBUG] Re-arming accept')
-					       }
-					       io_uring.prep_accept(&worker.ring, worker.listen_fd, worker.use_multishot)
-				       }
-			       }
-			       io_uring.op_read {
-				       if res <= 0 {
-					       $if verbose ? {
-						       eprintln('[DEBUG] Read EOF/error: ${res}')
-					       }
-					       if unsafe { c_ptr != nil } {
-						       mut conn := unsafe { &io_uring.Connection(c_ptr) }
-						       io_uring.pool_release_from_ptr(worker, mut *conn)
-					       }
-				       } else if unsafe { c_ptr != nil } {
-					       mut conn := unsafe { &io_uring.Connection(c_ptr) }
-					       conn.bytes_read = res
-					       $if verbose ? {
-						       eprintln('[DEBUG] Read ${res} bytes from fd=${conn.fd}')
-					       }
-
-					       request_data := unsafe { conn.buf[..conn.bytes_read] }
-
-					       response_data := handler(request_data, conn.fd) or {
-						       response.send_bad_request_response(conn.fd)
-						       io_uring.pool_release_from_ptr(worker, mut *conn)
-						       C.io_uring_cqe_seen(&worker.ring, cqe)
-						       C.io_uring_submit(&worker.ring)
-						       continue
-					       }
-
-					       conn.response_buffer = response_data
-					       conn.bytes_sent = 0
-					       $if verbose ? {
-						       eprintln('[DEBUG] Preparing write of ${conn.response_buffer.len} bytes')
-					       }
-					       io_uring.prep_write(&worker.ring, mut *conn, conn.response_buffer.data,
-						       usize(conn.response_buffer.len))
-				       }
-			       }
-			       io_uring.op_write {
-				       if res >= 0 {
-					       $if verbose ? {
-						       eprintln('[DEBUG] Wrote ${res} bytes')
-					       }
-					       if unsafe { c_ptr != nil } {
-						       mut conn := unsafe { &io_uring.Connection(c_ptr) }
-						       conn.bytes_sent += res
-
-						       if conn.bytes_sent < conn.response_buffer.len {
-							       remaining := conn.response_buffer.len - conn.bytes_sent
-							       io_uring.prep_write(&worker.ring, mut *conn, unsafe {
-								       &u8(u64(conn.response_buffer.data) + u64(conn.bytes_sent))
-							       }, usize(remaining))
-						       } else {
-							       $if verbose ? {
-								       eprintln('[DEBUG] Write complete, keep-alive next read')
-							       }
-							       conn.bytes_read = 0
-							       unsafe { conn.response_buffer.free() }
-							       conn.response_buffer = []u8{}
-							       io_uring.prep_read(&worker.ring, mut *conn)
-						       }
-					       }
-				       } else {
-					       $if verbose ? {
-						       eprintln('[DEBUG] Write error: ${res}')
-					       }
-					       if unsafe { c_ptr != nil } {
-						       mut conn := unsafe { &io_uring.Connection(c_ptr) }
-						       io_uring.pool_release_from_ptr(worker, mut *conn)
-					       }
-				       }
-			       }
-			       else {}
-		       }
-
-		       C.io_uring_cqe_seen(&worker.ring, cqe)
-		       submitted := C.io_uring_submit(&worker.ring)
-		       $if verbose ? {
-			       eprintln('[DEBUG] Submitted ${submitted} SQE(s)\n')
-		       }
-	       }
-
-	// No global verbose flag needed; debug logs are compile-time gated
+	mut pending := 0
+	for {
+		mut cqe := &C.io_uring_cqe(unsafe { nil })
+		for C.io_uring_peek_cqe(&worker.ring, &cqe) == 0 {
+			dispatch_io_uring_cqe(worker, cqe, handler)
+			pending++
+			C.io_uring_cqe_seen(&worker.ring, cqe)
+		}
+		if pending > 0 {
+			submitted := C.io_uring_submit(&worker.ring)
+			$if verbose ? {
+				eprintln('[DEBUG] Submitted ${submitted} SQE(s)')
+			}
+			pending = 0
+		}
+	}
 }

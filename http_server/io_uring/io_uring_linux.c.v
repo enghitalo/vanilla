@@ -109,10 +109,10 @@ pub struct C.io_uring_cqe {
 
 // Simplified params with features field for capability detection
 pub struct C.io_uring_params {
-	flags    u32
-	sq_thread_cpu u32
+	flags          u32
+	sq_thread_cpu  u32
 	sq_thread_idle u32
-	features u32
+	features       u32
 }
 
 pub struct C.cpu_set_t {
@@ -178,15 +178,15 @@ pub mut:
 
 pub struct Worker {
 pub mut:
-	ring       C.io_uring
-	cpu_id     int
-	tid        C.pthread_t
-	listen_fd  int
+	ring          C.io_uring
+	cpu_id        int
+	tid           C.pthread_t
+	listen_fd     int
 	use_multishot bool
-	verbose    bool
-	conns      []Connection
-	free_stack []int
-	free_top   int
+	verbose       bool
+	conns         []Connection
+	free_stack    []int
+	free_top      int
 }
 
 // ==================== Connection Pool ====================
@@ -286,7 +286,8 @@ pub fn prepare_accept(ring &C.io_uring, listen_fd int, multishot bool) bool {
 		return false
 	}
 	if multishot {
-		C.io_uring_prep_multishot_accept(sqe, listen_fd, unsafe { nil }, unsafe { nil }, C.SOCK_NONBLOCK)
+		C.io_uring_prep_multishot_accept(sqe, listen_fd, unsafe { nil }, unsafe { nil },
+			C.SOCK_NONBLOCK)
 	} else {
 		C.io_uring_prep_accept(sqe, listen_fd, unsafe { nil }, unsafe { nil }, 0)
 	}
