@@ -19,7 +19,9 @@ fn C.close(fd int) int
 // Handles a readable client connection: receives the request, routes it, and sends the response.
 fn handle_readable_fd(request_handler fn ([]u8, int) ![]u8, epoll_fd int, client_conn_fd int) {
 	request_buffer := request.read_request(client_conn_fd) or {
-		eprintln('Error reading request: ${err}')
+		$if verbose ? {} {
+			eprintln('[epoll-worker] Error reading request from fd ${client_conn_fd}: ${err}')
+		}
 		response.send_status_444_response(client_conn_fd)
 		epoll.remove_fd_from_epoll(epoll_fd, client_conn_fd)
 		return
@@ -50,6 +52,9 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int) {
 	for {
 		// Wait for events on the main epoll fd (listening socket)
 		num_events := C.epoll_wait(main_epoll_fd, &event, 1, -1)
+		$if verbose ? {
+			eprintln('[epoll] epoll_wait returned ${num_events}')
+		}
 		if num_events < 0 {
 			if C.errno == C.EINTR {
 				continue
@@ -64,12 +69,21 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int) {
 		}
 
 		if event.events & u32(C.EPOLLIN) != 0 {
+			$if verbose ? {
+				eprintln('[epoll] EPOLLIN event on listening socket')
+			}
 			for {
 				// Accept new client connection
 				client_conn_fd := C.accept(socket_fd, C.NULL, C.NULL)
+				$if verbose ? {
+					println('[epoll] accept() returned ${client_conn_fd}')
+				}
 				if client_conn_fd < 0 {
 					// Check for EAGAIN or EWOULDBLOCK, usually represented by errno 11.
 					if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
+						$if verbose ? {
+							println('[epoll] No more incoming connections to accept (EAGAIN/EWOULDBLOCK)')
+						}
 						break // No more incoming connections; exit loop.
 					}
 					eprintln(@LOCATION)
@@ -81,6 +95,9 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int) {
 				// Distribute client connection to worker threads (round-robin)
 				epoll_fd := epoll_fds[next_worker]
 				next_worker = (next_worker + 1) % max_thread_pool_size
+				$if verbose ? {
+					eprintln('[epoll] Adding client fd ${client_conn_fd} to worker epoll fd ${epoll_fd}')
+				}
 				if epoll.add_fd_to_epoll(epoll_fd, client_conn_fd, u32(C.EPOLLIN | C.EPOLLET)) < 0 {
 					socket.close_socket(client_conn_fd)
 					continue
@@ -97,6 +114,9 @@ fn process_events(event_callbacks epoll.EpollEventCallbacks, epoll_fd int) {
 	for {
 		// Wait for events on the worker's epoll fd
 		num_events := C.epoll_wait(epoll_fd, &events[0], socket.max_connection_size, -1)
+		$if verbose ? {
+			eprintln('[epoll-worker] epoll_wait returned ${num_events} on fd ${epoll_fd}')
+		}
 		if num_events < 0 {
 			if C.errno == C.EINTR {
 				continue
@@ -108,19 +128,29 @@ fn process_events(event_callbacks epoll.EpollEventCallbacks, epoll_fd int) {
 
 		for i in 0 .. num_events {
 			client_conn_fd := unsafe { events[i].data.fd }
+			$if verbose ? {
+				eprintln('[epoll-worker] Event for client fd ${client_conn_fd}: events=${events[i].events}')
+			}
 			// Remove fd if hangup or error
 			if events[i].events & u32(C.EPOLLHUP | C.EPOLLERR) != 0 {
+				println('[epoll-worker] HUP/ERR on fd ${client_conn_fd}, removing')
 				epoll.remove_fd_from_epoll(epoll_fd, client_conn_fd)
 				continue
 			}
 
 			// Readable event
 			if events[i].events & u32(C.EPOLLIN) != 0 {
+				$if verbose ? {
+					println('[epoll-worker] EPOLLIN for fd ${client_conn_fd}, calling on_read')
+				}
 				event_callbacks.on_read(client_conn_fd)
 			}
 
 			// Writable event
 			if events[i].events & u32(C.EPOLLOUT) != 0 {
+				$if verbose ? {
+					println('[epoll-worker] EPOLLOUT for fd ${client_conn_fd}, calling on_write')
+				}
 				event_callbacks.on_write(client_conn_fd)
 			}
 		}
@@ -129,19 +159,19 @@ fn process_events(event_callbacks epoll.EpollEventCallbacks, epoll_fd int) {
 
 // ==================== Epoll Backend ====================
 
-fn (mut server Server) run_epoll() {
-	if server.socket_fd < 0 {
+pub fn run_epoll_backend(socket_fd int, handler fn ([]u8, int) ![]u8, port int, mut threads []thread) {
+	if socket_fd < 0 {
 		return
 	}
 
 	main_epoll_fd := epoll.create_epoll_fd()
 	if main_epoll_fd < 0 {
-		socket.close_socket(server.socket_fd)
+		socket.close_socket(socket_fd)
 		exit(1)
 	}
 
-	if epoll.add_fd_to_epoll(main_epoll_fd, server.socket_fd, u32(C.EPOLLIN)) < 0 {
-		socket.close_socket(server.socket_fd)
+	if epoll.add_fd_to_epoll(main_epoll_fd, socket_fd, u32(C.EPOLLIN)) < 0 {
+		socket.close_socket(socket_fd)
 		socket.close_socket(main_epoll_fd)
 		exit(1)
 	}
@@ -156,29 +186,28 @@ fn (mut server Server) run_epoll() {
 				socket.close_socket(epoll_fds[j])
 			}
 			socket.close_socket(main_epoll_fd)
-			socket.close_socket(server.socket_fd)
+			socket.close_socket(socket_fd)
 			exit(1)
 		}
 
 		// Build per-thread callbacks: default to handle_readable_fd; write is a no-op.
 		epfd := epoll_fds[i]
-		handler := server.request_handler
 		callbacks := epoll.EpollEventCallbacks{
 			on_read:  fn [handler, epfd] (fd int) {
 				handle_readable_fd(handler, epfd, fd)
 			}
 			on_write: fn (_ int) {}
 		}
-		server.threads[i] = spawn process_events(callbacks, epoll_fds[i])
+		threads[i] = spawn process_events(callbacks, epoll_fds[i])
 	}
 
-	println('listening on http://localhost:${server.port}/')
-	handle_accept_loop(server.socket_fd, main_epoll_fd, epoll_fds)
+	println('listening on http://localhost:${port}/')
+	handle_accept_loop(socket_fd, main_epoll_fd, epoll_fds)
 }
 
 // ==================== IO Uring Backend ====================
 
-fn (mut server Server) run_io_uring() {
+pub fn run_io_uring_backend(handler fn ([]u8, int) ![]u8, port int, mut threads []thread) {
 	num_workers := max_thread_pool_size
 
 	for i in 0 .. num_workers {
@@ -213,17 +242,16 @@ fn (mut server Server) run_io_uring() {
 		}
 
 		// Create per-worker listener
-		worker.listen_fd = io_uring.create_listener(server.port)
+		worker.listen_fd = io_uring.create_listener(port)
 		if worker.listen_fd < 0 {
 			eprintln('Failed to create listener for worker ${i}')
 			exit(1)
 		}
 		// Spawn worker thread
-		handler := server.request_handler
-		server.threads[i] = spawn io_uring_worker_loop(worker, handler)
+		threads[i] = spawn io_uring_worker_loop(worker, handler)
 	}
 
-	println('listening on http://localhost:${server.port}/ (io_uring)')
+	println('listening on http://localhost:${port}/ (io_uring)')
 
 	// Keep main thread alive
 	for {
@@ -388,10 +416,11 @@ fn io_uring_worker_loop(worker &io_uring.Worker, handler fn ([]u8, int) ![]u8) {
 pub fn (mut server Server) run() {
 	match server.io_multiplexing {
 		.epoll {
-			server.run_epoll()
+			run_epoll_backend(server.socket_fd, server.request_handler, server.port, mut
+				server.threads)
 		}
 		.io_uring_backend {
-			server.run_io_uring()
+			run_io_uring_backend(server.request_handler, server.port, mut server.threads)
 		}
 		else {
 			eprintln('Selected io_multiplexing is not supported on Linux.')

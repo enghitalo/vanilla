@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install V
+        run: |
+          curl -fsSL https://github.com/vlang/v/releases/latest/download/v_linux.zip -o v.zip
+          unzip v.zip
+          sudo mv v /usr/local/bin/v
+          v -version
+      - name: Run all tests
+        run: |
+          v test .
+          v test examples/simple/src
+          v test examples/simple2/src
+          v test examples/etag/src

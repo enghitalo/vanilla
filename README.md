@@ -1,15 +1,17 @@
 <img src="./logo.png" alt="vanilla Logo" width="100">
 
-# vanilla
+# HTTP Server
 
-- **Fast**: Multi-threaded, non-blocking I/O, lock-free, copy-free, epoll, SO_REUSEPORT.
-- **Thread Affinity**: Work in Progress (W.I.P.).
-- **Modular**: Compatible with any HTTP parser.
+- **Fast**: Multi-threaded, non-blocking I/O, lock-free, copy-free, I/O multiplexing, SO_REUSEPORT (native load balancing on Linux)
+- **Modular**: Easy
 - **Memory Safety**: No race conditions.
 - **No Magic**: Transparent and straightforward.
 - **E2E Testing**: Allows end-to-end testing and scripting without running the server. Simply pass the raw request to `handle_request()`.
 - **SSE Friendly**: Server-Sent Events support.
 - **Graceful Shutdown**: Work in Progress (W.I.P.).
+## Test Mode
+
+The `Server` provides a test method that accepts an array of raw HTTP requests, sends them directly to the socket, and processes each one sequentially. After receiving the response for the last request, the loop ends and the server shuts down automatically. This enables efficient end-to-end testing without running a persistent server process longer that needed.
 
 ## Installation
 

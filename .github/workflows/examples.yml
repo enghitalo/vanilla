@@ -16,11 +16,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Set up V
         uses: vlang/setup-v@v1
-      - name: Run all example main files
+      - name: Build all example main files
         shell: bash
         run: |
           set -e
-          find examples -type f -name 'main.v' | while read -r file; do
-            echo "Running $file"
-            v run "$file"
+          for file in examples/*/; do
+            echo "Compiling $file"
+            v "$file"
           done

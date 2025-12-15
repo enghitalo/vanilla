@@ -17,6 +17,7 @@ fn C.close(fd int) int
 fn C.accept(sockfd int, address &C.sockaddr_in, addrlen &u32) int
 fn C.htons(__hostshort u16) u16
 fn C.fcntl(fd int, cmd int, arg int) int
+fn C.connect(sockfd int, addr &C.sockaddr_in, addrlen u32) int
 
 struct C.in_addr {
 	s_addr u32
@@ -27,6 +28,30 @@ struct C.sockaddr_in {
 	sin_port   u16
 	sin_addr   C.in_addr
 	sin_zero   [8]u8
+}
+
+// Helper for client connections (for testing)
+pub fn connect_to_server(port int) !int {
+	println('[client] Creating client socket...')
+	client_fd := C.socket(C.AF_INET, C.SOCK_STREAM, 0)
+	if client_fd < 0 {
+		println('[client] Failed to create client socket')
+		return error('Failed to create client socket')
+	}
+	muts := C.sockaddr_in{
+		sin_family: u16(C.AF_INET)
+		sin_port:   C.htons(u16(port))
+		sin_addr:   C.in_addr{u32(0)} // 0.0.0.0
+		sin_zero:   [8]u8{}
+	}
+	println('[client] Connecting to server on port ${port} (0.0.0.0)...')
+	if C.connect(client_fd, &muts, sizeof(muts)) < 0 {
+		println('[client] Failed to connect to server')
+		C.close(client_fd)
+		return error('Failed to connect to server')
+	}
+	println('[client] Connected to server, fd=${client_fd}')
+	return client_fd
 }
 
 // Setup and teardown for server sockets.
@@ -63,6 +88,8 @@ pub fn create_server_socket(port int) int {
 		exit(1)
 	}
 
+	// Bind to INADDR_ANY (0.0.0.0)
+	println('[server] Binding to 0.0.0.0:${port}')
 	server_addr := C.sockaddr_in{
 		sin_family: u16(C.AF_INET)
 		sin_port:   C.htons(port)
