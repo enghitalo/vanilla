@@ -16,12 +16,7 @@ fn main() {
 		http_server.IOBackend.epoll
 	}
 
-	backend_name := match backend {
-		.epoll { 'epoll' }
-		.io_uring_backend { 'io_uring' }
-	}
-
-	println('Starting server with ${backend_name} backend...')
+	println('Starting server with ${backend} backend...')
 
 	mut server := http_server.Server{
 		request_handler: handle_request
