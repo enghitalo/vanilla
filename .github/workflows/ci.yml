@@ -19,6 +19,19 @@ jobs:
           make
           sudo ./v symlink
           v -version
+          cd ..
+          # remove downloaded files
+          rm -rf v v.zip
+          # remove V folder to avoid conflicts
+          rmdir /home/runner/v || true
+      - name: Cache V modules
+        uses: actions/cache@v3
+        with:
+          path: ~/.vmodules
+          key: ${{ runner.os }}-vmodules-${{ hashFiles('**/v.mod') }}
+          restore-keys: |
+            ${{ runner.os }}-vmodules-
+
       - name: Run all tests
         run: |
           v test .
