@@ -2,6 +2,7 @@ module main
 
 import http_server
 import request_parser
+import http_server.response
 
 fn handle_request(req_buffer []u8, client_conn_fd int) ![]u8 {
 	req := request_parser.decode_http_request(req_buffer)!
@@ -22,7 +23,7 @@ fn handle_request(req_buffer []u8, client_conn_fd int) ![]u8 {
 						id := path[6..]
 						return get_user_controller([id])
 					}
-					return http_server.tiny_bad_request_response
+					return response.tiny_bad_request_response
 				}
 			}
 		}
@@ -30,14 +31,14 @@ fn handle_request(req_buffer []u8, client_conn_fd int) ![]u8 {
 			if path == '/user' {
 				return create_user_controller([])
 			}
-			return http_server.tiny_bad_request_response
+			return response.tiny_bad_request_response
 		}
 		else {
-			return http_server.tiny_bad_request_response
+			return response.tiny_bad_request_response
 		}
 	}
 
-	return http_server.tiny_bad_request_response
+	return response.tiny_bad_request_response
 }
 
 fn main() {
