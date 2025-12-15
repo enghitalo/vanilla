@@ -11,20 +11,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install V
-        run: |
-          curl -fsSL https://github.com/vlang/v/releases/latest/download/v_linux.zip -o v.zip
-          unzip v.zip
-          cd v
-          make
-          v -version
-          cd ..
-          cp v/v .
-          cp v/v ~/user/local/bin/
-          # remove downloaded files
-          rm -rf v v.zip
-          # remove V folder to avoid conflicts
-          rmdir $(pwd)/v || true
+      - name: Set up V
+        uses: vlang/setup-v@v1.4
       - name: Cache V modules
         uses: actions/cache@v3
         with:
