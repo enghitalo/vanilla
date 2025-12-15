@@ -3,7 +3,26 @@
 
 module http_server
 
+import iocp
+
+// ==================== Server Startup ====================
+
+fn (mut server Server) run_iocp() {
+	// TODO: Implement server startup for IOCP
+}
+
 pub fn run(mut server Server) {
-	eprintln('Windows is not supported yet. Please, use WSL or Linux.')
-	exit(1)
+	match server.io_multiplexing {
+		.epoll {
+			eprintln('Selected io_multiplexing is not supported on Windows.')
+			exit(1)
+		}
+		.io_uring_backend {
+			eprintln('Selected io_multiplexing is not supported on Windows.')
+			exit(1)
+		}
+		else {
+			server.run_iocp()
+		}
+	}
 }
