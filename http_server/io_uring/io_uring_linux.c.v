@@ -19,6 +19,7 @@ fn C.close(fd int) int
 
 // Network byte order
 fn C.htons(hostshort u16) u16
+fn C.htonl(hostlong u32) u32
 
 // File control
 fn C.fcntl(fd int, cmd int, arg int) int
@@ -29,6 +30,7 @@ fn C.perror(s &char)
 // ==================== Constants ====================
 
 // Server configuration
+pub const inaddr_any = u32(0)
 pub const default_port = 8080
 pub const default_backlog = 65535
 pub const default_ring_entries = 16384
@@ -44,6 +46,8 @@ pub const op_write = u8(3)
 
 // IO uring CQE flags
 const ioring_cqe_f_more = u32(1 << 1)
+// io_uring features
+pub const ioring_feat_accept_multishot = u32(1 << 19)
 
 // User data bit masks
 const op_type_shift = 48
@@ -103,8 +107,13 @@ pub struct C.io_uring_cqe {
 	flags     u32
 }
 
-// Simplified - we just need to zero-initialize
-pub struct C.io_uring_params {}
+// Simplified params with features field for capability detection
+pub struct C.io_uring_params {
+	flags    u32
+	sq_thread_cpu u32
+	sq_thread_idle u32
+	features u32
+}
 
 pub struct C.cpu_set_t {
 	val [16]u64
@@ -115,7 +124,8 @@ fn C.io_uring_queue_init_params(entries u32, ring &C.io_uring, p &C.io_uring_par
 
 // fn C.io_uring_queue_exit(ring &C.io_uring)
 fn C.io_uring_get_sqe(ring &C.io_uring) &C.io_uring_sqe
-fn C.io_uring_prep_multishot_accept(sqe &C.io_uring_sqe, fd int, addr &C.sockaddr_in, addrlen &u32, flags int)
+fn C.io_uring_prep_accept(sqe &C.io_uring_sqe, fd int, addr voidptr, addrlen voidptr, flags int)
+fn C.io_uring_prep_multishot_accept(sqe &C.io_uring_sqe, fd int, addr voidptr, addrlen voidptr, flags int)
 fn C.io_uring_sqe_set_data64(sqe &C.io_uring_sqe, data u64)
 fn C.io_uring_prep_recv(sqe &C.io_uring_sqe, fd int, buf voidptr, nbytes usize, flags int)
 fn C.io_uring_prep_send(sqe &C.io_uring_sqe, fd int, buf voidptr, nbytes usize, flags int)
@@ -172,6 +182,8 @@ pub mut:
 	cpu_id     int
 	tid        C.pthread_t
 	listen_fd  int
+	use_multishot bool
+	verbose    bool
 	conns      []Connection
 	free_stack []int
 	free_top   int
@@ -266,14 +278,18 @@ pub fn tune_socket(fd int) {
 
 // ==================== IO Uring Operations ====================
 
-// Prepare multishot accept operation
+// Prepare accept operation (multishot when supported)
 // Returns true if SQE was successfully obtained, false otherwise
-pub fn prepare_accept(ring &C.io_uring, listen_fd int) bool {
+pub fn prepare_accept(ring &C.io_uring, listen_fd int, multishot bool) bool {
 	sqe := C.io_uring_get_sqe(ring)
 	if unsafe { sqe == nil } {
 		return false
 	}
-	C.io_uring_prep_multishot_accept(sqe, listen_fd, unsafe { nil }, unsafe { nil }, C.SOCK_NONBLOCK)
+	if multishot {
+		C.io_uring_prep_multishot_accept(sqe, listen_fd, unsafe { nil }, unsafe { nil }, C.SOCK_NONBLOCK)
+	} else {
+		C.io_uring_prep_accept(sqe, listen_fd, unsafe { nil }, unsafe { nil }, 0)
+	}
 	C.io_uring_sqe_set_data64(sqe, encode_user_data(op_accept, unsafe { nil }))
 	return true
 }
@@ -301,8 +317,8 @@ pub fn prepare_send(ring &C.io_uring, mut c Connection, data &u8, data_len usize
 }
 
 // Legacy aliases
-pub fn prep_accept(ring &C.io_uring, listen_fd int) {
-	prepare_accept(ring, listen_fd)
+pub fn prep_accept(ring &C.io_uring, listen_fd int, multishot bool) {
+	prepare_accept(ring, listen_fd, multishot)
 }
 
 pub fn prep_read(ring &C.io_uring, mut c Connection) {
@@ -337,12 +353,14 @@ pub fn create_listener(port_num int) int {
 		// sin_addr.s_addr (u32) at offset 4
 		*(&u32(&addr[4])) = C.htonl(C.INADDR_ANY)
 	}
+	eprintln('[io_uring] binding fd=${lfd} to 0.0.0.0:${port_num}')
 	if C.bind(lfd, voidptr(&addr[0]), u32(16)) < 0 {
 		C.perror(c'bind')
 		C.close(lfd)
 		return -1
 	}
 
+	eprintln('[io_uring] listen fd=${lfd} backlog=${default_backlog}')
 	if C.listen(lfd, default_backlog) < 0 {
 		C.perror(c'listen')
 		C.close(lfd)
@@ -351,6 +369,7 @@ pub fn create_listener(port_num int) int {
 
 	flags := C.fcntl(lfd, C.F_GETFL, 0)
 	C.fcntl(lfd, C.F_SETFL, flags | C.O_NONBLOCK)
+	eprintln('[io_uring] listener fd=${lfd} ready (nonblocking set)')
 
 	return lfd
 }
