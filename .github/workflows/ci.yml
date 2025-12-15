@@ -17,13 +17,15 @@ jobs:
           unzip v.zip
           cd v
           make
-          sudo ./v symlink
+          v symlink
           v -version
           cd ..
+          cp v/v .
+          cp v/v ~/user/local/bin/
           # remove downloaded files
           rm -rf v v.zip
           # remove V folder to avoid conflicts
-          rmdir /home/runner/v || true
+          rmdir $(pwd)/v || true
       - name: Cache V modules
         uses: actions/cache@v3
         with:
