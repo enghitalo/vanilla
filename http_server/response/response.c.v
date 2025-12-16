@@ -11,10 +11,10 @@ const status_444_response = 'HTTP/1.1 444 No Response\r\nContent-Length: 0\r\nCo
 // HTTP response helpers.
 
 pub fn send_response(fd int, buffer_ptr &u8, buffer_len int) ! {
-	$if linux {
-		flags := C.MSG_NOSIGNAL | C.MSG_ZEROCOPY
+	flags := $if linux {
+		C.MSG_NOSIGNAL | C.MSG_ZEROCOPY
 	} $else {
-		flags := C.MSG_NOSIGNAL
+		C.MSG_NOSIGNAL
 	}
 	sent := C.send(fd, buffer_ptr, buffer_len, flags)
 	if sent < 0 && C.errno != C.EAGAIN && C.errno != C.EWOULDBLOCK {
