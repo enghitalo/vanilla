@@ -15,8 +15,8 @@ jobs:
       - name: Set up V
         uses: vlang/setup-v@v1.4
       - name: Run v fmt check
+        shell: bash
         run: |
-          set -e
             for file in $(find . -type f \( -name '*.v' -o -name '*.vv' \)); do \
                 v fmt -verify "$file" \
             done

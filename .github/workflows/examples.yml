@@ -39,7 +39,6 @@ jobs:
       - name: Install dependencies
         shell: bash
         run: |
-          set -e
           if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
             sudo apt-get update
             sudo apt-get install -y libsqlite3-dev liburing-dev linux-libc-dev
@@ -50,10 +49,8 @@ jobs:
       - name: Build ${{ matrix.folder }}
         shell: bash
         run: |
-          set -e
           v "${{ matrix.folder }}"
       - name: Test ${{ matrix.folder }}
         shell: bash
         run: |
-          set -e
           v test "${{ matrix.folder }}"
