@@ -2,6 +2,32 @@ module database
 
 import db.pg
 
+import db.sqlite
+
+// SQLite connection pool (trivial, as SQLite is file-based and thread-safe for most use cases)
+pub struct SqliteConnectionPool {
+	db sqlite.DB
+}
+
+pub fn new_sqlite_connection_pool(path string) !SqliteConnectionPool {
+	db := sqlite.connect(path)!
+	return SqliteConnectionPool{
+		db: db
+	}
+}
+
+pub fn (mut pool SqliteConnectionPool) acquire() !sqlite.DB {
+	return pool.db
+}
+
+pub fn (mut pool SqliteConnectionPool) release(_ sqlite.DB) {
+	// No-op for SQLite
+}
+
+pub fn (mut pool SqliteConnectionPool) close() {
+	pool.db.close()
+}
+
 pub struct ConnectionPool {
 mut:
 	connections chan pg.DB

@@ -138,14 +138,14 @@ pub fn start_accept_ex(listen_socket int, accept_socket int, overlapped &C.OVERL
 
 pub fn post_recv(socket_fd int, buffers &C.WSABUF, buffer_count u32, flags &u32,
 	overlapped &C.OVERLAPPED) int {
-	return C.WSARecv(u64(socket_fd), buffers, buffer_count, unsafe { nil }, flags,
-		overlapped, unsafe { nil })
+	return C.WSARecv(u64(socket_fd), buffers, buffer_count, unsafe { nil }, flags, overlapped,
+		unsafe { nil })
 }
 
 pub fn post_send(socket_fd int, buffers &C.WSABUF, buffer_count u32, flags u32,
 	overlapped &C.OVERLAPPED) int {
-	return C.WSASend(u64(socket_fd), buffers, buffer_count, unsafe { nil }, flags,
-		overlapped, unsafe { nil })
+	return C.WSASend(u64(socket_fd), buffers, buffer_count, unsafe { nil }, flags, overlapped,
+		unsafe { nil })
 }
 
 pub fn create_io_data(socket_fd int, operation IOOperation, buffer_size int) &IOData {
