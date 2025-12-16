@@ -10,6 +10,7 @@ pub enum IOBackend {
 	epoll            // Linux only
 	io_uring_backend // Linux only
 	kqueue_backend   // Darwin/macOS only
+	iocp_backend     // Windows only
 }
 
 struct Server {
@@ -25,6 +26,11 @@ pub mut:
 // Test method: send raw HTTP requests directly to the server socket, process sequentially, and shutdown after last response.
 pub fn (mut s Server) test(requests [][]u8) ![][]u8 {
 	println('[test] Starting server thread...')
+
+	$if windows {
+		socket.init_winsock() or { return error('Failed to initialize Winsock: ${err}') }
+	}
+
 	// Use a channel to signal when the server is ready
 	ready_ch := chan bool{cap: 1}
 	mut threads := []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
@@ -49,6 +55,9 @@ pub fn (mut s Server) test(requests [][]u8) ![][]u8 {
 		} $else $if darwin {
 			println('[test] Running kqueue backend')
 			run_kqueue_backend(s.socket_fd, s.request_handler, s.port, mut threads)
+		} $else $if windows {
+			println('[test] Running IOCP backend')
+			run_iocp_backend(s.socket_fd, s.request_handler, s.port, mut threads)
 		} $else {
 			eprintln('Unsupported OS for http_server.')
 			exit(1)
@@ -64,6 +73,7 @@ pub fn (mut s Server) test(requests [][]u8) ![][]u8 {
 		eprintln('[test] Failed to connect to server: ${err}')
 		return err
 	}
+
 	println('[test] Client connected, sending requests...')
 	for i, req in requests {
 		println('[test] Preparing to send request #${i + 1} (${req.len} bytes)')
@@ -129,10 +139,16 @@ pub fn (mut s Server) test(requests [][]u8) ![][]u8 {
 		println('[test] Received response #${i + 1} (${buf.len} bytes)')
 		responses << buf.clone()
 	}
+
 	C.close(client_fd)
 	println('[test] Client closed, shutting down server socket...')
 	// Shutdown server after last response
 	socket.close_socket(s.socket_fd)
+
+	$if windows {
+		socket.cleanup_winsock()
+	}
+
 	println('[test] Test complete, returning responses')
 	return responses
 }
@@ -146,9 +162,29 @@ pub:
 
 pub fn new_server(config ServerConfig) Server {
 	socket_fd := socket.create_server_socket(config.port)
+
+	// Set default backend based on OS
+	mut io_backend := config.io_multiplexing
+	$if windows {
+		if io_backend != .iocp_backend {
+			println('Windows only supports IOCP backend, switching to IOCP')
+			io_backend = .iocp_backend
+		}
+	} $else $if linux {
+		if io_backend == .iocp_backend {
+			println('Linux does not support IOCP, switching to epoll')
+			io_backend = .epoll
+		}
+	} $else $if darwin {
+		if io_backend == .iocp_backend {
+			println('macOS does not support IOCP, switching to kqueue')
+			io_backend = .kqueue_backend
+		}
+	}
+
 	return Server{
 		port:            config.port
-		io_multiplexing: config.io_multiplexing
+		io_multiplexing: io_backend
 		socket_fd:       socket_fd
 		request_handler: config.request_handler
 		threads:         []thread{len: max_thread_pool_size, cap: max_thread_pool_size}

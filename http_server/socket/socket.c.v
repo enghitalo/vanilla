@@ -44,6 +44,10 @@ struct C.sockaddr_in {
 // Helper for client connections (for testing)
 pub fn connect_to_server(port int) !int {
 	println('[client] Creating client socket...')
+	$if windows {
+		return connect_to_server_on_windows(port)
+	}
+
 	client_fd := C.socket(C.AF_INET, C.SOCK_STREAM, 0)
 	if client_fd < 0 {
 		println('[client] Failed to create client socket')
@@ -69,20 +73,35 @@ pub fn connect_to_server(port int) !int {
 // Setup and teardown for server sockets.
 
 pub fn set_blocking(fd int, blocking bool) {
-	flags := C.fcntl(fd, C.F_GETFL, 0)
-	if flags == -1 {
-		eprintln(@LOCATION)
-		return
+	$if windows {
+		mut mode := u32(if blocking { 0 } else { 1 })
+		if C.ioctlsocket(SOCKET(fd), 0x8004667E, &mode) != 0 // FIONBIO
+		  {
+			eprintln(@LOCATION + ' ioctlsocket failed: ${C.WSAGetLastError()}')
+		}
+	} $else {
+		flags := C.fcntl(fd, C.F_GETFL, 0)
+		if flags == -1 {
+			eprintln(@LOCATION)
+			return
+		}
+		new_flags := if blocking { flags & ~C.O_NONBLOCK } else { flags | C.O_NONBLOCK }
+		C.fcntl(fd, C.F_SETFL, new_flags)
 	}
-	new_flags := if blocking { flags & ~C.O_NONBLOCK } else { flags | C.O_NONBLOCK }
-	C.fcntl(fd, C.F_SETFL, new_flags)
 }
 
 pub fn close_socket(fd int) {
-	C.close(fd)
+	$if windows {
+		C.closesocket(SOCKET(fd))
+	} $else {
+		C.close(fd)
+	}
 }
 
 pub fn create_server_socket(port int) int {
+	$if windows {
+		return create_server_socket_on_windows(port)
+	}
 	server_fd := C.socket(C.AF_INET, C.SOCK_STREAM, 0)
 	if server_fd < 0 {
 		eprintln(@LOCATION)
