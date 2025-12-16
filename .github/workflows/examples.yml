@@ -7,20 +7,44 @@ on:
     branches: [ main ]
 
 jobs:
-  build-and-test:
+  build-and-test-examples:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        folder:
+          - examples/database/src
+          - examples/etag/src
+          - examples/hexagonal/src
+          - examples/io_uring_demo/src
+          - examples/simple/src
+          - examples/simple2/src
+          - examples/sse/src
     steps:
       - uses: actions/checkout@v4
       - name: Set up V
         uses: vlang/setup-v@v1.4
-      - name: Build all example main files
+      - name: Remove Vlang folder to avoid conflicts
+        run: |
+          rm -rf -v ./vlang || true
+      - name: Install dependencies
+        run: |
+          set -e
+          $if matrix.os == 'ubuntu-latest' {
+            sudo apt-get update
+            sudo apt-get install -y libsqlite3-dev
+            sudo apt install linux-libc-dev # for io_uring
+          } $else if matrix.os == 'macos-latest' {
+            brew update
+            brew install sqlite3
+          }
+      - name: Build ${{ matrix.folder }}
         shell: bash
         run: |
           set -e
-          for file in examples/*/; do
-            echo "Compiling $file"
-            v "$file"
-          done
+          v "${{ matrix.folder }}"
+      - name: Test ${{ matrix.folder }}
+        shell: bash
+        run: |
+          set -e
+          v test "${{ matrix.folder }}"
