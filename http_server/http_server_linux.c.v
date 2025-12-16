@@ -16,6 +16,17 @@ fn C.perror(s &u8)
 fn C.sleep(seconds u32) u32
 fn C.close(fd int) int
 
+const connection_keep_alive_variants = [
+	'Connection: keep-alive'.bytes(),
+	'connection: keep-alive'.bytes(),
+	'Connection: "keep-alive"'.bytes(),
+	'connection: "keep-alive"'.bytes(),
+	'Connection: Keep-Alive'.bytes(),
+	'connection: Keep-Alive'.bytes(),
+	'Connection: "Keep-Alive"'.bytes(),
+	'connection: "Keep-Alive"'.bytes(),
+]!
+
 // Handles a readable client connection: receives the request, routes it, and sends the response.
 fn handle_readable_fd(request_handler fn ([]u8, int) ![]u8, epoll_fd int, client_conn_fd int) {
 	request_buffer := request.read_request(client_conn_fd) or {
@@ -41,6 +52,32 @@ fn handle_readable_fd(request_handler fn ([]u8, int) ![]u8, epoll_fd int, client
 	response.send_response(client_conn_fd, response_buffer.data, response_buffer.len) or {
 		epoll.remove_fd_from_epoll(epoll_fd, client_conn_fd)
 		return
+	}
+
+	$if force_keep_alive ? {
+		return
+	} $else {
+		mut keep_alive := false
+		for variant in connection_keep_alive_variants {
+			mut i := 0
+			for i <= request_buffer.len - variant.len {
+				if unsafe { vmemcmp(&request_buffer[i], &variant[0], variant.len) } == 0 {
+					keep_alive = true
+					break
+				}
+				// Move to next line
+				for i < request_buffer.len && request_buffer[i] != `\n` {
+					i++
+				}
+				i++
+			}
+			if keep_alive {
+				break
+			}
+		}
+		if !keep_alive {
+			epoll.remove_fd_from_epoll(epoll_fd, client_conn_fd)
+		}
 	}
 }
 

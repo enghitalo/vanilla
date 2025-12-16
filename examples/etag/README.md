@@ -1,4 +1,4 @@
-### Running the Server
+## Running the Server
 
 To run the example server in production mode, use the following command:
 
@@ -28,6 +28,10 @@ You can test the server's ETag functionality using `curl`:
    ```sh
    curl -v -H "If-None-Match: c4ca4238a0b923820dcc509a6f75849b" http://localhost:3001/user/1
    ```
+
+## Benchmarking
+
+- use `-d force_keep_alive` to make sure that client will not be "blocked" by having to create a new connection at each request
 
 ### Benchmarking with `wrk`
 

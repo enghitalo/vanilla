@@ -38,6 +38,8 @@ curl -X GET -v http://localhost:3000/user/1
 
 ### Benchmarking
 
+- use `-d force_keep_alive` to make sure that client will not be "blocked" by having to create a new connection at each request
+
 ## WRK
 
 ```sh

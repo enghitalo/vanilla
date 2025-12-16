@@ -112,6 +112,8 @@ fn handle_request(req_buffer []u8, client_conn_fd int, mut pool ConnectionPool) 
 
 ## Benchmarking
 
+- use `-d force_keep_alive` to make sure that client will not be "blocked" by having to create a new connection at each request
+
 ```sh
 wrk -t16 -c512 -d30s http://localhost:3001
 wrk -t16 -c512 -d30s -H "If-None-Match: c4ca4238a0b923820dcc509a6f75849b" http://localhost:3001/user/1
@@ -166,6 +168,8 @@ v install https://github.com/enghitalo/vanilla
 ```
 
 ## Benchmarking
+
+- use `-d force_keep_alive` to make sure that client will not be "blocked" by having to create a new connection at each request
 
 Run the following commands to benchmark the server:
 
