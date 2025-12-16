@@ -9,7 +9,7 @@ on:
 jobs:
   examples-building-and-testing:
     runs-on: ${{ matrix.os }}
-    name: Build'n Test ${{ matrix.os }}, ${{ matrix.folder }}
+    name: Build & Test (${{ matrix.os }}) -> ${{ matrix.folder }}
     strategy:
       fail-fast: false # Continue other jobs if one fails
       matrix:
