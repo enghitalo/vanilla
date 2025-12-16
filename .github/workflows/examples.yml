@@ -28,16 +28,17 @@ jobs:
         run: |
           rm -rf -v ./vlang || true
       - name: Install dependencies
+        shell: bash
         run: |
           set -e
-          $if matrix.os == 'ubuntu-latest' {
+          if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
             sudo apt-get update
             sudo apt-get install -y libsqlite3-dev
             sudo apt install linux-libc-dev # for io_uring
-          } $else if matrix.os == 'macos-latest' {
+          elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
             brew update
             brew install sqlite3
-          }
+          fi
       - name: Build ${{ matrix.folder }}
         shell: bash
         run: |
