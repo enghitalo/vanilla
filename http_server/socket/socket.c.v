@@ -81,6 +81,9 @@ pub fn create_server_socket(port int) int {
 	set_blocking(server_fd, false)
 
 	opt := 1
+
+	// On macOS, also set SO_REUSEPORT to allow quick restarts and multiple listeners
+	// On Linux/other Unix, use SO_REUSEPORT for socket sharding/load balancing
 	if C.setsockopt(server_fd, C.SOL_SOCKET, C.SO_REUSEPORT, &opt, sizeof(opt)) < 0 {
 		eprintln(@LOCATION)
 		C.perror(c'setsockopt SO_REUSEPORT failed')
