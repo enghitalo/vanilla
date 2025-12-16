@@ -19,7 +19,7 @@ pub fn cleanup_winsock() {
 
 type SOCKET = u64
 
-const invalid_socket = SOCKET(~u64(0))
+const invalid_socket = u64(~u64(0))
 const socket_error = -1
 
 fn C.WSAStartup(wVersionRequired u16, lpWSAData voidptr) int

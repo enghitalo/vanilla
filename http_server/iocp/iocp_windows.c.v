@@ -132,7 +132,7 @@ pub fn close_handle(handle voidptr) bool {
 }
 
 pub fn start_accept_ex(listen_socket int, accept_socket int, overlapped &C.OVERLAPPED) bool {
-	return C.AcceptEx(u64(listen_socket), SOCKET(accept_socket), unsafe { nil }, 0,
+	return C.AcceptEx(u64(listen_socket), u64(accept_socket), unsafe { nil }, 0,
 		sizeof(C.sockaddr_in) + 16, sizeof(C.sockaddr_in) + 16, unsafe { nil }, overlapped)
 }
 
