@@ -48,11 +48,17 @@ fn main() {
 
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
-		io_multiplexing: .epoll
+		io_multiplexing: $if linux {
+			.epoll
+		} $else $if darwin {
+			.kqueue
+		} $else {
+			.iocp
+		}
 		request_handler: fn [mut pool] (req_buffer []u8, client_conn_fd int) ![]u8 {
 			return handle_request(req_buffer, client_conn_fd, mut pool)
 		}
-	})
+	})!
 
 	server.run()
 

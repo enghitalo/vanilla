@@ -9,20 +9,24 @@ fn handle_request(req_buffer []u8, client_conn_fd int) ![]u8 {
 }
 
 fn main() {
-	// Get io_multiplexing from command line arg, default to epoll
-	io_multiplexing := $if io_uring ? {
-		http_server.IOBackend.io_uring_backend
-	} $else {
-		http_server.IOBackend.epoll
-	}
-
-	println('Starting server with ${io_multiplexing} io_multiplexing...')
+	// println('Starting server with ${io_multiplexing} io_multiplexing...')
 
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
-		io_multiplexing: io_multiplexing
+		io_multiplexing: $if linux {
+			// Get io_multiplexing from command line arg, default to epoll
+			$if io_uring ? {
+				http_server.IOBackend.io_uring
+			} $else {
+				http_server.IOBackend.epoll
+			}
+		} $else $if darwin {
+			http_server.IOBackend.kqueue
+		} $else {
+			http_server.IOBackend.iocp
+		}
 		request_handler: handle_request
-	})
+	})!
 
 	server.run()
 }

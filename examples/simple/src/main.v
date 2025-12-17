@@ -30,8 +30,14 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		request_handler: handle_request
-		io_multiplexing: .epoll
-	})
+		io_multiplexing: $if linux {
+			.epoll
+		} $else $if darwin {
+			.kqueue
+		} $else {
+			.iocp
+		}
+	})!
 
 	server.run()
 }

@@ -14,8 +14,14 @@ fn test_server_end_to_end() ! {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            8082
 		request_handler: handle_request
-		io_multiplexing: .epoll
-	})
+		io_multiplexing: $if linux {
+			.epoll
+		} $else $if darwin {
+			.kqueue
+		} $else {
+			.iocp
+		}
+	})!
 	responses := server.test(requests) or { panic('[test] server.test failed: ${err}') }
 	assert responses.len == 4
 	assert responses[0] == http_ok_response

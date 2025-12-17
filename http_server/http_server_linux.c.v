@@ -460,7 +460,7 @@ pub fn (mut server Server) run() {
 			run_epoll_backend(server.socket_fd, server.request_handler, server.port, mut
 				server.threads)
 		}
-		.io_uring_backend {
+		.io_uring {
 			run_io_uring_backend(server.request_handler, server.port, mut server.threads)
 		}
 		else {

@@ -7,10 +7,10 @@ const max_thread_pool_size = runtime.nr_cpus()
 
 // Backend selection
 pub enum IOBackend {
-	epoll            // Linux only
-	io_uring_backend // Linux only
-	kqueue_backend   // Darwin/macOS only
-	iocp_backend     // Windows only
+	epoll    // Linux only
+	io_uring // Linux only
+	kqueue   // Darwin/macOS only
+	iocp     // Windows only
 }
 
 struct Server {
@@ -43,7 +43,7 @@ pub fn (mut s Server) test(requests [][]u8) ![][]u8 {
 					println('[test] Running epoll backend')
 					run_epoll_backend(s.socket_fd, s.request_handler, s.port, mut threads)
 				}
-				.io_uring_backend {
+				.io_uring {
 					println('[test] Running io_uring backend')
 					run_io_uring_backend(s.request_handler, s.port, mut threads)
 				}
@@ -160,31 +160,28 @@ pub:
 	request_handler fn ([]u8, int) ![]u8 @[required]
 }
 
-pub fn new_server(config ServerConfig) Server {
+pub fn new_server(config ServerConfig) !Server {
 	socket_fd := socket.create_server_socket(config.port)
 
 	// Set default backend based on OS
-	mut io_backend := config.io_multiplexing
+	io_multiplexing := config.io_multiplexing
 	$if windows {
-		if io_backend != .iocp_backend {
-			println('Windows only supports IOCP backend, switching to IOCP')
-			io_backend = .iocp_backend
+		if io_multiplexing != .iocp {
+			return error('Windows only supports IOCP backend')
 		}
 	} $else $if linux {
-		if io_backend == .iocp_backend {
-			println('Linux does not support IOCP, switching to epoll')
-			io_backend = .epoll
+		if io_multiplexing != .epoll && io_multiplexing != .io_uring {
+			return error('Linux only supports epoll and io_uring backends')
 		}
 	} $else $if darwin {
-		if io_backend == .iocp_backend {
-			println('macOS does not support IOCP, switching to kqueue')
-			io_backend = .kqueue_backend
+		if io_multiplexing != .kqueue {
+			return error('macOS only supports kqueue backend')
 		}
 	}
 
 	return Server{
 		port:            config.port
-		io_multiplexing: io_backend
+		io_multiplexing: io_multiplexing
 		socket_fd:       socket_fd
 		request_handler: config.request_handler
 		threads:         []thread{len: max_thread_pool_size, cap: max_thread_pool_size}

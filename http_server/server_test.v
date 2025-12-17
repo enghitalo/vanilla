@@ -16,11 +16,18 @@ fn test_server_end_to_end() ! {
 	requests := [request1, request2]
 
 	println('[test] Creating server...')
+	mut io_multiplexing := IOBackend{}
 	mut server := new_server(ServerConfig{
 		port:            8081
-		io_multiplexing: .epoll
+		io_multiplexing: $if linux {
+			.epoll
+		} $else $if darwin {
+			.kqueue
+		} $else {
+			.iocp
+		}
 		request_handler: dummy_handler
-	})
+	})!
 	println('[test] Running server.test...')
 	responses := server.test(requests) or {
 		eprintln('[test] server.test failed: ${err}')

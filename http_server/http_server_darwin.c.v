@@ -107,12 +107,12 @@ pub fn run_kqueue_backend(socket_fd int, handler fn ([]u8, int) ![]u8, port int,
 
 pub fn (mut server Server) run() {
 	match server.io_multiplexing {
-		.kqueue_backend {
+		.kqueue {
 			run_kqueue_backend(server.socket_fd, server.request_handler, server.port, mut
 				server.threads)
 		}
 		else {
-			eprintln('Only kqueue_backend is supported on macOS/Darwin.')
+			eprintln('Only kqueue is supported on macOS/Darwin.')
 			exit(1)
 		}
 	}
