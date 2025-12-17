@@ -3,8 +3,6 @@ name: Pretty Fmt Checker
 on:
   pull_request:
     branches: [ main ]
-  push:
-    branches: [ main ]
 
 jobs:
   fmt-check:
@@ -14,9 +12,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Set up V
         uses: vlang/setup-v@v1.4
-      - name: Run v fmt check
+      - name: Remove Vlang folder to avoid conflicts
         shell: bash
         run: |
-            for file in $(find . -type f \( -name '*.v' -o -name '*.vv' \)); do \
-                v fmt -verify "$file" \
-            done
+          rm -rf -v ./vlang || true
+      - name: Run v fmt checker
+        shell: bash
+        run: |
+          v fmt -verify .
