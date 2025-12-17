@@ -14,7 +14,13 @@ jobs:
       fail-fast: false # Continue other jobs if one fails
       matrix:
         folder:
-          - examples/**/src
+          - examples/database/src
+          - examples/etag/src
+          - examples/hexagonal/src
+          - examples/io_uring_demo/src
+          - examples/simple/src
+          - examples/simple2/src
+          - examples/sse/src
     steps:
       - uses: actions/checkout@v4
       - name: Set up V
