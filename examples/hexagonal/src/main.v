@@ -7,9 +7,6 @@ import infrastructure.http
 import application
 // import domain
 
-
-import infrastructure.repositories { DummyProductRepository }
-
 fn main() {
 	// Choose database backend: "pg" or "sqlite"
 	db_backend := 'sqlite' // change to 'pg' for PostgreSQL
@@ -19,11 +16,11 @@ fn main() {
 		'pg' {
 			// PostgreSQL connection
 			config := pg.Config{
-				host: 'localhost'
-				port: 5432
-				user: 'postgres'
+				host:     'localhost'
+				port:     5432
+				user:     'postgres'
 				password: 'postgres'
-				dbname: 'hexagonal'
+				dbname:   'hexagonal'
 			}
 			mut pool := database.new_connection_pool(config, 5) or {
 				panic('Failed to create connection pool: ' + err.msg())
@@ -31,9 +28,7 @@ fn main() {
 			defer {
 				pool.close()
 			}
-			mut db := pool.acquire() or {
-				panic('Failed to acquire DB connection: ' + err.msg())
-			}
+			mut db := pool.acquire() or { panic('Failed to acquire DB connection: ' + err.msg()) }
 			defer {
 				pool.release(db)
 			}
@@ -47,9 +42,7 @@ fn main() {
 			defer {
 				pool.close()
 			}
-			db := pool.acquire() or {
-				panic('Failed to acquire SQLite DB: ' + err.msg())
-			}
+			db := pool.acquire() or { panic('Failed to acquire SQLite DB: ' + err.msg()) }
 			repositories.new_sqlite_user_repository(db)
 		}
 		else {
@@ -58,7 +51,7 @@ fn main() {
 	}
 
 	// TODO: implement ProductRepository for real use
-	product_repo := DummyProductRepository{}
+	product_repo := repositories.DummyProductRepository{}
 
 	// Infrastructure: auth service
 	auth_service := http.new_simple_auth_service(user_repo)
@@ -81,6 +74,3 @@ fn main() {
 	resp3 := http.handle_list_users(user_uc)
 	println(resp3.bytestr())
 }
-
-
-
