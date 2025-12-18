@@ -38,8 +38,8 @@ jobs:
       - name: Build ${{ matrix.folder }}
         shell: bash
         run: |
-          v "${{ matrix.folder }}"
-      - name: Test ${{ matrix.folder }}
+          v $(pwd)/${{ matrix.folder }}
+      - name: Test $(pwd)/examples/**/src
         shell: bash
         run: |
-          v test "${{ matrix.folder }}"
+          v test $(pwd)/examples/**/

@@ -2,7 +2,6 @@ module http
 
 import strings
 import application
-import domain
 import json
 
 const http_ok = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n'.bytes()
