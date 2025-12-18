@@ -1,4 +1,4 @@
-name: Build & Test Examples (Linux)
+name: (Linux) Build & Test Examples
 
 on:
   push:

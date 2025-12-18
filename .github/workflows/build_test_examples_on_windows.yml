@@ -1,4 +1,4 @@
-name: Build & Test Examples (Windows)
+name: (Windows) Build & Test Examples
 
 on:
   push:
