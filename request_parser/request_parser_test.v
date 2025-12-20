@@ -22,7 +22,7 @@ fn test_parse_http1_request_line_invalid_request() {
 	mut has_error := false
 	parse_http1_request_line(mut req) or {
 		has_error = true
-		assert err.msg() == 'Invalid HTTP request line'
+		assert err.msg() == 'Missing CR'
 	}
 	assert has_error, 'Expected error for invalid request line'
 }
@@ -42,7 +42,7 @@ fn test_decode_http_request_invalid_request() {
 	mut has_error := false
 	decode_http_request(buffer) or {
 		has_error = true
-		assert err.msg() == 'Invalid HTTP request line'
+		assert err.msg() == 'Missing CR'
 	}
 	assert has_error, 'Expected error for invalid request'
 }

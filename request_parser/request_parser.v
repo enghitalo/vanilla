@@ -6,53 +6,94 @@ pub:
 	len   int
 }
 
+// TODO make fields immutable
 pub struct HttpRequest {
+pub:
+	buffer []u8
 pub mut:
-	buffer  []u8
 	method  Slice
 	path    Slice
 	version Slice
 }
 
+fn C.memchr(s &u8, c int, n usize) &u8
+
+// libc memchr is AVX2-accelerated via glibc IFUNC
+@[inline]
+fn find_byte(buf &u8, len int, c u8) int {
+	unsafe {
+		p := C.memchr(buf, c, len)
+		if p == voidptr(nil) {
+			return -1
+		}
+		return int(p - buf)
+	}
+}
+
 @[direct_array_access]
-fn parse_http1_request_line(mut req HttpRequest) ! {
-	mut i := 0
-	// Parse HTTP method
-	for i < req.buffer.len && req.buffer[i] != ` ` {
-		i++
-	}
-	req.method = Slice{
-		start: 0
-		len:   i
-	}
-	i++
+pub fn parse_http1_request_line(mut req HttpRequest) ! {
+	unsafe {
+		buf := &req.buffer[0]
+		len := req.buffer.len
 
-	// Parse path
-	mut path_start := i
-	for i < req.buffer.len && req.buffer[i] != ` ` {
-		i++
-	}
-	req.path = Slice{
-		start: path_start
-		len:   i - path_start
-	}
-	i++
+		if len < 12 {
+			return error('Too short')
+		}
 
-	// Parse HTTP version
-	mut version_start := i
-	for i < req.buffer.len && req.buffer[i] != `\r` {
-		i++
-	}
-	req.version = Slice{
-		start: version_start
-		len:   i - version_start
-	}
+		// METHOD
+		pos1 := find_byte(buf, len, u8(` `))
+		if pos1 <= 0 {
+			return error('Invalid method')
+		}
+		req.method = Slice{0, pos1}
 
-	// Move to the end of the request line
-	if i + 1 < req.buffer.len && req.buffer[i] == `\r` && req.buffer[i + 1] == `\n` {
-		i += 2
-	} else {
-		return error('Invalid HTTP request line')
+		// PATH
+		mut pos2 := pos1 + 1
+		for pos2 < len && buf[pos2] == u8(` `) {
+			pos2++
+		}
+		if pos2 >= len {
+			return error('Missing path')
+		}
+
+		path_start := pos2
+		space_pos := find_byte(buf + pos2, len - pos2, ` `)
+		cr_pos := find_byte(buf + pos2, len - pos2, `\r`)
+
+		if space_pos < 0 && cr_pos < 0 {
+			return error('Invalid request line')
+		}
+
+		// pick earliest delimiter
+		mut path_len := 0
+		mut delim_pos := 0
+		if space_pos >= 0 && (cr_pos < 0 || space_pos < cr_pos) {
+			path_len = space_pos
+			delim_pos = pos2 + space_pos
+		} else {
+			path_len = cr_pos
+			delim_pos = pos2 + cr_pos
+		}
+
+		req.path = Slice{path_start, path_len}
+
+		// VERSION
+		if buf[delim_pos] == `\r` {
+			req.version = Slice{delim_pos, 0}
+		} else {
+			version_start := delim_pos + 1
+			cr := find_byte(buf + version_start, len - version_start, `\r`)
+			if cr < 0 {
+				return error('Missing CR')
+			}
+			req.version = Slice{version_start, cr}
+			delim_pos = version_start + cr
+		}
+
+		// Validate CRLF
+		if delim_pos + 1 >= len || buf[delim_pos + 1] != `\n` {
+			return error('Invalid CRLF')
+		}
 	}
 }
 
@@ -62,7 +103,6 @@ pub fn decode_http_request(buffer []u8) !HttpRequest {
 	}
 
 	parse_http1_request_line(mut req)!
-
 	return req
 }
 
