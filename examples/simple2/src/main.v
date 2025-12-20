@@ -6,8 +6,8 @@ import http_server.response
 
 fn handle_request(req_buffer []u8, client_conn_fd int) ![]u8 {
 	req := request_parser.decode_http_request(req_buffer)!
-	method := request_parser.slice_to_string(req.buffer, req.method)
-	path := request_parser.slice_to_string(req.buffer, req.path)
+	method := req.method.to_string(req.buffer)
+	path := req.path.to_string(req.buffer)
 
 	match method {
 		'GET' {

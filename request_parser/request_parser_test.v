@@ -8,9 +8,9 @@ fn test_parse_http1_request_line_valid_request() {
 
 	parse_http1_request_line(mut req) or { panic(err) }
 
-	assert slice_to_string(req.buffer, req.method) == 'GET'
-	assert slice_to_string(req.buffer, req.path) == '/path/to/resource'
-	assert slice_to_string(req.buffer, req.version) == 'HTTP/1.1'
+	req.method.to_string(req.buffer) == 'GET'
+	req.path.to_string(req.buffer) == '/path/to/resource'
+	req.version.to_string(req.buffer) == 'HTTP/1.1'
 }
 
 fn test_parse_http1_request_line_invalid_request() {
@@ -31,9 +31,9 @@ fn test_decode_http_request_valid_request() {
 	buffer := 'POST /api/resource HTTP/1.0\r\n'.bytes()
 	req := decode_http_request(buffer) or { panic(err) }
 
-	assert slice_to_string(req.buffer, req.method) == 'POST'
-	assert slice_to_string(req.buffer, req.path) == '/api/resource'
-	assert slice_to_string(req.buffer, req.version) == 'HTTP/1.0'
+	assert req.method.to_string(req.buffer) == 'POST'
+	assert req.path.to_string(req.buffer) == '/api/resource'
+	assert req.version.to_string(req.buffer) == 'HTTP/1.0'
 }
 
 fn test_decode_http_request_invalid_request() {
@@ -52,12 +52,12 @@ fn test_get_header_value_slice_existing_header() {
 	req := decode_http_request(buffer) or { panic(err) }
 
 	host_slice := req.get_header_value_slice('Host') or { panic('Header not found') }
-	assert slice_to_string(req.buffer, host_slice) == 'example.com'
+	assert host_slice.to_string(req.buffer) == 'example.com'
 
 	content_type_slice := req.get_header_value_slice('Content-Type') or {
 		panic('Header not found')
 	}
-	assert slice_to_string(req.buffer, content_type_slice) == 'text/html'
+	assert content_type_slice.to_string(req.buffer) == 'text/html'
 }
 
 fn test_get_header_value_slice_non_existing_header() {

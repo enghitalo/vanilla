@@ -114,11 +114,11 @@ pub fn decode_http_request(buffer []u8) !HttpRequest {
 }
 
 // Helper function to convert Slice to string for debugging
-pub fn slice_to_string(buffer []u8, s Slice) string {
-	if s.len <= 0 {
+pub fn (slice Slice) to_string(buffer []u8) string {
+	if slice.len <= 0 {
 		return ''
 	}
-	return buffer[s.start..s.start + s.len].bytestr()
+	return buffer[slice.start..slice.start + slice.len].bytestr()
 }
 
 @[direct_array_access]
