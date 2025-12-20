@@ -1,5 +1,9 @@
 module request_parser
 
+const empty_space = u8(` `)
+const cr_char = u8(`\r`)
+const lf_char = u8(`\n`)
+
 pub struct Slice {
 pub:
 	start int
@@ -14,6 +18,8 @@ pub mut:
 	method  Slice
 	path    Slice
 	version Slice
+	// headers Slice
+	// payload Slice
 }
 
 fn C.memchr(s &u8, c int, n usize) &u8
@@ -41,15 +47,15 @@ pub fn parse_http1_request_line(mut req HttpRequest) ! {
 		}
 
 		// METHOD
-		pos1 := find_byte(buf, len, u8(` `))
+		pos1 := find_byte(buf, len, empty_space)
 		if pos1 <= 0 {
 			return error('Invalid method')
 		}
 		req.method = Slice{0, pos1}
 
-		// PATH
+		// PATH - skip any extra spaces
 		mut pos2 := pos1 + 1
-		for pos2 < len && buf[pos2] == u8(` `) {
+		for pos2 < len && buf[pos2] == empty_space {
 			pos2++
 		}
 		if pos2 >= len {
@@ -57,8 +63,8 @@ pub fn parse_http1_request_line(mut req HttpRequest) ! {
 		}
 
 		path_start := pos2
-		space_pos := find_byte(buf + pos2, len - pos2, ` `)
-		cr_pos := find_byte(buf + pos2, len - pos2, `\r`)
+		space_pos := find_byte(buf + pos2, len - pos2, empty_space)
+		cr_pos := find_byte(buf + pos2, len - pos2, cr_char)
 
 		if space_pos < 0 && cr_pos < 0 {
 			return error('Invalid request line')
@@ -78,11 +84,12 @@ pub fn parse_http1_request_line(mut req HttpRequest) ! {
 		req.path = Slice{path_start, path_len}
 
 		// VERSION
-		if buf[delim_pos] == `\r` {
+		if buf[delim_pos] == cr_char {
+			// No HTTP version specified
 			req.version = Slice{delim_pos, 0}
 		} else {
 			version_start := delim_pos + 1
-			cr := find_byte(buf + version_start, len - version_start, `\r`)
+			cr := find_byte(buf + version_start, len - version_start, cr_char)
 			if cr < 0 {
 				return error('Missing CR')
 			}
@@ -91,7 +98,7 @@ pub fn parse_http1_request_line(mut req HttpRequest) ! {
 		}
 
 		// Validate CRLF
-		if delim_pos + 1 >= len || buf[delim_pos + 1] != `\n` {
+		if delim_pos + 1 >= len || buf[delim_pos + 1] != lf_char {
 			return error('Invalid CRLF')
 		}
 	}
@@ -108,6 +115,9 @@ pub fn decode_http_request(buffer []u8) !HttpRequest {
 
 // Helper function to convert Slice to string for debugging
 pub fn slice_to_string(buffer []u8, s Slice) string {
+	if s.len <= 0 {
+		return ''
+	}
 	return buffer[s.start..s.start + s.len].bytestr()
 }
 
