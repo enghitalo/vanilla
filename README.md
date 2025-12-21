@@ -14,6 +14,7 @@
 - **Database Friendly**: Example with PostgreSQL connection pool.
 - **Graceful Shutdown**: Automatic shutdown after test mode or on signal (W.I.P.).
 - **Multiple Backends**: epoll, io_uring, kqueue (platform-dependent).
+- **Compliant with HTTP standards**: It follows [RFC9112](https://datatracker.ietf.org/doc/rfc9112/) and [IANA Field Name Registry](https://www.iana.org/assignments/http-fields/http-fields.xhtml)
 
 ---
 

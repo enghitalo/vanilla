@@ -16,10 +16,10 @@ pub:
 	buffer []u8
 pub mut:
 	method  Slice
-	path    Slice
+	path    Slice // TODO: change to request_target (rfc9112)
 	version Slice
-	// headers Slice
-	// payload Slice
+	// header_fields Slice
+	// body Slice
 }
 
 fn C.memchr(s &u8, c int, n usize) &u8
@@ -36,6 +36,16 @@ fn find_byte(buf &u8, len int, c u8) int {
 	}
 }
 
+// spec: https://datatracker.ietf.org/doc/rfc9112/
+// request-line is the start-line for for requests
+// According to RFC 9112, the request line is structured as:
+// `request-line   = method SP request-target SP HTTP-version`
+// where:
+// METHOD is the HTTP method (e.g., GET, POST)
+// SP is a single space character
+// REQUEST-TARGET is the path or resource being requested
+// HTTP-VERSION is the version of HTTP being used (e.g., HTTP/1.1)
+// CRLF is a carriage return followed by a line feed
 @[direct_array_access]
 pub fn parse_http1_request_line(mut req HttpRequest) ! {
 	unsafe {
