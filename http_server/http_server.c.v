@@ -150,6 +150,9 @@ pub:
 	port            int       = 3000
 	io_multiplexing IOBackend = unsafe { IOBackend(0) }
 	request_handler fn ([]u8, int) ![]u8 @[required]
+	cert_pem        []u8
+	key_pem         []u8
+	ca_cert_pem     []u8
 }
 
 pub fn new_server(config ServerConfig) !Server {
