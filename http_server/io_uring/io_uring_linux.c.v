@@ -72,19 +72,6 @@ pub fn decode_connection_ptr(data u64) voidptr {
 	return voidptr(data & ptr_mask)
 }
 
-// Legacy aliases for backward compatibility
-pub fn pack(op u8, ptr voidptr) u64 {
-	return encode_user_data(op, ptr)
-}
-
-pub fn unpack_op(data u64) u8 {
-	return decode_op_type(data)
-}
-
-pub fn unpack_ptr(data u64) voidptr {
-	return decode_connection_ptr(data)
-}
-
 // ==================== C Bindings ====================
 
 // io_uring structures and functions
@@ -121,8 +108,7 @@ pub struct C.cpu_set_t {
 
 // C function bindings
 fn C.io_uring_queue_init_params(entries u32, ring &C.io_uring, p &C.io_uring_params) int
-
-// fn C.io_uring_queue_exit(ring &C.io_uring)
+fn C.io_uring_queue_exit(ring &C.io_uring)
 fn C.io_uring_get_sqe(ring &C.io_uring) &C.io_uring_sqe
 fn C.io_uring_prep_accept(sqe &C.io_uring_sqe, fd int, addr voidptr, addrlen voidptr, flags int)
 fn C.io_uring_prep_multishot_accept(sqe &C.io_uring_sqe, fd int, addr voidptr, addrlen voidptr, flags int)
@@ -315,19 +301,6 @@ pub fn prepare_send(ring &C.io_uring, mut c Connection, data &u8, data_len usize
 	C.io_uring_prep_send(sqe, c.fd, unsafe { data }, data_len, 0)
 	C.io_uring_sqe_set_data64(sqe, encode_user_data(op_write, &c))
 	return true
-}
-
-// Legacy aliases
-pub fn prep_accept(ring &C.io_uring, listen_fd int, multishot bool) {
-	prepare_accept(ring, listen_fd, multishot)
-}
-
-pub fn prep_read(ring &C.io_uring, mut c Connection) {
-	prepare_recv(ring, mut c)
-}
-
-pub fn prep_write(ring &C.io_uring, mut c Connection, resp &u8, resp_len usize) {
-	prepare_send(ring, mut c, resp, resp_len)
 }
 
 // ==================== Server Setup ====================
