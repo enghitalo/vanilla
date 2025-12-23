@@ -206,11 +206,14 @@ fn process_events(event_callbacks epoll.EpollEventCallbacks, epoll_fd int) {
 
 // ==================== Epoll Backend ====================
 
-pub fn run_epoll_backend(socket_fd int, handler fn ([]u8, int) ![]u8, port int, mut threads []thread) {
+pub fn run_epoll_backend(socket_fd int, request_handler fn ([]u8, int) ![]u8, port int, mut threads []thread) {
 	if socket_fd < 0 {
 		return
 	}
 
+	// Create main epoll instance
+	// the function of the main_epoll_fd is to monitor the listening socket for incoming connections
+	// then distribute them to worker threads
 	main_epoll_fd := epoll.create_epoll_fd()
 	if main_epoll_fd < 0 {
 		socket.close_socket(socket_fd)
@@ -223,7 +226,10 @@ pub fn run_epoll_backend(socket_fd int, handler fn ([]u8, int) ![]u8, port int, 
 		exit(1)
 	}
 
+	// the function of this epoll_fds array is to hold epoll fds for each worker thread
+	// they are used to distribute client connections among worker threads
 	mut epoll_fds := []int{len: max_thread_pool_size, cap: max_thread_pool_size}
+
 	unsafe { epoll_fds.flags.set(.noslices | .noshrink | .nogrow) }
 	for i in 0 .. max_thread_pool_size {
 		epoll_fds[i] = epoll.create_epoll_fd()
@@ -238,10 +244,10 @@ pub fn run_epoll_backend(socket_fd int, handler fn ([]u8, int) ![]u8, port int, 
 		}
 
 		// Build per-thread callbacks: default to handle_readable_fd; write is a no-op.
-		epfd := epoll_fds[i]
+		epoll_fd := epoll_fds[i]
 		callbacks := epoll.EpollEventCallbacks{
-			on_read:  fn [handler, epfd] (fd int) {
-				handle_readable_fd(handler, epfd, fd)
+			on_read:  fn [request_handler, epoll_fd] (client_conn_fd int) {
+				handle_readable_fd(request_handler, epoll_fd, client_conn_fd)
 			}
 			on_write: fn (_ int) {}
 		}
@@ -254,7 +260,7 @@ pub fn run_epoll_backend(socket_fd int, handler fn ([]u8, int) ![]u8, port int, 
 
 // ==================== IO Uring Backend ====================
 
-pub fn run_io_uring_backend(handler fn ([]u8, int) ![]u8, port int, mut threads []thread) {
+pub fn run_io_uring_backend(request_handler fn ([]u8, int) ![]u8, port int, mut threads []thread) {
 	num_workers := max_thread_pool_size
 
 	for i in 0 .. num_workers {
@@ -295,7 +301,7 @@ pub fn run_io_uring_backend(handler fn ([]u8, int) ![]u8, port int, mut threads 
 			exit(1)
 		}
 		// Spawn worker thread
-		threads[i] = spawn io_uring_worker_loop(worker, handler)
+		threads[i] = spawn io_uring_worker_loop(worker, request_handler)
 	}
 
 	println('listening on http://localhost:${port}/ (io_uring)')
