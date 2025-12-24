@@ -31,8 +31,6 @@ You can test the server's ETag functionality using `curl`:
 
 ## Benchmarking
 
-- use `-d force_keep_alive` to make sure that client will not be "blocked" by having to create a new connection at each request
-
 ### Benchmarking with `wrk`
 
 You can benchmark the server's performance using `wrk`. For example:
