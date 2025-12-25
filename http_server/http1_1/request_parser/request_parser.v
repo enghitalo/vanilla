@@ -129,32 +129,31 @@ pub fn decode_http_request(buffer []u8) !HttpRequest {
 	// header_start is the byte index immediately after the request line's \r\n
 	header_start := parse_http1_request_line(mut req)!
 
-	// Find the end of the header block (\r\n\r\n)
-	mut body_start := -1
-	for i := header_start; i <= buffer.len - 4; i++ {
-		if buffer[i] == cr_char && buffer[i + 1] == lf_char && buffer[i + 2] == cr_char
-			&& buffer[i + 3] == lf_char {
-			body_start = i + 4
-
-			// The header fields slice covers everything from header_start
-			// up to (but not including) the final double CRLF
-			req.header_fields = Slice{
-				start: header_start
-				len:   i - header_start
-			}
-			break
-		}
+	header_len := find_sequence(&buffer[header_start], buffer.len - header_start, &double_crlf[0],
+		double_crlf.len) or {
+		return error("Missing header-body delimiter. Non-header HTTP/1.0 aren't supported.")
 	}
 
-	if body_start != -1 {
+	if header_len + header_start + double_crlf.len == buffer.len {
+		// No body present
+		req.header_fields = Slice{
+			start: header_start
+			len:   header_len
+		}
+		req.body = Slice{0, 0}
+		return req
+	} else {
+		// Body present
+		req.header_fields = Slice{
+			start: header_start
+			len:   header_len
+		}
+		body_start := header_start + header_len + double_crlf.len
 		req.body = Slice{
 			start: body_start
 			len:   buffer.len - body_start
 		}
-	} else {
-		// If no body delimiter found, assume headers go to end or body is missing
-		req.header_fields = Slice{header_start, buffer.len - header_start - 2}
-		req.body = Slice{0, 0}
+		return req
 	}
 
 	return req

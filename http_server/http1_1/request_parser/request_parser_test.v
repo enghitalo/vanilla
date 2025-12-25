@@ -28,8 +28,16 @@ fn test_parse_http1_request_line_invalid_request() {
 }
 
 fn test_decode_http_request_valid_request() {
-	buffer := 'POST /api/resource HTTP/1.0\r\n'.bytes()
-	req := decode_http_request(buffer) or { panic(err) }
+	// HTTP/1.0 does not require Host header
+	// But I don't want to support HTTP/1.0 so it is a error now :)
+	buffer := 'POST /api/resource HTTP/1.0\r\n\r\n'.bytes()
+	mut has_error := false
+	req := decode_http_request(buffer) or {
+		has_error = true
+		assert err.msg() == "Missing header-body delimiter. Non-header HTTP/1.0 aren't supported."
+		return
+	}
+	assert has_error, 'Expected error for HTTP/1.0 request without Host header'
 
 	assert req.method.to_string(req.buffer) == 'POST'
 	assert req.path.to_string(req.buffer) == '/api/resource'
@@ -79,8 +87,13 @@ fn test_decode_http_request_no_body() {
 fn test_decode_http_request_malformed_no_double_crlf() {
 	// Request that never finishes headers
 	buffer := 'GET / HTTP/1.1\r\nHost: example.com\r\n'.bytes()
-	req := decode_http_request(buffer) or { panic(err) }
-
+	mut has_error := false
+	req := decode_http_request(buffer) or {
+		has_error = true
+		assert err.msg() == "Missing header-body delimiter. Non-header HTTP/1.0 aren't supported."
+		return
+	}
+	assert has_error, 'Expected error for missing header-body delimiter'
 	// Based on our implementation, if no \r\n\r\n is found,
 	// body should be empty and headers go to the end.
 	assert req.body.len == 0
