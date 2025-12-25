@@ -42,7 +42,6 @@ fn handle_readable_fd(request_handler fn ([]u8, int) ![]u8, epoll_fd int, client
 		epoll.remove_fd_from_epoll(epoll_fd, client_conn_fd)
 		return
 	}
-
 }
 
 // Accept loop for the main epoll thread. Distributes new client connections to worker threads (round-robin).
