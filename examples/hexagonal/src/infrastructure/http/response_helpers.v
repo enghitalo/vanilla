@@ -4,6 +4,14 @@ import strings
 import crypto.md5
 import time
 
+const http_ok = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n'.bytes()
+const http_created = 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n'.bytes()
+
+const http_not_modified = 'HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
+const http_bad_request = 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
+const http_not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
+const http_server_error = 'HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
+
 const http1_version = 'HTTP/1.1 '.bytes()
 const content_type_header_field = 'Content-Type: '.bytes()
 const connection_header_field = 'Connection: '.bytes()
