@@ -28,7 +28,8 @@ pub fn build_basic_response(status int, body_buffer []u8, content_type_buffer []
 		else { 'OK'.bytes() }
 	}
 
-	etag := md5.sum(body_buffer).hex()
+	// slow
+	etag := md5.sum(body_buffer).hex().bytes()
 
 	mut sb := strings.new_builder(256)
 	// request line
@@ -39,8 +40,6 @@ pub fn build_basic_response(status int, body_buffer []u8, content_type_buffer []
 	sb.write('\r\n'.bytes()) or { println(err) }
 
 	// headers
-	// TODO: missing HTTP/1.1 obligatory headers
-	// like Date, Server, etc.
 	// Date
 	sb.write('Date: '.bytes()) or { println(err) }
 	// time.utc().push_to_http_header(sb) // After https://github.com/vlang/v/pull/26155
@@ -49,9 +48,10 @@ pub fn build_basic_response(status int, body_buffer []u8, content_type_buffer []
 	// content type
 	sb.write(content_type_header_field) or { println(err) }
 	sb.write(content_type_buffer) or { println(err) }
+	sb.write('\r\n'.bytes()) or { println(err) }
 	// etag
 	sb.write(etag_header_field) or { println(err) }
-	sb.write(etag.bytes()) or { println(err) }
+	sb.write(etag) or { println(err) }
 	sb.write('\r\n'.bytes()) or { println(err) }
 	// content length
 	sb.write(content_length_header_field) or { println(err) }
