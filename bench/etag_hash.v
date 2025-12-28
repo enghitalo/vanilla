@@ -45,10 +45,10 @@ const hex_lut_u16 = [
 // vfmt on
 
 @[inline]
-fn u64_to_hex_chunked(mut out []u8, v u64) {
+fn u64_to_hex_chunked(mut out [16]u8, v u64) {
 	unsafe {
 		// Cast output to u16 pointer to write 2 bytes at a time
-		mut p_out := &u16(out.data)
+		mut p_out := &u16(&out[0])
 		p_out[0] = hex_lut_u16[u8(v >> 56)]
 		p_out[1] = hex_lut_u16[u8(v >> 48)]
 		p_out[2] = hex_lut_u16[u8(v >> 40)]
@@ -60,8 +60,11 @@ fn u64_to_hex_chunked(mut out []u8, v u64) {
 	}
 }
 
-const m_80 = u64(0x8080808080808080)
-const m_20 = u64(0x2020202020202020)
+fn push_u64_to_hex_chunked_to_buffer(mut buffer []u8, v u64) {
+	mut result := [16]u8{}
+	u64_to_hex_chunked(mut result, v)
+	unsafe { buffer.push_many(&result[0], 16) }
+}
 
 // validate_u64_to_hex checks if the hex string (16 chars) represents a valid hex sequence.
 // v is the original u64 (useful if you wanted to verify the value match,
@@ -109,9 +112,14 @@ fn validate_u64_to_hex(v u64, hex_ptr &u8, hex_len int) bool {
 
 fn generate_wyhash_etag(content_ptr &u8, content_len int) []u8 {
 	hash := wyhash.wyhash_c(content_ptr, u64(content_len), 0)
-	mut etag := []u8{len: 16}
-	u64_to_hex_chunked(mut etag, hash)
+	mut etag := []u8{cap: 16}
+	push_u64_to_hex_chunked_to_buffer(mut etag, hash)
 	return etag
+}
+
+fn push_wyhash_etag_to_http1_header(mut header []u8, content_ptr &u8, content_len int) {
+	hash := wyhash.wyhash_c(content_ptr, u64(content_len), 0)
+	push_u64_to_hex_chunked_to_buffer(mut header, hash)
 }
 
 fn generate_md5_etag(content_ptr &u8, content_len int) []u8 {
@@ -137,6 +145,9 @@ fn main() {
 	println('MD5 stdlib:	' + md5.sum(buffer).hex().bytes().bytestr())
 	println('Wyhash Fast:	' + generate_wyhash_etag(buffer.data, buffer.len).bytestr())
 	println('Wyhash stdlib:	' + wyhash.wyhash_c(buffer.data, u64(buffer.len), 0).hex())
+	mut buffer2 := ''.bytes()
+	push_wyhash_etag_to_http1_header(mut buffer2, buffer.data, buffer.len)
+	println('Wyhash Fast push to header:' + buffer2.bytestr())
 	// println(wyhash.wyhash_c(buffer.data, u64(buffer.len), 0))
 	// validation test
 	etag_wyhash := '08e445df107bb587'.bytes() // or 08e445df107bb587 // or  generate_wyhash_etag(buffer.data, buffer.len)
