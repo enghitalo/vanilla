@@ -6,6 +6,12 @@ const lf_char = u8(`\n`)
 const crlf = [u8(`\r`), `\n`]!
 const double_crlf = [u8(`\r`), `\n`, `\r`, `\n`]!
 
+const colon_u8 = u8(`:`)
+const slash_u8 = u8(`/`)
+const question_mark_u8 = u8(`?`)
+const amperstand_u8 = u8(`&`)
+const equal_u8 = u8(`=`)
+
 pub struct Slice {
 pub:
 	start int
@@ -32,20 +38,32 @@ fn C.memmem(haystack &u8, h_len usize, needle &u8, n_len usize) &u8
 fn find_byte(buf &u8, len int, c u8) !int {
 	unsafe {
 		p := C.memchr(buf, c, len)
-		if p == voidptr(nil) {
+		if p == nil {
 			return error('byte not found')
 		}
 		return int(&u8(p) - buf)
 	}
 }
 
+@[inline]
 fn find_sequence(buf &u8, len int, bytes_ptr &u8, bytes_len int) !int {
 	unsafe {
 		p := C.memmem(buf, len, bytes_ptr, bytes_len)
-		if p == voidptr(nil) {
+		if p == nil {
 			return error('bytes not found')
 		}
 		return int(&u8(p) - buf)
+	}
+}
+
+// Fast comparison of two byte slices
+@[inline]
+fn bytes_equal(a &u8, a_len int, b &u8, b_len int) bool {
+	if a_len != b_len {
+		return false
+	}
+	unsafe {
+		return C.memcmp(a, b, a_len) == 0
 	}
 }
 
@@ -211,4 +229,9 @@ pub fn (req HttpRequest) get_header_value_slice(name string) ?Slice {
 	}
 
 	return none
+}
+
+pub fn (req HttpRequest) get_query(key string) Slice {
+	// TODO
+	return Slice{}
 }
