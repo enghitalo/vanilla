@@ -1,40 +1,71 @@
+import time
+import http_server.http1_1.request_parser { Slice }
+
 struct UserController {
 }
 
 @['GET /users']
-fn (controller UserController) list_users() []u8 {
-	return []u8{}
+fn (controller UserController) list_users(_ request_parser.HttpRequest, params map[string]Slice) []u8 {
+	return 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n[]'.bytes()
 }
 
 @['POST /users']
-fn (controller UserController) create_user() []u8 {
-	return []u8{}
+fn (controller UserController) create_user(req request_parser.HttpRequest, params map[string]Slice) []u8 {
+	return 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n\r\n{"id": 1}'.bytes()
 }
 
 @['GET /users/:id/get']
-fn (controller UserController) get_user() []u8 {
-	return []u8{}
+fn (controller UserController) get_user(req request_parser.HttpRequest, params map[string]Slice) []u8 {
+	id_slice := unsafe { params[':id'] }
+	format_slice := req.get_query('format=')
+	pretty_slice := req.get_query('pretty=')
+	content := 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{"id": "${id_slice}", "format": "${format_slice}", "pretty": "${pretty_slice}"}'.bytes()
+	return content
+}
+
+@['GET /users/:id/posts/:post_id']
+fn (controller UserController) get_user_post(req request_parser.HttpRequest, params map[string]Slice) []u8 {
+	// id_str := unsafe { string(id.start).substr(0, id.len) }
+	id_slice := unsafe { params[':id'] }
+	// post_id_str := unsafe { string(post_id.start).substr(0, post_id.len) }
+	post_id_slice := unsafe { params[':post_id'] }
+	// TODO rest
+	content := 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{"id": ${id_slice}, "post_id": ${post_id_slice}}'.bytes()
+	return content
 }
 
 fn main() {
-	http1_1_requests := [
-		'GET /users'.bytes(),
-		'POST /users'.bytes(),
-		'GET /users/123/get'.bytes(),
-		'GET /users/321/get'.bytes(),
-		'GET /users/321/get?a=b'.bytes(),
+	// Production test requests
+	http_requests := [
+		'GET /users HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes(),
+		'POST /users HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes(),
+		'GET /users/123/get HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes(),
+		'GET /users/321/get HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes(),
+		'GET /users/456/get?format=json&pretty=true HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes(),
+		'GET /users/789/posts/42 HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes(),
 	]!
+	user_controller := UserController{}
 
-	// Controller: list_users
-	// Controller: list_users, Attribute: GET /users
-	// Controller: create_user
-	// Controller: create_user, Attribute: POST /users
-	// Controller: get_user
-	// Controller: get_user, Attribute: GET /users/:id/get
-	$for method in UserController.methods {
-		println('Controller: ${method.name}')
-		for attr in method.attrs {
-			println('Controller: ${method.name}, Attribute: ${attr}')
+	for req_bytes in http_requests {
+		parsed_http1_1_request := request_parser.decode_http_request(req_bytes) or { panic(err) }
+		params := map[string]Slice{}
+		$for method in UserController.methods {
+			for attr in method.attrs {
+				// Static route
+				if attr.len == parsed_http1_1_request.method.len + 1 +
+					parsed_http1_1_request.path.len {
+					if unsafe {
+						C.memcmp(attr.str, &parsed_http1_1_request.buffer[0], attr.len)
+					} == 0 {
+						println(user_controller.$method(parsed_http1_1_request, params).bytestr())
+						println('Static controller: ${method.name}, Attribute: ${attr}')
+						break
+					}
+				} else {
+					// Dynamic route
+				}
+				continue
+			}
 		}
 	}
 }
