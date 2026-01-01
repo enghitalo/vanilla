@@ -1,5 +1,7 @@
 module socket
 
+import net.conv
+
 pub const max_connection_size = 1024
 
 #include <fcntl.h>
@@ -137,7 +139,7 @@ pub fn create_server_socket(port int) int {
 	println('[socket] Binding to 0.0.0.0:${port}')
 	server_addr := C.sockaddr_in{
 		sin_family: u16(C.AF_INET)
-		sin_port:   C.htons(port)
+		sin_port:   conv.hton16(u16(port))
 		sin_addr:   C.in_addr{u32(C.INADDR_ANY)}
 		sin_zero:   [8]u8{}
 	}
