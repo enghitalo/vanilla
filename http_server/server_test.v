@@ -17,7 +17,7 @@ fn test_server_end_to_end() ! {
 
 	println('[test] Creating server...')
 	mut server := new_server(ServerConfig{
-		port:            8081
+		port:            8083
 		io_multiplexing: unsafe { IOBackend(0) }
 		request_handler: dummy_handler
 	})!

@@ -194,8 +194,8 @@ pub fn (req HttpRequest) get_header_value_slice(name string) ?Slice {
 	}
 
 	for pos <= req.header_fields.start + req.header_fields.len - 2 {
-		line_len := find_byte(&req.buffer[pos], req.header_fields.len + 2 - (pos - req.header_fields.start),
-			lf_char)! - 1
+		line_len := find_byte(&req.buffer[pos], req.header_fields.start + req.header_fields.len + 2 - pos,
+			lf_char) or { return none } - 1
 		if line_len <= 0 {
 			return none
 		}
