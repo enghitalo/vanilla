@@ -1,8 +1,8 @@
 module main
 
 // Helper to create controller for tests
-fn new_test_controller() UserController {
-	return UserController{}
+fn new_test_controller() App {
+	return App{}
 }
 
 fn test_static_routes() {

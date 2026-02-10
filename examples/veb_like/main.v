@@ -2,21 +2,21 @@ import http_server
 import http_server.http1_1.request_parser { Slice }
 import strings
 
-struct UserController {
+struct App {
 }
 
 @['GET /users']
-fn (controller UserController) list_users(_ request_parser.HttpRequest, params map[string]Slice) []u8 {
+fn (app App) list_users(_ request_parser.HttpRequest, params map[string]Slice) []u8 {
 	return 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Type: application/json\r\n\r\n'.bytes()
 }
 
 @['POST /users']
-fn (controller UserController) create_user(req request_parser.HttpRequest, params map[string]Slice) []u8 {
+fn (app App) create_user(req request_parser.HttpRequest, params map[string]Slice) []u8 {
 	return 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 17\r\n\r\n{"id": 1}'.bytes()
 }
 
 @['GET /users/:id/get']
-fn (controller UserController) get_user(req request_parser.HttpRequest, params map[string]Slice) []u8 {
+fn (app App) get_user(req request_parser.HttpRequest, params map[string]Slice) []u8 {
 	id_slice := unsafe { params[':id'] }
 	format_slice := req.get_query('format=')
 	pretty_slice := req.get_query('pretty=')
@@ -41,7 +41,7 @@ fn (controller UserController) get_user(req request_parser.HttpRequest, params m
 }
 
 @['GET /users/:id/posts/:post_id']
-fn (controller UserController) get_user_post(req request_parser.HttpRequest, params map[string]Slice) []u8 {
+fn (app App) get_user_post(req request_parser.HttpRequest, params map[string]Slice) []u8 {
 	id_slice := unsafe { params[':id'] }
 	post_id_slice := unsafe { params[':post_id'] }
 	id_str := id_slice.to_string(req.buffer)
@@ -61,21 +61,21 @@ fn (controller UserController) get_user_post(req request_parser.HttpRequest, par
 }
 
 fn main() {
-	user_controller := UserController{}
+	app := App{}
 	mut server := http_server.new_server(http_server.ServerConfig{
-		request_handler: fn [user_controller] (req_buffer []u8, client_conn_fd int) ![]u8 {
-			return handle_request(req_buffer, client_conn_fd, user_controller)
+		request_handler: fn [app] (req_buffer []u8, client_conn_fd int) ![]u8 {
+			return handle_request(req_buffer, client_conn_fd, app)
 		}
 	})!
 
 	server.run()
 }
 
-fn handle_request(req_buffer []u8, client_conn_fd int, user_controller UserController) ![]u8 {
+fn handle_request(req_buffer []u8, client_conn_fd int, app App) ![]u8 {
 	parsed_http1_1_request := request_parser.decode_http_request(req_buffer) or { panic(err) }
 	mut params := map[string]Slice{}
 
-	$for method in UserController.methods {
+	$for method in App.methods {
 		for attr in method.attrs {
 			// Check if slash counts match (quick rejection)
 			count_slashes_in_attr := count_char(attr.str, attr.len, `/`)
@@ -87,12 +87,12 @@ fn handle_request(req_buffer []u8, client_conn_fd int, user_controller UserContr
 
 			// Try static route first
 			if try_static_route(parsed_http1_1_request, attr, attr.len) {
-				return user_controller.$method(parsed_http1_1_request, params)
+				return app.$method(parsed_http1_1_request, params)
 			}
 
 			// Try dynamic route
 			if try_dynamic_route(parsed_http1_1_request, attr, attr.len, mut params) {
-				return user_controller.$method(parsed_http1_1_request, params)
+				return app.$method(parsed_http1_1_request, params)
 			}
 		}
 	}
