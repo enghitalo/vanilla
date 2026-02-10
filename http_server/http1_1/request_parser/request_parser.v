@@ -231,7 +231,59 @@ pub fn (req HttpRequest) get_header_value_slice(name string) ?Slice {
 	return none
 }
 
+// get_query_slice extracts a query parameter value as a Slice (ZERO ALLOCATIONS)
+// Example: GET /users?id=123&format=json
+//   get_query_slice('id'.bytes()) -> Slice pointing to "123"
+pub fn (req HttpRequest) get_query_slice(key []u8) ?Slice {
+	path_start := req.path.start
+	path_len := req.path.len
+
+	// Find '?' in path using memchr
+	q_pos := find_byte(&req.buffer[path_start], path_len, question_mark_u8) or {
+		return none // No query string
+	}
+
+	// Start of query string (after '?')
+	mut pos := path_start + q_pos + 1
+	path_end := path_start + path_len
+
+	// Parse query string: key1=val1&key2=val2
+	for pos < path_end {
+		// Find '=' for this key
+		eq_pos := find_byte(&req.buffer[pos], path_end - pos, equal_u8) or {
+			break // No '=' found, malformed query
+		}
+
+		key_len := eq_pos
+
+		// Check if key matches using memcmp
+		if key_len == key.len && unsafe { C.memcmp(&req.buffer[pos], &key[0], key.len) } == 0 {
+			// Found matching key, extract value
+			value_start := pos + eq_pos + 1
+
+			// Find '&' or end of path using memchr
+			value_len := find_byte(&req.buffer[value_start], path_end - value_start, amperstand_u8) or {
+				// Last parameter, no '&' found
+				path_end - value_start
+			}
+
+			return Slice{
+				start: value_start
+				len:   value_len
+			}
+		}
+
+		// Skip to next parameter (find '&')
+		amp_pos := find_byte(&req.buffer[pos], path_end - pos, amperstand_u8) or {
+			break // Last parameter, no match
+		}
+		pos += amp_pos + 1
+	}
+
+	return none
+}
+
+// Deprecated: Use get_query_slice instead for zero-copy performance
 pub fn (req HttpRequest) get_query(key string) Slice {
-	// TODO
-	return Slice{}
+	return req.get_query_slice(key.bytes()) or { Slice{0, 0} }
 }
