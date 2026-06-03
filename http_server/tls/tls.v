@@ -18,7 +18,9 @@ fn C.vtls_ctx_free(ctx voidptr)
 fn C.vtls_use_self_signed(ctx voidptr) int
 fn C.vtls_use_pem(ctx voidptr, cert &u8, clen usize, key &u8, klen usize) int
 fn C.vtls_setup(ctx voidptr) int
+fn C.vtls_set_alpn(ctx voidptr, list &char) int
 fn C.vtls_cert_pem(ctx voidptr) &char
+fn C.vtls_get_alpn(sess voidptr) &char
 fn C.vtls_session_new(ctx voidptr, fd int) voidptr
 fn C.vtls_session_free(sess voidptr)
 fn C.vtls_handshake(sess voidptr) int
@@ -27,8 +29,15 @@ fn C.vtls_write(sess voidptr, buf &u8, len usize) int
 
 // Handshake/read/write status (mirrors the C shim). Negative so they never
 // collide with a byte count from read/write.
-pub const want = -2 // would block — retry on the next epoll readiness event
+pub const want = -2 // would block on READ — retry on the next EPOLLIN
+pub const want_write = -3 // would block on WRITE — retry on the next EPOLLOUT
 pub const closed = -1 // fatal — close the connection
+
+// Default ALPN offer. Only `http/1.1` for now: advertising `h2` while the
+// server speaks only HTTP/1.1 would let an h2 client negotiate a protocol we
+// can't serve (RFC 7301 §3.2). When HTTP/2 lands, this becomes 'h2,http/1.1'
+// and the worker branches on Session.alpn().
+pub const default_alpn = 'http/1.1'
 
 // Config is a server-wide TLS configuration (certificate + key + SSL settings).
 pub struct Config {
@@ -57,6 +66,10 @@ pub fn new_self_signed() !&Config {
 	if C.vtls_setup(ctx) != 0 {
 		C.vtls_ctx_free(ctx)
 		return error('vtls: ssl config setup failed')
+	}
+	if C.vtls_set_alpn(ctx, &char(default_alpn.str)) != 0 {
+		C.vtls_ctx_free(ctx)
+		return error('vtls: failed to set ALPN')
 	}
 	return &Config{
 		ctx: ctx
@@ -88,8 +101,21 @@ pub fn new_from_pem(cert []u8, key []u8) !&Config {
 		C.vtls_ctx_free(ctx)
 		return error('vtls: ssl config setup failed')
 	}
+	if C.vtls_set_alpn(ctx, &char(default_alpn.str)) != 0 {
+		C.vtls_ctx_free(ctx)
+		return error('vtls: failed to set ALPN')
+	}
 	return &Config{
 		ctx: ctx
+	}
+}
+
+// set_alpn overrides the advertised ALPN list (comma-separated, preference
+// order — e.g. 'h2,http/1.1'). Defaults to `http/1.1`. Only advertise protocols
+// the server can actually serve. Call before accepting connections.
+pub fn (c &Config) set_alpn(protos string) ! {
+	if C.vtls_set_alpn(c.ctx, &char(protos.str)) != 0 {
+		return error('vtls: failed to set ALPN to "${protos}"')
 	}
 }
 
@@ -137,6 +163,16 @@ pub fn (s &Session) read_into(ptr &u8, len int) int {
 // `want`, or `closed`.
 pub fn (s &Session) write_from(ptr &u8, len int) int {
 	return C.vtls_write(s.sess, ptr, usize(len))
+}
+
+// alpn returns the protocol negotiated via ALPN (e.g. 'http/1.1'), or '' if the
+// client offered none. Meaningful only after the handshake completes.
+pub fn (s &Session) alpn() string {
+	p := C.vtls_get_alpn(s.sess)
+	if p == unsafe { nil } {
+		return ''
+	}
+	return unsafe { cstring_to_vstring(p) }
 }
 
 pub fn (s &Session) free() {

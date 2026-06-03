@@ -21,6 +21,11 @@ struct vtls_ctx {
     mbedtls_svc_key_id_t key_id;
     char cert_pem[4096];
     size_t cert_pem_len;
+    // ALPN: mbedtls_ssl_conf_alpn_protocols stores the POINTER, so the backing
+    // strings and the NULL-terminated pointer list must outlive the config —
+    // hence they live here in the ctx, not on the stack.
+    char alpn_buf[64];     // protocol names, NUL-separated in place
+    const char *alpn[5];   // pointers into alpn_buf, NULL-terminated
 };
 
 typedef struct {
@@ -112,6 +117,27 @@ const char *vtls_cert_pem(vtls_ctx *c) {
     return (c && c->cert_pem_len > 0) ? c->cert_pem : NULL;
 }
 
+// Configure ALPN from a comma-separated list (e.g. "http/1.1" or "h2,http/1.1").
+// The server offers these in order; mbedTLS picks the first the client also
+// supports. The names are copied into the ctx (the config keeps the pointers).
+int vtls_set_alpn(vtls_ctx *c, const char *list) {
+    if (!c || !list) return -1;
+    size_t n = strlen(list);
+    if (n == 0 || n >= sizeof(c->alpn_buf)) return -1;
+    memcpy(c->alpn_buf, list, n + 1); // include the NUL
+    size_t count = 0;
+    char *p = c->alpn_buf;
+    c->alpn[count++] = p; // first token starts at the buffer
+    for (size_t i = 0; i < n && count < (sizeof(c->alpn) / sizeof(c->alpn[0])) - 1; i++) {
+        if (c->alpn_buf[i] == ',') {
+            c->alpn_buf[i] = '\0';                 // terminate this token
+            c->alpn[count++] = &c->alpn_buf[i + 1]; // next token
+        }
+    }
+    c->alpn[count] = NULL; // NULL-terminate the list
+    return mbedtls_ssl_conf_alpn_protocols(&c->conf, c->alpn);
+}
+
 // ---- per-connection session -------------------------------------------------
 
 void *vtls_session_new(vtls_ctx *c, int fd) {
@@ -130,6 +156,12 @@ void vtls_session_free(void *sess) {
     mbedtls_ssl_close_notify(&s->ssl);
     mbedtls_ssl_free(&s->ssl);
     free(s);
+}
+
+// Negotiated ALPN protocol (e.g. "http/1.1"), or NULL if none was agreed.
+// Valid only after the handshake completes.
+const char *vtls_get_alpn(void *sess) {
+    return mbedtls_ssl_get_alpn_protocol(&((vtls_session *)sess)->ssl);
 }
 
 static int map_ret(int ret) {

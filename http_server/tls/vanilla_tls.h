@@ -34,9 +34,18 @@ int vtls_use_pem(vtls_ctx *ctx, const unsigned char *cert, size_t clen,
 // Finalize the SSL config (defaults, TLS 1.3, own cert). Call after use_*.
 int vtls_setup(vtls_ctx *ctx);
 
+// Configure the ALPN protocol list from a comma-separated string, in preference
+// order (e.g. "http/1.1" or "h2,http/1.1"). Returns 0 on success. Call after
+// vtls_setup, before creating sessions. Only advertise protocols you can serve.
+int vtls_set_alpn(vtls_ctx *ctx, const char *list);
+
 // The generated/loaded certificate as PEM (NUL-terminated), or NULL. Useful to
 // save so a client can trust it (curl --cacert). Valid until vtls_ctx_free.
 const char *vtls_cert_pem(vtls_ctx *ctx);
+
+// The protocol negotiated via ALPN (e.g. "http/1.1"), or NULL if none. Valid
+// only once the handshake on this session has completed.
+const char *vtls_get_alpn(void *sess);
 
 // ---- per-connection session (driven by the non-blocking epoll loop) --------
 

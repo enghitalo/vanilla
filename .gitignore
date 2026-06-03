@@ -22,3 +22,7 @@ bin/
 # vweb and database
 *.db
 *.js
+
+server_cert.pem
+examples/tiny/src/src
+examples/veb_like/veb_like
