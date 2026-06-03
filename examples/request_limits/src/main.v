@@ -7,16 +7,20 @@ module main
 // via `ServerConfig.limits`.
 //
 // WORKS TODAY (this example):
-//   - max_body_bytes  -> 413 Payload Too Large, rejected from Content-Length
+//   - max_body_bytes   -> 413 Payload Too Large, rejected from Content-Length
 //     BEFORE the body is buffered (and bounds a chunked body too).
-//   - max_header_bytes -> 431 Request Header Fields Too Large.
-//   Both default to 0 = unlimited (zero-cost on the hot path).
+//   - max_header_bytes  -> 431 Request Header Fields Too Large.
+//   - max_connections   -> refuse (close) new connections past the cap, checked
+//     at accept; counted per-connection, so zero per-request cost.
+//   All default to 0 = unlimited (zero-cost on the hot path).
 //
 // STILL TO COME (see IMPLEMENTATION_PLAN.md, Phase 2 remainder):
-//   - Slowloris is already mitigated (read_request drops a connection that can't
-//     complete a message in one readiness burst); explicit read/idle/write
-//     timeouts arrive with cross-edge buffering.
-//   - max_connections cap (global atomic at accept/close).
+//   - Explicit read-header / write timeouts are coupled to Phase 1 remainders
+//     (cross-edge buffering / EPOLLOUT). Until then slowloris is mitigated
+//     (read_request drops a connection that can't complete a message in one
+//     readiness burst) and slow consumers are dropped (send errors out).
+//   - idle_timeout to reap idle keep-alive connections (max_connections already
+//     bounds total fds).
 
 import http_server
 
@@ -36,8 +40,9 @@ fn main() {
 		limits:          http_server.Limits{
 			max_body_bytes:   10 * 1024 * 1024 // 10 MiB -> 413
 			max_header_bytes: 16 * 1024 // 16 KiB  -> 431
+			max_connections:  100_000 // refuse past this many concurrent
 		}
 	})!
-	println('Request-limits demo — most limits are CORE roadmap items (see file header).')
+	println('Request-limits demo — core enforces max body/header/connections (see file header).')
 	server.run()
 }

@@ -115,10 +115,3 @@ fn main() {
 }
 
 
-
-git commit -m "examples: apps de referencia funcionais" \
-  -m "redirects, cors, security_headers, csrf, cookies_sessions, observability, url_form, static_files, auth; json_api (body), request_limits (413/431), ip_block (peer_addr), compression (gzip), chunked_streaming, sse, rate_limit, proxy_aware. Compilam + green unit tests." \
-  -- examples/redirects/* examples/cors/* examples/security_headers examples/csrf/* \
-     examples/cookies_sessions examples/observability/* examples/url_form examples/static_files/* \
-     examples/auth examples/json_api examples/request_limits examples/ip_block/* \
-     examples/compression examples/chunked_streaming/* examples/sse examples/rate_limit examples/proxy_aware/*
