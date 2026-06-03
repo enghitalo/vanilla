@@ -28,20 +28,16 @@ fn test_parse_http1_request_line_invalid_request() {
 }
 
 fn test_decode_http_request_valid_request() {
-	// HTTP/1.0 does not require Host header
-	// But I don't want to support HTTP/1.0 so it is a error now :)
+	// A zero-header HTTP/1.0 request is valid SYNTAX (RFC 9112 §2.1) and must
+	// parse. Refusing to *serve* HTTP/1.0 is a server policy (respond 505 HTTP
+	// Version Not Supported, RFC 9110 §15.6.6) — never a parse error. The parser
+	// stays strict-but-not-inventive (Invariant 3).
 	buffer := 'POST /api/resource HTTP/1.0\r\n\r\n'.bytes()
-	mut has_error := false
-	req := decode_http_request(buffer) or {
-		has_error = true
-		assert err.msg() == "Missing header-body delimiter. Non-header HTTP/1.0 aren't supported."
-		return
-	}
-	assert has_error, 'Expected error for HTTP/1.0 request without Host header'
-
+	req := decode_http_request(buffer) or { panic('HTTP/1.0 zero-header should parse: ${err}') }
 	assert req.method.to_string(req.buffer) == 'POST'
 	assert req.path.to_string(req.buffer) == '/api/resource'
 	assert req.version.to_string(req.buffer) == 'HTTP/1.0'
+	assert req.header_fields.len == 0
 }
 
 fn test_decode_http_request_invalid_request() {
@@ -85,19 +81,15 @@ fn test_decode_http_request_no_body() {
 }
 
 fn test_decode_http_request_malformed_no_double_crlf() {
-	// Request that never finishes headers
+	// A header line with no terminating blank line is an incomplete message and
+	// must be rejected (there is no header/body delimiter).
 	buffer := 'GET / HTTP/1.1\r\nHost: example.com\r\n'.bytes()
 	mut has_error := false
-	req := decode_http_request(buffer) or {
+	decode_http_request(buffer) or {
 		has_error = true
-		assert err.msg() == "Missing header-body delimiter. Non-header HTTP/1.0 aren't supported."
-		return
+		assert err.msg() == 'Missing header-body delimiter (no blank line terminating the header section)'
 	}
 	assert has_error, 'Expected error for missing header-body delimiter'
-	// Based on our implementation, if no \r\n\r\n is found,
-	// body should be empty and headers go to the end.
-	assert req.body.len == 0
-	assert req.header_fields.to_string(req.buffer) == 'Host: example.com'
 }
 
 fn test_get_header_value_slice_existing_header() {
@@ -283,4 +275,85 @@ fn test_get_query_deprecated_not_found() {
 
 	result := req.get_query('id')
 	assert result.len == 0
+}
+
+// --- Phase 0: RFC conformance gates ---------------------------------------
+
+fn test_decode_zero_header_request() {
+	// RFC 9112 §2.1: zero field-lines is valid syntax. Must parse, not error.
+	buffer := 'GET / HTTP/1.1\r\n\r\n'.bytes()
+	req := decode_http_request(buffer) or { panic('zero-header should parse: ${err}') }
+	assert req.path.to_string(req.buffer) == '/'
+	assert req.header_fields.len == 0
+	assert req.body.len == 0
+}
+
+fn test_decode_zero_header_with_body() {
+	buffer := 'POST /x HTTP/1.1\r\n\r\nhello'.bytes()
+	req := decode_http_request(buffer) or { panic('zero-header+body should parse: ${err}') }
+	assert req.header_fields.len == 0
+	assert req.body.to_string(req.buffer) == 'hello'
+}
+
+fn test_get_header_value_case_insensitive() {
+	// RFC 9110 §5.1: field names are case-insensitive.
+	buffer := 'GET / HTTP/1.1\r\nHost: example.com\r\ncontent-type: text/html\r\nACCEPT: */*\r\n\r\n'.bytes()
+	req := decode_http_request(buffer) or { panic(err) }
+
+	a := req.get_header_value_slice('Content-Type') or { panic('Content-Type') }
+	assert a.to_string(req.buffer) == 'text/html'
+	b := req.get_header_value_slice('CONTENT-TYPE') or { panic('CONTENT-TYPE') }
+	assert b.to_string(req.buffer) == 'text/html'
+	c := req.get_header_value_slice('accept') or { panic('accept') }
+	assert c.to_string(req.buffer) == '*/*'
+	d := req.get_header_value_slice('host') or { panic('host') }
+	assert d.to_string(req.buffer) == 'example.com'
+}
+
+fn test_get_header_prefix_does_not_false_match() {
+	// 'Host' must not match 'Hostname'; the colon-follows check enforces it.
+	buffer := 'GET / HTTP/1.1\r\nHostname: nope\r\nHost: real.com\r\n\r\n'.bytes()
+	req := decode_http_request(buffer) or { panic(err) }
+	h := req.get_header_value_slice('Host') or { panic('Host') }
+	assert h.to_string(req.buffer) == 'real.com'
+}
+
+fn test_count_header() {
+	buffer := 'GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\nAccept: x\r\n\r\n'.bytes()
+	req := decode_http_request(buffer) or { panic(err) }
+	assert req.count_header('host') == 2
+	assert req.count_header('Accept') == 1
+	assert req.count_header('Missing') == 0
+}
+
+fn test_validate_http1_ok() {
+	buffer := 'GET / HTTP/1.1\r\nHost: example.com\r\n\r\n'.bytes()
+	req := decode_http_request(buffer) or { panic(err) }
+	req.validate_http1() or { panic('valid request rejected: ${err}') }
+}
+
+fn test_validate_http1_missing_host() {
+	// RFC 9112 §3.2: HTTP/1.1 without Host => 400.
+	buffer := 'GET / HTTP/1.1\r\n\r\n'.bytes()
+	req := decode_http_request(buffer) or { panic(err) }
+	if _ := req.validate_http1() {
+		assert false, 'missing Host must be rejected'
+	}
+}
+
+fn test_validate_http1_duplicate_host() {
+	buffer := 'GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n'.bytes()
+	req := decode_http_request(buffer) or { panic(err) }
+	if _ := req.validate_http1() {
+		assert false, 'duplicate Host must be rejected'
+	}
+}
+
+fn test_validate_http1_cl_te_conflict() {
+	// RFC 9112 §6.1: Content-Length + Transfer-Encoding => reject (smuggling).
+	buffer := 'POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n'.bytes()
+	req := decode_http_request(buffer) or { panic(err) }
+	if _ := req.validate_http1() {
+		assert false, 'CL+TE must be rejected'
+	}
 }

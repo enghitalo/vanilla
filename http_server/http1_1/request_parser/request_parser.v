@@ -1,10 +1,13 @@
 module request_parser
 
 const empty_space = u8(` `)
-const cr_char = u8(`\r`)
-const lf_char = u8(`\n`)
-const crlf = [u8(`\r`), `\n`]!
-const double_crlf = [u8(`\r`), `\n`, `\r`, `\n`]!
+// NOTE: escaped rune literals like `\r` evaluate to the backslash byte (92) in
+// this V toolchain, not 13/10 — which silently breaks all request parsing. Use
+// explicit numeric byte values for CR (13) and LF (10).
+const cr_char = u8(13)
+const lf_char = u8(10)
+const crlf = [u8(13), 10]!
+const double_crlf = [u8(13), 10, 13, 10]!
 
 const colon_u8 = u8(`:`)
 const slash_u8 = u8(`/`)
@@ -147,9 +150,32 @@ pub fn decode_http_request(buffer []u8) !HttpRequest {
 	// header_start is the byte index immediately after the request line's \r\n
 	header_start := parse_http1_request_line(mut req)!
 
+	// RFC 9112 §2.1: the header section is `*( field-line CRLF )` and MAY be
+	// empty. An empty section means the terminating blank-line CRLF sits right
+	// at header_start (e.g. `GET / HTTP/1.1\r\n\r\n`). Handle it explicitly —
+	// otherwise the double-CRLF search below never matches and a syntactically
+	// valid request is wrongly rejected.
+	if header_start + 1 < buffer.len && buffer[header_start] == cr_char
+		&& buffer[header_start + 1] == lf_char {
+		req.header_fields = Slice{
+			start: header_start
+			len:   0
+		}
+		body_start := header_start + crlf.len
+		req.body = if body_start < buffer.len {
+			Slice{
+				start: body_start
+				len:   buffer.len - body_start
+			}
+		} else {
+			Slice{0, 0}
+		}
+		return req
+	}
+
 	header_len := find_sequence(&buffer[header_start], buffer.len - header_start, &double_crlf[0],
 		double_crlf.len) or {
-		return error("Missing header-body delimiter. Non-header HTTP/1.0 aren't supported.")
+		return error('Missing header-body delimiter (no blank line terminating the header section)')
 	}
 
 	if header_len + header_start + double_crlf.len == buffer.len {
@@ -185,50 +211,121 @@ pub fn (slice Slice) to_string(buffer []u8) string {
 	return buffer[slice.start..slice.start + slice.len].bytestr()
 }
 
+// ascii_ci_eq compares `len` bytes case-insensitively (ASCII only — HTTP header
+// names are ASCII per RFC 9110 §5.1). No allocation, no lowercase copy: fold each
+// byte inline. Kept tight because it runs on the header hot path.
+@[direct_array_access; inline]
+fn ascii_ci_eq(a &u8, b &u8, len int) bool {
+	unsafe {
+		for i in 0 .. len {
+			x := a[i] ^ b[i]
+			if x != 0 {
+				// Bytes differ. The ONLY acceptable difference is the ASCII
+				// case bit (0x20) on a letter — everything else is a mismatch.
+				// This keeps the common (equal) byte to a single branch.
+				if x != 0x20 {
+					return false
+				}
+				c := a[i] | 0x20
+				if c < `a` || c > `z` {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// get_header_value_slice returns the value of `name` as a zero-copy Slice.
+// Header field names are CASE-INSENSITIVE (RFC 9110 §5.1), so `Content-Type`,
+// `content-type` and `CONTENT-TYPE` all match.
 @[direct_array_access]
 pub fn (req HttpRequest) get_header_value_slice(name string) ?Slice {
-	mut pos := req.header_fields.start
-
-	if pos >= req.buffer.len {
+	if req.header_fields.len <= 0 {
 		return none
 	}
+	section_end := req.header_fields.start + req.header_fields.len
+	mut pos := req.header_fields.start
 
-	for pos <= req.header_fields.start + req.header_fields.len - 2 {
-		line_len := find_byte(&req.buffer[pos], req.header_fields.start + req.header_fields.len + 2 - pos,
-			lf_char) or { return none } - 1
+	for pos <= section_end - 2 {
+		line_start := pos
+		// line_len = bytes before CRLF (the `-1` drops the CR before the LF).
+		line_len := find_byte(&req.buffer[pos], section_end + 2 - pos, lf_char) or { return none } - 1
 		if line_len <= 0 {
 			return none
 		}
-		if unsafe {
-			vmemcmp(&req.buffer[pos], name.str, name.len)
-		} != 0 {
-			pos += line_len + 2
+		next_line := line_start + line_len + 2
+
+		// Name must fit in the line and be followed immediately by ':'.
+		if name.len > line_len || !ascii_ci_eq(&req.buffer[line_start], name.str, name.len)
+			|| req.buffer[line_start + name.len] != colon_u8 {
+			pos = next_line
 			continue
-		} else {
-			pos += name.len
-			if req.buffer[pos] != `:` {
-				pos = line_len + 1
-				continue
-			}
-			pos++
-			for pos < req.buffer.len && req.buffer[pos] == empty_space {
-				pos++
-			}
-			if pos >= req.buffer.len {
-				return none
-			}
-			mut start := pos
-			for pos < req.buffer.len && req.buffer[pos] != cr_char {
-				pos++
-			}
-			return Slice{
-				start: start
-				len:   pos - start
-			}
+		}
+
+		// Skip optional whitespace after the colon (RFC 9112 §5).
+		mut vpos := line_start + name.len + 1
+		for vpos < req.buffer.len && req.buffer[vpos] == empty_space {
+			vpos++
+		}
+		mut vend := vpos
+		for vend < req.buffer.len && req.buffer[vend] != cr_char {
+			vend++
+		}
+		return Slice{
+			start: vpos
+			len:   vend - vpos
 		}
 	}
 
 	return none
+}
+
+// count_header counts header lines whose name case-insensitively equals `name`.
+// Used by validate_http1 to enforce "exactly one Host" (RFC 9112 §3.2).
+@[direct_array_access]
+pub fn (req HttpRequest) count_header(name string) int {
+	if req.header_fields.len <= 0 {
+		return 0
+	}
+	section_end := req.header_fields.start + req.header_fields.len
+	mut pos := req.header_fields.start
+	mut count := 0
+	for pos <= section_end - 2 {
+		line_start := pos
+		line_len := find_byte(&req.buffer[pos], section_end + 2 - pos, lf_char) or { break } - 1
+		if line_len <= 0 {
+			break
+		}
+		if name.len <= line_len && ascii_ci_eq(&req.buffer[line_start], name.str, name.len)
+			&& req.buffer[line_start + name.len] == colon_u8 {
+			count++
+		}
+		pos = line_start + line_len + 2
+	}
+	return count
+}
+
+// validate_http1 enforces the HTTP/1.1 MUSTs that require a 400 response. Call
+// it after decode_http_request and map the returned error to 400 Bad Request.
+//
+// Kept separate from parsing on purpose: a parse-free fast responder pays
+// nothing, and servers that DO process requests stay strictly conformant
+// (Invariant 3). No new behavior is invented — only what the RFCs mandate.
+pub fn (req HttpRequest) validate_http1() ! {
+	// RFC 9112 §3.2: an HTTP/1.1 request MUST contain exactly one Host field;
+	// a server MUST respond 400 to a request that lacks Host or has more than one.
+	if req.version.len == 8 && ascii_ci_eq(&req.buffer[req.version.start], 'HTTP/1.1'.str, 8) {
+		if req.count_header('Host') != 1 {
+			return error('HTTP/1.1 request must have exactly one Host header (RFC 9112 §3.2)')
+		}
+	}
+	// RFC 9112 §6.1: Content-Length and Transfer-Encoding must not both appear
+	// (the classic request-smuggling ambiguity) — reject when they do.
+	if req.get_header_value_slice('Content-Length') != none
+		&& req.get_header_value_slice('Transfer-Encoding') != none {
+		return error('Content-Length together with Transfer-Encoding is forbidden (RFC 9112 §6.1)')
+	}
 }
 
 // get_query_slice extracts a query parameter value as a Slice (ZERO ALLOCATIONS)
