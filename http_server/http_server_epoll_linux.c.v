@@ -127,7 +127,7 @@ fn process_events(event_callbacks epoll.EpollEventCallbacks, epoll_fd int) {
 		}
 
 		for i in 0 .. num_events {
-			client_conn_fd := unsafe { events[i].data.fd }
+			client_conn_fd := epoll.event_fd(events[i])
 			$if verbose ? {
 				eprintln('[epoll-worker] Event for client fd ${client_conn_fd}: events=${events[i].events}')
 			}
