@@ -12,7 +12,7 @@ fn test_static_routes() {
 
 	// Test GET /users
 	req1 := 'GET /users HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
-	response1 := handle_request(req1, -1, user_controller) or {
+	response1 := router(req1, -1, user_controller) or {
 		panic('Failed to handle request: ${err}')
 	}
 	response1_str := response1.bytestr()
@@ -21,7 +21,7 @@ fn test_static_routes() {
 
 	// Test POST /users
 	req2 := 'POST /users HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
-	response2 := handle_request(req2, -1, user_controller) or {
+	response2 := router(req2, -1, user_controller) or {
 		panic('Failed to handle request: ${err}')
 	}
 	response2_str := response2.bytestr()
@@ -37,7 +37,7 @@ fn test_single_parameter_route() {
 
 	// Test GET /users/123/get
 	req := 'GET /users/123/get HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
-	response := handle_request(req, -1, user_controller) or {
+	response := router(req, -1, user_controller) or {
 		panic('Failed to handle request: ${err}')
 	}
 	response_str := response.bytestr()
@@ -47,7 +47,7 @@ fn test_single_parameter_route() {
 
 	// Test with different ID
 	req2 := 'GET /users/abc/get HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
-	response2 := handle_request(req2, -1, user_controller) or {
+	response2 := router(req2, -1, user_controller) or {
 		panic('Failed to handle request: ${err}')
 	}
 	response2_str := response2.bytestr()
@@ -62,7 +62,7 @@ fn test_multiple_parameter_route() {
 
 	// Test GET /users/456/posts/789
 	req := 'GET /users/456/posts/789 HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
-	response := handle_request(req, -1, user_controller) or {
+	response := router(req, -1, user_controller) or {
 		panic('Failed to handle request: ${err}')
 	}
 	response_str := response.bytestr()
@@ -79,7 +79,7 @@ fn test_route_not_found() {
 
 	// Test non-existent route
 	req := 'GET /nonexistent HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
-	response := handle_request(req, -1, user_controller) or {
+	response := router(req, -1, user_controller) or {
 		panic('Failed to handle request: ${err}')
 	}
 	response_str := response.bytestr()
@@ -88,7 +88,7 @@ fn test_route_not_found() {
 
 	// Test partial match should also fail
 	req2 := 'GET /users/123 HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
-	response2 := handle_request(req2, -1, user_controller) or {
+	response2 := router(req2, -1, user_controller) or {
 		panic('Failed to handle request: ${err}')
 	}
 	response2_str := response2.bytestr()
@@ -103,7 +103,7 @@ fn test_route_with_query_string() {
 
 	// Test with query string
 	req := 'GET /users/999/get?format=json&pretty=true HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
-	response := handle_request(req, -1, user_controller) or {
+	response := router(req, -1, user_controller) or {
 		panic('Failed to handle request: ${err}')
 	}
 	response_str := response.bytestr()
@@ -119,7 +119,7 @@ fn test_method_mismatch() {
 
 	// Try POST on GET-only route
 	req := 'POST /users/123/get HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
-	response := handle_request(req, -1, user_controller) or {
+	response := router(req, -1, user_controller) or {
 		panic('Failed to handle request: ${err}')
 	}
 	response_str := response.bytestr()

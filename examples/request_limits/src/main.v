@@ -12,13 +12,16 @@ module main
 //   - max_header_bytes  -> 431 Request Header Fields Too Large.
 //   - max_connections   -> refuse (close) new connections past the cap, checked
 //     at accept; counted per-connection, so zero per-request cost.
-//   All default to 0 = unlimited (zero-cost on the hot path).
+//   - read_timeout_ms    -> a connection that opens but can't finish its request
+//     within this window is closed with 408 Request Timeout. This is the real
+//     slowloris defence: a peer that dribbles one byte at a time is reaped on a
+//     deadline, not just on a single readiness burst.
+//   - write_timeout_ms   -> a parked response (slow consumer, full socket buffer)
+//     that can't drain within this window is dropped.
+//   All default to 0 = unlimited (zero-cost on the hot path — the worker only
+//   arms a periodic sweep when a timeout is set AND a connection is mid-transfer).
 //
 // STILL TO COME (see IMPLEMENTATION_PLAN.md, Phase 2 remainder):
-//   - Explicit read-header / write timeouts are coupled to Phase 1 remainders
-//     (cross-edge buffering / EPOLLOUT). Until then slowloris is mitigated
-//     (read_request drops a connection that can't complete a message in one
-//     readiness burst) and slow consumers are dropped (send errors out).
 //   - idle_timeout to reap idle keep-alive connections (max_connections already
 //     bounds total fds).
 
@@ -41,6 +44,8 @@ fn main() {
 			max_body_bytes:   10 * 1024 * 1024 // 10 MiB -> 413
 			max_header_bytes: 16 * 1024 // 16 KiB  -> 431
 			max_connections:  100_000 // refuse past this many concurrent
+			read_timeout_ms:  5_000 // finish the request within 5s or get 408
+			write_timeout_ms: 10_000 // drain a parked response within 10s or be dropped
 		}
 	})!
 	println('Request-limits demo — core enforces max body/header/connections (see file header).')
