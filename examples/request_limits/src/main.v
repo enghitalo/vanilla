@@ -1,0 +1,43 @@
+module main
+
+// Request limits — reference design (DoS resistance).
+//
+// A server with no limits falls over. These are CORE concerns — a handler can't
+// enforce them after the fact — so they live in the read loop and are configured
+// via `ServerConfig.limits`.
+//
+// WORKS TODAY (this example):
+//   - max_body_bytes  -> 413 Payload Too Large, rejected from Content-Length
+//     BEFORE the body is buffered (and bounds a chunked body too).
+//   - max_header_bytes -> 431 Request Header Fields Too Large.
+//   Both default to 0 = unlimited (zero-cost on the hot path).
+//
+// STILL TO COME (see IMPLEMENTATION_PLAN.md, Phase 2 remainder):
+//   - Slowloris is already mitigated (read_request drops a connection that can't
+//     complete a message in one readiness burst); explicit read/idle/write
+//     timeouts arrive with cross-edge buffering.
+//   - max_connections cap (global atomic at accept/close).
+
+import http_server
+
+// The handler is now trivial: the CORE enforces the size limits before the
+// handler ever runs — over-large bodies are rejected (413) from Content-Length
+// WITHOUT buffering them, and oversized header blocks get 431. That's the whole
+// point: limits belong in the read loop, not bolted onto each handler.
+fn handle(req_buffer []u8, _ int) ![]u8 {
+	return 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+}
+
+fn main() {
+	mut server := http_server.new_server(http_server.ServerConfig{
+		port:            3000
+		io_multiplexing: http_server.IOBackend.epoll
+		request_handler: handle
+		limits:          http_server.Limits{
+			max_body_bytes:   10 * 1024 * 1024 // 10 MiB -> 413
+			max_header_bytes: 16 * 1024 // 16 KiB  -> 431
+		}
+	})!
+	println('Request-limits demo — most limits are CORE roadmap items (see file header).')
+	server.run()
+}
