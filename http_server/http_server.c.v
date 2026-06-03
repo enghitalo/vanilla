@@ -1,33 +1,18 @@
 module http_server
 
-import runtime
 import socket
 import time
 import sync.stdatomic
+import http_server.core
+import http_server.backend_epoll
 import http_server.tls
 
-const max_thread_pool_size = runtime.nr_cpus()
+const max_thread_pool_size = core.max_thread_pool_size
 
-// Counter is a single i64 padded to a full cache line, so independent counters
-// (per-worker in-flight, global active-connections) never false-share. Mutated
-// via atomic add, read via atomic load (sync.stdatomic free funcs on &n).
-@[heap]
-struct Counter {
-mut:
-	n   i64
-	pad [56]u8
-}
-
-// Limits bounds resource use. Every field defaults to 0 = unlimited, so the
-// checks are zero-cost unless a server opts in.
-pub struct Limits {
-pub:
-	max_header_bytes int // > 0 ⇒ 431 Request Header Fields Too Large
-	max_body_bytes   int // > 0 ⇒ 413 Payload Too Large (rejected from Content-Length, before buffering)
-	max_connections  int // > 0 ⇒ refuse new connections past this many concurrent (checked at accept)
-	read_timeout_ms  int // > 0 ⇒ close a connection that can't finish its request in this long (408)
-	write_timeout_ms int // > 0 ⇒ close a connection whose parked response can't drain in this long
-}
+// Limits is re-exported from `core` so the public config API stays ergonomic
+// (`http_server.Limits{...}`). The real definition lives in `core` because the
+// backend reads it too, and `core` is the leaf both sides depend on.
+pub type Limits = core.Limits
 
 pub struct Server {
 pub:
@@ -42,10 +27,10 @@ pub mut:
 	// Per-worker in-flight request counters (one per worker, each on its own
 	// cache line — written only by its worker, so no contention/false sharing).
 	// shutdown() sums them to drain precisely.
-	inflight        []&Counter = []&Counter{len: max_thread_pool_size, init: &Counter{}}
+	inflight        []&core.Counter = []&core.Counter{len: max_thread_pool_size, init: &core.Counter{}}
 	// Global count of open connections (incremented at accept, decremented at
 	// close) — enforces max_connections. Touched per CONNECTION, not per request.
-	active_conns    &Counter = &Counter{}
+	active_conns    &core.Counter = &core.Counter{}
 }
 
 // shutdown performs a graceful stop: it closes the listening socket so the
@@ -103,7 +88,7 @@ pub fn (mut s Server) test(requests [][]u8) ![][]u8 {
 			match s.io_multiplexing {
 				.epoll {
 					println('[test] Running epoll backend')
-					run_epoll_backend(s.socket_fd, s.request_handler, s.port, s.limits, s.inflight,
+					backend_epoll.run_epoll_backend(s.socket_fd, s.request_handler, s.port, s.limits, s.inflight,
 						s.active_conns, s.tls_config, mut threads)
 				}
 				.io_uring {

@@ -1,5 +1,7 @@
 module http_server
 
+import http_server.backend_epoll
+
 // Backend selection
 pub enum IOBackend {
 	epoll    = 0 // Linux only
@@ -20,8 +22,8 @@ const connection_keep_alive_variants = [
 pub fn (mut server Server) run() {
 	match server.io_multiplexing {
 		.epoll {
-			run_epoll_backend(server.socket_fd, server.request_handler, server.port, server.limits,
-				server.inflight, server.active_conns, server.tls_config, mut server.threads)
+			backend_epoll.run_epoll_backend(server.socket_fd, server.request_handler, server.port,
+				server.limits, server.inflight, server.active_conns, server.tls_config, mut server.threads)
 		}
 		.io_uring {
 			run_io_uring_backend(server.request_handler, server.port, mut server.threads)
