@@ -17,6 +17,7 @@ import epoll
 import http1_1.request_parser
 import http1_1.response
 import sync.stdatomic
+import time
 
 #include <errno.h>
 #include <sys/socket.h>
@@ -27,9 +28,11 @@ const sm_max_request_bytes = 8 * 1024 * 1024
 // ConnState is only allocated for a connection that blocks mid-transfer.
 struct ConnState {
 mut:
-	read_buf  []u8 // partial request accumulated across epoll edges
-	write_buf []u8 // response remaining to be sent
-	write_off int
+	read_buf      []u8 // partial request accumulated across epoll edges
+	write_buf     []u8 // response remaining to be sent
+	write_off     int
+	read_deadline u64 // monotonic ns; >0 while a request is mid-read (read_timeout)
+	write_deadline u64 // monotonic ns; >0 while a response is parked (write_timeout)
 }
 
 @[direct_array_access; manualfree]
@@ -64,7 +67,7 @@ fn handle_readable_plain(request_handler fn ([]u8, int) ![]u8, epoll_fd int, fd 
 					unsafe { buf.free() }
 					return // spurious wake, nothing buffered — keep the connection
 				}
-				save_read(mut conns, fd, buf) // partial — resume on the next EPOLLIN
+				save_read(mut conns, fd, buf, limits.read_timeout_ms) // partial — resume on next EPOLLIN
 				return
 			}
 			unsafe { buf.free() }
@@ -103,6 +106,13 @@ fn handle_readable_plain(request_handler fn ([]u8, int) ![]u8, epoll_fd int, fd 
 		// incomplete — keep draining this burst
 	}
 
+	// Request complete — clear any read deadline on this connection.
+	if conns.len > 0 {
+		if mut cs := conns[fd] {
+			cs.read_deadline = 0
+		}
+	}
+
 	resp := request_handler(buf, fd) or {
 		unsafe { buf.free() }
 		response.send_bad_request_response(fd)
@@ -110,13 +120,13 @@ fn handle_readable_plain(request_handler fn ([]u8, int) ![]u8, epoll_fd int, fd 
 		return
 	}
 	unsafe { buf.free() }
-	send_or_park(epoll_fd, fd, active_conns, mut conns, resp)
+	send_or_park(epoll_fd, fd, limits, active_conns, mut conns, resp)
 }
 
 // send_or_park writes the whole response, or parks the remainder for EPOLLOUT.
 // Takes ownership of `resp` (frees it when fully sent or parked-then-drained).
 @[manualfree]
-fn send_or_park(epoll_fd int, fd int, active_conns &Counter, mut conns map[int]&ConnState, resp []u8) {
+fn send_or_park(epoll_fd int, fd int, limits Limits, active_conns &Counter, mut conns map[int]&ConnState, resp []u8) {
 	mut sent := 0
 	for sent < resp.len {
 		n := C.send(fd, unsafe { &u8(resp.data) + sent }, usize(resp.len - sent), C.MSG_NOSIGNAL)
@@ -125,7 +135,7 @@ fn send_or_park(epoll_fd int, fd int, active_conns &Counter, mut conns map[int]&
 			continue
 		}
 		if n < 0 && (C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK) {
-			park_write(mut conns, fd, resp, sent) // ownership → parked state
+			park_write(mut conns, fd, resp, sent, limits.write_timeout_ms) // ownership → parked
 			epoll.mod_fd_in_epoll(epoll_fd, fd, u32(C.EPOLLIN | C.EPOLLOUT | C.EPOLLET))
 			return
 		}
@@ -161,16 +171,20 @@ fn handle_writable_plain(epoll_fd int, fd int, active_conns &Counter, mut conns 
 	cleanup_if_idle(mut conns, fd)
 }
 
-fn save_read(mut conns map[int]&ConnState, fd int, buf []u8) {
+fn save_read(mut conns map[int]&ConnState, fd int, buf []u8, read_timeout_ms int) {
 	mut cs := conns[fd] or {
 		nc := &ConnState{}
 		conns[fd] = nc
 		nc
 	}
 	cs.read_buf = buf
+	// Set the deadline once, from when reading began (don't extend per fragment).
+	if read_timeout_ms > 0 && cs.read_deadline == 0 {
+		cs.read_deadline = time.sys_mono_now() + u64(read_timeout_ms) * 1_000_000
+	}
 }
 
-fn park_write(mut conns map[int]&ConnState, fd int, resp []u8, sent int) {
+fn park_write(mut conns map[int]&ConnState, fd int, resp []u8, sent int, write_timeout_ms int) {
 	mut cs := conns[fd] or {
 		nc := &ConnState{}
 		conns[fd] = nc
@@ -178,6 +192,33 @@ fn park_write(mut conns map[int]&ConnState, fd int, resp []u8, sent int) {
 	}
 	cs.write_buf = resp
 	cs.write_off = sent
+	if write_timeout_ms > 0 {
+		cs.write_deadline = time.sys_mono_now() + u64(write_timeout_ms) * 1_000_000
+	}
+}
+
+// sweep_timeouts closes connections whose read/write deadline has passed. Called
+// from the worker only when there are pending connections and a timeout is set,
+// so it costs nothing on an idle/fast server.
+@[manualfree]
+fn sweep_timeouts(epoll_fd int, active_conns &Counter, mut conns map[int]&ConnState) {
+	now := time.sys_mono_now()
+	mut expired := []int{}
+	mut timed_out_read := map[int]bool{}
+	for fd, cs in conns {
+		if cs.read_deadline > 0 && now > cs.read_deadline {
+			expired << fd
+			timed_out_read[fd] = true
+		} else if cs.write_deadline > 0 && now > cs.write_deadline {
+			expired << fd
+		}
+	}
+	for fd in expired {
+		if fd in timed_out_read {
+			response.send_status_408_response(fd) // couldn't finish the request in time
+		}
+		close_conn(epoll_fd, fd, active_conns, mut conns)
+	}
 }
 
 @[manualfree]

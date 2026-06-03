@@ -101,8 +101,14 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 fn process_events_plain(epoll_fd int, request_handler fn ([]u8, int) ![]u8, limits Limits, counter &Counter, active_conns &Counter) {
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut conns := map[int]&ConnState{}
+	// Only arm the timeout sweep if a deadline is actually configured.
+	sweep_on := limits.read_timeout_ms > 0 || limits.write_timeout_ms > 0
 	for {
-		num_events := C.epoll_wait(epoll_fd, &events[0], socket.max_connection_size, -1)
+		// Block indefinitely unless there are connections parked mid-transfer and a
+		// timeout is set — then wake periodically to sweep stale ones. Zero cost on
+		// an idle/fast server (conns stays empty ⇒ -1, the original behaviour).
+		wait_ms := if sweep_on && conns.len > 0 { 250 } else { -1 }
+		num_events := C.epoll_wait(epoll_fd, &events[0], socket.max_connection_size, wait_ms)
 		if num_events < 0 {
 			if C.errno == C.EINTR {
 				continue
@@ -124,6 +130,11 @@ fn process_events_plain(epoll_fd int, request_handler fn ([]u8, int) ![]u8, limi
 				handle_readable_plain(request_handler, epoll_fd, fd, limits, counter, active_conns, mut
 					conns)
 			}
+		}
+		// After handling this batch (or a timeout wake with num_events == 0),
+		// reap any connection whose read/write deadline has passed.
+		if sweep_on && conns.len > 0 {
+			sweep_timeouts(epoll_fd, active_conns, mut conns)
 		}
 	}
 }

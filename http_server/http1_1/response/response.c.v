@@ -9,6 +9,7 @@ pub const tiny_bad_request_response = 'HTTP/1.1 400 Bad Request\r\nContent-Lengt
 const status_444_response = 'HTTP/1.1 444 No Response\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 const status_413_response = 'HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 const status_431_response = 'HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
+const status_408_response = 'HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 
 // HTTP response helpers.
 
@@ -58,4 +59,8 @@ pub fn send_status_413_response(fd int) {
 
 pub fn send_status_431_response(fd int) {
 	C.send(fd, status_431_response.data, status_431_response.len, 0)
+}
+
+pub fn send_status_408_response(fd int) {
+	C.send(fd, status_408_response.data, status_408_response.len, 0)
 }
