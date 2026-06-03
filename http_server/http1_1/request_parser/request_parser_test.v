@@ -357,3 +357,104 @@ fn test_validate_http1_cl_te_conflict() {
 		assert false, 'CL+TE must be rejected'
 	}
 }
+
+// --- Phase 1: request framing (pure, split-fuzz testable) ------------------
+
+fn test_frame_no_body() {
+	req := 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+	assert frame_request_length(req)! == req.len // complete, ends at \r\n\r\n
+}
+
+fn test_frame_zero_header() {
+	req := 'GET / HTTP/1.1\r\n\r\n'.bytes()
+	assert frame_request_length(req)! == req.len
+}
+
+fn test_frame_content_length() {
+	req := 'POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello'.bytes()
+	assert frame_request_length(req)! == req.len
+	// one byte short of the body => incomplete
+	assert frame_request_length(req[..req.len - 1])! == -1
+	// headers only => incomplete
+	short := 'POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n'.bytes()
+	assert frame_request_length(short)! == -1
+}
+
+fn test_frame_chunked() {
+	req := 'POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n'.bytes()
+	assert frame_request_length(req)! == req.len
+	assert frame_request_length(req[..req.len - 1])! == -1 // missing final CRLF
+}
+
+fn test_frame_incomplete_request_line() {
+	assert frame_request_length('GET / HTT'.bytes())! == -1
+	assert frame_request_length('GET'.bytes())! == -1
+}
+
+fn test_frame_malformed_content_length() {
+	req := 'POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n'.bytes()
+	if _ := frame_request_length(req) {
+		assert false, 'non-numeric Content-Length must error'
+	}
+}
+
+// Split-point fuzzing: the regression guard for the read-loop framing. For a
+// full request, EVERY prefix shorter than the message reports incomplete (-1),
+// and the exact full length reports complete. No sockets involved.
+fn test_frame_split_fuzz() {
+	requests := [
+		'GET / HTTP/1.1\r\nHost: x\r\n\r\n',
+		'POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\nhello world',
+		'POST /c HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n',
+	]
+	for r in requests {
+		full := r.bytes()
+		for split in 1 .. full.len {
+			assert frame_request_length(full[..split])! == -1, 'prefix ${split}/${full.len} should be incomplete'
+		}
+		assert frame_request_length(full)! == full.len, 'full message should be complete'
+	}
+}
+
+// Over-read (pipelined second request present): frame returns only the FIRST
+// message's length, so the read loop knows where it ends.
+fn test_frame_pipelined_returns_first() {
+	two := 'GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+	first := 'GET /a HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+	assert frame_request_length(two)! == first.len
+}
+
+// --- Phase 2: size limits (413 / 431) via frame_request_length_lim ----------
+
+fn test_frame_limit_body_413() {
+	// Content-Length over the limit must be rejected with status 413, BEFORE
+	// the body is buffered (here only headers are present).
+	req := 'POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\n\r\n'.bytes()
+	if _ := frame_request_length_lim(req, 0, 1024) {
+		assert false, 'over-limit body must be rejected'
+	} else {
+		assert err.code() == 413
+	}
+}
+
+fn test_frame_limit_body_ok_when_under() {
+	req := 'POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc'.bytes()
+	assert frame_request_length_lim(req, 0, 1024)! == req.len
+}
+
+fn test_frame_limit_header_431() {
+	// A head larger than the limit, with no terminator yet, must yield 431.
+	big := 'GET / HTTP/1.1\r\nX-Pad: ' + 'a'.repeat(2000) + '\r\n'
+	if _ := frame_request_length_lim(big.bytes(), 64, 0) {
+		assert false, 'over-limit header must be rejected'
+	} else {
+		assert err.code() == 431
+	}
+}
+
+fn test_frame_limits_zero_is_unlimited() {
+	// 0/0 must behave exactly like the unlimited framer.
+	req := 'POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello'.bytes()
+	assert frame_request_length_lim(req, 0, 0)! == req.len
+	assert frame_request_length(req)! == req.len
+}

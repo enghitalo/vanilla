@@ -384,3 +384,192 @@ pub fn (req HttpRequest) get_query_slice(key []u8) ?Slice {
 pub fn (req HttpRequest) get_query(key string) Slice {
 	return req.get_query_slice(key.bytes()) or { Slice{0, 0} }
 }
+
+// ---- request framing -------------------------------------------------------
+//
+// The read loop needs to know when a full message has arrived. That decision is
+// a PURE function of the bytes received so far, kept here so it can be
+// unit-tested by feeding growing prefixes (split-point fuzzing) — no sockets.
+
+// frame_request_length inspects the bytes received so far and returns:
+//   -1          -> incomplete; read more bytes
+//   total >= 0  -> a complete message occupying exactly `total` bytes is present
+// It errors only on genuinely malformed framing (map to 400). Body length comes
+// from Content-Length, or from chunked decoding (Transfer-Encoding), or is zero.
+pub fn frame_request_length(buf []u8) !int {
+	return frame_request_length_lim(buf, 0, 0)
+}
+
+// frame_request_length_lim is frame_request_length with optional size limits
+// (0 = unlimited, zero-cost). When a limit is exceeded it returns an error whose
+// `.code()` is the HTTP status to send: 431 (header fields too large) or 413
+// (payload too large). Other malformed framing carries code 400.
+@[direct_array_access]
+pub fn frame_request_length_lim(buf []u8, max_header int, max_body int) !int {
+	if buf.len < 4 {
+		return -1
+	}
+	// End of the request line (first LF). Headers start right after it.
+	rl := find_byte(&buf[0], buf.len, lf_char) or { return -1 }
+	mut pos := rl + 1
+
+	// ONE pass over the header lines: locate the blank-line terminator AND
+	// detect Content-Length / Transfer-Encoding as we go. (Two separate header
+	// scans here measurably regressed the hot path — keep it to a single walk
+	// with a cheap per-line reject.)
+	mut content_length := -1
+	mut chunked := false
+	for {
+		// Cap the head size so a hostile peer can't grow it without bound.
+		if max_header > 0 && pos > max_header {
+			return error_with_code('header fields exceed ${max_header} bytes', 431)
+		}
+		if pos >= buf.len {
+			return -1
+		}
+		// Blank line => end of header section.
+		if buf[pos] == cr_char {
+			if pos + 1 >= buf.len {
+				return -1
+			}
+			if buf[pos + 1] == lf_char {
+				body_start := pos + 2
+				if chunked {
+					return frame_chunked_total(buf, body_start, max_body)
+				}
+				if content_length >= 0 {
+					total := body_start + content_length
+					return if buf.len >= total { total } else { -1 }
+				}
+				return body_start
+			}
+		}
+		line_lf := find_byte(&buf[pos], buf.len - pos, lf_char) or { return -1 }
+		line_start := pos
+		line_len := line_lf - 1 // bytes before the CR
+		pos = line_start + line_lf + 1
+
+		// Cheap checks: both reject at byte 0 for the vast majority of headers.
+		if v := line_header_value(buf, line_start, line_len, 'Content-Length') {
+			content_length = parse_content_length(buf, v) or {
+				return error_with_code('invalid Content-Length', 400)
+			}
+			// Reject an over-large body from the declared length, BEFORE buffering it.
+			if max_body > 0 && content_length > max_body {
+				return error_with_code('body exceeds ${max_body} bytes', 413)
+			}
+		} else if v := line_header_value(buf, line_start, line_len, 'Transfer-Encoding') {
+			if ci_contains(buf, v, 'chunked') {
+				chunked = true
+			}
+		}
+	}
+	return -1
+}
+
+// line_header_value returns the value Slice if a header line (line_len bytes
+// before CRLF, starting at line_start) has the case-insensitive name `name`
+// immediately followed by ':'. Used by the single-pass framer.
+@[direct_array_access; inline]
+fn line_header_value(buf []u8, line_start int, line_len int, name string) ?Slice {
+	if name.len + 1 > line_len {
+		return none
+	}
+	if !ascii_ci_eq(&buf[line_start], name.str, name.len) || buf[line_start + name.len] != colon_u8 {
+		return none
+	}
+	line_end := line_start + line_len
+	mut v := line_start + name.len + 1
+	for v < line_end && buf[v] == empty_space {
+		v++
+	}
+	return Slice{
+		start: v
+		len:   line_end - v
+	}
+}
+
+fn parse_content_length(buf []u8, s Slice) !int {
+	if s.len == 0 {
+		return error('empty Content-Length')
+	}
+	mut n := 0
+	for i in s.start .. s.start + s.len {
+		c := buf[i]
+		if c < `0` || c > `9` {
+			return error('non-digit in Content-Length')
+		}
+		n = n * 10 + int(c - `0`)
+	}
+	return n
+}
+
+// ci_contains reports whether the value slice contains `needle` (ASCII, CI).
+fn ci_contains(buf []u8, val Slice, needle string) bool {
+	if needle.len > val.len {
+		return false
+	}
+	last := val.start + val.len - needle.len
+	for i := val.start; i <= last; i++ {
+		if ascii_ci_eq(&buf[i], needle.str, needle.len) {
+			return true
+		}
+	}
+	return false
+}
+
+fn hex_digit(c u8) !int {
+	return match c {
+		`0`...`9` { int(c - `0`) }
+		`a`...`f` { int(c - `a` + 10) }
+		`A`...`F` { int(c - `A` + 10) }
+		else { error('not a hex digit') }
+	}
+}
+
+// frame_chunked_total walks chunk-size lines from body_start and returns the
+// total message length once the terminating zero-length chunk + CRLF is present,
+// -1 if more bytes are needed, or an error on malformed chunk framing.
+@[direct_array_access]
+fn frame_chunked_total(buf []u8, body_start int, max_body int) !int {
+	// Bound the buffered chunked payload (the total length isn't known up front).
+	if max_body > 0 && buf.len - body_start > max_body {
+		return error_with_code('body exceeds ${max_body} bytes', 413)
+	}
+	mut pos := body_start
+	for {
+		if pos >= buf.len {
+			return -1
+		}
+		line_lf := find_byte(&buf[pos], buf.len - pos, lf_char) or { return -1 }
+		size_end := pos + line_lf // index of LF
+		mut size := 0
+		mut j := pos
+		for j < size_end && buf[j] != cr_char {
+			c := buf[j]
+			if c == `;` {
+				break // chunk extensions: ignore the rest of the size line
+			}
+			d := hex_digit(c) or { return error_with_code('invalid chunk size', 400) }
+			size = size * 16 + d
+			j++
+		}
+		data_start := size_end + 1
+		if size == 0 {
+			// Terminating chunk; require the closing CRLF (trailers not modeled).
+			if data_start + 1 >= buf.len {
+				return -1
+			}
+			if buf[data_start] == cr_char && buf[data_start + 1] == lf_char {
+				return data_start + 2
+			}
+			return -1
+		}
+		next := data_start + size + 2 // data + trailing CRLF
+		if next > buf.len {
+			return -1
+		}
+		pos = next
+	}
+	return -1
+}

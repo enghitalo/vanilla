@@ -14,12 +14,18 @@ fn C.close(fd int) int
 
 // Handles a readable client connection: receives the request, routes it, and sends the response.
 @[manualfree]
-fn handle_readable_fd(request_handler fn ([]u8, int) ![]u8, epoll_fd int, client_conn_fd int) {
-	request_buffer := request.read_request(client_conn_fd) or {
+fn handle_readable_fd(request_handler fn ([]u8, int) ![]u8, epoll_fd int, client_conn_fd int, limits Limits) {
+	request_buffer := request.read_request(client_conn_fd, limits.max_header_bytes, limits.max_body_bytes) or {
 		$if verbose ? {
 			eprintln('[epoll-worker] Error reading request from fd ${client_conn_fd}: ${err}')
 		}
-		response.send_status_444_response(client_conn_fd)
+		// The framer/read loop puts the HTTP status to send in err.code().
+		match err.code() {
+			413 { response.send_status_413_response(client_conn_fd) }
+			431 { response.send_status_431_response(client_conn_fd) }
+			400 { response.send_bad_request_response(client_conn_fd) }
+			else { response.send_status_444_response(client_conn_fd) } // connection-level
+		}
 		epoll.remove_fd_from_epoll(epoll_fd, client_conn_fd)
 		return
 	}
@@ -73,8 +79,8 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int) {
 				eprintln('[epoll] EPOLLIN event on listening socket')
 			}
 			for {
-				// Accept new client connection
-				client_conn_fd := C.accept(socket_fd, C.NULL, C.NULL)
+				// Accept new client connection (already non-blocking via accept4).
+				client_conn_fd := socket.accept_client(socket_fd)
 				$if verbose ? {
 					println('[epoll] accept() returned ${client_conn_fd}')
 				}
@@ -90,8 +96,8 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int) {
 					C.perror(c'Accept failed')
 					continue
 				}
-				// Set client socket to non-blocking
-				socket.set_blocking(client_conn_fd, false)
+				// Disable Nagle so small responses are not delayed.
+				socket.set_tcp_nodelay(client_conn_fd)
 				// Distribute client connection to worker threads (round-robin)
 				epoll_fd := epoll_fds[next_worker]
 				next_worker = (next_worker + 1) % max_thread_pool_size
@@ -157,7 +163,7 @@ fn process_events(event_callbacks epoll.EpollEventCallbacks, epoll_fd int) {
 	}
 }
 
-pub fn run_epoll_backend(socket_fd int, request_handler fn ([]u8, int) ![]u8, port int, mut threads []thread) {
+pub fn run_epoll_backend(socket_fd int, request_handler fn ([]u8, int) ![]u8, port int, limits Limits, mut threads []thread) {
 	if socket_fd < 0 {
 		return
 	}
@@ -197,8 +203,8 @@ pub fn run_epoll_backend(socket_fd int, request_handler fn ([]u8, int) ![]u8, po
 		// Build per-thread callbacks: default to handle_readable_fd; write is a no-op.
 		epoll_fd := epoll_fds[i]
 		callbacks := epoll.EpollEventCallbacks{
-			on_read:  fn [request_handler, epoll_fd] (client_conn_fd int) {
-				handle_readable_fd(request_handler, epoll_fd, client_conn_fd)
+			on_read:  fn [request_handler, epoll_fd, limits] (client_conn_fd int) {
+				handle_readable_fd(request_handler, epoll_fd, client_conn_fd, limits)
 			}
 			on_write: fn (_ int) {}
 		}

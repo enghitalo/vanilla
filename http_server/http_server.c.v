@@ -5,11 +5,20 @@ import socket
 
 const max_thread_pool_size = runtime.nr_cpus()
 
+// Limits bounds resource use per request. Every field defaults to 0 = unlimited,
+// so the checks are zero-cost on the hot path unless a server opts in.
+pub struct Limits {
+pub:
+	max_header_bytes int // > 0 ⇒ 431 Request Header Fields Too Large
+	max_body_bytes   int // > 0 ⇒ 413 Payload Too Large (rejected from Content-Length, before buffering)
+}
+
 struct Server {
 pub:
 	port            int       = 3000
 	io_multiplexing IOBackend = unsafe { IOBackend(0) }
 	socket_fd       int
+	limits          Limits
 pub mut:
 	threads         []thread = []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
 	request_handler fn ([]u8, int) ![]u8 @[required]
@@ -37,7 +46,7 @@ pub fn (mut s Server) test(requests [][]u8) ![][]u8 {
 			match s.io_multiplexing {
 				.epoll {
 					println('[test] Running epoll backend')
-					run_epoll_backend(s.socket_fd, s.request_handler, s.port, mut threads)
+					run_epoll_backend(s.socket_fd, s.request_handler, s.port, s.limits, mut threads)
 				}
 				.io_uring {
 					println('[test] Running io_uring backend')
@@ -145,7 +154,7 @@ pub fn (mut s Server) test(requests [][]u8) ![][]u8 {
 	return responses
 }
 
-struct Certificates {
+pub struct Certificates {
 pub:
 	cert_pem    []u8
 	key_pem     []u8
@@ -158,6 +167,7 @@ pub:
 	io_multiplexing IOBackend = unsafe { IOBackend(0) }
 	request_handler fn ([]u8, int) ![]u8 @[required]
 	certificates    Certificates
+	limits          Limits
 }
 
 pub fn new_server(config ServerConfig) !Server {
@@ -184,6 +194,7 @@ pub fn new_server(config ServerConfig) !Server {
 		io_multiplexing: config.io_multiplexing
 		socket_fd:       socket_fd
 		request_handler: config.request_handler
+		limits:          config.limits
 		threads:         []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
 	}
 }

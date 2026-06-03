@@ -20,7 +20,7 @@ const connection_keep_alive_variants = [
 pub fn (mut server Server) run() {
 	match server.io_multiplexing {
 		.epoll {
-			run_epoll_backend(server.socket_fd, server.request_handler, server.port, mut
+			run_epoll_backend(server.socket_fd, server.request_handler, server.port, server.limits, mut
 				server.threads)
 		}
 		.io_uring {

@@ -11,6 +11,17 @@ $if !windows {
 	#include <netinet/in.h>
 	// superset of previous
 	#include <netinet/ip.h>
+	#include <netinet/tcp.h> // TCP_NODELAY
+	#include <arpa/inet.h> // inet_ntop
+}
+
+fn C.getpeername(fd int, addr voidptr, addrlen &u32) int
+fn C.inet_ntop(af int, src voidptr, dst &char, size u32) &char
+
+$if linux {
+	// accept4 sets the client socket non-blocking atomically, saving the two
+	// fcntl() syscalls that set_blocking() would otherwise do per connection.
+	fn C.accept4(sockfd int, address voidptr, addrlen voidptr, flags int) int
 }
 
 fn C.socket(socket_family int, socket_type int, protocol int) int
@@ -99,6 +110,52 @@ pub fn set_blocking(fd int, blocking bool) {
 		}
 		new_flags := if blocking { flags & ~C.O_NONBLOCK } else { flags | C.O_NONBLOCK }
 		C.fcntl(fd, C.F_SETFL, new_flags)
+	}
+}
+
+// set_tcp_nodelay disables Nagle's algorithm so small responses go out
+// immediately instead of waiting to coalesce. Standard for request/response
+// HTTP servers; the win shows on real networks (negligible on loopback).
+pub fn set_tcp_nodelay(fd int) {
+	$if !windows {
+		opt := 1
+		C.setsockopt(fd, C.IPPROTO_TCP, C.TCP_NODELAY, &opt, sizeof(opt))
+	}
+}
+
+// accept_client accepts a connection and returns a NON-BLOCKING client fd
+// (or <0). On Linux this is a single accept4() syscall; elsewhere it falls
+// back to accept() + fcntl.
+pub fn accept_client(server_fd int) int {
+	$if linux {
+		return C.accept4(server_fd, C.NULL, C.NULL, C.SOCK_NONBLOCK)
+	} $else {
+		fd := C.accept(server_fd, C.NULL, C.NULL)
+		if fd >= 0 {
+			set_blocking(fd, false)
+		}
+		return fd
+	}
+}
+
+// peer_addr returns the remote IPv4 address of a connected socket (e.g.
+// "203.0.113.7"), or '' on error. Call it from a handler only when you need the
+// client IP (rate limiting, proxy trust) — it costs one getpeername syscall and
+// nothing otherwise, keeping the `fn ([]u8, int)` handler contract intact.
+pub fn peer_addr(fd int) string {
+	$if windows {
+		return ''
+	} $else {
+		mut a := C.sockaddr_in{}
+		mut l := u32(sizeof(a))
+		if C.getpeername(fd, voidptr(&a), &l) != 0 {
+			return ''
+		}
+		mut buf := [46]u8{} // INET6_ADDRSTRLEN
+		if C.inet_ntop(C.AF_INET, voidptr(&a.sin_addr), &char(&buf[0]), 46) == 0 {
+			return ''
+		}
+		return unsafe { cstring_to_vstring(&char(&buf[0])) }
 	}
 }
 

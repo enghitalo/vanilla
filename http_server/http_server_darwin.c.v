@@ -17,7 +17,7 @@ fn C.close(fd int) int
 
 // Handle readable client connection
 fn handle_readable_fd(handler fn ([]u8, int) ![]u8, kq_fd int, client_fd int) {
-	request_buffer := request.read_request(client_fd) or {
+	request_buffer := request.read_request(client_fd, 0, 0) or { // TODO: thread Limits on darwin
 		response.send_status_444_response(client_fd)
 		kqueue.remove_fd_from_kqueue(kq_fd, client_fd)
 		return
