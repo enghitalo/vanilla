@@ -4,7 +4,6 @@ import socket
 import time
 import sync.stdatomic
 import http_server.core
-import http_server.backend_epoll
 import http_server.tls
 
 const max_thread_pool_size = core.max_thread_pool_size
@@ -84,28 +83,9 @@ pub fn (mut s Server) test(requests [][]u8) ![][]u8 {
 	spawn fn [mut s, mut threads, ready_ch] () {
 		println('[test] Server backend setup...')
 		ready_ch <- true
-		$if linux {
-			match s.io_multiplexing {
-				.epoll {
-					println('[test] Running epoll backend')
-					backend_epoll.run_epoll_backend(s.socket_fd, s.request_handler, s.port, s.limits, s.inflight,
-						s.active_conns, s.tls_config, mut threads)
-				}
-				.io_uring {
-					println('[test] Running io_uring backend')
-					run_io_uring_backend(s.request_handler, s.port, mut threads)
-				}
-			}
-		} $else $if darwin {
-			println('[test] Running kqueue backend')
-			run_kqueue_backend(s.socket_fd, s.request_handler, s.port, mut threads)
-		} $else $if windows {
-			println('[test] Running IOCP backend')
-			run_iocp_backend(s.socket_fd, s.request_handler, s.port, mut threads)
-		} $else {
-			eprintln('Unsupported OS for http_server.')
-			exit(1)
-		}
+		// Platform dispatch lives in the per-OS facade file (run_selected_backend),
+		// so this all-platform file imports no platform-specific backend module.
+		run_selected_backend(s, mut threads)
 	}()
 
 	// Wait for the server to signal readiness

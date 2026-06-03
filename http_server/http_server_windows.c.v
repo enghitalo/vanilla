@@ -4,7 +4,6 @@ import socket
 import runtime
 import iocp
 import http1_1.response
-import http1_1.request
 
 // Backend selection
 pub enum IOBackend {
@@ -333,11 +332,17 @@ pub fn run_iocp_backend(socket_fd int, handler fn ([]u8, int) ![]u8, port int, m
 	println('[iocp] Server stopped')
 }
 
-pub fn (mut server Server) run() {
-	$if windows {
-		run_iocp_backend(server.socket_fd, server.request_handler, server.port, mut server.threads)
-	} $else {
-		eprintln('Windows IOCP backend only works on Windows')
-		exit(1)
+// run_selected_backend dispatches to the configured Windows backend. Defined per
+// OS so the all-platform facade (http_server.c.v) needs no platform-specific
+// backend import. Blocks in the accept loop.
+fn run_selected_backend(server Server, mut threads []thread) {
+	match server.io_multiplexing {
+		.iocp {
+			run_iocp_backend(server.socket_fd, server.request_handler, server.port, mut threads)
+		}
 	}
+}
+
+pub fn (mut server Server) run() {
+	run_selected_backend(server, mut server.threads)
 }

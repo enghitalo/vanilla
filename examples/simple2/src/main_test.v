@@ -1,6 +1,5 @@
 module main
 
-import http_server
 import http_server.http1_1.response
 
 fn test_handle_request_get_home() {

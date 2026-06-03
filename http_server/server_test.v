@@ -1,7 +1,5 @@
 module http_server
 
-import os
-
 fn dummy_handler(req []u8, _ int) ![]u8 {
 	if req.bytestr().contains('/notfound') {
 		return 'HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found'.bytes()

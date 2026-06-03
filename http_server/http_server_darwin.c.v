@@ -110,15 +110,17 @@ pub fn run_kqueue_backend(socket_fd int, handler fn ([]u8, int) ![]u8, port int,
 	handle_accept_loop(socket_fd, main_kq, worker_kqs)
 }
 
-pub fn (mut server Server) run() {
+// run_selected_backend dispatches to the configured macOS backend. Defined per
+// OS so the all-platform facade (http_server.c.v) needs no platform-specific
+// backend import. Blocks in the accept loop.
+fn run_selected_backend(server Server, mut threads []thread) {
 	match server.io_multiplexing {
 		.kqueue {
-			run_kqueue_backend(server.socket_fd, server.request_handler, server.port, mut
-				server.threads)
-		}
-		else {
-			eprintln('Only kqueue is supported on macOS/Darwin.')
-			exit(1)
+			run_kqueue_backend(server.socket_fd, server.request_handler, server.port, mut threads)
 		}
 	}
+}
+
+pub fn (mut server Server) run() {
+	run_selected_backend(server, mut server.threads)
 }
