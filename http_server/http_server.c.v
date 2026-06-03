@@ -4,6 +4,7 @@ import runtime
 import socket
 import time
 import sync.stdatomic
+import http_server.tls
 
 const max_thread_pool_size = runtime.nr_cpus()
 
@@ -32,6 +33,7 @@ pub:
 	io_multiplexing IOBackend = unsafe { IOBackend(0) }
 	socket_fd       int
 	limits          Limits
+	tls_config      &tls.Config = unsafe { nil } // nil ⇒ plain HTTP; set ⇒ HTTPS
 pub mut:
 	threads         []thread = []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
 	request_handler fn ([]u8, int) ![]u8 @[required]
@@ -100,7 +102,7 @@ pub fn (mut s Server) test(requests [][]u8) ![][]u8 {
 				.epoll {
 					println('[test] Running epoll backend')
 					run_epoll_backend(s.socket_fd, s.request_handler, s.port, s.limits, s.inflight,
-						s.active_conns, mut threads)
+						s.active_conns, s.tls_config, mut threads)
 				}
 				.io_uring {
 					println('[test] Running io_uring backend')
@@ -222,6 +224,7 @@ pub:
 	request_handler fn ([]u8, int) ![]u8 @[required]
 	certificates    Certificates
 	limits          Limits
+	tls_config      &tls.Config = unsafe { nil } // set for HTTPS (e.g. tls.new_self_signed())
 }
 
 pub fn new_server(config ServerConfig) !Server {
@@ -249,6 +252,7 @@ pub fn new_server(config ServerConfig) !Server {
 		socket_fd:       socket_fd
 		request_handler: config.request_handler
 		limits:          config.limits
+		tls_config:      config.tls_config
 		threads:         []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
 	}
 }

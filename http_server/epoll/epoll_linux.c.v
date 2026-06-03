@@ -60,6 +60,16 @@ pub fn add_fd_to_epoll(epoll_fd int, fd int, events u32) int {
 	return 0
 }
 
+// Change the watched events for an fd already in the epoll set (EPOLL_CTL_MOD).
+// Used to add/drop EPOLLOUT when a response is parked for backpressure.
+pub fn mod_fd_in_epoll(epoll_fd int, fd int, events u32) int {
+	mut ev := C.epoll_event{
+		events: events
+	}
+	C.v_epoll_event_set_fd(&ev, fd)
+	return C.epoll_ctl(epoll_fd, C.EPOLL_CTL_MOD, fd, &ev)
+}
+
 // Remove a file descriptor from an epoll instance.
 pub fn remove_fd_from_epoll(epoll_fd int, fd int) {
 	C.epoll_ctl(epoll_fd, C.EPOLL_CTL_DEL, fd, C.NULL)

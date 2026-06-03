@@ -2,9 +2,8 @@ module http_server
 
 import epoll
 import socket
-import http1_1.response
-import http1_1.request
 import sync.stdatomic
+import http_server.tls
 
 #include <errno.h>
 #include <sys/epoll.h>
@@ -22,49 +21,8 @@ fn release_conn(epoll_fd int, fd int, active_conns &Counter) {
 	stdatomic.add_i64(&active_conns.n, -1)
 }
 
-// Handles a readable client connection: receives the request, routes it, and sends the response.
-@[manualfree]
-fn handle_readable_fd(request_handler fn ([]u8, int) ![]u8, epoll_fd int, client_conn_fd int, limits Limits, counter &Counter, active_conns &Counter) {
-	// Mark this worker busy for the whole request so shutdown() can drain
-	// precisely. Per-worker counter on its own cache line: no contention.
-	stdatomic.add_i64(&counter.n, 1)
-	defer {
-		stdatomic.add_i64(&counter.n, -1)
-	}
-	request_buffer := request.read_request(client_conn_fd, limits.max_header_bytes, limits.max_body_bytes) or {
-		$if verbose ? {
-			eprintln('[epoll-worker] Error reading request from fd ${client_conn_fd}: ${err}')
-		}
-		// The framer/read loop puts the HTTP status to send in err.code().
-		match err.code() {
-			413 { response.send_status_413_response(client_conn_fd) }
-			431 { response.send_status_431_response(client_conn_fd) }
-			400 { response.send_bad_request_response(client_conn_fd) }
-			else { response.send_status_444_response(client_conn_fd) } // connection-level
-		}
-		release_conn(epoll_fd, client_conn_fd, active_conns)
-		return
-	}
-
-	defer {
-		unsafe { request_buffer.free() }
-	}
-
-	response_buffer := request_handler(request_buffer, client_conn_fd) or {
-		eprintln('Error handling request: ${err}')
-		response.send_bad_request_response(client_conn_fd)
-		release_conn(epoll_fd, client_conn_fd, active_conns)
-		return
-	}
-	defer {
-		unsafe { response_buffer.free() }
-	}
-
-	response.send_response(client_conn_fd, response_buffer.data, response_buffer.len) or {
-		release_conn(epoll_fd, client_conn_fd, active_conns)
-		return
-	}
-}
+// (The plain request cycle now lives in the per-fd state machine — see
+// conn_state.c.v: handle_readable_plain / handle_writable_plain.)
 
 // Accept loop for the main epoll thread. Distributes new client connections to worker threads (round-robin).
 fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits Limits, active_conns &Counter) {
@@ -137,59 +95,68 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 	}
 }
 
+// Plain (HTTP) worker: owns the per-fd connection state map for cross-edge
+// reads + EPOLLOUT writes.
 @[direct_array_access; manualfree]
-fn process_events(event_callbacks epoll.EpollEventCallbacks, epoll_fd int, active_conns &Counter) {
+fn process_events_plain(epoll_fd int, request_handler fn ([]u8, int) ![]u8, limits Limits, counter &Counter, active_conns &Counter) {
 	mut events := [socket.max_connection_size]C.epoll_event{}
-
+	mut conns := map[int]&ConnState{}
 	for {
-		// Wait for events on the worker's epoll fd
 		num_events := C.epoll_wait(epoll_fd, &events[0], socket.max_connection_size, -1)
-		$if verbose ? {
-			eprintln('[epoll-worker] epoll_wait returned ${num_events} on fd ${epoll_fd}')
-		}
 		if num_events < 0 {
 			if C.errno == C.EINTR {
 				continue
 			}
-			eprintln(@LOCATION)
 			C.perror(c'epoll_wait')
 			break
 		}
-
 		for i in 0 .. num_events {
-			client_conn_fd := epoll.event_fd(events[i])
-			$if verbose ? {
-				eprintln('[epoll-worker] Event for client fd ${client_conn_fd}: events=${events[i].events}')
-			}
-			// Remove fd if hangup or error
-			if events[i].events & u32(C.EPOLLHUP | C.EPOLLERR) != 0 {
-				$if verbose ? {
-					println('[epoll-worker] HUP/ERR on fd ${client_conn_fd}, removing')
-				}
-				release_conn(epoll_fd, client_conn_fd, active_conns)
+			fd := epoll.event_fd(events[i])
+			ev := events[i].events
+			if ev & u32(C.EPOLLHUP | C.EPOLLERR) != 0 {
+				close_conn(epoll_fd, fd, active_conns, mut conns)
 				continue
 			}
-
-			// Readable event
-			if events[i].events & u32(C.EPOLLIN) != 0 {
-				$if verbose ? {
-					println('[epoll-worker] EPOLLIN for fd ${client_conn_fd}, calling on_read')
-				}
-				event_callbacks.on_read(client_conn_fd)
+			if ev & u32(C.EPOLLOUT) != 0 {
+				handle_writable_plain(epoll_fd, fd, active_conns, mut conns)
 			}
-
-			// Writable event
-			if events[i].events & u32(C.EPOLLOUT) != 0 {
-				$if verbose ? {
-					println('[epoll-worker] EPOLLOUT for fd ${client_conn_fd}, calling on_write')
-				}
-				event_callbacks.on_write(client_conn_fd)
+			if ev & u32(C.EPOLLIN) != 0 {
+				handle_readable_plain(request_handler, epoll_fd, fd, limits, counter, active_conns, mut
+					conns)
 			}
 		}
 	}
 }
 
-pub fn run_epoll_backend(socket_fd int, request_handler fn ([]u8, int) ![]u8, port int, limits Limits, inflight []&Counter, active_conns &Counter, mut threads []thread) {
+// TLS (HTTPS) worker: owns the per-fd TLS session map (handshake + ssl read/write).
+@[direct_array_access; manualfree]
+fn process_events_tls(epoll_fd int, request_handler fn ([]u8, int) ![]u8, limits Limits, counter &Counter, active_conns &Counter, cfg &tls.Config) {
+	mut events := [socket.max_connection_size]C.epoll_event{}
+	mut sessions := map[int]&TlsConn{}
+	for {
+		num_events := C.epoll_wait(epoll_fd, &events[0], socket.max_connection_size, -1)
+		if num_events < 0 {
+			if C.errno == C.EINTR {
+				continue
+			}
+			C.perror(c'epoll_wait')
+			break
+		}
+		for i in 0 .. num_events {
+			fd := epoll.event_fd(events[i])
+			if events[i].events & u32(C.EPOLLHUP | C.EPOLLERR) != 0 {
+				close_tls(epoll_fd, fd, active_conns, mut sessions)
+				continue
+			}
+			if events[i].events & u32(C.EPOLLIN) != 0 {
+				handle_readable_fd_tls(request_handler, epoll_fd, fd, limits, counter, active_conns,
+					cfg, mut sessions)
+			}
+		}
+	}
+}
+
+pub fn run_epoll_backend(socket_fd int, request_handler fn ([]u8, int) ![]u8, port int, limits Limits, inflight []&Counter, active_conns &Counter, tls_config &tls.Config, mut threads []thread) {
 	if socket_fd < 0 {
 		return
 	}
@@ -226,17 +193,17 @@ pub fn run_epoll_backend(socket_fd int, request_handler fn ([]u8, int) ![]u8, po
 			exit(1)
 		}
 
-		// Build per-thread callbacks: default to handle_readable_fd; write is a no-op.
-		epoll_fd := epoll_fds[i]
+		// Build per-thread callbacks. The plaintext and TLS paths are SEPARATE
+		// Spawn the right concrete worker: HTTPS or plain HTTP. The plain worker
+		// has no TLS code at all, so the plain hot path carries zero TLS cost.
 		counter := inflight[i] // this worker's own in-flight counter
-		callbacks := epoll.EpollEventCallbacks{
-			on_read:  fn [request_handler, epoll_fd, limits, counter, active_conns] (client_conn_fd int) {
-				handle_readable_fd(request_handler, epoll_fd, client_conn_fd, limits, counter,
-					active_conns)
-			}
-			on_write: fn (_ int) {}
+		if tls_config != unsafe { nil } {
+			threads[i] = spawn process_events_tls(epoll_fds[i], request_handler, limits, counter,
+				active_conns, tls_config)
+		} else {
+			threads[i] = spawn process_events_plain(epoll_fds[i], request_handler, limits, counter,
+				active_conns)
 		}
-		threads[i] = spawn process_events(callbacks, epoll_fds[i], active_conns)
 	}
 
 	println('listening on http://localhost:${port}/')
