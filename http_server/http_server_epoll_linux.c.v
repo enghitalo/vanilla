@@ -144,8 +144,10 @@ fn process_events_plain(epoll_fd int, request_handler fn ([]u8, int) ![]u8, limi
 fn process_events_tls(epoll_fd int, request_handler fn ([]u8, int) ![]u8, limits Limits, counter &Counter, active_conns &Counter, cfg &tls.Config) {
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut sessions := map[int]&TlsConn{}
+	sweep_on := limits.read_timeout_ms > 0 || limits.write_timeout_ms > 0
 	for {
-		num_events := C.epoll_wait(epoll_fd, &events[0], socket.max_connection_size, -1)
+		wait_ms := if sweep_on && sessions.len > 0 { 250 } else { -1 }
+		num_events := C.epoll_wait(epoll_fd, &events[0], socket.max_connection_size, wait_ms)
 		if num_events < 0 {
 			if C.errno == C.EINTR {
 				continue
@@ -155,14 +157,21 @@ fn process_events_tls(epoll_fd int, request_handler fn ([]u8, int) ![]u8, limits
 		}
 		for i in 0 .. num_events {
 			fd := epoll.event_fd(events[i])
-			if events[i].events & u32(C.EPOLLHUP | C.EPOLLERR) != 0 {
+			ev := events[i].events
+			if ev & u32(C.EPOLLHUP | C.EPOLLERR) != 0 {
 				close_tls(epoll_fd, fd, active_conns, mut sessions)
 				continue
 			}
-			if events[i].events & u32(C.EPOLLIN) != 0 {
+			if ev & u32(C.EPOLLOUT) != 0 {
+				handle_writable_fd_tls(epoll_fd, fd, active_conns, mut sessions)
+			}
+			if ev & u32(C.EPOLLIN) != 0 {
 				handle_readable_fd_tls(request_handler, epoll_fd, fd, limits, counter, active_conns,
 					cfg, mut sessions)
 			}
+		}
+		if sweep_on && sessions.len > 0 {
+			sweep_timeouts_tls(epoll_fd, active_conns, mut sessions)
 		}
 	}
 }

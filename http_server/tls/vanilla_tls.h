@@ -46,9 +46,14 @@ void vtls_session_free(void *sess);
 
 // Return codes. read/write return byte counts >= 0 on success, so the "blocked"
 // and "error" signals are NEGATIVE to never collide with a 1-byte read.
-#define VTLS_OK 0      // handshake done
-#define VTLS_WANT (-2) // would block — retry on the next epoll readiness event
-#define VTLS_ERROR -1  // fatal — close the connection
+//
+// WANT_READ vs WANT_WRITE are distinct so the epoll worker knows which readiness
+// to wait for: WANT_READ → arm EPOLLIN (the default), WANT_WRITE → arm EPOLLOUT
+// (the socket send buffer is full; resume the same operation when it drains).
+#define VTLS_OK 0          // handshake done
+#define VTLS_WANT (-2)     // would block on READ — retry on the next EPOLLIN
+#define VTLS_WANT_WRITE (-3) // would block on WRITE — retry on the next EPOLLOUT
+#define VTLS_ERROR -1      // fatal — close the connection
 
 // Drive the TLS handshake. VTLS_OK when complete, VTLS_WANT to retry, VTLS_ERROR.
 int vtls_handshake(void *sess);

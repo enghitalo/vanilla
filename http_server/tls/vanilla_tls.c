@@ -133,7 +133,8 @@ void vtls_session_free(void *sess) {
 }
 
 static int map_ret(int ret) {
-    if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) return VTLS_WANT;
+    if (ret == MBEDTLS_ERR_SSL_WANT_READ) return VTLS_WANT;
+    if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) return VTLS_WANT_WRITE;
     return VTLS_ERROR;
 }
 
