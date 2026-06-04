@@ -26,9 +26,10 @@ pub mut:
 // `http_server.Limits` for the ergonomic config API.
 pub struct Limits {
 pub:
-	max_header_bytes int // > 0 ⇒ 431 Request Header Fields Too Large
-	max_body_bytes   int // > 0 ⇒ 413 Payload Too Large (rejected from Content-Length, before buffering)
-	max_connections  int // > 0 ⇒ refuse new connections past this many concurrent (checked at accept)
-	read_timeout_ms  int // > 0 ⇒ close a connection that can't finish its request in this long (408)
-	write_timeout_ms int // > 0 ⇒ close a connection whose parked response can't drain in this long
+	max_header_bytes  int // > 0 ⇒ 431 Request Header Fields Too Large
+	max_body_bytes    int // > 0 ⇒ 413 Payload Too Large (rejected from Content-Length, before buffering)
+	max_request_bytes int // > 0 ⇒ ceiling on a single buffered request (headers+body); 0 ⇒ built-in default (8 MiB)
+	max_connections   int // > 0 ⇒ refuse new connections past this many concurrent (checked at accept)
+	read_timeout_ms   int // > 0 ⇒ close a connection that can't finish its request in this long (408)
+	write_timeout_ms  int // > 0 ⇒ close a connection whose parked response can't drain in this long
 }

@@ -140,7 +140,8 @@ fn handle_readable_fd_tls(request_handler fn ([]u8, int) ![]u8, epoll_fd int, fd
 			return
 		}
 		unsafe { buf.len += n }
-		if buf.len > tls_max_request_bytes {
+		req_cap := if limits.max_request_bytes > 0 { limits.max_request_bytes } else { tls_max_request_bytes }
+		if buf.len > req_cap {
 			unsafe { buf.free() }
 			close_tls(epoll_fd, fd, active_conns, mut sessions)
 			return
