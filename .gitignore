@@ -30,3 +30,4 @@ examples/veb_like/veb_like
 # generated at runtime by examples/video_stream
 sample.mp4
 *.mp4
+*.log
