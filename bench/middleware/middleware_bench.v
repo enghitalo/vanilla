@@ -49,10 +49,10 @@ fn inject_headers(resp []u8, hdrs []u8) []u8 {
 	if nl < 0 || hdrs.len == 0 {
 		return resp
 	}
-	mut out := []u8{len: resp.len + hdrs.len}
-	copy(mut out[..nl], resp[..nl])
-	copy(mut out[nl..nl + hdrs.len], hdrs)
-	copy(mut out[nl + hdrs.len..], resp[nl..])
+	mut out := []u8{cap: resp.len + hdrs.len}
+	out << resp[..nl]
+	out << hdrs
+	out << resp[nl..]
 	return out
 }
 

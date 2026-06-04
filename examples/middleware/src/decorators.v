@@ -23,10 +23,12 @@ fn inject_headers(resp []u8, headers []u8) []u8 {
 	if end < 0 || headers.len == 0 {
 		return resp
 	}
-	mut out := []u8{len: resp.len + headers.len}
-	copy(mut out[..end], resp[..end])
-	copy(mut out[end..end + headers.len], headers)
-	copy(mut out[end + headers.len..], resp[end..])
+	// cap form: uninitialized/noscan, no wasted zeroing — we overwrite every byte
+	// anyway, and the exact capacity means the three appends never reallocate (§4).
+	mut out := []u8{cap: resp.len + headers.len}
+	out << resp[..end]
+	out << headers
+	out << resp[end..]
 	return out
 }
 
