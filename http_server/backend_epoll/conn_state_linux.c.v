@@ -86,7 +86,8 @@ fn handle_readable_plain(request_handler fn ([]u8, int) ![]u8, epoll_fd int, fd 
 			return
 		}
 		unsafe { buf.len += n }
-		if buf.len > sm_max_request_bytes {
+		req_cap := if limits.max_request_bytes > 0 { limits.max_request_bytes } else { sm_max_request_bytes }
+		if buf.len > req_cap {
 			unsafe { buf.free() }
 			response.send_status_413_response(fd)
 			close_conn(epoll_fd, fd, active_conns, mut conns)
