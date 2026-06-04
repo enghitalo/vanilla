@@ -12,15 +12,16 @@ module main
 
 import http_server.http1_1.request_parser { Slice }
 
-// try_dynamic_route attempts to match a dynamic route (path with parameters like :id)
-// Uses a two-pass approach to avoid temporary allocations:
-// Pass 1: Validate route matches without extracting parameters
-// Pass 2: Extract parameters only if route matched
-pub fn try_dynamic_route(parsed_req request_parser.HttpRequest, attr string, attr_len int, mut params map[string]Slice) bool {
+// try_dynamic_route matches a parameterized route (e.g. `/users/:id`) and, on a
+// match, extracts the params. `path_len` is the request path length WITHOUT the
+// `?query`, so route boundaries never bleed into the query string.
+// Two passes (validate, then extract) avoid allocating on a non-match.
+pub fn try_dynamic_route(parsed_req request_parser.HttpRequest, attr string, attr_len int, path_len int, mut params map[string]Slice) bool {
 	// Find the first colon in the attribute (indicates a parameter)
 	colon_pos := find_byte(attr.str, attr_len, `:`) or { return false }
 
-	// Check if the prefix before the colon matches
+	// Check if the prefix before the colon matches (this includes "METHOD SP",
+	// so the method must match too).
 	if unsafe {
 		C.memcmp(attr.str, &parsed_req.buffer[0], colon_pos)
 	} != 0 {
@@ -28,21 +29,21 @@ pub fn try_dynamic_route(parsed_req request_parser.HttpRequest, attr string, att
 	}
 
 	// Pass 1: Validate the route matches (without extracting parameters)
-	if !validate_route_match(parsed_req, attr, attr_len, colon_pos) {
+	if !validate_route_match(parsed_req, attr, attr_len, colon_pos, path_len) {
 		return false
 	}
 
 	// Pass 2: Extract parameters (we know the route matches)
-	extract_route_params(parsed_req, attr, attr_len, colon_pos, mut params)
+	extract_route_params(parsed_req, attr, attr_len, colon_pos, path_len, mut params)
 	return true
 }
 
 // validate_route_match checks if the route pattern matches without extracting parameters
-fn validate_route_match(parsed_req request_parser.HttpRequest, attr string, attr_len int, colon_pos int) bool {
+fn validate_route_match(parsed_req request_parser.HttpRequest, attr string, attr_len int, colon_pos int, path_len int) bool {
 	unsafe {
 		mut attr_pos := colon_pos
 		mut req_pos := colon_pos
-		req_path_end := parsed_req.method.len + 1 + parsed_req.path.len
+		req_path_end := parsed_req.method.len + 1 + path_len
 
 		for attr_pos < attr_len {
 			if attr.str[attr_pos] == `:` {
@@ -53,20 +54,19 @@ fn validate_route_match(parsed_req request_parser.HttpRequest, attr string, attr
 					attr_pos++
 				}
 
-				// Skip parameter value in request (until '/' or '?' or end)
-				for req_pos < req_path_end && parsed_req.buffer[req_pos] != `/`
-					&& parsed_req.buffer[req_pos] != `?` && parsed_req.buffer[req_pos] != ` ` {
+				// Skip parameter value in request (until '/' or end of path)
+				for req_pos < req_path_end && parsed_req.buffer[req_pos] != `/` {
 					req_pos++
 				}
 
 				// Check if we're at the end of pattern
 				if attr_pos >= attr_len {
-					return req_pos >= req_path_end || parsed_req.buffer[req_pos] == `?`
-						|| parsed_req.buffer[req_pos] == ` `
+					return req_pos >= req_path_end
 				}
 
 				// Both should be at '/' now
-				if attr.str[attr_pos] == `/` && parsed_req.buffer[req_pos] == `/` {
+				if attr.str[attr_pos] == `/` && req_pos < req_path_end
+					&& parsed_req.buffer[req_pos] == `/` {
 					attr_pos++
 					req_pos++
 				} else {
@@ -82,18 +82,17 @@ fn validate_route_match(parsed_req request_parser.HttpRequest, attr string, attr
 			}
 		}
 
-		// Check if we consumed the entire request path
-		return req_pos >= req_path_end || parsed_req.buffer[req_pos] == `?`
-			|| parsed_req.buffer[req_pos] == ` `
+		// Match only if we consumed the entire request path
+		return req_pos >= req_path_end
 	}
 }
 
 // extract_route_params extracts parameters from a matched route
-fn extract_route_params(parsed_req request_parser.HttpRequest, attr string, attr_len int, colon_pos int, mut params map[string]Slice) {
+fn extract_route_params(parsed_req request_parser.HttpRequest, attr string, attr_len int, colon_pos int, path_len int, mut params map[string]Slice) {
 	unsafe {
 		mut attr_pos := colon_pos
 		mut req_pos := colon_pos
-		req_path_end := parsed_req.method.len + 1 + parsed_req.path.len
+		req_path_end := parsed_req.method.len + 1 + path_len
 
 		for attr_pos < attr_len {
 			if attr.str[attr_pos] == `:` {
@@ -108,8 +107,7 @@ fn extract_route_params(parsed_req request_parser.HttpRequest, attr string, attr
 
 				// Extract parameter value
 				param_value_start := req_pos
-				for req_pos < req_path_end && parsed_req.buffer[req_pos] != `/`
-					&& parsed_req.buffer[req_pos] != `?` && parsed_req.buffer[req_pos] != ` ` {
+				for req_pos < req_path_end && parsed_req.buffer[req_pos] != `/` {
 					req_pos++
 				}
 				param_value_len := req_pos - param_value_start
@@ -137,35 +135,6 @@ fn extract_route_params(parsed_req request_parser.HttpRequest, attr string, attr
 }
 
 @[inline]
-pub fn count_char(buf &u8, len int, c u8) int {
-	mut count := 0
-	$if gcc {
-		unsafe {
-			for i in 0 .. len {
-				count += if buf[i] == c { 1 } else { 0 }
-			}
-		}
-		return count
-	} $else {
-		unsafe {
-			mut p := buf
-			end := buf + len
-
-			for {
-				p = C.memchr(p, c, end - p)
-				if isnil(p) {
-					break
-				}
-				count++
-				p++ // move past the found '/'
-			}
-		}
-	}
-
-	return count
-}
-
-@[inline]
 fn find_byte(buf &u8, len int, c u8) !int {
 	unsafe {
 		p := C.memchr(buf, c, len)
@@ -174,4 +143,47 @@ fn find_byte(buf &u8, len int, c u8) !int {
 		}
 		return int(&u8(p) - buf)
 	}
+}
+
+// scan_attr walks a route attribute ONCE and returns (slash count, index of the
+// first '*' or -1). Folding both into a single pass keeps the hot loop's
+// per-route cost the same as before while letting it recognize wildcard routes.
+@[inline]
+fn scan_attr(buf &u8, len int) (int, int) {
+	mut slashes := 0
+	mut star := -1
+	unsafe {
+		for i in 0 .. len {
+			c := buf[i]
+			if c == `/` {
+				slashes++
+			} else if c == `*` && star < 0 {
+				star = i
+			}
+		}
+	}
+	return slashes, star
+}
+
+// try_wildcard_route matches a catch-all route ("METHOD /prefix/*name"): the
+// literal prefix up to '*' must match, and EVERYTHING remaining in the path —
+// slashes included — is captured under the key "*name". `star` is the '*' index
+// in attr (from scan_attr), so there's no rescan. Wildcards bypass the
+// slash-count gate because '*' spans a variable number of segments.
+fn try_wildcard_route(req request_parser.HttpRequest, attr string, attr_len int, star int, path_len int, mut params map[string]Slice) bool {
+	req_path_end := req.method.len + 1 + path_len
+	// The request must be at least as long as the literal prefix.
+	if req_path_end < star {
+		return false
+	}
+	// Prefix ("METHOD /prefix/") must match byte-for-byte.
+	if unsafe { C.memcmp(attr.str, &req.buffer[0], star) } != 0 {
+		return false
+	}
+	name := unsafe { tos(attr.str + star + 1, attr_len - star - 1) }
+	params['*' + name] = Slice{
+		start: star
+		len:   req_path_end - star
+	}
+	return true
 }
