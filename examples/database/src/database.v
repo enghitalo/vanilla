@@ -13,7 +13,7 @@ pub fn new_connection_pool(config pg.Config, size int) !ConnectionPool {
 	mut connections := chan pg.DB{cap: size}
 	for _ in 0 .. size {
 		conn := pg.connect(config)!
-		connections <- conn
+		connections <- *conn
 	}
 	return ConnectionPool{
 		connections: connections
