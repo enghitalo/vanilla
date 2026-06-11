@@ -23,7 +23,6 @@ module main
 //    whole chunked body in memory (defeating the point). The pure design gives
 //    the handler a writer it can push chunks into, backed by the fd and
 //    EPOLLOUT for backpressure (see examples/request_limits for the write path).
-
 import http_server
 import http_server.http1_1.request_parser
 import strings
@@ -87,9 +86,17 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 }
 
 fn main() {
+	// Explicit per-OS backend selection (other OSes keep the default = 0).
+	mut backend := unsafe { http_server.IOBackend(0) }
+	$if linux {
+		backend = http_server.IOBackend.epoll
+	}
+	$if darwin {
+		backend = http_server.IOBackend.kqueue
+	}
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
-		io_multiplexing: http_server.IOBackend.epoll
+		io_multiplexing: backend
 		request_handler: handle
 	})!
 	println('Chunked streaming demo on http://localhost:3000/')

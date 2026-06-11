@@ -123,9 +123,19 @@ pub fn set_tcp_nodelay(fd int) {
 	}
 }
 
+// set_nosigpipe stops send() to a dead peer from raising SIGPIPE on
+// macOS/BSD, where there is no MSG_NOSIGNAL send flag — the suppression is a
+// per-socket option instead. No-op elsewhere.
+pub fn set_nosigpipe(fd int) {
+	$if darwin {
+		opt := 1
+		C.setsockopt(fd, C.SOL_SOCKET, C.SO_NOSIGPIPE, &opt, sizeof(opt))
+	}
+}
+
 // accept_client accepts a connection and returns a NON-BLOCKING client fd
 // (or <0). On Linux this is a single accept4() syscall; elsewhere it falls
-// back to accept() + fcntl.
+// back to accept() + fcntl (+ SO_NOSIGPIPE on darwin).
 pub fn accept_client(server_fd int) int {
 	$if linux {
 		return C.accept4(server_fd, C.NULL, C.NULL, C.SOCK_NONBLOCK)
@@ -133,6 +143,7 @@ pub fn accept_client(server_fd int) int {
 		fd := C.accept(server_fd, C.NULL, C.NULL)
 		if fd >= 0 {
 			set_blocking(fd, false)
+			set_nosigpipe(fd)
 		}
 		return fd
 	}

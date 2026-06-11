@@ -13,12 +13,16 @@ fn C.kevent(kq int, changelist &C.kevent, nchanges int, eventlist &C.kevent, nev
 fn C.close(fd int) int
 fn C.perror(s &char)
 
-// Proper constants
-pub const evfilt_read = i16(-1)
-pub const evfilt_write = i16(-2)
-pub const ev_add = u16(0x0001)
-pub const ev_delete = u16(0x0002)
-pub const ev_eof = u16(0x0010)
+// Values from darwin <sys/event.h> (stable kernel ABI). NOTE: the previous
+// hand-written ev_eof was 0x0010, which is EV_ONESHOT — the real EV_EOF is
+// 0x8000, so EOF events were never matched and dead connections were only
+// reaped via the recv()==0 path.
+pub const evfilt_read = i16(-1) // EVFILT_READ
+pub const evfilt_write = i16(-2) // EVFILT_WRITE
+pub const ev_add = u16(0x0001) // EV_ADD
+pub const ev_delete = u16(0x0002) // EV_DELETE
+pub const ev_eof = u16(0x8000) // EV_EOF
+pub const ev_error = u16(0x4000) // EV_ERROR
 
 // V struct for kevent (mirrors C struct)
 pub struct C.kevent {
@@ -105,7 +109,7 @@ pub fn process_kqueue_events(callbacks KqueueEventCallbacks, kq int) {
 		}
 		for i in 0 .. nev {
 			fd := int(events[i].ident)
-			if (events[i].flags & ev_eof) != 0 || events[i].fflags != 0 {
+			if (events[i].flags & (ev_eof | ev_error)) != 0 {
 				remove_fd_from_kqueue(kq, fd)
 				continue
 			}

@@ -29,11 +29,13 @@ fn test_post_without_token_forbidden() ! {
 
 fn test_post_with_matching_token_ok() ! {
 	tok := 'deadbeefcafe'
-	req := 'POST /save HTTP/1.1\r\nCookie: csrf=${tok}\r\nX-CSRF-Token: ${tok}\r\nContent-Length: 0\r\n\r\n'.bytes()
+	req :=
+		'POST /save HTTP/1.1\r\nCookie: csrf=${tok}\r\nX-CSRF-Token: ${tok}\r\nContent-Length: 0\r\n\r\n'.bytes()
 	assert handle(req, -1)!.bytestr().contains('200 OK')
 }
 
 fn test_post_with_mismatched_token_forbidden() ! {
-	req := 'POST /save HTTP/1.1\r\nCookie: csrf=aaaa\r\nX-CSRF-Token: bbbb\r\nContent-Length: 0\r\n\r\n'.bytes()
+	req :=
+		'POST /save HTTP/1.1\r\nCookie: csrf=aaaa\r\nX-CSRF-Token: bbbb\r\nContent-Length: 0\r\n\r\n'.bytes()
 	assert handle(req, -1)!.bytestr().contains('403 Forbidden')
 }

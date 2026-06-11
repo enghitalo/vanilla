@@ -27,10 +27,18 @@ fn handle_request(req_buffer []u8, client_conn_fd int) ![]u8 {
 }
 
 fn main() {
+	// Explicit per-OS backend selection (other OSes keep the default = 0).
+	mut backend := unsafe { http_server.IOBackend(0) }
+	$if linux {
+		backend = http_server.IOBackend.epoll
+	}
+	$if darwin {
+		backend = http_server.IOBackend.kqueue
+	}
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		request_handler: handle_request
-		io_multiplexing: unsafe { http_server.IOBackend.epoll }
+		io_multiplexing: backend
 	})!
 
 	server.run()

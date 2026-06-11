@@ -10,7 +10,8 @@ fn test_allowlist() {
 }
 
 fn test_preflight_allowed_origin() ! {
-	req := 'OPTIONS /api HTTP/1.1\r\nOrigin: http://localhost:5173\r\nAccess-Control-Request-Method: POST\r\n\r\n'.bytes()
+	req :=
+		'OPTIONS /api HTTP/1.1\r\nOrigin: http://localhost:5173\r\nAccess-Control-Request-Method: POST\r\n\r\n'.bytes()
 	out := handle(req, -1)!.bytestr()
 	assert out.contains('204 No Content')
 	assert out.contains('Access-Control-Allow-Origin: http://localhost:5173')

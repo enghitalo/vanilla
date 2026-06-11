@@ -4,7 +4,6 @@ module main
 // controller. Public routes call nothing; private routes call require_auth();
 // role-gated routes call require_role(). A guard returns the User, or an error
 // carrying the HTTP status the controller should send.
-
 import http_server.http1_1.request_parser { HttpRequest }
 
 struct User {
@@ -56,8 +55,22 @@ fn bearer_token(req HttpRequest) string {
 // signed JWT (see examples/auth) instead of a static table.
 fn user_for_token(token string) ?User {
 	return match token {
-		'tok-alice' { User{id: 1, name: 'alice', role: 'user'} }
-		'tok-root' { User{id: 2, name: 'root', role: 'admin'} }
-		else { none }
+		'tok-alice' {
+			User{
+				id:   1
+				name: 'alice'
+				role: 'user'
+			}
+		}
+		'tok-root' {
+			User{
+				id:   2
+				name: 'root'
+				role: 'admin'
+			}
+		}
+		else {
+			none
+		}
 	}
 }

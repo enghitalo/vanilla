@@ -19,8 +19,9 @@ pub fn new_pg_user_repository(get_conn fn () !pg.DB, release_conn fn (pg.DB) !) 
 pub fn (r PgUserRepository) find_by_id(id string) !domain.User {
 	mut db := r.get_conn()!
 	defer { r.release_conn(db) or { panic(err) } }
-	rows := db.exec_param_many('SELECT id, username, email, password FROM users WHERE id = $1',
-		[id])!
+	rows := db.exec_param_many('SELECT id, username, email, password FROM users WHERE id = $1', [
+		id,
+	])!
 	if rows.len == 0 {
 		return error('not found')
 	}
@@ -36,8 +37,9 @@ pub fn (r PgUserRepository) find_by_id(id string) !domain.User {
 pub fn (r PgUserRepository) find_by_username(username string) !domain.User {
 	mut db := r.get_conn()!
 	defer { r.release_conn(db) or { panic(err) } }
-	rows := db.exec_param_many('SELECT id, username, email, password FROM users WHERE username = $1',
-		[username])!
+	rows := db.exec_param_many('SELECT id, username, email, password FROM users WHERE username = $1', [
+		username,
+	])!
 	if rows.len == 0 {
 		return error('not found')
 	}
@@ -54,8 +56,12 @@ pub fn (r PgUserRepository) create(user domain.User) !domain.User {
 	mut db := r.get_conn()!
 	defer { r.release_conn(db) or { panic(err) } }
 	id := if user.id == '' { rand.uuid_v4() } else { user.id }
-	db.exec_param_many('INSERT INTO users (id, username, email, password) VALUES ($1, $2, $3, $4)',
-		[id, user.username, user.email, user.password])!
+	db.exec_param_many('INSERT INTO users (id, username, email, password) VALUES ($1, $2, $3, $4)', [
+		id,
+		user.username,
+		user.email,
+		user.password,
+	])!
 	return domain.User{
 		id:       id
 		username: user.username

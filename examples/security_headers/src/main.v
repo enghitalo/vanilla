@@ -20,7 +20,6 @@ module main
 // logging, auth gates, CORS, rate limiting.
 //
 // WORKS TODAY.
-
 import http_server
 import http_server.http1_1.request_parser
 
@@ -50,9 +49,17 @@ fn app(req_buffer []u8, _ int) ![]u8 {
 }
 
 fn main() {
+	// Explicit per-OS backend selection (other OSes keep the default = 0).
+	mut backend := unsafe { http_server.IOBackend(0) }
+	$if linux {
+		backend = http_server.IOBackend.epoll
+	}
+	$if darwin {
+		backend = http_server.IOBackend.kqueue
+	}
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
-		io_multiplexing: http_server.IOBackend.epoll
+		io_multiplexing: backend
 		// The whole point: one wrap, every response hardened.
 		request_handler: with_security_headers(app)
 	})!

@@ -15,7 +15,6 @@ module main
 // thing the core could improve is zero-copy `sendfile(2)` for large files
 // (kernel copies file -> socket without a userspace bounce) and EPOLLOUT-driven
 // streaming so a 4 GB file doesn't sit in a single []u8.
-
 import http_server
 import http_server.http1_1.request_parser
 import os
@@ -148,9 +147,17 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 }
 
 fn main() {
+	// Explicit per-OS backend selection (other OSes keep the default = 0).
+	mut backend := unsafe { http_server.IOBackend(0) }
+	$if linux {
+		backend = http_server.IOBackend.epoll
+	}
+	$if darwin {
+		backend = http_server.IOBackend.kqueue
+	}
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
-		io_multiplexing: http_server.IOBackend.epoll
+		io_multiplexing: backend
 		request_handler: handle
 	})!
 	println('Static server on http://localhost:3000/  (root: ${web_root})')

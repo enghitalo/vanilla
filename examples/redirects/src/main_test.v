@@ -17,14 +17,14 @@ fn test_permanent_move_301() ! {
 }
 
 fn test_api_redirect_preserves_method_308() ! {
-	out := handle('POST /api/v1/resource HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n'.bytes(),
-		-1)!.bytestr()
+	out :=
+		handle('POST /api/v1/resource HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n'.bytes(), -1)!.bytestr()
 	assert out.contains('308 Permanent Redirect') // method+body preserving
 }
 
 fn test_post_redirect_get_303() ! {
-	out := handle('POST /login?next=/profile HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n'.bytes(),
-		-1)!.bytestr()
+	out :=
+		handle('POST /login?next=/profile HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n'.bytes(), -1)!.bytestr()
 	assert out.contains('303 See Other')
 	assert out.contains('Location: /profile')
 }

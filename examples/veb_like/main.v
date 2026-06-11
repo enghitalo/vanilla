@@ -16,7 +16,6 @@ module main
 //   • safe output — URL-derived values are JSON-escaped (no injection);
 //   • bounded — request size / connection limits and read/write timeouts;
 //   • graceful shutdown — SIGTERM/SIGINT drain in-flight work, then exit.
-
 import http_server
 import http_server.http1_1.request_parser { HttpRequest, Slice }
 import os
@@ -122,20 +121,28 @@ fn (app App) proxy(req HttpRequest, params map[string]Slice) []u8 {
 
 fn main() {
 	app := App{}
+	// Explicit per-OS backend selection (other OSes keep the default = 0).
+	mut backend := unsafe { http_server.IOBackend(0) }
+	$if linux {
+		backend = http_server.IOBackend.epoll
+	}
+	$if darwin {
+		backend = http_server.IOBackend.kqueue
+	}
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
-		io_multiplexing: http_server.IOBackend.epoll
+		io_multiplexing: backend
 		request_handler: fn [app] (req_buffer []u8, client_conn_fd int) ![]u8 {
 			return router(req_buffer, client_conn_fd, app)
 		}
 		// Production limits: bound resource use so a single client can't exhaust
 		// the server. All default to 0 (unlimited) — set explicitly here.
-		limits:          http_server.Limits{
-			max_header_bytes: 16 * 1024 // 16 KiB headers  -> 431
+		limits: http_server.Limits{
+			max_header_bytes: 16 * 1024   // 16 KiB headers  -> 431
 			max_body_bytes:   1024 * 1024 // 1 MiB body     -> 413 (from Content-Length)
-			max_connections:  100_000 // refuse past this many concurrent
-			read_timeout_ms:  10_000 // finish the request within 10s or 408
-			write_timeout_ms: 30_000 // drain a parked response within 30s
+			max_connections:  100_000     // refuse past this many concurrent
+			read_timeout_ms:  10_000      // finish the request within 10s or 408
+			write_timeout_ms: 30_000      // drain a parked response within 30s
 		}
 	})!
 

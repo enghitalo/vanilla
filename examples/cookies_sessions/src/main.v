@@ -16,7 +16,6 @@ module main
 // WORKS TODAY: cookie parsing + Set-Cookie are just headers; crypto.rand is
 // stdlib. The only shared state is the session store (a mutex-guarded map here;
 // Redis/db in production).
-
 import http_server
 import http_server.http1_1.request_parser
 import sync
@@ -24,7 +23,7 @@ import crypto.rand
 import encoding.hex
 
 struct Session {
-	user_id   string
+	user_id    string
 	csrf_token string
 }
 
@@ -111,9 +110,17 @@ fn handle(req_buffer []u8, _ int, mut store Store) ![]u8 {
 
 fn main() {
 	mut store := &Store{}
+	// Explicit per-OS backend selection (other OSes keep the default = 0).
+	mut backend := unsafe { http_server.IOBackend(0) }
+	$if linux {
+		backend = http_server.IOBackend.epoll
+	}
+	$if darwin {
+		backend = http_server.IOBackend.kqueue
+	}
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
-		io_multiplexing: http_server.IOBackend.epoll
+		io_multiplexing: backend
 		request_handler: fn [mut store] (req_buffer []u8, fd int) ![]u8 {
 			return handle(req_buffer, fd, mut store)
 		}

@@ -14,7 +14,8 @@ fn test_subscribe_returns_event_stream_and_registers_fd() ! {
 
 fn test_broadcast_endpoint_accepts() ! {
 	mut clients := Clients{} // empty set: no real fds to write to
-	out := handle('POST /broadcast HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello'.bytes(), 7, mut clients)!.bytestr()
+	out := handle('POST /broadcast HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello'.bytes(), 7, mut
+		clients)!.bytestr()
 	assert out.contains('200 OK')
 }
 

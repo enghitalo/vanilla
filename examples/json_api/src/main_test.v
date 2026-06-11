@@ -13,7 +13,8 @@ fn mkreq(s string) request_parser.HttpRequest {
 }
 
 fn test_create_user_json() {
-	req := mkreq('POST /users HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 41\r\n\r\n{"name":"Ada","email":"ada@example.com"}')
+	req :=
+		mkreq('POST /users HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: 41\r\n\r\n{"name":"Ada","email":"ada@example.com"}')
 	out := create_user_json(req).bytestr()
 	assert out.contains('201 Created')
 	assert out.contains('"name":"Ada"')

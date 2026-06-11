@@ -19,7 +19,6 @@ module main
 //   - `Vary: Accept-Encoding` is mandatory so caches don't serve a gzipped body
 //     to a client that can't decode it.
 //   - Quality values (`gzip;q=0`) can DISABLE an encoding — respect them.
-
 import http_server
 import http_server.http1_1.request_parser
 import compress.gzip
@@ -72,8 +71,6 @@ fn build_response(content_type string, body []u8, encoding string) []u8 {
 		}
 	}
 
-
-
 	mut sb := strings.new_builder(128 + out_body.len)
 	sb.write_string('HTTP/1.1 200 OK\r\n')
 	sb.write_string('Content-Type: ${content_type}\r\n')
@@ -105,13 +102,19 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 }
 
 fn main() {
+	// Explicit per-OS backend selection (other OSes keep the default = 0).
+	mut backend := unsafe { http_server.IOBackend(0) }
+	$if linux {
+		backend = http_server.IOBackend.epoll
+	}
+	$if darwin {
+		backend = http_server.IOBackend.kqueue
+	}
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
-		io_multiplexing: http_server.IOBackend.epoll
+		io_multiplexing: backend
 		request_handler: handle
 	})!
 	println('Compression demo on http://localhost:3000/  (try: curl --compressed -v localhost:3000)')
 	server.run()
 }
-
-

@@ -8,7 +8,6 @@ module main
 // fixed response is a precomputed `const ... .bytes()` (§3a); a dynamic one is
 // built with a pre-sized strings.Builder, writing integers via write_decimal so
 // there is no `.str()` / concat allocation (§3b).
-
 import strings
 import http_server.http1_1.request_parser { HttpRequest }
 

@@ -118,8 +118,10 @@ fn test_access_log_writes_method_path_status() {
 	tmp := os.join_path(os.temp_dir(), 'mw_access_ok.log')
 	os.rm(tmp) or {}
 	log := new_access_log(tmp)!
-	log.record('GET /users/42 HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'.bytes())
-	log.record('POST /users HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), 'HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n'.bytes())
+	log.record('GET /users/42 HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(),
+		'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'.bytes())
+	log.record('POST /users HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(),
+		'HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n'.bytes())
 	log.flush()
 	content := os.read_file(tmp)!
 	assert content == 'GET /users/42 200\nPOST /users 201\n'

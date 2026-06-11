@@ -28,7 +28,12 @@ const status_408_response = 'HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r
 // reported as an error (the caller closes the fd) rather than silently
 // truncating — loud beats wrong. Small responses (the hot path) send in one go.
 pub fn send_response(fd int, buffer_ptr &u8, buffer_len int) ! {
-	flags := C.MSG_NOSIGNAL
+	// MSG_NOSIGNAL exists only on Linux; on macOS/BSD SIGPIPE suppression is
+	// per-socket via SO_NOSIGPIPE (set at accept — see socket.set_nosigpipe).
+	mut flags := 0
+	$if linux {
+		flags = C.MSG_NOSIGNAL
+	}
 	mut total_sent := 0
 	for total_sent < buffer_len {
 		sent := C.send(fd, unsafe { buffer_ptr + total_sent }, usize(buffer_len - total_sent),

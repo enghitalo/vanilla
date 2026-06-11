@@ -24,9 +24,17 @@ import time
 
 fn C.send(fd int, buf voidptr, n usize, flags int) int
 
-// MSG_NOSIGNAL (Linux): never raise SIGPIPE when a peer has gone away — we
-// detect the dead client from send()'s return value and drop it instead.
-const msg_nosignal = 0x4000
+// msg_nosignal returns MSG_NOSIGNAL on Linux: never raise SIGPIPE when a peer
+// has gone away — we detect the dead client from send()'s return value and
+// drop it instead. macOS has no such send() flag; SIGPIPE is suppressed
+// per-socket via SO_NOSIGPIPE, set at accept.
+@[inline]
+fn msg_nosignal() int {
+	$if linux {
+		return 0x4000
+	}
+	return 0
+}
 
 // The only shared state: the set of connected client fds.
 struct Clients {
@@ -59,7 +67,7 @@ fn (mut c Clients) snapshot() []int {
 // per client, no blocking — just a loop over live descriptors.
 fn (mut c Clients) broadcast(event []u8) {
 	for fd in c.snapshot() {
-		if C.send(fd, event.data, event.len, msg_nosignal) <= 0 {
+		if C.send(fd, event.data, event.len, msg_nosignal()) <= 0 {
 			c.drop(fd)
 		}
 	}
@@ -79,6 +87,13 @@ const bad_request = ('HTTP/1.1 400 Bad Request\r\n' + 'Content-Length: 0\r\n' +
 	'Connection: close\r\n' + '\r\n').bytes()
 
 fn handle(req_buffer []u8, fd int, mut clients Clients) ![]u8 {
+	// The kernel recycles fd numbers: a NEW request arriving on an fd that is
+	// still in the subscriber set means that subscription is stale — the old
+	// stream's connection was closed by the core and its number reused. Drop
+	// it first, or a broadcast would be written into THIS request's response.
+	// (A real subscriber never sends a second request on its SSE connection.)
+	clients.drop(fd)
+
 	req := request_parser.decode_http_request(req_buffer)!
 	method := req.method.to_string(req.buffer)
 	path := req.path.to_string(req.buffer)
@@ -112,9 +127,17 @@ fn main() {
 		}
 	}()
 
+	// Explicit per-OS backend selection (other OSes keep the default = 0).
+	mut backend := unsafe { http_server.IOBackend(0) }
+	$if linux {
+		backend = http_server.IOBackend.epoll
+	}
+	$if darwin {
+		backend = http_server.IOBackend.kqueue
+	}
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
-		io_multiplexing: http_server.IOBackend.epoll
+		io_multiplexing: backend
 		request_handler: fn [mut clients] (req_buffer []u8, fd int) ![]u8 {
 			return handle(req_buffer, fd, mut clients)
 		}

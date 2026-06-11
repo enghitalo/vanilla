@@ -84,7 +84,7 @@ fn (l &AccessLog) record(req_buffer []u8, resp []u8) {
 		total := prefix_len + 1 + 3 + 1
 		mut line := [512]u8{}
 		if total > line.len {
-			return // request-target longer than the stack buffer: skip the line
+			return
 		}
 		vmemcpy(&line[0], &req_buffer[0], prefix_len)
 		mut n := prefix_len

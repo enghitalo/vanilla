@@ -15,7 +15,6 @@ module main
 // Both keep the project's contract: the handler is still fn ([]u8, int) ![]u8.
 // /video returns the response bytes (the core streams large ones via EPOLLOUT
 // back-pressure); /webcam registers the fd and a single broadcaster owns it.
-
 import http_server
 import http_server.http1_1.request_parser
 import os
@@ -27,12 +26,13 @@ const sample_video = 'sample.mp4'
 // memory. A client (every media player does) just asks for the next range.
 const video_chunk_max = 2 * 1024 * 1024
 
-const index_page = ('HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: keep-alive\r\n\r\n' +
+const index_page = (
+	'HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: keep-alive\r\n\r\n' +
 	'<!doctype html><meta charset=utf-8><title>vanilla video</title>' +
-	'<h2>File stream (Range / seekable)</h2>' + '<video src="/video" controls width=640></video>' +
-	'<h2>Webcam (live MJPEG)</h2>' + '<img src="/webcam" width=640>').bytes()
+	'<h2>File stream (Range / seekable)</h2>' + '<video src="/video" controls width=640></video>' + '<h2>Webcam (live MJPEG)</h2>' + '<img src="/webcam" width=640>').bytes()
 
-const mjpeg_headers = ('HTTP/1.1 200 OK\r\n' + 'Content-Type: multipart/x-mixed-replace; boundary=${boundary}\r\n' +
+const mjpeg_headers = ('HTTP/1.1 200 OK\r\n' +
+	'Content-Type: multipart/x-mixed-replace; boundary=${boundary}\r\n' +
 	'Cache-Control: no-cache\r\n' + 'Connection: close\r\n' + '\r\n').bytes()
 
 const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
@@ -158,9 +158,17 @@ fn main() {
 	}
 
 	mut viewers := &Viewers{}
+	// Explicit per-OS backend selection (other OSes keep the default = 0).
+	mut backend := unsafe { http_server.IOBackend(0) }
+	$if linux {
+		backend = http_server.IOBackend.epoll
+	}
+	$if darwin {
+		backend = http_server.IOBackend.kqueue
+	}
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
-		io_multiplexing: http_server.IOBackend.epoll
+		io_multiplexing: backend
 		request_handler: fn [mut viewers] (req_buffer []u8, fd int) ![]u8 {
 			return handle(req_buffer, fd, mut viewers)
 		}

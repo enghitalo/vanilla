@@ -12,7 +12,6 @@ module main
 // Frames come straight from the kernel via V4L2 (see capture_v4l2.c.v / vcam.c):
 // no ffmpeg subprocess, no pipe, no transcode. Each V4L2 buffer already holds one
 // complete JPEG, so there is nothing to parse — we broadcast it as-is.
-
 import sync
 import time
 
@@ -20,8 +19,16 @@ import time
 
 fn C.send(fd int, buf voidptr, n usize, flags int) int
 
-// MSG_NOSIGNAL: a dead viewer must not raise SIGPIPE — we detect it from send().
-const msg_nosignal = 0x4000
+// msg_nosignal returns MSG_NOSIGNAL on Linux: a dead viewer must not raise
+// SIGPIPE — we detect it from send(). macOS has no such flag; SIGPIPE is
+// suppressed per-socket via SO_NOSIGPIPE, set at accept.
+@[inline]
+fn msg_nosignal() int {
+	$if linux {
+		return 0x4000
+	}
+	return 0
+}
 
 // multipart part boundary (must match the Content-Type sent to the client).
 const boundary = 'vanillaframe'
@@ -80,7 +87,8 @@ fn capture_loop(mut v Viewers) {
 // broadcast_frame writes one multipart part (headers + JPEG + CRLF) to every
 // viewer, dropping any that can't keep up or have disconnected.
 fn (mut v Viewers) broadcast_frame(jpeg []u8) {
-	part_header := '--${boundary}\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpeg.len}\r\n\r\n'.bytes()
+	part_header :=
+		'--${boundary}\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpeg.len}\r\n\r\n'.bytes()
 	part_trailer := '\r\n'.bytes()
 	for fd in v.snapshot() {
 		if !send_all(fd, part_header) || !send_all(fd, jpeg) || !send_all(fd, part_trailer) {
@@ -97,7 +105,7 @@ fn send_all(fd int, data []u8) bool {
 	mut off := 0
 	mut stalls := 0
 	for off < data.len {
-		n := C.send(fd, unsafe { &u8(data.data) + off }, usize(data.len - off), msg_nosignal)
+		n := C.send(fd, unsafe { &u8(data.data) + off }, usize(data.len - off), msg_nosignal())
 		if n > 0 {
 			off += n
 			stalls = 0

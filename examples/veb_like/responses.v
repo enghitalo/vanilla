@@ -22,11 +22,21 @@ fn json_str(s string) string {
 	b.write_u8(`"`)
 	for c in s {
 		match c {
-			`"` { b.write_string('\\"') }
-			`\\` { b.write_string('\\\\') }
-			`\n` { b.write_string('\\n') }
-			`\r` { b.write_string('\\r') }
-			`\t` { b.write_string('\\t') }
+			`"` {
+				b.write_string('\\"')
+			}
+			`\\` {
+				b.write_string('\\\\')
+			}
+			`\n` {
+				b.write_string('\\n')
+			}
+			`\r` {
+				b.write_string('\\r')
+			}
+			`\t` {
+				b.write_string('\\t')
+			}
 			else {
 				if c < 0x20 {
 					// Other control chars must be \u00XX-escaped per RFC 8259.

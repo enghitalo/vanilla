@@ -46,7 +46,6 @@ fn router(req_buffer []u8, _ int, app App) ![]u8 {
 			}
 		}
 	}
-
 	// No handler matched — resolve the correct status off the hot path.
 	return resolve_no_match(req, path_len)
 }

@@ -20,7 +20,6 @@ module main
 //
 // WORKS TODAY. The one core dependency for perfect timing is a request-start
 // timestamp; we stamp it at handler entry, which is close enough.
-
 import http_server
 import http_server.http1_1.request_parser
 import sync
@@ -45,6 +44,7 @@ fn (mut m Metrics) record(status int) {
 		5 { m.status_5xx++ }
 		else {}
 	}
+
 	m.mu.unlock()
 }
 
@@ -66,9 +66,7 @@ fn status_of(resp []u8) int {
 fn observed(next fn ([]u8, int) ![]u8, mut m Metrics) fn ([]u8, int) ![]u8 {
 	return fn [next, mut m] (req_buffer []u8, fd int) ![]u8 {
 		start := time.now()
-		req := request_parser.decode_http_request(req_buffer) or {
-			return error('parse')
-		}
+		req := request_parser.decode_http_request(req_buffer) or { return error('parse') }
 		method := req.method.to_string(req.buffer)
 		path := req.path.to_string(req.buffer)
 
@@ -116,9 +114,17 @@ fn main() {
 	handler := observed(fn [mut m] (req_buffer []u8, fd int) ![]u8 {
 		return app(req_buffer, fd, mut m)
 	}, mut m)
+	// Explicit per-OS backend selection (other OSes keep the default = 0).
+	mut backend := unsafe { http_server.IOBackend(0) }
+	$if linux {
+		backend = http_server.IOBackend.epoll
+	}
+	$if darwin {
+		backend = http_server.IOBackend.kqueue
+	}
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
-		io_multiplexing: http_server.IOBackend.epoll
+		io_multiplexing: backend
 		request_handler: handler
 	})!
 	println('Observability demo on http://localhost:3000/  (/healthz, /readyz, /metrics)')

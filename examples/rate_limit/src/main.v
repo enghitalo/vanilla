@@ -23,7 +23,6 @@ module main
 //
 // WORKS TODAY except real-client-IP extraction, which depends on the core
 // exposing the peer address (and on proxy_aware for the XFF trust logic).
-
 import http_server
 import http_server.http1_1.request_parser
 import sync
@@ -31,8 +30,8 @@ import time
 
 struct Bucket {
 mut:
-	tokens    f64
-	last_ns   i64
+	tokens  f64
+	last_ns i64
 }
 
 struct Limiter {
@@ -52,10 +51,12 @@ mut:
 fn (mut l Limiter) allow(client string, now i64) (bool, int) {
 	l.mu.lock()
 	defer { l.mu.unlock() }
-	mut b := l.buckets[client] or { Bucket{
-		tokens:  l.capacity
-		last_ns: now
-	} }
+	mut b := l.buckets[client] or {
+		Bucket{
+			tokens:  l.capacity
+			last_ns: now
+		}
+	}
 	elapsed := f64(now - b.last_ns) / 1e9
 	b.tokens = math_min(l.capacity, b.tokens + elapsed * l.rate)
 	b.last_ns = now
@@ -103,9 +104,17 @@ fn main() {
 		rate:     10.0 // 10 req/s sustained
 		capacity: 20.0 // burst up to 20
 	}
+	// Explicit per-OS backend selection (other OSes keep the default = 0).
+	mut backend := unsafe { http_server.IOBackend(0) }
+	$if linux {
+		backend = http_server.IOBackend.epoll
+	}
+	$if darwin {
+		backend = http_server.IOBackend.kqueue
+	}
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
-		io_multiplexing: http_server.IOBackend.epoll
+		io_multiplexing: backend
 		request_handler: fn [mut limiter] (req_buffer []u8, fd int) ![]u8 {
 			return handle(req_buffer, fd, mut limiter)
 		}

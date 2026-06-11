@@ -20,7 +20,6 @@ module main
 //     getpeername syscall per connection.
 //   - The most efficient block is at CONNECTION time (drop on accept). That
 //     needs a core accept-hook; here we answer 403 per request at handler level.
-
 import http_server
 import http_server.socket
 import sync
@@ -69,9 +68,17 @@ fn main() {
 	blocklist.block('10.0.0.5')
 	blocklist.block('192.168.1.100')
 
+	// Explicit per-OS backend selection (other OSes keep the default = 0).
+	mut backend := unsafe { http_server.IOBackend(0) }
+	$if linux {
+		backend = http_server.IOBackend.epoll
+	}
+	$if darwin {
+		backend = http_server.IOBackend.kqueue
+	}
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
-		io_multiplexing: http_server.IOBackend.epoll
+		io_multiplexing: backend
 		request_handler: fn [mut blocklist] (req_buffer []u8, fd int) ![]u8 {
 			return handle(req_buffer, fd, mut blocklist)
 		}

@@ -24,7 +24,6 @@ module main
 // STILL TO COME (see IMPLEMENTATION_PLAN.md, Phase 2 remainder):
 //   - idle_timeout to reap idle keep-alive connections (max_connections already
 //     bounds total fds).
-
 import http_server
 
 // The handler is now trivial: the CORE enforces the size limits before the
@@ -36,16 +35,24 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 }
 
 fn main() {
+	// Explicit per-OS backend selection (other OSes keep the default = 0).
+	mut backend := unsafe { http_server.IOBackend(0) }
+	$if linux {
+		backend = http_server.IOBackend.epoll
+	}
+	$if darwin {
+		backend = http_server.IOBackend.kqueue
+	}
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
-		io_multiplexing: http_server.IOBackend.epoll
+		io_multiplexing: backend
 		request_handler: handle
 		limits:          http_server.Limits{
 			max_body_bytes:   10 * 1024 * 1024 // 10 MiB -> 413
-			max_header_bytes: 16 * 1024 // 16 KiB  -> 431
-			max_connections:  100_000 // refuse past this many concurrent
-			read_timeout_ms:  5_000 // finish the request within 5s or get 408
-			write_timeout_ms: 10_000 // drain a parked response within 10s or be dropped
+			max_header_bytes: 16 * 1024        // 16 KiB  -> 431
+			max_connections:  100_000          // refuse past this many concurrent
+			read_timeout_ms:  5_000            // finish the request within 5s or get 408
+			write_timeout_ms: 10_000           // drain a parked response within 10s or be dropped
 		}
 	})!
 	println('Request-limits demo — core enforces max body/header/connections (see file header).')

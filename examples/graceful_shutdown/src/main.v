@@ -15,7 +15,6 @@ module main
 // the instant the last request finishes (so an idle server exits in ~ms, not the
 // full 2s grace; the grace is just the cap). The counters are per-worker and
 // cache-line-padded, so the per-request increment is free on the hot path.
-
 import http_server
 import os
 
@@ -24,9 +23,17 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 }
 
 fn main() {
+	// Explicit per-OS backend selection (other OSes keep the default = 0).
+	mut backend := unsafe { http_server.IOBackend(0) }
+	$if linux {
+		backend = http_server.IOBackend.epoll
+	}
+	$if darwin {
+		backend = http_server.IOBackend.kqueue
+	}
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
-		io_multiplexing: http_server.IOBackend.epoll
+		io_multiplexing: backend
 		request_handler: handle
 	})!
 

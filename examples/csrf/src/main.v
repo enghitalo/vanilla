@@ -22,7 +22,6 @@ module main
 //   - Token must come from a CSPRNG.
 //
 // WORKS TODAY: crypto.rand + crypto.hmac.equal + header/cookie plumbing.
-
 import http_server
 import http_server.http1_1.request_parser
 import crypto.rand
@@ -86,9 +85,17 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 }
 
 fn main() {
+	// Explicit per-OS backend selection (other OSes keep the default = 0).
+	mut backend := unsafe { http_server.IOBackend(0) }
+	$if linux {
+		backend = http_server.IOBackend.epoll
+	}
+	$if darwin {
+		backend = http_server.IOBackend.kqueue
+	}
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
-		io_multiplexing: http_server.IOBackend.epoll
+		io_multiplexing: backend
 		request_handler: handle
 	})!
 	println('CSRF demo on http://localhost:3000/  (GET /form sets token; unsafe methods require X-CSRF-Token)')
