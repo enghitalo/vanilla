@@ -24,7 +24,7 @@ fn main() {
 	}
 
 	if db_backend != 'pg' && db_backend != 'sqlite' {
-		panic('Unknown db_backend: ${db_backend}')
+		panic('Unknown db_backend: ' + db_backend)
 	}
 
 	// User repository (switchable)
