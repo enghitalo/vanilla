@@ -26,10 +26,10 @@ pub mut:
 	// Per-worker in-flight request counters (one per worker, each on its own
 	// cache line — written only by its worker, so no contention/false sharing).
 	// shutdown() sums them to drain precisely.
-	inflight        []&core.Counter = []&core.Counter{len: max_thread_pool_size, init: &core.Counter{}}
+	inflight []&core.Counter = []&core.Counter{len: max_thread_pool_size, init: &core.Counter{}}
 	// Global count of open connections (incremented at accept, decremented at
 	// close) — enforces max_connections. Touched per CONNECTION, not per request.
-	active_conns    &core.Counter = &core.Counter{}
+	active_conns &core.Counter = &core.Counter{}
 }
 
 // shutdown performs a graceful stop: it closes the listening socket so the

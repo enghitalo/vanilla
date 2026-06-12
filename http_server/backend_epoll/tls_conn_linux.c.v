@@ -16,7 +16,6 @@ module backend_epoll
 //
 // Per-fd state lives in a per-worker `map[int]&TlsConn`; the worker is
 // single-threaded, so no locking.
-
 import http_server.core
 import http_server.epoll
 import http_server.http1_1.request_parser
@@ -122,7 +121,7 @@ fn handle_readable_fd_tls(request_handler fn ([]u8, int) ![]u8, epoll_fd int, fd
 		if n == tls.want {
 			if buf.len == 0 {
 				unsafe { buf.free() }
-				return // nothing buffered yet — keep the connection, wait for EPOLLIN
+				return
 			}
 			tls_save_read(mut conn, buf, limits.read_timeout_ms) // partial — resume on EPOLLIN
 			return
@@ -139,8 +138,14 @@ fn handle_readable_fd_tls(request_handler fn ([]u8, int) ![]u8, epoll_fd int, fd
 			close_tls(epoll_fd, fd, active_conns, mut sessions)
 			return
 		}
-		unsafe { buf.len += n }
-		req_cap := if limits.max_request_bytes > 0 { limits.max_request_bytes } else { tls_max_request_bytes }
+		unsafe {
+			buf.len += n
+		}
+		req_cap := if limits.max_request_bytes > 0 {
+			limits.max_request_bytes
+		} else {
+			tls_max_request_bytes
+		}
 		if buf.len > req_cap {
 			unsafe { buf.free() }
 			close_tls(epoll_fd, fd, active_conns, mut sessions)
@@ -199,7 +204,7 @@ fn handle_writable_fd_tls(epoll_fd int, fd int, active_conns &core.Counter, mut 
 			continue
 		}
 		if n == tls.want || n == tls.want_write {
-			return // still blocked — wait for the next EPOLLOUT
+			return
 		}
 		close_tls(epoll_fd, fd, active_conns, mut sessions) // fatal
 		return

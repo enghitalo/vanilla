@@ -14,7 +14,6 @@ module main
 //   v -prod run bench/middleware/middleware_bench.v
 //
 // (Use -prod: the default debug build is not representative.)
-
 import benchmark
 import http_server.http1_1.request_parser
 
@@ -67,6 +66,7 @@ fn inject_headers_string(resp []u8, hdrs string) []u8 {
 // ── chain composition (mirrors examples/middleware) ───────────────────────────
 
 type Handler = fn ([]u8, int) ![]u8
+
 type Middleware = fn (Handler) Handler
 
 fn chain(app Handler, mw ...Middleware) Handler {

@@ -65,7 +65,9 @@ pub fn read_request(client_fd int, max_header_bytes int, max_body_bytes int) ![]
 			}
 			return error('connection closed mid-request')
 		}
-		unsafe { buf.len += bytes_read }
+		unsafe {
+			buf.len += bytes_read
+		}
 		// Configured body limit (if any) is enforced in the framer from
 		// Content-Length before buffering; this is the absolute backstop.
 		if buf.len > max_request_bytes {

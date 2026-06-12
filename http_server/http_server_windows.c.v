@@ -42,8 +42,8 @@ pub mut:
 fn get_system_error() string {
 	error_code := C.WSAGetLastError()
 	mut buffer := [256]u16{}
-	C.FormatMessageW(C.FORMAT_MESSAGE_FROM_SYSTEM | C.FORMAT_MESSAGE_IGNORE_INSERTS, unsafe { nil },
-		error_code, 0, &buffer[0], 256, unsafe { nil })
+	C.FormatMessageW(C.FORMAT_MESSAGE_FROM_SYSTEM | C.FORMAT_MESSAGE_IGNORE_INSERTS,
+		unsafe { nil }, error_code, 0, &buffer[0], 256, unsafe { nil })
 	return string_from_wide(&buffer[0])
 }
 
@@ -182,8 +182,7 @@ fn handle_write_completion(io_data &iocp.IOData, mut ctx WorkerContext) {
 		// Partial write, adjust buffer and repost
 		remaining := io_data.wsabuf.len - io_data.bytes_transferred
 		unsafe {
-			C.memmove(&io_data.buffer[0], &io_data.buffer[io_data.bytes_transferred],
-				remaining)
+			C.memmove(&io_data.buffer[0], &io_data.buffer[io_data.bytes_transferred], remaining)
 		}
 		io_data.wsabuf.len = remaining
 

@@ -150,8 +150,10 @@ fn main() {
 	println('Wyhash Fast push to header:' + buffer2.bytestr())
 	// println(wyhash.wyhash_c(buffer.data, u64(buffer.len), 0))
 	// validation test
-	etag_wyhash := '08e445df107bb587'.bytes() // or 08e445df107bb587 // or  generate_wyhash_etag(buffer.data, buffer.len)
-	etag_wyhash_u64 := wyhash.wyhash_c(buffer.data, u64(buffer.len), 0) // returned u64(640713871350019463)
+	etag_wyhash :=
+		'08e445df107bb587'.bytes() // or 08e445df107bb587 // or  generate_wyhash_etag(buffer.data, buffer.len)
+	etag_wyhash_u64 :=
+		wyhash.wyhash_c(buffer.data, u64(buffer.len), 0) // returned u64(640713871350019463)
 	is_valid_wyhash := validate_u64_to_hex(etag_wyhash_u64, etag_wyhash.data, etag_wyhash.len)
 	println('Wyhash ETag valid: ' + is_valid_wyhash.str())
 

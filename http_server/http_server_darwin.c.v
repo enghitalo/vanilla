@@ -24,11 +24,18 @@ fn C.close(fd int) int
 // `Connection: keep-alive` the example handlers advertise — the previous
 // close-per-request behaviour both lied to clients and crippled throughput.
 fn handle_readable_fd(handler fn ([]u8, int) ![]u8, kq_fd int, client_fd int, limits Limits) {
-	request_buffer := request.read_request(client_fd, limits.max_header_bytes, limits.max_body_bytes) or {
+	request_buffer := request.read_request(client_fd, limits.max_header_bytes,
+		limits.max_body_bytes) or {
 		match err.code() {
-			413 { response.send_status_413_response(client_fd) }
-			431 { response.send_status_431_response(client_fd) }
-			400 { response.send_bad_request_response(client_fd) }
+			413 {
+				response.send_status_413_response(client_fd)
+			}
+			431 {
+				response.send_status_431_response(client_fd)
+			}
+			400 {
+				response.send_bad_request_response(client_fd)
+			}
 			else {
 				if err.msg() == 'no data available' {
 					// Spurious wakeup on an idle keep-alive connection — keep it.
@@ -39,6 +46,7 @@ fn handle_readable_fd(handler fn ([]u8, int) ![]u8, kq_fd int, client_fd int, li
 				}
 			}
 		}
+
 		kqueue.remove_fd_from_kqueue(kq_fd, client_fd)
 		return
 	}

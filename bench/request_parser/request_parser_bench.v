@@ -10,7 +10,6 @@ module main
 //   v -prod run bench/request_parser_bench.v
 //
 // (Use -prod: the default debug build is not representative.)
-
 import benchmark
 import http_server.http1_1.request_parser
 

@@ -96,8 +96,7 @@ pub fn create_iocp(max_concurrent_threads u32) !voidptr {
 }
 
 pub fn associate_handle_with_iocp(iocp_handle voidptr, socket_handle int, completion_key u64) ! {
-	handle := C.CreateIoCompletionPort(voidptr(socket_handle), iocp_handle, completion_key,
-		0)
+	handle := C.CreateIoCompletionPort(voidptr(socket_handle), iocp_handle, completion_key, 0)
 	if handle == unsafe { nil } {
 		return error('Failed to associate socket with IOCP')
 	}
@@ -105,14 +104,13 @@ pub fn associate_handle_with_iocp(iocp_handle voidptr, socket_handle int, comple
 
 pub fn post_iocp_status(iocp_handle voidptr, bytes_transferred u32, completion_key u64,
 	overlapped &C.OVERLAPPED) bool {
-	return C.PostQueuedCompletionStatus(iocp_handle, bytes_transferred, completion_key,
-		overlapped)
+	return C.PostQueuedCompletionStatus(iocp_handle, bytes_transferred, completion_key, overlapped)
 }
 
 pub fn get_queued_completion_status(iocp_handle voidptr, bytes_transferred &u32,
 	completion_key &u64, overlapped &&C.OVERLAPPED, timeout_ms u32) bool {
-	return C.GetQueuedCompletionStatus(iocp_handle, bytes_transferred, completion_key,
-		overlapped, timeout_ms)
+	return C.GetQueuedCompletionStatus(iocp_handle, bytes_transferred, completion_key, overlapped,
+		timeout_ms)
 }
 
 pub fn create_event() voidptr {
@@ -133,6 +131,7 @@ pub fn close_handle(handle voidptr) bool {
 
 pub fn start_accept_ex(listen_socket int, accept_socket int, overlapped &C.OVERLAPPED) bool {
 	return C.AcceptEx(u64(listen_socket), u64(accept_socket), unsafe { nil }, 0,
+
 		sizeof(C.sockaddr_in) + 16, sizeof(C.sockaddr_in) + 16, unsafe { nil }, overlapped)
 }
 

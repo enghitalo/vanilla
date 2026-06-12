@@ -64,7 +64,8 @@ fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn
 		$if verbose ? {
 			eprintln('[DEBUG] Preparing write of ${conn.response_buffer.len} bytes')
 		}
-		io_uring.prepare_send(&worker.ring, mut *conn, conn.response_buffer.data, usize(conn.response_buffer.len))
+		io_uring.prepare_send(&worker.ring, mut *conn, conn.response_buffer.data,
+			usize(conn.response_buffer.len))
 	}
 }
 
@@ -177,8 +178,7 @@ pub fn run_io_uring_backend(request_handler fn ([]u8, int) ![]u8, port int, mut 
 		params.flags |= 1 << 3 // IORING_SETUP_SQPOLL
 		params.sq_thread_cpu = i // Pin SQ thread to worker CPU
 		mut sqpoll_failed := false
-		if C.io_uring_queue_init_params(u32(io_uring.default_ring_entries), &worker.ring,
-			&params) < 0 {
+		if C.io_uring_queue_init_params(u32(io_uring.default_ring_entries), &worker.ring, &params) < 0 {
 			eprintln('[io_uring] worker ${i}: SQPOLL failed, falling back to normal io_uring')
 			// Try again without SQPOLL
 			params = C.io_uring_params{}

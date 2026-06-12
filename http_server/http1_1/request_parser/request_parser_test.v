@@ -297,7 +297,8 @@ fn test_decode_zero_header_with_body() {
 
 fn test_get_header_value_case_insensitive() {
 	// RFC 9110 §5.1: field names are case-insensitive.
-	buffer := 'GET / HTTP/1.1\r\nHost: example.com\r\ncontent-type: text/html\r\nACCEPT: */*\r\n\r\n'.bytes()
+	buffer :=
+		'GET / HTTP/1.1\r\nHost: example.com\r\ncontent-type: text/html\r\nACCEPT: */*\r\n\r\n'.bytes()
 	req := decode_http_request(buffer) or { panic(err) }
 
 	a := req.get_header_value_slice('Content-Type') or { panic('Content-Type') }
@@ -351,7 +352,8 @@ fn test_validate_http1_duplicate_host() {
 
 fn test_validate_http1_cl_te_conflict() {
 	// RFC 9112 §6.1: Content-Length + Transfer-Encoding => reject (smuggling).
-	buffer := 'POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n'.bytes()
+	buffer :=
+		'POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n'.bytes()
 	req := decode_http_request(buffer) or { panic(err) }
 	if _ := req.validate_http1() {
 		assert false, 'CL+TE must be rejected'
@@ -381,7 +383,8 @@ fn test_frame_content_length() {
 }
 
 fn test_frame_chunked() {
-	req := 'POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n'.bytes()
+	req :=
+		'POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n'.bytes()
 	assert frame_request_length(req)! == req.len
 	assert frame_request_length(req[..req.len - 1])! == -1 // missing final CRLF
 }

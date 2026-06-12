@@ -315,7 +315,7 @@ pub fn (req HttpRequest) count_header(name string) int {
 pub fn (req HttpRequest) validate_http1() ! {
 	// RFC 9112 §3.2: an HTTP/1.1 request MUST contain exactly one Host field;
 	// a server MUST respond 400 to a request that lacks Host or has more than one.
-	if req.version.len == 8 && ascii_ci_eq(&req.buffer[req.version.start], 'HTTP/1.1'.str, 8) {
+	if req.version.len == 8 && ascii_ci_eq(&req.buffer[req.version.start], c'HTTP/1.1', 8) {
 		if req.count_header('Host') != 1 {
 			return error('HTTP/1.1 request must have exactly one Host header (RFC 9112 §3.2)')
 		}

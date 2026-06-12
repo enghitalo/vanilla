@@ -167,8 +167,8 @@ fn process_events_tls(epoll_fd int, request_handler fn ([]u8, int) ![]u8, limits
 				handle_writable_fd_tls(epoll_fd, fd, active_conns, mut sessions)
 			}
 			if ev & u32(C.EPOLLIN) != 0 {
-				handle_readable_fd_tls(request_handler, epoll_fd, fd, limits, counter, active_conns,
-					cfg, mut sessions)
+				handle_readable_fd_tls(request_handler, epoll_fd, fd, limits, counter,
+					active_conns, cfg, mut sessions)
 			}
 		}
 		if sweep_on && sessions.len > 0 {

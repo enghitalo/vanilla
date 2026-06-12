@@ -12,7 +12,6 @@ module backend_epoll
 // connections that actually block mid-read or mid-write. The fast path (request
 // complete in one burst + response sent in one go) creates no entry and pays
 // only a `conns.len > 0` check — so the 510k baseline is preserved.
-
 import http_server.core
 import http_server.epoll
 import http_server.http1_1.request_parser
@@ -34,10 +33,10 @@ const sm_max_request_bytes = 8 * 1024 * 1024
 // ConnState is only allocated for a connection that blocks mid-transfer.
 struct ConnState {
 mut:
-	read_buf      []u8 // partial request accumulated across epoll edges
-	write_buf     []u8 // response remaining to be sent
-	write_off     int
-	read_deadline u64 // monotonic ns; >0 while a request is mid-read (read_timeout)
+	read_buf       []u8 // partial request accumulated across epoll edges
+	write_buf      []u8 // response remaining to be sent
+	write_off      int
+	read_deadline  u64 // monotonic ns; >0 while a request is mid-read (read_timeout)
 	write_deadline u64 // monotonic ns; >0 while a response is parked (write_timeout)
 }
 
@@ -71,7 +70,7 @@ fn handle_readable_plain(request_handler fn ([]u8, int) ![]u8, epoll_fd int, fd 
 			if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
 				if buf.len == 0 {
 					unsafe { buf.free() }
-					return // spurious wake, nothing buffered — keep the connection
+					return
 				}
 				save_read(mut conns, fd, buf, limits.read_timeout_ms) // partial — resume on next EPOLLIN
 				return
@@ -85,8 +84,14 @@ fn handle_readable_plain(request_handler fn ([]u8, int) ![]u8, epoll_fd int, fd 
 			close_conn(epoll_fd, fd, active_conns, mut conns)
 			return
 		}
-		unsafe { buf.len += n }
-		req_cap := if limits.max_request_bytes > 0 { limits.max_request_bytes } else { sm_max_request_bytes }
+		unsafe {
+			buf.len += n
+		}
+		req_cap := if limits.max_request_bytes > 0 {
+			limits.max_request_bytes
+		} else {
+			sm_max_request_bytes
+		}
 		if buf.len > req_cap {
 			unsafe { buf.free() }
 			response.send_status_413_response(fd)
@@ -101,6 +106,7 @@ fn handle_readable_plain(request_handler fn ([]u8, int) ![]u8, epoll_fd int, fd 
 				431 { response.send_status_431_response(fd) }
 				else { response.send_bad_request_response(fd) }
 			}
+
 			close_conn(epoll_fd, fd, active_conns, mut conns)
 			return
 		}
@@ -159,14 +165,14 @@ fn send_or_park(epoll_fd int, fd int, limits core.Limits, active_conns &core.Cou
 fn handle_writable_plain(epoll_fd int, fd int, active_conns &core.Counter, mut conns map[int]&ConnState) {
 	mut cs := conns[fd] or { return }
 	for cs.write_off < cs.write_buf.len {
-		n := C.send(fd, unsafe { &u8(cs.write_buf.data) + cs.write_off }, usize(cs.write_buf.len - cs.write_off),
-			C.MSG_NOSIGNAL)
+		n := C.send(fd, unsafe { &u8(cs.write_buf.data) + cs.write_off },
+			usize(cs.write_buf.len - cs.write_off), C.MSG_NOSIGNAL)
 		if n > 0 {
 			cs.write_off += n
 			continue
 		}
 		if n < 0 && (C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK) {
-			return // still full — wait for the next EPOLLOUT
+			return
 		}
 		close_conn(epoll_fd, fd, active_conns, mut conns)
 		return
