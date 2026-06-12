@@ -77,7 +77,7 @@ fn tls_handshake_step(mut conn TlsConn, epoll_fd int, fd int, active_conns &core
 }
 
 @[direct_array_access; manualfree]
-fn handle_readable_fd_tls(request_handler fn ([]u8, int, mut []u8) !, epoll_fd int, fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config, mut sessions map[int]&TlsConn) {
+fn handle_readable_fd_tls(request_handler core.RequestHandler, epoll_fd int, fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config, mut sessions map[int]&TlsConn) {
 	stdatomic.add_i64(&counter.n, 1)
 	defer {
 		stdatomic.add_i64(&counter.n, -1)

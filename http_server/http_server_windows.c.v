@@ -24,7 +24,7 @@ const buffer_size = 8192
 struct WorkerContext {
 pub mut:
 	iocp_handle voidptr
-	handler     fn ([]u8, int, mut []u8) ! @[required]
+	handler     fn (req []u8, fd int, mut out []u8) ! @[required]
 	running     bool
 	thread_id   u32
 }
@@ -101,7 +101,7 @@ fn worker_thread(mut ctx WorkerContext) {
 	println('[iocp-worker] Worker thread exiting')
 }
 
-fn handle_accept_completion(io_data &iocp.IOData, handler fn ([]u8, int, mut []u8) !,
+fn handle_accept_completion(io_data &iocp.IOData, handler fn (req []u8, fd int, mut out []u8) !,
 	mut ctx WorkerContext) {
 	socket_fd := io_data.socket_fd
 
@@ -124,7 +124,7 @@ fn handle_accept_completion(io_data &iocp.IOData, handler fn ([]u8, int, mut []u
 	// (We need to get the listening socket from somewhere - stored in context)
 }
 
-fn handle_read_completion(io_data &iocp.IOData, handler fn ([]u8, int, mut []u8) !,
+fn handle_read_completion(io_data &iocp.IOData, handler fn (req []u8, fd int, mut out []u8) !,
 	mut ctx WorkerContext) {
 	socket_fd := io_data.socket_fd
 	bytes_read := io_data.bytes_transferred
@@ -280,7 +280,7 @@ fn accept_thread(listen_socket int, iocp_handle voidptr) {
 	println('[iocp-accept] Accept thread exiting')
 }
 
-pub fn run_iocp_backend(socket_fd int, handler fn ([]u8, int, mut []u8) !, port int, mut threads []thread) {
+pub fn run_iocp_backend(socket_fd int, handler fn (req []u8, fd int, mut out []u8) !, port int, mut threads []thread) {
 	println('[iocp] Starting IOCP backend on port ${port}')
 
 	// Create IOCP handle

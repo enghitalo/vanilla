@@ -65,7 +65,7 @@ fn inject_headers_string(resp []u8, hdrs string) []u8 {
 
 // ── chain composition (mirrors examples/middleware) ───────────────────────────
 
-type Handler = fn ([]u8, int, mut []u8) !
+type Handler = fn (req []u8, fd int, mut out []u8) !
 
 type Middleware = fn (Handler) Handler
 

@@ -30,7 +30,7 @@ const security_headers = 'Strict-Transport-Security: max-age=63072000; includeSu
 
 // with_security_headers wraps any handler and injects the headers into its
 // response, right after the status line. Composition, not inheritance.
-fn with_security_headers(next fn ([]u8, int, mut []u8) !) fn ([]u8, int, mut []u8) ! {
+fn with_security_headers(next fn (req []u8, fd int, mut out []u8) !) fn (req []u8, fd int, mut out []u8) ! {
 	return fn [next] (req_buffer []u8, fd int, mut out []u8) ! {
 		start := out.len
 		next(req_buffer, fd, mut out)!

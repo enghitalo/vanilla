@@ -6,7 +6,7 @@ module main
 
 // Handler is the frozen core contract: bytes in (+ fd), response bytes
 // APPENDED to `out`.
-type Handler = fn ([]u8, int, mut []u8) !
+type Handler = fn (req []u8, fd int, mut out []u8) !
 
 // Middleware takes the next handler and returns a wrapping handler.
 type Middleware = fn (Handler) Handler

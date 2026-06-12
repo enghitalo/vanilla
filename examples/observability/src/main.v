@@ -63,7 +63,7 @@ fn status_of(resp []u8) int {
 }
 
 // observed wraps a handler: access log + metrics around every request.
-fn observed(next fn ([]u8, int, mut []u8) !, mut m Metrics) fn ([]u8, int, mut []u8) ! {
+fn observed(next fn (req []u8, fd int, mut out []u8) !, mut m Metrics) fn (req []u8, fd int, mut out []u8) ! {
 	return fn [next, mut m] (req_buffer []u8, fd int, mut out []u8) ! {
 		start := time.now()
 		req := request_parser.decode_http_request(req_buffer) or { return error('parse') }

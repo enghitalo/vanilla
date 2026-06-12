@@ -23,7 +23,7 @@ fn C.close(fd int) int
 // read of 0 bytes) cleans up when the client goes away. This matches the
 // `Connection: keep-alive` the example handlers advertise — the previous
 // close-per-request behaviour both lied to clients and crippled throughput.
-fn handle_readable_fd(handler fn ([]u8, int, mut []u8) !, kq_fd int, client_fd int, limits Limits) {
+fn handle_readable_fd(handler fn (req []u8, fd int, mut out []u8) !, kq_fd int, client_fd int, limits Limits) {
 	request_buffer := request.read_request(client_fd, limits.max_header_bytes,
 		limits.max_body_bytes) or {
 		match err.code() {
@@ -103,7 +103,7 @@ fn handle_accept_loop(socket_fd int, main_kq int, worker_kqs []int) {
 	}
 }
 
-pub fn run_kqueue_backend(socket_fd int, handler fn ([]u8, int, mut []u8) !, port int, limits Limits, mut threads []thread) {
+pub fn run_kqueue_backend(socket_fd int, handler fn (req []u8, fd int, mut out []u8) !, port int, limits Limits, mut threads []thread) {
 	main_kq := kqueue.create_kqueue_fd()
 	if main_kq < 0 {
 		return

@@ -99,7 +99,7 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 // Plain (HTTP) worker: owns the per-fd connection state table (persistent
 // buffers, cross-edge reads, EPOLLOUT writes).
 @[direct_array_access; manualfree]
-fn process_events_plain(epoll_fd int, request_handler fn ([]u8, int, mut []u8) !, limits core.Limits, counter &core.Counter, active_conns &core.Counter) {
+fn process_events_plain(epoll_fd int, request_handler core.RequestHandler, limits core.Limits, counter &core.Counter, active_conns &core.Counter) {
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut st := new_plain_state()
 	// Only arm the timeout sweep if a deadline is actually configured.
@@ -125,7 +125,9 @@ fn process_events_plain(epoll_fd int, request_handler fn ([]u8, int, mut []u8) !
 				continue
 			}
 			if ev & u32(C.EPOLLOUT) != 0 {
-				handle_writable_plain(epoll_fd, fd, active_conns, mut st)
+				if !handle_writable_plain(epoll_fd, fd, active_conns, mut st) {
+					continue // connection closed — skip the EPOLLIN half of this event
+				}
 			}
 			if ev & u32(C.EPOLLIN) != 0 {
 				handle_readable_plain(request_handler, epoll_fd, fd, limits, counter, active_conns, mut
@@ -142,7 +144,7 @@ fn process_events_plain(epoll_fd int, request_handler fn ([]u8, int, mut []u8) !
 
 // TLS (HTTPS) worker: owns the per-fd TLS session map (handshake + ssl read/write).
 @[direct_array_access; manualfree]
-fn process_events_tls(epoll_fd int, request_handler fn ([]u8, int, mut []u8) !, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config) {
+fn process_events_tls(epoll_fd int, request_handler core.RequestHandler, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config) {
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut sessions := map[int]&TlsConn{}
 	sweep_on := limits.read_timeout_ms > 0 || limits.write_timeout_ms > 0
@@ -165,6 +167,9 @@ fn process_events_tls(epoll_fd int, request_handler fn ([]u8, int, mut []u8) !, 
 			}
 			if ev & u32(C.EPOLLOUT) != 0 {
 				handle_writable_fd_tls(epoll_fd, fd, active_conns, mut sessions)
+				if fd !in sessions {
+					continue // session closed — skip the EPOLLIN half of this event
+				}
 			}
 			if ev & u32(C.EPOLLIN) != 0 {
 				handle_readable_fd_tls(request_handler, epoll_fd, fd, limits, counter,
@@ -177,7 +182,7 @@ fn process_events_tls(epoll_fd int, request_handler fn ([]u8, int, mut []u8) !, 
 	}
 }
 
-pub fn run_epoll_backend(socket_fd int, request_handler fn ([]u8, int, mut []u8) !, port int, limits core.Limits, inflight []&core.Counter, active_conns &core.Counter, tls_config &tls.Config, mut threads []thread) {
+pub fn run_epoll_backend(socket_fd int, request_handler core.RequestHandler, port int, limits core.Limits, inflight []&core.Counter, active_conns &core.Counter, tls_config &tls.Config, mut threads []thread) {
 	if socket_fd < 0 {
 		return
 	}
