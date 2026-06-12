@@ -96,19 +96,19 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 	}
 }
 
-// Plain (HTTP) worker: owns the per-fd connection state map for cross-edge
-// reads + EPOLLOUT writes.
+// Plain (HTTP) worker: owns the per-fd connection state table (persistent
+// buffers, cross-edge reads, EPOLLOUT writes).
 @[direct_array_access; manualfree]
-fn process_events_plain(epoll_fd int, request_handler fn ([]u8, int) ![]u8, limits core.Limits, counter &core.Counter, active_conns &core.Counter) {
+fn process_events_plain(epoll_fd int, request_handler fn ([]u8, int, mut []u8) !, limits core.Limits, counter &core.Counter, active_conns &core.Counter) {
 	mut events := [socket.max_connection_size]C.epoll_event{}
-	mut conns := map[int]&ConnState{}
+	mut st := new_plain_state()
 	// Only arm the timeout sweep if a deadline is actually configured.
 	sweep_on := limits.read_timeout_ms > 0 || limits.write_timeout_ms > 0
 	for {
 		// Block indefinitely unless there are connections parked mid-transfer and a
 		// timeout is set — then wake periodically to sweep stale ones. Zero cost on
-		// an idle/fast server (conns stays empty ⇒ -1, the original behaviour).
-		wait_ms := if sweep_on && conns.len > 0 { 250 } else { -1 }
+		// an idle/fast server (nothing parked ⇒ -1, the original behaviour).
+		wait_ms := if sweep_on && st.parked > 0 { 250 } else { -1 }
 		num_events := C.epoll_wait(epoll_fd, &events[0], socket.max_connection_size, wait_ms)
 		if num_events < 0 {
 			if C.errno == C.EINTR {
@@ -121,28 +121,28 @@ fn process_events_plain(epoll_fd int, request_handler fn ([]u8, int) ![]u8, limi
 			fd := epoll.event_fd(events[i])
 			ev := events[i].events
 			if ev & u32(C.EPOLLHUP | C.EPOLLERR) != 0 {
-				close_conn(epoll_fd, fd, active_conns, mut conns)
+				close_conn(epoll_fd, fd, active_conns, mut st)
 				continue
 			}
 			if ev & u32(C.EPOLLOUT) != 0 {
-				handle_writable_plain(epoll_fd, fd, active_conns, mut conns)
+				handle_writable_plain(epoll_fd, fd, active_conns, mut st)
 			}
 			if ev & u32(C.EPOLLIN) != 0 {
 				handle_readable_plain(request_handler, epoll_fd, fd, limits, counter, active_conns, mut
-					conns)
+					st)
 			}
 		}
 		// After handling this batch (or a timeout wake with num_events == 0),
 		// reap any connection whose read/write deadline has passed.
-		if sweep_on && conns.len > 0 {
-			sweep_timeouts(epoll_fd, active_conns, mut conns)
+		if sweep_on && st.parked > 0 {
+			sweep_timeouts(epoll_fd, active_conns, mut st)
 		}
 	}
 }
 
 // TLS (HTTPS) worker: owns the per-fd TLS session map (handshake + ssl read/write).
 @[direct_array_access; manualfree]
-fn process_events_tls(epoll_fd int, request_handler fn ([]u8, int) ![]u8, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config) {
+fn process_events_tls(epoll_fd int, request_handler fn ([]u8, int, mut []u8) !, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config) {
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut sessions := map[int]&TlsConn{}
 	sweep_on := limits.read_timeout_ms > 0 || limits.write_timeout_ms > 0
@@ -177,7 +177,7 @@ fn process_events_tls(epoll_fd int, request_handler fn ([]u8, int) ![]u8, limits
 	}
 }
 
-pub fn run_epoll_backend(socket_fd int, request_handler fn ([]u8, int) ![]u8, port int, limits core.Limits, inflight []&core.Counter, active_conns &core.Counter, tls_config &tls.Config, mut threads []thread) {
+pub fn run_epoll_backend(socket_fd int, request_handler fn ([]u8, int, mut []u8) !, port int, limits core.Limits, inflight []&core.Counter, active_conns &core.Counter, tls_config &tls.Config, mut threads []thread) {
 	if socket_fd < 0 {
 		return
 	}
