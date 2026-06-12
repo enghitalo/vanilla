@@ -35,7 +35,7 @@ fn safe_next(next string) string {
 	return '/' // reject absolute / protocol-relative targets
 }
 
-fn handle(req_buffer []u8, _ int) ![]u8 {
+fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 	req := request_parser.decode_http_request(req_buffer)!
 	method := req.method.to_string(req.buffer)
 	mut path := req.path.to_string(req.buffer)
@@ -46,7 +46,7 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 	match path {
 		'/old' {
 			// Canonical move: permanent, cacheable.
-			return redirect(301, 'Moved Permanently', '/new')
+			out << redirect(301, 'Moved Permanently', '/new')
 		}
 		'/login' {
 			if method == 'POST' {
@@ -56,16 +56,17 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 				} else {
 					'/dashboard'
 				}
-				return redirect(303, 'See Other', nxt)
+				out << redirect(303, 'See Other', nxt)
+				return
 			}
-			return 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'.bytes()
+			out << 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'.bytes()
 		}
 		'/api/v1/resource' {
 			// API redirect: preserve method + body.
-			return redirect(308, 'Permanent Redirect', '/api/v2/resource')
+			out << redirect(308, 'Permanent Redirect', '/api/v2/resource')
 		}
 		else {
-			return 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+			out << 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 		}
 	}
 }

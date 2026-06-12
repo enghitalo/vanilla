@@ -90,7 +90,7 @@ fn bearer(req request_parser.HttpRequest) string {
 	return ''
 }
 
-fn handle(req_buffer []u8, _ int) ![]u8 {
+fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 	req := request_parser.decode_http_request(req_buffer)!
 	path := req.path.to_string(req.buffer)
 
@@ -99,13 +99,14 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 			// After verifying a password (verify_password above), issue a JWT.
 			token := jwt_sign('{"sub":"user-42","exp":9999999999}')
 			body := '{"token":"${token}"}'
-			return 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${body.len}\r\n\r\n${body}'.bytes()
+			out << 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${body.len}\r\n\r\n${body}'.bytes()
 		}
 		'/protected' {
 			if !jwt_verify(bearer(req)) {
-				return 'HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\n\r\n'.bytes()
+				out << 'HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\n\r\n'.bytes()
+				return
 			}
-			return 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'.bytes()
+			out << 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'.bytes()
 		}
 		'/service' {
 			key := if s := req.get_header_value_slice('X-API-Key') {
@@ -114,12 +115,13 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 				''
 			}
 			if !check_api_key(key) {
-				return 'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n'.bytes()
+				out << 'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n'.bytes()
+				return
 			}
-			return 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'.bytes()
+			out << 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'.bytes()
 		}
 		else {
-			return 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n'.bytes()
+			out << 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n'.bytes()
 		}
 	}
 }

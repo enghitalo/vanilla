@@ -27,7 +27,7 @@ fn origin_allowed(origin string) bool {
 	return origin in allowed_origins
 }
 
-fn handle(req_buffer []u8, _ int) ![]u8 {
+fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 	req := request_parser.decode_http_request(req_buffer)!
 	method := req.method.to_string(req.buffer)
 	origin := if o := req.get_header_value_slice('Origin') {
@@ -43,13 +43,15 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 	// PREFLIGHT: answer the browser's permission probe.
 	if method == 'OPTIONS' {
 		if allow_origin == '' {
-			return 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'.bytes()
+			out << 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'.bytes()
+			return
 		}
-		return ('HTTP/1.1 204 No Content\r\n' + 'Access-Control-Allow-Origin: ${allow_origin}\r\n' +
+		out << ('HTTP/1.1 204 No Content\r\n' + 'Access-Control-Allow-Origin: ${allow_origin}\r\n' +
 			'Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n' +
 			'Access-Control-Allow-Headers: Content-Type, Authorization, X-CSRF-Token\r\n' +
 			'Access-Control-Allow-Credentials: true\r\n' + 'Access-Control-Max-Age: 86400\r\n' +
 			'Vary: Origin\r\n' + 'Content-Length: 0\r\n\r\n').bytes()
+		return
 	}
 
 	// Actual request: attach CORS headers to the real response.
@@ -59,7 +61,7 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 			'Access-Control-Allow-Credentials: true\r\nVary: Origin\r\n'
 	}
 	body := '{"ok":true}'
-	return 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n${cors}Content-Length: ${body.len}\r\n\r\n${body}'.bytes()
+	out << 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n${cors}Content-Length: ${body.len}\r\n\r\n${body}'.bytes()
 }
 
 fn main() {

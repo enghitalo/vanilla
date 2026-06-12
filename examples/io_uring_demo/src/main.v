@@ -2,11 +2,11 @@ module main
 
 import http_server
 
-fn handle_request(req_buffer []u8, client_conn_fd int) ![]u8 {
+fn handle_request(req_buffer []u8, client_conn_fd int, mut out []u8) ! {
 	// Simple request handler that returns OK response
 	res :=
 		'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!'.bytes()
-	return res
+	out << res
 }
 
 fn main() {

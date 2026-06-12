@@ -80,7 +80,7 @@ fn parse_form(s string) map[string]string {
 	return out
 }
 
-fn handle(req_buffer []u8, _ int) ![]u8 {
+fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 	req := request_parser.decode_http_request(req_buffer)!
 	method := req.method.to_string(req.buffer)
 	path := req.path.to_string(req.buffer)
@@ -109,7 +109,7 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 		parts << '"${k}":"${v}"'
 	}
 	body := '{${parts.join(',')}}'
-	return 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${body.len}\r\n\r\n${body}'.bytes()
+	out << 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${body.len}\r\n\r\n${body}'.bytes()
 }
 
 fn main() {

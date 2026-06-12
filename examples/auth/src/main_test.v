@@ -36,9 +36,13 @@ fn test_api_key_constant_time_check() {
 
 fn test_protected_route_requires_valid_bearer() ! {
 	// no token -> 401
-	assert handle('GET /protected HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), -1)!.bytestr().contains('401')
+	mut out1 := []u8{}
+	handle('GET /protected HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), -1, mut out1)!
+	assert out1.bytestr().contains('401')
 	// valid token -> 200
 	token := jwt_sign('{"sub":"user-42","exp":9999999999}')
 	req := 'GET /protected HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${token}\r\n\r\n'.bytes()
-	assert handle(req, -1)!.bytestr().contains('200 OK')
+	mut out2 := []u8{}
+	handle(req, -1, mut out2)!
+	assert out2.bytestr().contains('200 OK')
 }

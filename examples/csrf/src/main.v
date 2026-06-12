@@ -46,7 +46,7 @@ fn is_unsafe(method string) bool {
 	return method in ['POST', 'PUT', 'PATCH', 'DELETE']
 }
 
-fn handle(req_buffer []u8, _ int) ![]u8 {
+fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 	req := request_parser.decode_http_request(req_buffer)!
 	method := req.method.to_string(req.buffer)
 	path := req.path.to_string(req.buffer)
@@ -62,9 +62,10 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 	// variant; the synchronizer variant keeps it server-side instead).
 	if path == '/form' && method == 'GET' {
 		token := new_token()
-		return ('HTTP/1.1 200 OK\r\n' +
+		out << ('HTTP/1.1 200 OK\r\n' +
 			'Set-Cookie: csrf=${token}; Secure; SameSite=Strict; Path=/\r\n' +
 			'Content-Type: text/html\r\nContent-Length: 0\r\n\r\n').bytes()
+		return
 	}
 
 	// State-changing request: require the header token to match the cookie.
@@ -76,12 +77,14 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 			''
 		}
 		if cookie_token == '' || !hmac.equal(cookie_token.bytes(), header_token.bytes()) {
-			return 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'.bytes()
+			out << 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'.bytes()
+			return
 		}
-		return 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'.bytes()
+		out << 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'.bytes()
+		return
 	}
 
-	return 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+	out << 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 }
 
 fn main() {

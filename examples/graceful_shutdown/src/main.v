@@ -18,8 +18,8 @@ module main
 import http_server
 import os
 
-fn handle(req_buffer []u8, _ int) ![]u8 {
-	return 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+fn handle(req_buffer []u8, _ int, mut out []u8) ! {
+	out << 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 }
 
 fn main() {

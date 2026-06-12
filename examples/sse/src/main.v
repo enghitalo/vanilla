@@ -86,7 +86,7 @@ const ok_response = ('HTTP/1.1 200 OK\r\n' + 'Content-Length: 0\r\n' +
 const bad_request = ('HTTP/1.1 400 Bad Request\r\n' + 'Content-Length: 0\r\n' +
 	'Connection: close\r\n' + '\r\n').bytes()
 
-fn handle(req_buffer []u8, fd int, mut clients Clients) ![]u8 {
+fn handle(req_buffer []u8, fd int, mut out []u8, mut clients Clients) ! {
 	// The kernel recycles fd numbers: a NEW request arriving on an fd that is
 	// still in the subscriber set means that subscription is stale — the old
 	// stream's connection was closed by the core and its number reused. Drop
@@ -102,17 +102,19 @@ fn handle(req_buffer []u8, fd int, mut clients Clients) ![]u8 {
 	//                and leaves the connection open. The broadcaster owns it now.
 	if method == 'GET' && path == '/events' {
 		clients.add(fd)
-		return sse_headers
+		out << sse_headers
+		return
 	}
 
 	// POST /broadcast — fan a message out to every subscriber, right now.
 	if method == 'POST' && path == '/broadcast' {
 		body := req.body.to_string(req.buffer)
 		clients.broadcast('data: ${body}\n\n'.bytes())
-		return ok_response
+		out << ok_response
+		return
 	}
 
-	return bad_request
+	out << bad_request
 }
 
 fn main() {
@@ -138,8 +140,8 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: fn [mut clients] (req_buffer []u8, fd int) ![]u8 {
-			return handle(req_buffer, fd, mut clients)
+		request_handler: fn [mut clients] (req_buffer []u8, fd int, mut out []u8) ! {
+			handle(req_buffer, fd, mut out, mut clients)!
 		}
 	})!
 	println('SSE server on http://localhost:3000/  (GET /events, POST /broadcast)')

@@ -63,7 +63,7 @@ fn chunk(data string) string {
 	return '${data.len:x}\r\n${data}\r\n'
 }
 
-fn handle(req_buffer []u8, _ int) ![]u8 {
+fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 	req := request_parser.decode_http_request(req_buffer)!
 
 	// If the request arrived chunked (once the core reassembles it), the body
@@ -82,7 +82,7 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 	sb.write_string(chunk('second piece\n'))
 	sb.write_string(chunk('third piece\n'))
 	sb.write_string('0\r\n\r\n') // terminating chunk
-	return sb
+	out << sb
 }
 
 fn main() {

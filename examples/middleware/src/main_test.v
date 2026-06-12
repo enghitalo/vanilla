@@ -40,23 +40,23 @@ fn test_inject_headers_noop_without_status_line() {
 // body's suffix order reveals the nesting (pure data flow, no shared state).
 fn tag_mw(tag string) Middleware {
 	return fn [tag] (next Handler) Handler {
-		return fn [tag, next] (req []u8, fd int) ![]u8 {
-			mut resp := next(req, fd)!
-			resp << tag.bytes()
-			return resp
+		return fn [tag, next] (req []u8, fd int, mut out []u8) ! {
+			next(req, fd, mut out)!
+			out << tag.bytes()
 		}
 	}
 }
 
 fn test_chain_runs_outermost_first() {
-	base := fn (req []u8, fd int) ![]u8 {
-		return 'app'.bytes()
+	base := fn (req []u8, fd int, mut out []u8) ! {
+		out << 'app'.bytes()
 	}
 	// A is OUTERMOST: it wraps B, which wraps app. On the way out the response
 	// unwinds app -> B -> A, so A's tag lands LAST.
 	h := chain(base, tag_mw('A'), tag_mw('B'))
-	out := h('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), -1)!.bytestr()
-	assert out == 'appBA'
+	mut out := []u8{}
+	h('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), -1, mut out)!
+	assert out.bytestr() == 'appBA'
 }
 
 // ── per-route auth policy through the composed handler ────────────────────────
@@ -68,7 +68,9 @@ fn serve(target string, auth string) string {
 		raw += 'Authorization: Bearer ${auth}\r\n'
 	}
 	raw += '\r\n'
-	return handler(raw.bytes(), -1) or { return 'ERR' }.bytestr()
+	mut out := []u8{}
+	handler(raw.bytes(), -1, mut out) or { return 'ERR' }
+	return out.bytestr()
 }
 
 fn test_public_route_needs_no_token() {

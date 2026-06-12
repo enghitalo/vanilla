@@ -132,8 +132,8 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: fn [app] (req_buffer []u8, client_conn_fd int) ![]u8 {
-			return router(req_buffer, client_conn_fd, app)
+		request_handler: fn [app] (req_buffer []u8, client_conn_fd int, mut out []u8) ! {
+			out << router(req_buffer, client_conn_fd, app)!
 		}
 		// Production limits: bound resource use so a single client can't exhaust
 		// the server. All default to 0 (unlimited) — set explicitly here.

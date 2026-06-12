@@ -30,22 +30,24 @@ const security_headers = 'Strict-Transport-Security: max-age=63072000; includeSu
 
 // with_security_headers wraps any handler and injects the headers into its
 // response, right after the status line. Composition, not inheritance.
-fn with_security_headers(next fn ([]u8, int) ![]u8) fn ([]u8, int) ![]u8 {
-	return fn [next] (req_buffer []u8, fd int) ![]u8 {
-		resp := next(req_buffer, fd)!
-		s := resp.bytestr()
+fn with_security_headers(next fn ([]u8, int, mut []u8) !) fn ([]u8, int, mut []u8) ! {
+	return fn [next] (req_buffer []u8, fd int, mut out []u8) ! {
+		start := out.len
+		next(req_buffer, fd, mut out)!
+		s := out[start..].bytestr()
 		// Insert headers after the first CRLF (the status line).
-		idx := s.index('\r\n') or { return resp }
+		idx := s.index('\r\n') or { return }
 		injected := s[..idx + 2] + security_headers + s[idx + 2..]
-		return injected.bytes()
+		out.trim(start)
+		out << injected.bytes()
 	}
 }
 
-fn app(req_buffer []u8, _ int) ![]u8 {
+fn app(req_buffer []u8, _ int, mut out []u8) ! {
 	req := request_parser.decode_http_request(req_buffer)!
 	_ := req
 	body := '<h1>secure</h1>'
-	return 'HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ${body.len}\r\n\r\n${body}'.bytes()
+	out << 'HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ${body.len}\r\n\r\n${body}'.bytes()
 }
 
 fn main() {

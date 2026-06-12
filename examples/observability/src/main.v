@@ -63,24 +63,24 @@ fn status_of(resp []u8) int {
 }
 
 // observed wraps a handler: access log + metrics around every request.
-fn observed(next fn ([]u8, int) ![]u8, mut m Metrics) fn ([]u8, int) ![]u8 {
-	return fn [next, mut m] (req_buffer []u8, fd int) ![]u8 {
+fn observed(next fn ([]u8, int, mut []u8) !, mut m Metrics) fn ([]u8, int, mut []u8) ! {
+	return fn [next, mut m] (req_buffer []u8, fd int, mut out []u8) ! {
 		start := time.now()
 		req := request_parser.decode_http_request(req_buffer) or { return error('parse') }
 		method := req.method.to_string(req.buffer)
 		path := req.path.to_string(req.buffer)
 
-		resp := next(req_buffer, fd) or {
+		start_len := out.len
+		next(req_buffer, fd, mut out) or {
 			m.record(500)
 			eprintln('level=error method=${method} path=${path} err=${err}')
 			return err
 		}
-		status := status_of(resp)
+		status := status_of(out[start_len..])
 		m.record(status)
 		dur_us := time.since(start).microseconds()
 		// One structured line per request.
 		println('level=info method=${method} path=${path} status=${status} dur_us=${dur_us}')
-		return resp
 	}
 }
 
@@ -111,8 +111,8 @@ fn app(req_buffer []u8, _ int, mut m Metrics) ![]u8 {
 
 fn main() {
 	mut m := &Metrics{}
-	handler := observed(fn [mut m] (req_buffer []u8, fd int) ![]u8 {
-		return app(req_buffer, fd, mut m)
+	handler := observed(fn [mut m] (req_buffer []u8, fd int, mut out []u8) ! {
+		out << app(req_buffer, fd, mut m)!
 	}, mut m)
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
 	mut backend := unsafe { http_server.IOBackend(0) }

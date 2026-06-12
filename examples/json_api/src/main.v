@@ -142,18 +142,20 @@ fn upload(req request_parser.HttpRequest) []u8 {
 
 // ----- routing -------------------------------------------------------------
 
-fn handle(req_buffer []u8, _ int) ![]u8 {
+fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 	req := request_parser.decode_http_request(req_buffer)!
 	method := req.method.to_string(req.buffer)
 	path := req.path.to_string(req.buffer)
 
 	if method == 'POST' && path == '/users' {
-		return create_user_json(req)
+		out << create_user_json(req)
+		return
 	}
 	if method == 'POST' && path == '/upload' {
-		return upload(req)
+		out << upload(req)
+		return
 	}
-	return bad_request('not found')
+	out << bad_request('not found')
 }
 
 fn main() {

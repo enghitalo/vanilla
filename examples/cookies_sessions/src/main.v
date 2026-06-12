@@ -67,7 +67,7 @@ fn parse_cookies(header string) map[string]string {
 	return out
 }
 
-fn handle(req_buffer []u8, _ int, mut store Store) ![]u8 {
+fn handle(req_buffer []u8, _ int, mut out []u8, mut store Store) ! {
 	req := request_parser.decode_http_request(req_buffer)!
 	path := req.path.to_string(req.buffer)
 
@@ -82,28 +82,30 @@ fn handle(req_buffer []u8, _ int, mut store Store) ![]u8 {
 			// (Authenticate first — see examples/auth.) Then mint a session.
 			sid := store.create('user-42')
 			// Note ALL the security attributes on the Set-Cookie.
-			return ('HTTP/1.1 200 OK\r\n' +
+			out << ('HTTP/1.1 200 OK\r\n' +
 				'Set-Cookie: sid=${sid}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400\r\n' +
 				'Content-Length: 0\r\n\r\n').bytes()
 		}
 		'/me' {
 			sid := cookies['sid'] or {
-				return 'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n'.bytes()
+				out << 'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n'.bytes()
+				return
 			}
 			sess := store.get(sid) or {
-				return 'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n'.bytes()
+				out << 'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n'.bytes()
+				return
 			}
 			body := '{"user":"${sess.user_id}"}'
-			return 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${body.len}\r\n\r\n${body}'.bytes()
+			out << 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${body.len}\r\n\r\n${body}'.bytes()
 		}
 		'/logout' {
 			// Expire the cookie (Max-Age=0) and drop the server-side session.
-			return ('HTTP/1.1 200 OK\r\n' +
+			out << ('HTTP/1.1 200 OK\r\n' +
 				'Set-Cookie: sid=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0\r\n' +
 				'Content-Length: 0\r\n\r\n').bytes()
 		}
 		else {
-			return 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n'.bytes()
+			out << 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n'.bytes()
 		}
 	}
 }
@@ -121,8 +123,8 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: fn [mut store] (req_buffer []u8, fd int) ![]u8 {
-			return handle(req_buffer, fd, mut store)
+		request_handler: fn [mut store] (req_buffer []u8, fd int, mut out []u8) ! {
+			handle(req_buffer, fd, mut out, mut store)!
 		}
 	})!
 	println('Cookies/sessions demo on http://localhost:3000/  (/login, /me, /logout)')
