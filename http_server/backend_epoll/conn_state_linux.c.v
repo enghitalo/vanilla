@@ -118,8 +118,7 @@ fn handle_readable_plain(request_handler core.RequestHandler, epoll_fd int, fd i
 			unsafe { cs.read_buf.grow_cap(cs.read_buf.cap) }
 		}
 		spare := cs.read_buf.cap - cs.read_buf.len
-		n := C.recv(fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, usize(spare),
-			0)
+		n := C.recv(fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, usize(spare), 0)
 		if n < 0 {
 			if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
 				break // burst fully drained
@@ -135,8 +134,7 @@ fn handle_readable_plain(request_handler core.RequestHandler, epoll_fd int, fd i
 			cs.read_buf.len += n
 		}
 		// Answer every complete request currently buffered; false ⇒ closed.
-		if !drain_requests(request_handler, epoll_fd, fd, limits, active_conns, mut st, mut
-			cs) {
+		if !drain_requests(request_handler, epoll_fd, fd, limits, active_conns, mut st, mut cs) {
 			return
 		}
 		// After draining, read_buf holds at most one partial request.
@@ -174,8 +172,8 @@ fn handle_readable_plain(request_handler core.RequestHandler, epoll_fd int, fd i
 fn drain_requests(request_handler core.RequestHandler, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState) bool {
 	mut pos := 0
 	for pos < cs.read_buf.len {
-		total := request_parser.frame_request_length_lim(cs.read_buf[pos..], limits.max_header_bytes,
-			limits.max_body_bytes) or {
+		total := request_parser.frame_request_length_lim(cs.read_buf[pos..],
+			limits.max_header_bytes, limits.max_body_bytes) or {
 			// Append the canned error so it lands AFTER the responses already
 			// batched for this burst, then flush and close.
 			match err.code() {
@@ -183,6 +181,7 @@ fn drain_requests(request_handler core.RequestHandler, epoll_fd int, fd int, lim
 				431 { cs.write_buf << response.status_431_response }
 				else { cs.write_buf << response.tiny_bad_request_response }
 			}
+
 			if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
 				close_conn(epoll_fd, fd, active_conns, mut st)
 			}
@@ -231,16 +230,15 @@ fn drain_requests(request_handler core.RequestHandler, epoll_fd int, fd int, lim
 @[manualfree]
 fn flush_batch(epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState) bool {
 	for cs.write_off < cs.write_buf.len {
-		n := C.send(fd, unsafe { &u8(cs.write_buf.data) + cs.write_off }, usize(cs.write_buf.len - cs.write_off),
-			C.MSG_NOSIGNAL)
+		n := C.send(fd, unsafe { &u8(cs.write_buf.data) + cs.write_off },
+			usize(cs.write_buf.len - cs.write_off), C.MSG_NOSIGNAL)
 		if n > 0 {
 			cs.write_off += n
 			continue
 		}
 		if n < 0 && (C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK) {
 			if limits.write_timeout_ms > 0 && cs.write_deadline == 0 {
-				cs.write_deadline = time.sys_mono_now() +
-					u64(limits.write_timeout_ms) * 1_000_000
+				cs.write_deadline = time.sys_mono_now() + u64(limits.write_timeout_ms) * 1_000_000
 				st.parked++
 			}
 			epoll.mod_fd_in_epoll(epoll_fd, fd, u32(C.EPOLLIN | C.EPOLLOUT | C.EPOLLET))
@@ -278,8 +276,8 @@ fn handle_writable_plain(epoll_fd int, fd int, active_conns &core.Counter, mut s
 		return true
 	}
 	for cs.write_off < cs.write_buf.len {
-		n := C.send(fd, unsafe { &u8(cs.write_buf.data) + cs.write_off }, usize(cs.write_buf.len - cs.write_off),
-			C.MSG_NOSIGNAL)
+		n := C.send(fd, unsafe { &u8(cs.write_buf.data) + cs.write_off },
+			usize(cs.write_buf.len - cs.write_off), C.MSG_NOSIGNAL)
 		if n > 0 {
 			cs.write_off += n
 			continue

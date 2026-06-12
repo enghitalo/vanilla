@@ -14,7 +14,7 @@ fn with_security_headers(next Handler) Handler {
 		next(req_buffer, fd, mut out)!
 		injected := inject_headers(out[start..], security_headers)
 		if injected.len == out.len - start {
-			return // nothing injected (malformed status line): out left untouched
+			return
 		}
 		out.trim(start)
 		out << injected
