@@ -23,7 +23,7 @@ fn C.close(fd int) int
 // read of 0 bytes) cleans up when the client goes away. This matches the
 // `Connection: keep-alive` the example handlers advertise — the previous
 // close-per-request behaviour both lied to clients and crippled throughput.
-fn handle_readable_fd(handler fn ([]u8, int) ![]u8, kq_fd int, client_fd int, limits Limits) {
+fn handle_readable_fd(handler fn ([]u8, int, mut []u8) !, kq_fd int, client_fd int, limits Limits) {
 	request_buffer := request.read_request(client_fd, limits.max_header_bytes,
 		limits.max_body_bytes) or {
 		match err.code() {
@@ -52,7 +52,10 @@ fn handle_readable_fd(handler fn ([]u8, int) ![]u8, kq_fd int, client_fd int, li
 	}
 	defer { unsafe { request_buffer.free() } }
 
-	response_buffer := handler(request_buffer, client_fd) or {
+	// Server-owned response buffer: the handler appends raw response bytes.
+	mut response_buffer := []u8{len: 0, cap: 4096}
+	defer { unsafe { response_buffer.free() } }
+	handler(request_buffer, client_fd, mut response_buffer) or {
 		response.send_bad_request_response(client_fd)
 		kqueue.remove_fd_from_kqueue(kq_fd, client_fd)
 		return
@@ -100,7 +103,7 @@ fn handle_accept_loop(socket_fd int, main_kq int, worker_kqs []int) {
 	}
 }
 
-pub fn run_kqueue_backend(socket_fd int, handler fn ([]u8, int) ![]u8, port int, limits Limits, mut threads []thread) {
+pub fn run_kqueue_backend(socket_fd int, handler fn ([]u8, int, mut []u8) !, port int, limits Limits, mut threads []thread) {
 	main_kq := kqueue.create_kqueue_fd()
 	if main_kq < 0 {
 		return

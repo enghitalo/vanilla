@@ -34,7 +34,7 @@ fn handle_io_uring_accept(worker &io_uring.Worker, cqe &C.io_uring_cqe) {
 	}
 }
 
-fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn ([]u8, int) ![]u8) {
+fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn ([]u8, int, mut []u8) !) {
 	res := cqe.res
 	c_ptr := io_uring.decode_connection_ptr(C.io_uring_cqe_get_data64(cqe))
 	if res <= 0 {
@@ -52,14 +52,16 @@ fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn
 			eprintln('[DEBUG] Read ${res} bytes from fd=${conn.fd}')
 		}
 		request_data := unsafe { conn.buf[..conn.bytes_read] }
-		response_data := handler(request_data, conn.fd) or {
+		// Reuse the connection's response buffer across requests: clear()
+		// keeps the capacity, the handler appends the raw response bytes.
+		conn.response_buffer.clear()
+		handler(request_data, conn.fd, mut conn.response_buffer) or {
 			response.send_bad_request_response(conn.fd)
 			io_uring.pool_release_from_ptr(worker, mut *conn)
 			C.io_uring_cqe_seen(&worker.ring, cqe)
 			C.io_uring_submit(&worker.ring)
 			return
 		}
-		conn.response_buffer = response_data
 		conn.bytes_sent = 0
 		$if verbose ? {
 			eprintln('[DEBUG] Preparing write of ${conn.response_buffer.len} bytes')
@@ -89,8 +91,7 @@ fn handle_io_uring_write(worker &io_uring.Worker, cqe &C.io_uring_cqe) {
 					eprintln('[DEBUG] Write complete, keep-alive next read')
 				}
 				conn.bytes_read = 0
-				unsafe { conn.response_buffer.free() }
-				conn.response_buffer = []u8{}
+				conn.response_buffer.clear() // keep capacity for the next response
 				io_uring.prepare_recv(&worker.ring, mut *conn)
 			}
 		}
@@ -105,7 +106,7 @@ fn handle_io_uring_write(worker &io_uring.Worker, cqe &C.io_uring_cqe) {
 	}
 }
 
-fn dispatch_io_uring_cqe(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn ([]u8, int) ![]u8) {
+fn dispatch_io_uring_cqe(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn ([]u8, int, mut []u8) !) {
 	data := C.io_uring_cqe_get_data64(cqe)
 	op := io_uring.decode_op_type(data)
 	match op {
@@ -116,7 +117,7 @@ fn dispatch_io_uring_cqe(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler f
 	}
 }
 
-fn io_uring_worker_loop(worker &io_uring.Worker, handler fn ([]u8, int) ![]u8) {
+fn io_uring_worker_loop(worker &io_uring.Worker, handler fn ([]u8, int, mut []u8) !) {
 	io_uring.prepare_accept(&worker.ring, worker.socket_fd, worker.use_multishot)
 	C.io_uring_submit(&worker.ring)
 	$if verbose ? {
@@ -164,7 +165,7 @@ fn io_uring_worker_loop(worker &io_uring.Worker, handler fn ([]u8, int) ![]u8) {
 	}
 }
 
-pub fn run_io_uring_backend(request_handler fn ([]u8, int) ![]u8, port int, mut threads []thread) {
+pub fn run_io_uring_backend(request_handler fn ([]u8, int, mut []u8) !, port int, mut threads []thread) {
 	num_workers := max_thread_pool_size
 
 	for i in 0 .. num_workers {

@@ -77,7 +77,7 @@ fn tls_handshake_step(mut conn TlsConn, epoll_fd int, fd int, active_conns &core
 }
 
 @[direct_array_access; manualfree]
-fn handle_readable_fd_tls(request_handler fn ([]u8, int) ![]u8, epoll_fd int, fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config, mut sessions map[int]&TlsConn) {
+fn handle_readable_fd_tls(request_handler fn ([]u8, int, mut []u8) !, epoll_fd int, fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config, mut sessions map[int]&TlsConn) {
 	stdatomic.add_i64(&counter.n, 1)
 	defer {
 		stdatomic.add_i64(&counter.n, -1)
@@ -169,8 +169,13 @@ fn handle_readable_fd_tls(request_handler fn ([]u8, int) ![]u8, epoll_fd int, fd
 	// Request complete — clear the read deadline.
 	conn.read_deadline = 0
 
-	resp := request_handler(buf, fd) or {
+	// Server-owned response buffer: the handler appends raw response bytes.
+	// (The TLS path keeps a per-request buffer; the persistent-buffer
+	// batching is implemented on the plain path.)
+	mut resp := []u8{len: 0, cap: 4096}
+	request_handler(buf, fd, mut resp) or {
 		unsafe { buf.free() }
+		unsafe { resp.free() }
 		close_tls(epoll_fd, fd, active_conns, mut sessions)
 		return
 	}

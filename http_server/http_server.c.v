@@ -22,7 +22,7 @@ pub:
 	tls_config      &tls.Config = unsafe { nil } // nil ⇒ plain HTTP; set ⇒ HTTPS
 pub mut:
 	threads         []thread = []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
-	request_handler fn ([]u8, int) ![]u8 @[required]
+	request_handler core.RequestHandler @[required]
 	// Per-worker in-flight request counters (one per worker, each on its own
 	// cache line — written only by its worker, so no contention/false sharing).
 	// shutdown() sums them to drain precisely.
@@ -188,7 +188,7 @@ pub struct ServerConfig {
 pub:
 	port            int       = 3000
 	io_multiplexing IOBackend = unsafe { IOBackend(0) }
-	request_handler fn ([]u8, int) ![]u8 @[required]
+	request_handler core.RequestHandler @[required]
 	certificates    Certificates
 	limits          Limits
 	tls_config      &tls.Config = unsafe { nil } // set for HTTPS (e.g. tls.new_self_signed())
