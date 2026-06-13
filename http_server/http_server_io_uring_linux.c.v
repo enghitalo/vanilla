@@ -125,6 +125,13 @@ fn handle_io_uring_accept(worker &io_uring.Worker, cqe &C.io_uring_cqe, limits L
 			}
 		}
 	}
+	// Graceful shutdown: once Server.shutdown() has set the draining flag (and
+	// shut the listener, which is what completed this accept with an error), do
+	// NOT re-arm — re-arming on a dead socket would spin. With no armed accept the
+	// worker simply stops taking new connections and lets the in-flight ones drain.
+	if unsafe { worker.draining != nil } && stdatomic.load_i64(&worker.draining.n) != 0 {
+		return
+	}
 	// Multishot accept delivers one CQE per connection with F_MORE set while it
 	// stays armed; re-arm only once F_MORE is clear (multishot ended) or on
 	// error. This branch also covers single-shot accept, where F_MORE is never
@@ -169,8 +176,12 @@ fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn
 	}
 	if conn.response_buffer.len > conn.bytes_sent {
 		// Sending now, not read-stalled: drop any read deadline. One batched send
-		// for every response produced this burst (arms the write deadline).
+		// for every response produced this burst (arms the write deadline). The
+		// response is now in flight — count it so Server.shutdown() drains it.
 		conn.read_deadline = 0
+		if unsafe { worker.inflight != nil } {
+			stdatomic.add_i64(&worker.inflight.n, 1)
+		}
 		iou_arm_send(worker, mut *conn, unsafe {
 			&u8(conn.response_buffer.data) + conn.bytes_sent
 		}, usize(conn.response_buffer.len - conn.bytes_sent), limits)
@@ -241,7 +252,11 @@ fn handle_io_uring_write(worker &io_uring.Worker, cqe &C.io_uring_cqe, limits Li
 	}
 	mut conn := unsafe { &io_uring.Connection(c_ptr) }
 	if res <= 0 {
-		// 0 on a non-empty send (or <0) means the peer is gone — drop it.
+		// 0 on a non-empty send (or <0) means the peer is gone — drop it. The
+		// response was in flight, so settle the drain counter before releasing.
+		if unsafe { worker.inflight != nil } {
+			stdatomic.add_i64(&worker.inflight.n, -1)
+		}
 		iou_release(worker, mut *conn, active_conns, track)
 		return
 	}
@@ -250,13 +265,17 @@ fn handle_io_uring_write(worker &io_uring.Worker, cqe &C.io_uring_cqe, limits Li
 		// Partial send — resume from the offset. iou_arm_send keeps the existing
 		// write deadline (armed on the first send), so the whole batch must drain
 		// within write_timeout_ms regardless of how many partial sends it takes.
+		// Still in flight — the inflight count stays held until the batch finishes.
 		iou_arm_send(worker, mut *conn, unsafe {
 			&u8(conn.response_buffer.data) + conn.bytes_sent
 		}, usize(conn.response_buffer.len - conn.bytes_sent), limits)
 		return
 	}
-	// Whole batch sent — the write is no longer outstanding.
+	// Whole batch sent — the write is no longer outstanding; release the drain hold.
 	conn.write_deadline = 0
+	if unsafe { worker.inflight != nil } {
+		stdatomic.add_i64(&worker.inflight.n, -1)
+	}
 	if conn.close_after_send {
 		iou_release(worker, mut *conn, active_conns, track)
 		return
@@ -314,7 +333,7 @@ fn iou_sweep_timeouts(worker &io_uring.Worker) {
 // up on the main thread and driving it here would make every submit_and_wait
 // fail; doing it all here keeps the ring single-owner (and matches how every
 // thread-per-core io_uring server sets up).
-fn io_uring_worker_main(listener int, cpu_id int, handler fn (req []u8, fd int, mut out []u8) !, limits Limits, active_conns &core.Counter) {
+fn io_uring_worker_main(listener int, cpu_id int, handler fn (req []u8, fd int, mut out []u8) !, limits Limits, active_conns &core.Counter, inflight &core.Counter, draining &core.Counter) {
 	maybe_pin_worker(cpu_id)
 	mut worker := &io_uring.Worker{}
 	worker.cpu_id = cpu_id
@@ -322,6 +341,10 @@ fn io_uring_worker_main(listener int, cpu_id int, handler fn (req []u8, fd int, 
 	// Multishot accept (kernel 5.19+). The re-arm logic in the accept handler
 	// also handles the single-shot case, so this is safe either way.
 	worker.use_multishot = true
+	// Graceful-shutdown plumbing: this worker's own in-flight counter and the
+	// shared draining flag (see Server.shutdown / handle_io_uring_accept).
+	worker.inflight = inflight
+	worker.draining = draining
 	io_uring.pool_init(mut worker)
 
 	if !iou_init_ring(&worker.ring) {
@@ -422,30 +445,30 @@ fn iou_init_ring(ring &C.io_uring) bool {
 // (a peer that stops reading mid-response is half-closed the same way) are all
 // enforced.
 //
-// Known io_uring-only gap (documented rather than worked around):
-//   • Server.shutdown() closes only worker 0's listener, so the other workers'
-//     SO_REUSEPORT listeners keep accepting until process exit. Graceful drain on
-//     io_uring would need all listener fds tracked on the Server (a lifecycle
-//     change); use the epoll backend when graceful shutdown is required.
-pub fn run_io_uring_backend(socket_fd int, request_handler fn (req []u8, fd int, mut out []u8) !, port int, limits Limits, active_conns &core.Counter, mut threads []thread) {
+// Graceful shutdown: Server.shutdown() sets the shared draining flag and
+// shutdown(2)s every listener in server.listener_fds (created up front in
+// new_server, one SO_REUSEPORT socket per worker), then waits for the per-worker
+// inflight counters to drain. The accept handler stops re-arming once draining,
+// so every worker quits accepting and the process can exit cleanly.
+pub fn run_io_uring_backend(server Server, mut threads []thread) {
 	num_workers := max_thread_pool_size
 
 	for i in 0 .. num_workers {
-		// Per-worker SO_REUSEPORT listener. Worker 0 reuses the listener that
-		// new_server already created, so there is no extra, never-accepted
-		// listener silently stealing ~1/N of incoming connections; the rest
-		// create their own. The kernel load-balances accepts across all of them.
-		// (Listeners aren't ring-bound, so creating them here on the main thread
-		// is fine — only the ring itself must stay on its worker thread.)
-		listener := if i == 0 { socket_fd } else { socket.create_server_socket(port) }
+		// One SO_REUSEPORT listener per worker, all created in new_server so
+		// Server.shutdown() can stop them all (worker 0 reuses socket_fd). The
+		// kernel load-balances accepts across them; none is left un-accepted.
+		// (Listeners aren't ring-bound, so they live on the main thread — only the
+		// ring itself must stay on its worker thread.)
+		listener := server.listener_fds[i]
 		if listener < 0 {
 			eprintln('Failed to create listener for worker ${i}')
 			exit(1)
 		}
-		threads[i] = spawn io_uring_worker_main(listener, i, request_handler, limits, active_conns)
+		threads[i] = spawn io_uring_worker_main(listener, i, server.request_handler, server.limits,
+			server.active_conns, server.inflight[i], server.draining)
 	}
 
-	println('listening on http://localhost:${port}/ (io_uring)')
+	println('listening on http://localhost:${server.port}/ (io_uring)')
 
 	// Keep main thread alive.
 	for {

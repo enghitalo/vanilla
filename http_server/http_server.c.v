@@ -30,11 +30,25 @@ pub mut:
 	// Global count of open connections (incremented at accept, decremented at
 	// close) — enforces max_connections. Touched per CONNECTION, not per request.
 	active_conns &core.Counter = &core.Counter{}
+	// Every listening socket the server accepts on. epoll uses one (socket_fd); the
+	// io_uring backend uses one SO_REUSEPORT listener per worker, all created up
+	// front in new_server so shutdown() can stop them ALL (not just worker 0's).
+	listener_fds []int
+	// Shared shutdown flag: shutdown() sets it so the io_uring accept handlers stop
+	// re-arming and the workers quit accepting. Unused by the epoll backend (which
+	// stops accepting when its single listener is closed).
+	draining &core.Counter = &core.Counter{}
 }
 
-// shutdown performs a graceful stop: it closes the listening socket so the
-// kernel refuses NEW connections, then waits up to `grace_ms` for in-flight
-// request handling to finish before the caller exits the process.
+// shutdown performs a graceful stop: it stops every listener so the kernel
+// refuses NEW connections, then waits up to `grace_ms` for in-flight request
+// handling to finish before the caller exits the process.
+//
+// It works for BOTH backends. epoll accepts on one listener (socket_fd); the
+// io_uring backend accepts on one SO_REUSEPORT listener per worker (all in
+// listener_fds). We set the shared `draining` flag — so io_uring accept handlers
+// stop re-arming — and shutdown(SHUT_RDWR) every listener (close() alone would
+// not cancel an io_uring multishot accept, which holds its own file reference).
 //
 // The drain is PRECISE: it sums the per-worker in-flight counters and returns
 // the instant they all hit zero, so an idle server shuts down in ~milliseconds
@@ -44,10 +58,22 @@ pub mut:
 // hold no in-flight work, so they're simply dropped on exit.
 //
 // Call it from a signal handler, then `exit(0)`. It is safe to call from another
-// thread while `run()` is blocked in the accept loop: closing the listener fd
-// stops new accepts; existing workers finish their current request.
+// thread while `run()` is blocked: stopping the listeners halts new accepts;
+// existing workers finish their current request.
 pub fn (s Server) shutdown(grace_ms int) {
-	socket.close_socket(s.socket_fd)
+	// Tell the io_uring accept handlers to stop re-arming BEFORE the listeners are
+	// shut, so the resulting accept-error completion already observes the flag.
+	stdatomic.store_i64(&s.draining.n, 1)
+	if s.listener_fds.len > 0 {
+		for fd in s.listener_fds {
+			if fd >= 0 {
+				socket.shutdown_socket(fd)
+			}
+		}
+	} else {
+		// Server built without new_server (defensive): fall back to the one fd.
+		socket.shutdown_socket(s.socket_fd)
+	}
 	// Precise drain: poll the per-worker in-flight counters and return as soon
 	// as they all reach zero (or the grace deadline elapses). An idle server
 	// shuts down in ~1 ms instead of waiting the full grace.
@@ -166,8 +192,15 @@ pub fn (mut s Server) test(requests [][]u8) ![][]u8 {
 
 	C.close(client_fd)
 	println('[test] Client closed, shutting down server socket...')
-	// Shutdown server after last response
-	socket.close_socket(s.socket_fd)
+	// Shutdown server after last response: stop every listener (the io_uring
+	// backend has one per worker), falling back to socket_fd if unset.
+	if s.listener_fds.len > 0 {
+		for fd in s.listener_fds {
+			socket.shutdown_socket(fd)
+		}
+	} else {
+		socket.close_socket(s.socket_fd)
+	}
 
 	$if windows {
 		socket.cleanup_winsock()
@@ -213,6 +246,20 @@ pub fn new_server(config ServerConfig) !Server {
 		}
 	}
 
+	// Listeners the server will accept on. The first is always socket_fd. The
+	// io_uring backend is shared-nothing with one SO_REUSEPORT listener PER worker,
+	// so create the rest up front (worker 0 reuses socket_fd): then shutdown() can
+	// stop them ALL, and there is no extra never-accepted listener. epoll and the
+	// other backends accept on the single socket_fd.
+	mut listener_fds := [socket_fd]
+	$if linux {
+		if io_multiplexing == .io_uring {
+			for _ in 1 .. max_thread_pool_size {
+				listener_fds << socket.create_server_socket(config.port)
+			}
+		}
+	}
+
 	return Server{
 		port:            config.port
 		io_multiplexing: config.io_multiplexing
@@ -221,5 +268,6 @@ pub fn new_server(config ServerConfig) !Server {
 		limits:          config.limits
 		tls_config:      config.tls_config
 		threads:         []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
+		listener_fds:    listener_fds
 	}
 }

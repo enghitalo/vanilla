@@ -43,6 +43,7 @@ fn C.setsockopt(__fd int, __level int, __optname int, __optval voidptr, __optlen
 fn C.listen(__fd int, __n int) int
 fn C.perror(s &char)
 fn C.close(fd int) int
+fn C.shutdown(__fd int, __how int) int
 
 $if linux {
 	fn C.accept(sockfd int, address &C.sockaddr_in, addrlen &u32) int
@@ -184,6 +185,18 @@ pub fn close_socket(fd int) {
 	} $else {
 		C.close(fd)
 	}
+}
+
+// shutdown_socket stops a listening socket and closes it. On Linux/Unix it first
+// calls shutdown(SHUT_RDWR): unlike close(), that terminates an io_uring multishot
+// accept armed on the socket (the ring holds its own file reference, so close()
+// alone would not cancel the accept). Used by Server.shutdown() to stop every
+// per-worker listener at once. SHUT_RDWR is 2 on every platform.
+pub fn shutdown_socket(fd int) {
+	$if !windows {
+		C.shutdown(fd, 2) // SHUT_RDWR
+	}
+	close_socket(fd)
 }
 
 pub fn create_server_socket(port int) int {

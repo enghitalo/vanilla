@@ -18,8 +18,7 @@ fn run_selected_backend(server Server, mut threads []thread) {
 				server.limits, server.inflight, server.active_conns, server.tls_config, mut threads)
 		}
 		.io_uring {
-			run_io_uring_backend(server.socket_fd, server.request_handler, server.port,
-				server.limits, server.active_conns, mut threads)
+			run_io_uring_backend(server, mut threads)
 		}
 	}
 }

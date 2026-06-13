@@ -7,6 +7,8 @@
 
 module io_uring
 
+import http_server.core
+
 #include <liburing.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -241,6 +243,13 @@ pub mut:
 	conns         []Connection
 	free_stack    []int
 	free_top      int
+	// Graceful-shutdown plumbing (set in io_uring_worker_main):
+	//   inflight — this worker's own in-flight-response counter; Server.shutdown()
+	//     sums all workers' counters to drain precisely. nil ⇒ not tracked.
+	//   draining — shared flag set by Server.shutdown(); the accept handler stops
+	//     re-arming once it is non-zero, so the worker quits accepting. nil ⇒ off.
+	inflight &core.Counter = unsafe { nil }
+	draining &core.Counter = unsafe { nil }
 }
 
 // ==================== Connection Pool ====================
