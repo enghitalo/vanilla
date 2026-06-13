@@ -27,6 +27,8 @@ import time
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <sys/sendfile.h>
+#include <unistd.h>
 
 // recv/send were inherited from http_server.c.v while this lived in that module;
 // now in backend_epoll they must be declared here.
@@ -34,7 +36,18 @@ fn C.recv(__fd int, __buf voidptr, __n usize, __flags int) int
 fn C.send(__fd int, __buf voidptr, __n usize, __flags int) int
 fn C.memmove(__dest voidptr, __src voidptr, __n usize) voidptr
 
+// sendfile(2): copy bytes from a file fd straight to the socket inside the
+// kernel (no userspace bounce). With a non-NULL offset the kernel advances it
+// and leaves the file's own position untouched, so ONE shared fd is safe to
+// send from many connections/threads at once. pread is the userspace fallback
+// used when a pipelined response must follow the file body in byte order.
+fn C.sendfile(out_fd int, in_fd int, offset &i64, count usize) isize
+fn C.pread(fd int, buf voidptr, count usize, offset i64) isize
+
 const sm_max_request_bytes = 8 * 1024 * 1024
+// Bound a single sendfile(2) call so one connection can't monopolize the worker;
+// the remainder streams on the next writable edge.
+const sm_sendfile_chunk = 1024 * 1024
 // Write-side cap: close a connection whose peer pipelines requests but never
 // drains responses (otherwise write_buf would grow without bound).
 const sm_max_pending_write = 8 * 1024 * 1024
@@ -53,6 +66,13 @@ mut:
 	write_off      int
 	read_deadline  u64 // monotonic ns; >0 while a request is mid-read (read_timeout)
 	write_deadline u64 // monotonic ns; >0 while a batch is parked (write_timeout)
+	// Deferred file body to stream with sendfile(2) AFTER write_buf drains (a
+	// handler appended its headers to write_buf and handed the body off via
+	// core.queue_file). file_fd is BORROWED (the asset table owns it) and is
+	// never closed here; file_off is advanced by the kernel as bytes go out.
+	file_fd        int = -1
+	file_off       i64
+	file_remaining i64
 }
 
 // PlainState is the per-worker connection table. `parked` counts connections
@@ -161,8 +181,8 @@ fn handle_readable_plain(request_handler core.RequestHandler, epoll_fd int, fd i
 		st.parked--
 	}
 
-	// One send for the whole batch of responses.
-	if cs.write_buf.len > cs.write_off {
+	// One send for the whole batch of responses (plus any deferred file body).
+	if cs.write_buf.len > cs.write_off || cs.file_remaining > 0 {
 		flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs)
 	}
 }
@@ -193,12 +213,28 @@ fn drain_requests(request_handler core.RequestHandler, epoll_fd int, fd int, lim
 			break // incomplete — wait for more bytes
 		}
 		req := cs.read_buf[pos..pos + total] // zero-copy view into the read buffer
+		// A file deferred by an earlier request in this batch must be emitted (as
+		// bytes, in order) BEFORE this next response is appended. This converts
+		// the rare "pipelined response after a sendfile body" case to a buffered
+		// copy of whatever file bytes remain — order preserved, sendfile skipped.
+		if cs.file_remaining > 0 {
+			append_file_region(mut cs.write_buf, cs.file_fd, cs.file_off, cs.file_remaining)
+			cs.file_fd = -1
+			cs.file_remaining = 0
+		}
 		request_handler(req, fd, mut cs.write_buf) or {
 			cs.write_buf << response.tiny_bad_request_response
 			if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
 				close_conn(epoll_fd, fd, active_conns, mut st)
 			}
 			return false
+		}
+		// The handler may have appended headers to write_buf and handed its body
+		// off for sendfile(2). Remember it; it streams after write_buf drains.
+		if qf := core.take_queued_file() {
+			cs.file_fd = qf.file_fd
+			cs.file_off = qf.off
+			cs.file_remaining = qf.len
 		}
 		pos += total
 		// Peer pipelines requests but never reads responses: bail out before
@@ -226,11 +262,78 @@ fn drain_requests(request_handler core.RequestHandler, epoll_fd int, fd int, lim
 	return true
 }
 
-// flush_batch writes all pending response bytes, or parks the remainder for
-// EPOLLOUT. The write buffer is reset (capacity kept) once fully sent.
-// Returns false if the connection was closed (callers must not touch it).
+// park_write arms the write deadline (once) and subscribes the fd to EPOLLOUT so
+// a batch that couldn't fully drain is resumed on the next writable edge.
+@[inline]
+fn park_write(epoll_fd int, fd int, limits core.Limits, mut st PlainState, mut cs ConnState) {
+	if limits.write_timeout_ms > 0 && cs.write_deadline == 0 {
+		cs.write_deadline = time.sys_mono_now() + u64(limits.write_timeout_ms) * 1_000_000
+		st.parked++
+	}
+	epoll.mod_fd_in_epoll(epoll_fd, fd, u32(C.EPOLLIN | C.EPOLLOUT | C.EPOLLET))
+}
+
+// append_file_region reads [off, off+len) from a borrowed file fd into `buf`.
+// Used to materialize a deferred sendfile body into the response buffer when a
+// pipelined response must follow it in order, and as the userspace fallback on
+// backends/OSes that can't sendfile.
+@[manualfree]
+fn append_file_region(mut buf []u8, file_fd int, off i64, length i64) {
+	if length <= 0 {
+		return
+	}
+	start := buf.len
+	unsafe { buf.grow_len(int(length)) }
+	mut got := i64(0)
+	for got < length {
+		n := C.pread(file_fd, unsafe { &u8(buf.data) + start + int(got) }, usize(length - got),
+
+			off + got)
+		if n <= 0 {
+			break // short read (file truncated mid-flight) — send what we got
+		}
+		got += i64(n)
+	}
+	if got < length {
+		unsafe {
+			buf.len = start + int(got)
+		}
+	}
+}
+
+// drain_file streams the connection's deferred file body to the socket with
+// sendfile(2), advancing file_off/file_remaining. Returns:
+//   1  fully sent (file_remaining == 0)
+//   0  partial — EAGAIN, more to send on the next writable edge
+//  -1  hard error — caller must close the connection
+@[inline]
+fn drain_file(fd int, mut cs ConnState) int {
+	for cs.file_remaining > 0 {
+		want := if cs.file_remaining > sm_sendfile_chunk {
+			usize(sm_sendfile_chunk)
+		} else {
+			usize(cs.file_remaining)
+		}
+		sent := C.sendfile(fd, cs.file_fd, &cs.file_off, want)
+		if sent > 0 {
+			cs.file_remaining -= i64(sent)
+			continue
+		}
+		if sent < 0 && (C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK) {
+			return 0
+		}
+		return -1 // sent == 0 (unexpected EOF) or a hard error
+	}
+	return 1
+}
+
+// flush_batch writes all pending response bytes then streams any deferred file
+// body with sendfile(2), or parks the remainder for EPOLLOUT. The write buffer
+// is reset (capacity kept) once everything is sent. Returns false if the
+// connection was closed (callers must not touch it).
 @[manualfree]
 fn flush_batch(epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState) bool {
+	// Phase 1: the buffered response bytes (status line, headers, small bodies).
 	for cs.write_off < cs.write_buf.len {
 		n := C.send(fd, unsafe { &u8(cs.write_buf.data) + cs.write_off },
 			usize(cs.write_buf.len - cs.write_off), C.MSG_NOSIGNAL)
@@ -239,18 +342,29 @@ fn flush_batch(epoll_fd int, fd int, limits core.Limits, active_conns &core.Coun
 			continue
 		}
 		if n < 0 && (C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK) {
-			if limits.write_timeout_ms > 0 && cs.write_deadline == 0 {
-				cs.write_deadline = time.sys_mono_now() + u64(limits.write_timeout_ms) * 1_000_000
-				st.parked++
-			}
-			epoll.mod_fd_in_epoll(epoll_fd, fd, u32(C.EPOLLIN | C.EPOLLOUT | C.EPOLLET))
+			park_write(epoll_fd, fd, limits, mut st, mut cs)
 			return true // parked, still alive
 		}
 		close_conn(epoll_fd, fd, active_conns, mut st)
 		return false
 	}
+	// Phase 2: stream the deferred file body straight from the page cache.
+	if cs.file_remaining > 0 {
+		match drain_file(fd, mut cs) {
+			0 {
+				park_write(epoll_fd, fd, limits, mut st, mut cs)
+				return true // parked mid-file, still alive
+			}
+			-1 {
+				close_conn(epoll_fd, fd, active_conns, mut st)
+				return false
+			}
+			else {}
+		}
+	}
 	cs.write_buf.clear() // len = 0, capacity kept for the next batch
 	cs.write_off = 0
+	cs.file_fd = -1 // borrowed — never closed here
 	if cs.write_deadline != 0 {
 		cs.write_deadline = 0
 		st.parked--
@@ -272,11 +386,12 @@ fn handle_writable_plain(epoll_fd int, fd int, active_conns &core.Counter, mut s
 		// this event in the same batch.
 		return false
 	}
-	if cs.write_off >= cs.write_buf.len {
+	if cs.write_off >= cs.write_buf.len && cs.file_remaining <= 0 {
 		// Spurious wake — nothing parked; stop watching writability.
 		epoll.mod_fd_in_epoll(epoll_fd, fd, u32(C.EPOLLIN | C.EPOLLET))
 		return true
 	}
+	// Phase 1: finish the buffered bytes.
 	for cs.write_off < cs.write_buf.len {
 		n := C.send(fd, unsafe { &u8(cs.write_buf.data) + cs.write_off },
 			usize(cs.write_buf.len - cs.write_off), C.MSG_NOSIGNAL)
@@ -285,13 +400,27 @@ fn handle_writable_plain(epoll_fd int, fd int, active_conns &core.Counter, mut s
 			continue
 		}
 		if n < 0 && (C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK) {
-			return true
+			return true // still parked
 		}
 		close_conn(epoll_fd, fd, active_conns, mut st)
 		return false
 	}
+	// Phase 2: finish the deferred file body.
+	if cs.file_remaining > 0 {
+		match drain_file(fd, mut cs) {
+			0 {
+				return true
+			} // still parked mid-file
+			-1 {
+				close_conn(epoll_fd, fd, active_conns, mut st)
+				return false
+			}
+			else {}
+		}
+	}
 	cs.write_buf.clear()
 	cs.write_off = 0
+	cs.file_fd = -1 // borrowed — never closed here
 	if cs.write_deadline != 0 {
 		cs.write_deadline = 0
 		st.parked--

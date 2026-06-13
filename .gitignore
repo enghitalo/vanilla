@@ -22,6 +22,8 @@ bin/
 # vweb and database
 *.db
 *.js
+# ...but DO track the static_assets example's SPA bundle (a real, committed .js asset)
+!examples/static_assets/dist/*.js
 
 server_cert.pem
 examples/tiny/src/src

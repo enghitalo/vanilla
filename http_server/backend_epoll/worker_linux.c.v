@@ -118,6 +118,9 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 @[direct_array_access; manualfree]
 fn process_events_plain(worker_id int, epoll_fd int, request_handler core.RequestHandler, limits core.Limits, counter &core.Counter, active_conns &core.Counter) {
 	maybe_pin_worker(worker_id)
+	// This worker can stream file bodies with sendfile(2): let handlers hand a
+	// file off via core.queue_file instead of copying it through write_buf.
+	core.enable_sendfile()
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut st := new_plain_state()
 	// Only arm the timeout sweep if a deadline is actually configured.

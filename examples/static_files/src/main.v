@@ -11,10 +11,16 @@ module main
 //   `GET /../../etc/passwd`. We resolve the requested path against the root and
 //   verify the result is still inside the root. Never trust the URL path.
 //
-// WORKS TODAY: everything here is plain file I/O + header building. The only
-// thing the core could improve is zero-copy `sendfile(2)` for large files
-// (kernel copies file -> socket without a userspace bounce) and EPOLLOUT-driven
-// streaming so a 4 GB file doesn't sit in a single []u8.
+// WORKS TODAY: everything here is plain file I/O + header building — read into a
+// []u8 and write it out, which is the clearest way to show the logic.
+//
+// ZERO-COPY IS NOW AVAILABLE: large files no longer have to bounce through a
+// userspace []u8. The epoll core can stream a file straight to the socket with
+// `sendfile(2)` (EPOLLOUT-driven, so a 4 GB file never sits in RAM) — a handler
+// hands the file off via `core.queue_file(fd, off, len)`. The reusable
+// `http_server.static_assets` module does exactly this for files past a size
+// threshold; see `examples/static_assets`. This example keeps the explicit
+// read-into-RAM path for teaching.
 import http_server
 import http_server.http1_1.request_parser
 import os
@@ -171,6 +177,6 @@ fn main() {
 		request_handler: handle
 	})!
 	println('Static server on http://localhost:3000/  (root: ${web_root})')
-	println('PURE UPGRADE: serve large files via sendfile(2) + EPOLLOUT instead of read_bytes into RAM.')
+	println('For zero-copy large-file serving (sendfile(2)), use http_server.static_assets — see examples/static_assets.')
 	server.run()
 }

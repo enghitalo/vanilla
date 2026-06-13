@@ -140,6 +140,8 @@ wrk -t16 -c512 -d30s -H "If-None-Match: c4ca4238a0b923820dcc509a6f75849b" http:/
 - `examples/sse/` – Server-Sent Events
 - `examples/database/` – PostgreSQL integration
 - `examples/hexagonal/` – Hexagonal architecture
+- `examples/static_files/` – Static file serving (MIME, Range, ETag, traversal safety)
+- `examples/static_assets/` – Serve a CSR/WASM SPA bundle via the `http_server.static_assets` module (`application/wasm`, `.br`/`.gz` negotiation, immutable caching, SPA fallback)
 
 ---
 

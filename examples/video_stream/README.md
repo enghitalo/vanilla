@@ -95,9 +95,22 @@ curl -s http://localhost:3000/webcam | head -c 80
   fd on disconnect); the broadcaster only writes and drops fds that fail. The
   small close/reuse race is the accepted cost of not parking a thread per viewer.
 
-## What the core could add later
+## Core support
 
-Zero-copy `sendfile(2)` for the file path (kernel copies file → socket, no
-userspace bounce) and EPOLLOUT-driven frame queues per viewer (so a briefly slow
-client is buffered rather than dropped). Both are core changes; the handler
-contract here stays the same.
+Zero-copy `sendfile(2)` for the file path **now exists** in the epoll core: a
+handler hands a file off via `core.queue_file(fd, off, len)` and the worker
+streams it straight to the socket (EPOLLOUT-driven, no userspace bounce). The
+`http_server.static_assets` module uses it for large files — see
+`examples/static_assets`. Serving a recorded clip can adopt it the same way; the
+handler contract here is unchanged.
+
+For the **live** path, dropping a viewer that can't keep up is intentional and
+correct: live video favors fresh frames over a backlog, so `send_all` tolerates a
+brief stall (~50 ms) and then drops, rather than buffering stale frames and adding
+latency. That is the right policy here and is **not** a deficiency.
+
+Reliable server push — where data must *not* be lost or truncated for a slow
+consumer (SSE, WebSocket) — needs the opposite: a bounded per-connection outbound
+queue drained on `EPOLLOUT`. That is a separate core facility, tracked in
+[#23](https://github.com/enghitalo/vanilla/issues/23); live media there would opt
+into a keep-latest policy rather than buffering.
