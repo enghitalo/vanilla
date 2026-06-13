@@ -39,11 +39,23 @@ fn C.perror(s &char)
 // Server configuration
 pub const inaddr_any = u32(0)
 pub const default_port = 8080
+// SQ entries per worker ring. CQ defaults to 2x (= 32768 >= max_conn_per_worker)
+// so completions never overflow even with one in-flight recv per connection.
 pub const default_ring_entries = 16384
-pub const default_buffer_size = 4096
 
 // Derived constants
 pub const max_conn_per_worker = default_ring_entries * 2
+
+// Persistent per-connection buffers (allocated on acquire, freed on release).
+// read_buf accumulates request bytes across recvs — framing across TCP
+// segments AND HTTP/1.1 pipelining; write_buf accumulates the batched responses.
+pub const read_buf_cap = 8 * 1024
+pub const write_buf_cap = 16 * 1024
+
+// How many CQE pointers to copy out of the ring per peek_batch call. The drain
+// loop submits queued SQEs between full batches, so the SQ (default_ring_entries)
+// can never overflow no matter how many completions are ready at once.
+pub const drain_batch = 256
 
 // Operation types for user_data encoding
 pub const op_accept = u8(1)
@@ -51,9 +63,18 @@ pub const op_read = u8(2)
 pub const op_write = u8(3)
 
 // IO uring CQE flags
-const ioring_cqe_f_more = u32(1 << 1)
+pub const ioring_cqe_f_more = u32(1 << 1)
 // io_uring features
 pub const ioring_feat_accept_multishot = u32(1 << 19)
+
+// io_uring setup flags (include/uapi/linux/io_uring.h). SQPOLL is deliberately
+// NOT used: one kernel poll thread per worker oversubscribes the cores the
+// workers need. The modern recommended combo is SINGLE_ISSUER | DEFER_TASKRUN
+// — each worker owns and drives its own ring from a single thread — and we fall
+// back to SINGLE_ISSUER | COOP_TASKRUN, then to plain flags, on older kernels.
+pub const setup_coop_taskrun = u32(1 << 8)
+pub const setup_single_issuer = u32(1 << 12)
+pub const setup_defer_taskrun = u32(1 << 13)
 
 // User data bit masks
 const op_type_shift = 48
@@ -94,13 +115,22 @@ pub struct C.io_uring {
 
 pub struct C.io_uring_sqe {}
 
+// Relative timeout for io_uring_submit_and_wait_timeout (kernel ABI struct).
+pub struct C.__kernel_timespec {
+pub mut:
+	tv_sec  i64
+	tv_nsec i64
+}
+
 pub struct C.io_uring_cqe {
 	user_data u64
 	res       i32
 	flags     u32
 }
 
-// Simplified params with features field for capability detection
+// io_uring_params. Field access is by name against the real C struct (this is a
+// `C.` type, so the kernel header in <liburing.h> defines the true layout); we
+// only declare the fields we touch. `features` is filled by the kernel on init.
 pub struct C.io_uring_params {
 	flags          u32
 	sq_thread_cpu  u32
@@ -122,10 +152,30 @@ fn C.io_uring_sqe_set_data64(sqe &C.io_uring_sqe, data u64)
 fn C.io_uring_prep_recv(sqe &C.io_uring_sqe, fd int, buf voidptr, nbytes usize, flags int)
 fn C.io_uring_prep_send(sqe &C.io_uring_sqe, fd int, buf voidptr, nbytes usize, flags int)
 fn C.io_uring_submit(ring &C.io_uring) int
+
+// One syscall per loop iteration: flush every SQE queued since the last call
+// AND block until at least wait_nr completions are ready. With DEFER_TASKRUN
+// this is also what runs the deferred task work, so the CQ is populated before
+// we peek it.
+fn C.io_uring_submit_and_wait(ring &C.io_uring, wait_nr u32) int
+
+// Like submit_and_wait, but wakes after `ts` even with no completion (returns
+// -ETIME). Used to drive a periodic connection-timeout sweep without a busy poll.
+fn C.io_uring_submit_and_wait_timeout(ring &C.io_uring, cqe_ptr &&C.io_uring_cqe, wait_nr u32, ts &C.__kernel_timespec, sigmask voidptr) int
 fn C.io_uring_wait_cqe(ring &C.io_uring, cqe_ptr &&C.io_uring_cqe) int
 fn C.io_uring_peek_cqe(ring &C.io_uring, cqe_ptr &&C.io_uring_cqe) int
+
+// Copy up to `count` ready CQE pointers out of the ring in one shot; returns how
+// many were copied. Paired with a single cq_advance(n) — never cqe_seen per CQE.
+fn C.io_uring_peek_batch_cqe(ring &C.io_uring, cqes &&C.io_uring_cqe, count u32) u32
 fn C.io_uring_cqe_seen(ring &C.io_uring, cqe &C.io_uring_cqe)
+
+// Acknowledge a whole batch of CQEs at once (advance the CQ head by nr).
+fn C.io_uring_cq_advance(ring &C.io_uring, nr u32)
 fn C.io_uring_cqe_get_data64(cqe &C.io_uring_cqe) u64
+
+// Register the ring fd so io_uring_enter skips the per-call fget/fput.
+fn C.io_uring_register_ring_fd(ring &C.io_uring) int
 
 // htonl function converts a u_long from host to TCP/IP network byte order (which is big-endian).
 // htonl() function converts the unsigned long integer hostlong from host byte order to network byte order.
@@ -146,7 +196,11 @@ pub struct C.sigaction {
 
 // ==================== Connection Structure ====================
 
-// Represents a client connection with request/response state
+// Represents a client connection with request/response state. The buffers are
+// persistent: allocated once on acquire, reused across every request on the
+// connection, and freed on release. read_buf accumulates request bytes across
+// recvs (TCP-segment reassembly + HTTP/1.1 pipelining); response_buffer holds
+// every response produced this burst, flushed in one batched send.
 pub struct Connection {
 pub mut:
 	// Socket file descriptor
@@ -154,16 +208,21 @@ pub mut:
 	// Backpointer to owning worker (for pool management)
 	owner &Worker = unsafe { nil }
 
-	// Request state
-	buf        [default_buffer_size]u8
-	bytes_read int
+	// Request state: bytes buffered = read_buf.len; recv appends into spare cap.
+	read_buf []u8
 
-	// Response state
+	// Response state: [bytes_sent..response_buffer.len) is still pending.
 	response_buffer []u8
 	bytes_sent      int
 
-	// Processing flag
-	processing bool
+	// Monotonic-ns deadline, >0 while a partial request is mid-read (read_timeout).
+	// The timeout sweep half-closes (shutdown) past-deadline connections; the
+	// in-flight recv then completes and the normal path frees the slot.
+	read_deadline u64
+
+	// Set when the pending batch ends a malformed/oversized request: once it has
+	// been sent, release the connection instead of posting the next recv.
+	close_after_send bool
 }
 
 // ==================== Worker Structure ====================
@@ -215,25 +274,36 @@ pub fn pool_acquire(mut w Worker, fd int) &Connection {
 	unsafe {
 		c.owner = &w
 	}
-	c.bytes_read = 0
 	c.bytes_sent = 0
-	c.processing = false
-	unsafe { c.response_buffer.free() }
-	c.response_buffer = []u8{}
+	c.close_after_send = false
+	c.read_deadline = 0
+	// Fresh persistent buffers for this connection's lifetime. Uninitialised
+	// (noscan) capacity — recv fills read_buf, the handler fills response_buffer.
+	c.read_buf = []u8{len: 0, cap: read_buf_cap}
+	c.response_buffer = []u8{len: 0, cap: write_buf_cap}
 	return c
 }
 
+// pool_release closes the fd, frees the connection's buffers and returns its
+// slot to the free stack. It is IDEMPOTENT: clearing `owner` makes a second
+// call a no-op, so a connection can never be double-freed (which would hand the
+// same slot to two future accepts).
 @[manualfree]
 pub fn pool_release(mut w Worker, mut c Connection) {
 	if unsafe { c.owner == nil } {
 		return
 	}
 	C.close(c.fd)
-	unsafe { c.response_buffer.free() }
+	unsafe {
+		c.read_buf.free()
+		c.response_buffer.free()
+	}
+	c.read_buf = []u8{}
 	c.response_buffer = []u8{}
-	c.bytes_read = 0
 	c.bytes_sent = 0
-	c.processing = false
+	c.close_after_send = false
+	c.read_deadline = 0
+	c.owner = unsafe { nil }
 	unsafe {
 		idx := int(u64(&c) - u64(&w.conns[0])) / int(sizeof(Connection))
 		if w.free_top < max_conn_per_worker {
@@ -273,24 +343,35 @@ pub fn prepare_accept(ring &C.io_uring, socket_fd int, multishot bool) bool {
 	return true
 }
 
-// Prepare receive operation for a connection
+// prepare_recv posts a recv that APPENDS into read_buf's spare capacity (so a
+// request split across TCP segments, or pipelined behind another, accumulates
+// rather than overwriting). The buffer doubles when full. The data pointer is
+// captured now and the connection has exactly one op in flight at a time, so it
+// stays valid for the recv's whole duration. Returns false if the SQ is full.
+@[direct_array_access]
 pub fn prepare_recv(ring &C.io_uring, mut c Connection) bool {
 	sqe := C.io_uring_get_sqe(ring)
 	if unsafe { sqe == nil } {
 		return false
 	}
-	C.io_uring_prep_recv(sqe, c.fd, unsafe { &c.buf[0] }, default_buffer_size, 0)
+	if c.read_buf.len == c.read_buf.cap {
+		unsafe { c.read_buf.grow_cap(c.read_buf.cap) }
+	}
+	spare := c.read_buf.cap - c.read_buf.len
+	C.io_uring_prep_recv(sqe, c.fd, unsafe { &u8(c.read_buf.data) + c.read_buf.len }, usize(spare),
+		0)
 	C.io_uring_sqe_set_data64(sqe, encode_user_data(op_read, &c))
 	return true
 }
 
-// Prepare send operation for a connection
+// prepare_send posts a send for [data, data+data_len). MSG_NOSIGNAL stops a
+// write to a dead peer from raising SIGPIPE (matches the epoll backend).
 pub fn prepare_send(ring &C.io_uring, mut c Connection, data &u8, data_len usize) bool {
 	sqe := C.io_uring_get_sqe(ring)
 	if unsafe { sqe == nil } {
 		return false
 	}
-	C.io_uring_prep_send(sqe, c.fd, unsafe { data }, data_len, 0)
+	C.io_uring_prep_send(sqe, c.fd, unsafe { data }, data_len, C.MSG_NOSIGNAL)
 	C.io_uring_sqe_set_data64(sqe, encode_user_data(op_write, &c))
 	return true
 }

@@ -2,216 +2,429 @@ module http_server
 
 import io_uring
 import http1_1.response
+import http1_1.request_parser
 import socket
+import http_server.core
+import sync.stdatomic
+import os
+import time
 
 #include <errno.h>
+#include <string.h>
+#include <sched.h>
+#include <sys/socket.h>
 
 fn C.perror(s &u8)
 fn C.sleep(seconds u32) u32
 fn C.close(fd int) int
+fn C.shutdown(sockfd int, how int) int
+fn C.memmove(dest voidptr, src voidptr, n usize) voidptr
+fn C.sched_setaffinity(pid int, cpusetsize usize, mask &u64) int
 
-// --- io_uring CQE Handlers ---
-fn handle_io_uring_accept(worker &io_uring.Worker, cqe &C.io_uring_cqe) {
+// Default ceiling on a single buffered request (headers+body) when the server
+// configures no max_request_bytes. Mirrors the epoll backend (sm_max_request_bytes).
+const iou_max_request_bytes = 8 * 1024 * 1024
+// Close a peer that pipelines requests but never drains responses, before its
+// response batch grows without bound.
+const iou_max_pending_write = 8 * 1024 * 1024
+// How often the worker wakes to sweep stale connections when a read timeout is
+// configured (ns). Zero cost when no timeout is set — the loop blocks instead.
+const iou_sweep_interval_ns = i64(250 * 1_000_000)
+
+// iou_release decrements the global connection count (only when max_connections
+// accounting is active) and returns the connection to its pool. pool_release is
+// idempotent (clears owner), so this is safe to call more than once for the same
+// connection and the counter stays exact: the decrement is guarded by the same
+// owner!=nil check, so it fires exactly once per accepted connection.
+@[inline]
+fn iou_release(worker &io_uring.Worker, mut conn io_uring.Connection, active_conns &core.Counter, track bool) {
+	if track && unsafe { conn.owner != nil } {
+		stdatomic.add_i64(&active_conns.n, -1)
+	}
+	io_uring.pool_release_from_ptr(worker, mut conn)
+}
+
+// iou_arm_recv posts the next recv and maintains the read deadline: armed while a
+// partial request is buffered (read_buf.len > 0), cleared on an idle keep-alive
+// wait (read_buf empty) so idle connections are never reaped mid-keep-alive.
+// All deadline logic is gated on read_timeout_ms > 0, so the default path pays
+// nothing (no clock read, no shared state). Returns false if the SQ is full.
+@[inline]
+fn iou_arm_recv(worker &io_uring.Worker, mut conn io_uring.Connection, limits Limits) bool {
+	if limits.read_timeout_ms > 0 {
+		if conn.read_buf.len > 0 {
+			if conn.read_deadline == 0 {
+				conn.read_deadline = time.sys_mono_now() + u64(limits.read_timeout_ms) * 1_000_000
+			}
+		} else {
+			conn.read_deadline = 0
+		}
+	}
+	return io_uring.prepare_recv(&worker.ring, mut conn)
+}
+
+// maybe_pin_worker pins the calling worker thread to `cpu` when VANILLA_PIN_CPUS
+// is set. Opt-in: pinning warms caches and stops migration on dedicated
+// hardware, but can hurt on a shared box (a co-located load generator competing
+// for the same core), so it is off by default. Failure (offline CPU, cgroup
+// cpuset restriction) is non-fatal — the thread just stays schedulable anywhere.
+fn maybe_pin_worker(cpu int) {
+	if cpu < 0 || cpu >= 1024 || os.getenv('VANILLA_PIN_CPUS') == '' {
+		return
+	}
+	mut set := [16]u64{} // CPU_SETSIZE/64 words → up to 1024 CPUs
+	set[cpu / 64] |= u64(1) << u32(cpu % 64)
+	C.sched_setaffinity(0, usize(sizeof(set)), &set[0])
+}
+
+// --- io_uring CQE handlers -------------------------------------------------
+//
+// Every handler only QUEUES SQEs (via the prepare_* helpers); nothing submits.
+// The single io_uring_submit_and_wait at the top of the worker loop flushes
+// everything queued during the previous drain. Each connection has exactly one
+// op in flight at a time (recv → send → recv …), so its buffers are never
+// touched by two operations concurrently.
+
+fn handle_io_uring_accept(worker &io_uring.Worker, cqe &C.io_uring_cqe, limits Limits, active_conns &core.Counter) {
 	res := cqe.res
 	if res >= 0 {
 		fd := res
-		$if verbose ? {
-			eprintln('[DEBUG] Accept: new fd=${fd}')
-		}
-		mut nc := io_uring.pool_acquire_from_ptr(worker, fd)
-		if unsafe { nc != nil } {
-			io_uring.prepare_recv(&worker.ring, mut *nc)
-		} else {
+		track := limits.max_connections > 0
+		// Enforce max_connections at accept (mirrors the epoll backend): refuse
+		// once the global count is at the cap. The counter is touched only when a
+		// cap is set, so the default path stays shared-nothing.
+		if track && stdatomic.load_i64(&active_conns.n) >= i64(limits.max_connections) {
 			C.close(fd)
+		} else {
+			// Disable Nagle so small responses are not delayed (missing before).
+			socket.set_tcp_nodelay(fd)
+			mut nc := io_uring.pool_acquire_from_ptr(worker, fd)
+			if unsafe { nc != nil } {
+				if track {
+					stdatomic.add_i64(&active_conns.n, 1)
+				}
+				if !iou_arm_recv(worker, mut *nc, limits) {
+					iou_release(worker, mut *nc, active_conns, track)
+				}
+			} else {
+				C.close(fd) // pool exhausted
+			}
 		}
 	}
-	// Re-arm accept if needed
-	if (cqe.flags & u32(1 << 1)) == 0 || res < 0 {
-		$if verbose ? {
-			eprintln('[DEBUG] Re-arming accept (end of multishot or error)')
-		}
+	// Multishot accept delivers one CQE per connection with F_MORE set while it
+	// stays armed; re-arm only once F_MORE is clear (multishot ended) or on
+	// error. This branch also covers single-shot accept, where F_MORE is never
+	// set, so we re-arm after every accept.
+	if (cqe.flags & io_uring.ioring_cqe_f_more) == 0 {
 		io_uring.prepare_accept(&worker.ring, worker.socket_fd, worker.use_multishot)
 	}
 }
 
-fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn (req []u8, fd int, mut out []u8) !) {
+fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn (req []u8, fd int, mut out []u8) !, limits Limits, active_conns &core.Counter) {
+	track := limits.max_connections > 0
 	res := cqe.res
 	c_ptr := io_uring.decode_connection_ptr(C.io_uring_cqe_get_data64(cqe))
+	if unsafe { c_ptr == nil } {
+		return
+	}
+	mut conn := unsafe { &io_uring.Connection(c_ptr) }
 	if res <= 0 {
-		$if verbose ? {
-			eprintln('[DEBUG] Read EOF/error: ${res}')
+		// res == 0: peer closed (EOF, incl. the half-close from a timeout sweep).
+		// res < 0: recv error (e.g. -ECONNRESET, -ECANCELED).
+		iou_release(worker, mut *conn, active_conns, track)
+		return
+	}
+	unsafe {
+		conn.read_buf.len += res
+	}
+	// Answer every complete request now buffered (pipelining), appending each
+	// raw response to response_buffer and compacting the partial leftover.
+	drain_iou_requests(mut conn, handler, limits)
+	// Enforce the single-request ceiling on a leftover partial that never frames
+	// (mirrors the epoll backend's req_cap check).
+	if !conn.close_after_send {
+		req_cap := if limits.max_request_bytes > 0 {
+			limits.max_request_bytes
+		} else {
+			iou_max_request_bytes
 		}
-		if unsafe { c_ptr != nil } {
-			mut conn := unsafe { &io_uring.Connection(c_ptr) }
-			io_uring.pool_release_from_ptr(worker, mut *conn)
+		if conn.read_buf.len > req_cap {
+			conn.response_buffer << response.status_413_response
+			conn.close_after_send = true
 		}
-	} else if unsafe { c_ptr != nil } {
-		mut conn := unsafe { &io_uring.Connection(c_ptr) }
-		conn.bytes_read = res
-		$if verbose ? {
-			eprintln('[DEBUG] Read ${res} bytes from fd=${conn.fd}')
-		}
-		request_data := unsafe { conn.buf[..conn.bytes_read] }
-		// Reuse the connection's response buffer across requests: clear()
-		// keeps the capacity, the handler appends the raw response bytes.
-		conn.response_buffer.clear()
-		handler(request_data, conn.fd, mut conn.response_buffer) or {
-			response.send_bad_request_response(conn.fd)
-			io_uring.pool_release_from_ptr(worker, mut *conn)
-			// The worker loop marks this CQE seen and submits after dispatch
-			// returns — doing it here too would advance the CQ head twice and
-			// silently consume the next completion.
+	}
+	if conn.response_buffer.len > conn.bytes_sent {
+		// Sending now, not read-stalled: drop any read deadline. One batched send
+		// for every response produced this burst.
+		conn.read_deadline = 0
+		io_uring.prepare_send(&worker.ring, mut *conn, unsafe {
+			&u8(conn.response_buffer.data) + conn.bytes_sent
+		}, usize(conn.response_buffer.len - conn.bytes_sent))
+	} else {
+		// Nothing complete yet — read more into the same buffer (arming/refreshing
+		// the read deadline since a partial request is now buffered).
+		iou_arm_recv(worker, mut *conn, limits)
+	}
+}
+
+// drain_iou_requests parses and answers every complete request in read_buf,
+// appending responses to response_buffer, then compacts the leftover partial
+// bytes to the front. On a framing error, an oversized payload, or a handler
+// error it appends the canned response and sets close_after_send so the worker
+// releases the connection once that final batch has been flushed.
+@[direct_array_access; manualfree]
+fn drain_iou_requests(mut conn io_uring.Connection, handler fn (req []u8, fd int, mut out []u8) !, limits Limits) {
+	mut pos := 0
+	for pos < conn.read_buf.len {
+		total := request_parser.frame_request_length_lim(conn.read_buf[pos..],
+			limits.max_header_bytes, limits.max_body_bytes) or {
+			match err.code() {
+				413 { conn.response_buffer << response.status_413_response }
+				431 { conn.response_buffer << response.status_431_response }
+				else { conn.response_buffer << response.tiny_bad_request_response }
+			}
+
+			conn.close_after_send = true
 			return
 		}
-		conn.bytes_sent = 0
-		$if verbose ? {
-			eprintln('[DEBUG] Preparing write of ${conn.response_buffer.len} bytes')
+		if total < 0 {
+			break // incomplete — wait for more bytes
 		}
-		io_uring.prepare_send(&worker.ring, mut *conn, conn.response_buffer.data,
-			usize(conn.response_buffer.len))
+		req := conn.read_buf[pos..pos + total] // zero-copy view into read_buf
+		handler(req, conn.fd, mut conn.response_buffer) or {
+			conn.response_buffer << response.tiny_bad_request_response
+			conn.close_after_send = true
+			return
+		}
+		pos += total
+		// Peer pipelines requests but never reads responses: bail before the
+		// pending batch grows without bound.
+		if conn.response_buffer.len - conn.bytes_sent > iou_max_pending_write {
+			conn.close_after_send = true
+			return
+		}
 	}
-}
-
-fn handle_io_uring_write(worker &io_uring.Worker, cqe &C.io_uring_cqe) {
-	res := cqe.res
-	c_ptr := io_uring.decode_connection_ptr(C.io_uring_cqe_get_data64(cqe))
-	if res >= 0 {
-		$if verbose ? {
-			eprintln('[DEBUG] Wrote ${res} bytes')
-		}
-		if unsafe { c_ptr != nil } {
-			mut conn := unsafe { &io_uring.Connection(c_ptr) }
-			conn.bytes_sent += res
-			if conn.bytes_sent < conn.response_buffer.len {
-				remaining := conn.response_buffer.len - conn.bytes_sent
-				io_uring.prepare_send(&worker.ring, mut *conn, unsafe {
-					&u8(u64(conn.response_buffer.data) + u64(conn.bytes_sent))
-				}, usize(remaining))
-			} else {
-				$if verbose ? {
-					eprintln('[DEBUG] Write complete, keep-alive next read')
-				}
-				conn.bytes_read = 0
-				conn.response_buffer.clear() // keep capacity for the next response
-				io_uring.prepare_recv(&worker.ring, mut *conn)
+	// Compact the leftover partial request to the buffer start (keeps capacity).
+	if pos > 0 {
+		leftover := conn.read_buf.len - pos
+		if leftover > 0 {
+			unsafe {
+				C.memmove(conn.read_buf.data, &u8(conn.read_buf.data) + pos, usize(leftover))
 			}
 		}
-	} else {
-		$if verbose ? {
-			eprintln('[DEBUG] Write error: ${res}')
-		}
-		if unsafe { c_ptr != nil } {
-			mut conn := unsafe { &io_uring.Connection(c_ptr) }
-			io_uring.pool_release_from_ptr(worker, mut *conn)
+		unsafe {
+			conn.read_buf.len = leftover
 		}
 	}
 }
 
-fn dispatch_io_uring_cqe(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn (req []u8, fd int, mut out []u8) !) {
-	data := C.io_uring_cqe_get_data64(cqe)
-	op := io_uring.decode_op_type(data)
+fn handle_io_uring_write(worker &io_uring.Worker, cqe &C.io_uring_cqe, limits Limits, active_conns &core.Counter) {
+	track := limits.max_connections > 0
+	res := cqe.res
+	c_ptr := io_uring.decode_connection_ptr(C.io_uring_cqe_get_data64(cqe))
+	if unsafe { c_ptr == nil } {
+		return
+	}
+	mut conn := unsafe { &io_uring.Connection(c_ptr) }
+	if res <= 0 {
+		// 0 on a non-empty send (or <0) means the peer is gone — drop it.
+		iou_release(worker, mut *conn, active_conns, track)
+		return
+	}
+	conn.bytes_sent += res
+	if conn.bytes_sent < conn.response_buffer.len {
+		// Partial send — resume from the offset.
+		io_uring.prepare_send(&worker.ring, mut *conn, unsafe {
+			&u8(conn.response_buffer.data) + conn.bytes_sent
+		}, usize(conn.response_buffer.len - conn.bytes_sent))
+		return
+	}
+	// Whole batch sent.
+	if conn.close_after_send {
+		iou_release(worker, mut *conn, active_conns, track)
+		return
+	}
+	conn.response_buffer.clear() // len = 0, capacity kept for the next batch
+	conn.bytes_sent = 0
+	// Keep-alive: read the next request. read_buf still holds any pipelined
+	// leftover; iou_arm_recv re-arms the read deadline iff that leftover is a
+	// partial request, and leaves an idle keep-alive wait deadline-free.
+	iou_arm_recv(worker, mut *conn, limits)
+}
+
+fn dispatch_io_uring_cqe(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn (req []u8, fd int, mut out []u8) !, limits Limits, active_conns &core.Counter) {
+	op := io_uring.decode_op_type(C.io_uring_cqe_get_data64(cqe))
 	match op {
-		io_uring.op_accept { handle_io_uring_accept(worker, cqe) }
-		io_uring.op_read { handle_io_uring_read(worker, cqe, handler) }
-		io_uring.op_write { handle_io_uring_write(worker, cqe) }
+		io_uring.op_accept { handle_io_uring_accept(worker, cqe, limits, active_conns) }
+		io_uring.op_read { handle_io_uring_read(worker, cqe, handler, limits, active_conns) }
+		io_uring.op_write { handle_io_uring_write(worker, cqe, limits, active_conns) }
 		else {}
 	}
 }
 
-fn io_uring_worker_loop(worker &io_uring.Worker, handler fn (req []u8, fd int, mut out []u8) !) {
-	io_uring.prepare_accept(&worker.ring, worker.socket_fd, worker.use_multishot)
-	C.io_uring_submit(&worker.ring)
-	$if verbose ? {
-		eprintln('[DEBUG] Worker started, listening on fd=${worker.socket_fd}')
-	}
-
-	for {
-		$if verbose ? {
-			eprintln('[DEBUG] Waiting for CQE...')
+// iou_sweep_timeouts half-closes every connection whose read deadline has
+// passed. It calls shutdown(2) (NOT close): the connection still has its single
+// recv in flight, so closing here would free the pool slot while a completion is
+// still pending — and a fresh accept could reuse that slot under the stale CQE.
+// shutdown makes the in-flight recv complete with EOF, and handle_io_uring_read
+// then frees the slot the normal way, after its CQE is drained. Scanned only
+// when a read timeout is configured.
+@[direct_array_access]
+fn iou_sweep_timeouts(worker &io_uring.Worker) {
+	mut w := unsafe { &io_uring.Worker(worker) }
+	now := time.sys_mono_now()
+	for i in 0 .. w.conns.len {
+		mut c := unsafe { &w.conns[i] }
+		if unsafe { c.owner == nil } {
+			continue // free slot
 		}
-		mut cqe := &C.io_uring_cqe(unsafe { nil })
-		ret := C.io_uring_wait_cqe(&worker.ring, &cqe)
-		if ret == -C.EINTR {
-			continue
-		}
-		if ret < 0 {
-			$if verbose ? {
-				eprintln('[DEBUG] wait_cqe error: ${ret}')
-			}
-			break
-		}
-		dispatch_io_uring_cqe(worker, cqe, handler)
-		C.io_uring_cqe_seen(&worker.ring, cqe)
-		submitted := C.io_uring_submit(&worker.ring)
-		$if verbose ? {
-			eprintln('[DEBUG] Submitted ${submitted} SQE(s)\n')
-		}
-	}
-
-	mut pending := 0
-	for {
-		mut cqe := &C.io_uring_cqe(unsafe { nil })
-		for C.io_uring_peek_cqe(&worker.ring, &cqe) == 0 {
-			dispatch_io_uring_cqe(worker, cqe, handler)
-			pending++
-			C.io_uring_cqe_seen(&worker.ring, cqe)
-		}
-		if pending > 0 {
-			submitted := C.io_uring_submit(&worker.ring)
-			$if verbose ? {
-				eprintln('[DEBUG] Submitted ${submitted} SQE(s)')
-			}
-			pending = 0
+		if c.read_deadline > 0 && now > c.read_deadline {
+			C.shutdown(c.fd, C.SHUT_RDWR)
+			c.read_deadline = 0 // don't shut it down again before the CQE lands
 		}
 	}
 }
 
-pub fn run_io_uring_backend(request_handler fn (req []u8, fd int, mut out []u8) !, port int, mut threads []thread) {
+// io_uring_worker_main is the spawned worker entry point. The ENTIRE ring
+// lifecycle — create, register, submit and reap — happens on this one thread.
+// SINGLE_ISSUER / DEFER_TASKRUN bind the ring to its issuing task, so setting it
+// up on the main thread and driving it here would make every submit_and_wait
+// fail; doing it all here keeps the ring single-owner (and matches how every
+// thread-per-core io_uring server sets up).
+fn io_uring_worker_main(listener int, cpu_id int, handler fn (req []u8, fd int, mut out []u8) !, limits Limits, active_conns &core.Counter) {
+	maybe_pin_worker(cpu_id)
+	mut worker := &io_uring.Worker{}
+	worker.cpu_id = cpu_id
+	worker.socket_fd = listener
+	// Multishot accept (kernel 5.19+). The re-arm logic in the accept handler
+	// also handles the single-shot case, so this is safe either way.
+	worker.use_multishot = true
+	io_uring.pool_init(mut worker)
+
+	if !iou_init_ring(&worker.ring) {
+		eprintln('Failed to initialize io_uring for worker ${cpu_id}')
+		exit(1)
+	}
+	// Skip the per-enter fget/fput on the ring fd.
+	C.io_uring_register_ring_fd(&worker.ring)
+
+	io_uring_worker_loop(worker, handler, limits, active_conns)
+}
+
+@[direct_array_access]
+fn io_uring_worker_loop(worker &io_uring.Worker, handler fn (req []u8, fd int, mut out []u8) !, limits Limits, active_conns &core.Counter) {
+	io_uring.prepare_accept(&worker.ring, worker.socket_fd, worker.use_multishot)
+
+	// Only arm the periodic timeout wake when a read timeout is configured;
+	// otherwise the loop blocks indefinitely (zero cost on the default path).
+	sweep_on := limits.read_timeout_ms > 0
+	mut ts := C.__kernel_timespec{
+		tv_sec:  0
+		tv_nsec: iou_sweep_interval_ns
+	}
+
+	mut cqes := unsafe { [io_uring.drain_batch]&C.io_uring_cqe{} }
+	for {
+		// ONE syscall per loop iteration: flush every SQE queued during the last
+		// drain and block until at least one completion is ready (or, when a read
+		// timeout is set, until the sweep interval elapses → -ETIME).
+		mut ret := 0
+		if sweep_on {
+			mut first := &C.io_uring_cqe(unsafe { nil })
+			ret = C.io_uring_submit_and_wait_timeout(&worker.ring, &first, 1, &ts, unsafe { nil })
+		} else {
+			ret = C.io_uring_submit_and_wait(&worker.ring, 1)
+		}
+		if ret < 0 {
+			if ret == -C.EINTR || ret == -C.ETIME {
+				// EINTR: retry. ETIME: no completion this interval — fall through
+				// to the (empty) drain and then the sweep.
+			} else {
+				C.perror(c'io_uring_submit_and_wait')
+				break
+			}
+		}
+		// Batch-drain the CQ: copy out ready CQEs, dispatch (which only queues
+		// new SQEs), then acknowledge the whole batch with one cq_advance.
+		for {
+			n := C.io_uring_peek_batch_cqe(&worker.ring, &cqes[0], u32(io_uring.drain_batch))
+			if n == 0 {
+				break
+			}
+			for i in 0 .. int(n) {
+				dispatch_io_uring_cqe(worker, cqes[i], handler, limits, active_conns)
+			}
+			C.io_uring_cq_advance(&worker.ring, n)
+			if int(n) < io_uring.drain_batch {
+				break
+			}
+			// A full batch may mean more are ready: flush the SQEs queued so far
+			// to free SQ slots before draining the rest (keeps the SQ from ever
+			// overflowing, regardless of how many completions piled up).
+			C.io_uring_submit(&worker.ring)
+		}
+		if sweep_on {
+			iou_sweep_timeouts(worker)
+		}
+	}
+}
+
+// iou_init_ring sets the ring up with the best available flag combo, trying in
+// order: SINGLE_ISSUER|DEFER_TASKRUN (kernel 6.0+, the recommended setup),
+// SINGLE_ISSUER|COOP_TASKRUN (5.19+), then plain flags. SQPOLL is intentionally
+// never used. Returns true on success.
+fn iou_init_ring(ring &C.io_uring) bool {
+	entries := u32(io_uring.default_ring_entries)
+	mut p := C.io_uring_params{}
+	p.flags = io_uring.setup_single_issuer | io_uring.setup_defer_taskrun
+	if C.io_uring_queue_init_params(entries, ring, &p) == 0 {
+		return true
+	}
+	p = C.io_uring_params{}
+	p.flags = io_uring.setup_single_issuer | io_uring.setup_coop_taskrun
+	if C.io_uring_queue_init_params(entries, ring, &p) == 0 {
+		return true
+	}
+	p = C.io_uring_params{}
+	return C.io_uring_queue_init_params(entries, ring, &p) == 0
+}
+
+// run_io_uring_backend spawns one shared-nothing worker per core, each owning
+// its own ring + SO_REUSEPORT listener + connection pool.
+//
+// Limits parity with the epoll backend: max_request_bytes/header/body (413/431),
+// max_connections (refused at accept), and read_timeout_ms (slowloris: a partial
+// request that stalls is half-closed by the per-worker sweep) are all enforced.
+//
+// Known io_uring-only gaps (documented rather than worked around, all low impact
+// and bounded by the limits above):
+//   • write_timeout_ms is not enforced — a peer that stops reading mid-response
+//     is bounded instead by iou_max_pending_write (8 MiB) and TCP's own timeout;
+//   • Server.shutdown() closes only worker 0's listener, so the other workers'
+//     SO_REUSEPORT listeners keep accepting until process exit. Graceful drain on
+//     io_uring would need all listener fds tracked on the Server (a lifecycle
+//     change); use the epoll backend when graceful shutdown is required.
+pub fn run_io_uring_backend(socket_fd int, request_handler fn (req []u8, fd int, mut out []u8) !, port int, limits Limits, active_conns &core.Counter, mut threads []thread) {
 	num_workers := max_thread_pool_size
 
 	for i in 0 .. num_workers {
-		mut worker := &io_uring.Worker{}
-		worker.cpu_id = i
-		worker.socket_fd = -1
-		io_uring.pool_init(mut worker)
-
-		// Try to initialize io_uring ring with SQPOLL, fall back if it fails
-		mut params := C.io_uring_params{}
-		params.flags |= 1 << 3 // IORING_SETUP_SQPOLL
-		params.sq_thread_cpu = i // Pin SQ thread to worker CPU
-		mut sqpoll_failed := false
-		if C.io_uring_queue_init_params(u32(io_uring.default_ring_entries), &worker.ring, &params) < 0 {
-			eprintln('[io_uring] worker ${i}: SQPOLL failed, falling back to normal io_uring')
-			// Try again without SQPOLL
-			params = C.io_uring_params{}
-			if C.io_uring_queue_init_params(u32(io_uring.default_ring_entries), &worker.ring,
-				&params) < 0 {
-				eprintln('Failed to initialize io_uring for worker ${i}')
-				exit(1)
-			}
-			sqpoll_failed = true
-		}
-		// Use single-shot accept for SO_REUSEPORT
-		//    worker.use_multishot = false
-		if sqpoll_failed {
-			eprintln('[io_uring] worker ${i}: single-shot accept enabled (no SQPOLL)')
-		} else {
-			eprintln('[io_uring] worker ${i}: single-shot accept + SQPOLL enabled')
-		}
-
-		// Create per-worker listener
-		worker.socket_fd = socket.create_server_socket(port)
-		if worker.socket_fd < 0 {
+		// Per-worker SO_REUSEPORT listener. Worker 0 reuses the listener that
+		// new_server already created, so there is no extra, never-accepted
+		// listener silently stealing ~1/N of incoming connections; the rest
+		// create their own. The kernel load-balances accepts across all of them.
+		// (Listeners aren't ring-bound, so creating them here on the main thread
+		// is fine — only the ring itself must stay on its worker thread.)
+		listener := if i == 0 { socket_fd } else { socket.create_server_socket(port) }
+		if listener < 0 {
 			eprintln('Failed to create listener for worker ${i}')
 			exit(1)
 		}
-		// Spawn worker thread
-		threads[i] = spawn io_uring_worker_loop(worker, request_handler)
+		threads[i] = spawn io_uring_worker_main(listener, i, request_handler, limits, active_conns)
 	}
 
 	println('listening on http://localhost:${port}/ (io_uring)')
 
-	// Keep main thread alive
+	// Keep main thread alive.
 	for {
 		C.sleep(1)
 	}
