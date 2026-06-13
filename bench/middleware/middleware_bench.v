@@ -65,7 +65,7 @@ fn inject_headers_string(resp []u8, hdrs string) []u8 {
 
 // ── chain composition (mirrors examples/middleware) ───────────────────────────
 
-type Handler = fn ([]u8, int) ![]u8
+type Handler = fn (req []u8, fd int, mut out []u8) !
 
 type Middleware = fn (Handler) Handler
 
@@ -78,8 +78,8 @@ fn chain(app Handler, mw ...Middleware) Handler {
 }
 
 fn passthrough(next Handler) Handler {
-	return fn [next] (req []u8, fd int) ![]u8 {
-		return next(req, fd)
+	return fn [next] (req []u8, fd int, mut out []u8) ! {
+		next(req, fd, mut out)!
 	}
 }
 
@@ -147,20 +147,25 @@ fn main() {
 	bm.measure('inject_headers_string (3 allocs, naive)')
 
 	// 3) direct handler call — the baseline for the chain overhead.
-	base := fn (req []u8, fd int) ![]u8 {
-		return base_resp
+	base := fn (req []u8, fd int, mut out []u8) ! {
+		out << base_resp
 	}
+	// One persistent buffer, cleared per call — mirrors the server's reused
+	// per-connection write buffer, so the loop measures call overhead only.
+	mut out_buf := []u8{cap: base_resp.len}
 	for _ in 0 .. iterations {
-		out := base([]u8{}, -1) or { base_resp }
-		acc += out.len
+		out_buf.clear()
+		base([]u8{}, -1, mut out_buf) or {}
+		acc += out_buf.len
 	}
 	bm.measure('direct handler call   (no middleware)')
 
 	// 4) 3-deep chain — same call through three composed wrappers.
 	wrapped := chain(base, passthrough, passthrough, passthrough)
 	for _ in 0 .. iterations {
-		out := wrapped([]u8{}, -1) or { base_resp }
-		acc += out.len
+		out_buf.clear()
+		wrapped([]u8{}, -1, mut out_buf) or {}
+		acc += out_buf.len
 	}
 	bm.measure('3-deep chain call     (3 middlewares)')
 

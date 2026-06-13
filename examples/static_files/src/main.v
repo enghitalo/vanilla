@@ -83,12 +83,13 @@ fn parse_range(range_header string, size i64) ?(i64, i64) {
 	return start, end
 }
 
-fn handle(req_buffer []u8, _ int) ![]u8 {
+fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 	req := request_parser.decode_http_request(req_buffer)!
 	method := req.method.to_string(req.buffer)
 	mut path := req.path.to_string(req.buffer)
 	if method != 'GET' && method != 'HEAD' {
-		return 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\n\r\n'.bytes()
+		out << 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\n\r\n'.bytes()
+		return
 	}
 	// Strip query string for file lookup.
 	if qi := path.index('?') {
@@ -98,19 +99,27 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 		path = '/index.html'
 	}
 
-	fs_path := safe_path(path) or { return not_found() }
+	fs_path := safe_path(path) or {
+		out << not_found()
+		return
+	}
 	if !os.is_file(fs_path) {
-		return not_found()
+		out << not_found()
+		return
 	}
 
-	content := os.read_bytes(fs_path) or { return not_found() }
+	content := os.read_bytes(fs_path) or {
+		out << not_found()
+		return
+	}
 	ctype := mime_type(fs_path)
 	etag := md5.sum(content).hex()
 
 	// Conditional GET: if the client's cached ETag matches, save the bytes.
 	if inm := req.get_header_value_slice('If-None-Match') {
 		if inm.to_string(req.buffer) == '"${etag}"' {
-			return 'HTTP/1.1 304 Not Modified\r\nETag: "${etag}"\r\n\r\n'.bytes()
+			out << 'HTTP/1.1 304 Not Modified\r\nETag: "${etag}"\r\n\r\n'.bytes()
+			return
 		}
 	}
 
@@ -128,7 +137,8 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 			if method == 'GET' {
 				sb.write(slice) or {}
 			}
-			return sb
+			out << sb
+			return
 		}
 	}
 
@@ -143,7 +153,7 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 	if method == 'GET' {
 		sb.write(content) or {}
 	}
-	return sb
+	out << sb
 }
 
 fn main() {

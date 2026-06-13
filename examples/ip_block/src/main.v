@@ -4,8 +4,8 @@ module main
 //
 // Rejects requests from denied client IPs with 403 Forbidden, using the socket
 // peer address exposed by Phase 2 (`socket.peer_addr(fd)`). The handler keeps
-// the plain `fn ([]u8, int)` contract — it just reads the fd's peer when it
-// needs to decide.
+// the plain `fn ([]u8, int, mut []u8)` contract — it just reads the fd's peer
+// when it needs to decide.
 //
 // SECURITY / DESIGN notes:
 //   - Blocks by the SOCKET peer. Behind a proxy/CDN the peer IS the proxy, so
@@ -53,13 +53,14 @@ fn (mut b Blocklist) is_blocked(ip string) bool {
 const forbidden_response = 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 const ok_response = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\nConnection: keep-alive\r\n\r\nallowed'.bytes()
 
-fn handle(req_buffer []u8, fd int, mut blocklist Blocklist) ![]u8 {
+fn handle(req_buffer []u8, fd int, mut out []u8, mut blocklist Blocklist) ! {
 	ip := socket.peer_addr(fd)
 	if blocklist.is_blocked(ip) {
 		eprintln('[ip-block] denied ${ip}')
-		return forbidden_response
+		out << forbidden_response
+		return
 	}
-	return ok_response
+	out << ok_response
 }
 
 fn main() {
@@ -79,8 +80,8 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: fn [mut blocklist] (req_buffer []u8, fd int) ![]u8 {
-			return handle(req_buffer, fd, mut blocklist)
+		request_handler: fn [mut blocklist] (req_buffer []u8, fd int, mut out []u8) ! {
+			handle(req_buffer, fd, mut out, mut blocklist)!
 		}
 	})!
 	println('IP-block demo on http://localhost:3000/  (denied IPs get 403)')

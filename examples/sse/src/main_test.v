@@ -6,7 +6,9 @@ module main
 
 fn test_subscribe_returns_event_stream_and_registers_fd() ! {
 	mut clients := Clients{}
-	out := handle('GET /events HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), 7, mut clients)!.bytestr()
+	mut resp := []u8{}
+	handle('GET /events HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), 7, mut resp, mut clients)!
+	out := resp.bytestr()
 	assert out.contains('Content-Type: text/event-stream')
 	assert !out.contains('Content-Length:') // a stream stays open, no fixed length
 	assert clients.snapshot().len == 1 // fd registered; cost is one map entry
@@ -14,14 +16,17 @@ fn test_subscribe_returns_event_stream_and_registers_fd() ! {
 
 fn test_broadcast_endpoint_accepts() ! {
 	mut clients := Clients{} // empty set: no real fds to write to
-	out := handle('POST /broadcast HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello'.bytes(), 7, mut
-		clients)!.bytestr()
-	assert out.contains('200 OK')
+	mut resp := []u8{}
+	handle('POST /broadcast HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello'.bytes(), 7, mut resp, mut
+		clients)!
+	assert resp.bytestr().contains('200 OK')
 }
 
 fn test_unknown_route_is_bad_request() ! {
 	mut clients := Clients{}
-	assert handle('GET /nope HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), 7, mut clients)!.bytestr().contains('400')
+	mut resp := []u8{}
+	handle('GET /nope HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), 7, mut resp, mut clients)!
+	assert resp.bytestr().contains('400')
 }
 
 /*

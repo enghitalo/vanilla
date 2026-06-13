@@ -24,7 +24,7 @@ const buffer_size = 8192
 struct WorkerContext {
 pub mut:
 	iocp_handle voidptr
-	handler     fn ([]u8, int) ![]u8 @[required]
+	handler     fn (req []u8, fd int, mut out []u8) ! @[required]
 	running     bool
 	thread_id   u32
 }
@@ -101,7 +101,7 @@ fn worker_thread(mut ctx WorkerContext) {
 	println('[iocp-worker] Worker thread exiting')
 }
 
-fn handle_accept_completion(io_data &iocp.IOData, handler fn ([]u8, int) ![]u8,
+fn handle_accept_completion(io_data &iocp.IOData, handler fn (req []u8, fd int, mut out []u8) !,
 	mut ctx WorkerContext) {
 	socket_fd := io_data.socket_fd
 
@@ -124,7 +124,8 @@ fn handle_accept_completion(io_data &iocp.IOData, handler fn ([]u8, int) ![]u8,
 	// (We need to get the listening socket from somewhere - stored in context)
 }
 
-fn handle_read_completion(io_data &iocp.IOData, handler fn ([]u8, int) ![]u8,
+@[manualfree]
+fn handle_read_completion(io_data &iocp.IOData, handler fn (req []u8, fd int, mut out []u8) !,
 	mut ctx WorkerContext) {
 	socket_fd := io_data.socket_fd
 	bytes_read := io_data.bytes_transferred
@@ -136,9 +137,11 @@ fn handle_read_completion(io_data &iocp.IOData, handler fn ([]u8, int) ![]u8,
 		return
 	}
 
-	// Process the request
+	// Process the request — server-owned response buffer, handler appends raw bytes.
 	request_data := io_data.buffer[..bytes_read]
-	response_data := handler(request_data, socket_fd) or {
+	mut response_data := []u8{len: 0, cap: 4096}
+	handler(request_data, socket_fd, mut response_data) or {
+		unsafe { response_data.free() }
 		response.send_bad_request_response(socket_fd)
 		socket.close_socket(socket_fd)
 		iocp.free_io_data(io_data)
@@ -151,6 +154,7 @@ fn handle_read_completion(io_data &iocp.IOData, handler fn ([]u8, int) ![]u8,
 		C.memcpy(&write_io_data.buffer[0], response_data.data, response_data.len)
 	}
 	write_io_data.wsabuf.len = u32(response_data.len)
+	unsafe { response_data.free() } // copied into write_io_data above
 
 	// Post write operation
 	flags := u32(0)
@@ -277,7 +281,7 @@ fn accept_thread(listen_socket int, iocp_handle voidptr) {
 	println('[iocp-accept] Accept thread exiting')
 }
 
-pub fn run_iocp_backend(socket_fd int, handler fn ([]u8, int) ![]u8, port int, mut threads []thread) {
+pub fn run_iocp_backend(socket_fd int, handler fn (req []u8, fd int, mut out []u8) !, port int, mut threads []thread) {
 	println('[iocp] Starting IOCP backend on port ${port}')
 
 	// Create IOCP handle

@@ -196,6 +196,7 @@ fn pool_has_capacity(w &Worker) bool {
 	return w.free_top > 0
 }
 
+@[manualfree]
 pub fn pool_acquire(mut w Worker, fd int) &Connection {
 	if w.free_top == 0 {
 		return unsafe { nil }
@@ -215,6 +216,7 @@ pub fn pool_acquire(mut w Worker, fd int) &Connection {
 	return c
 }
 
+@[manualfree]
 pub fn pool_release(mut w Worker, mut c Connection) {
 	if unsafe { c.owner == nil } {
 		return

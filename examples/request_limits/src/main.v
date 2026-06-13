@@ -30,8 +30,8 @@ import http_server
 // handler ever runs — over-large bodies are rejected (413) from Content-Length
 // WITHOUT buffering them, and oversized header blocks get 431. That's the whole
 // point: limits belong in the read loop, not bolted onto each handler.
-fn handle(req_buffer []u8, _ int) ![]u8 {
-	return 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+fn handle(req_buffer []u8, _ int, mut out []u8) ! {
+	out << 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 }
 
 fn main() {

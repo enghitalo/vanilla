@@ -11,8 +11,16 @@ fn test_simple_without_init_the_server() {
 	request2_response :=
 		'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: keep-alive\r\n\r\n123'.bytes()
 
-	assert handle_request(request1, -1)! == http_ok_response
-	assert handle_request(request2, -1)! == request2_response
-	assert handle_request(request3, -1)! == http_created_response
-	assert handle_request(request4, -1)! == response.tiny_bad_request_response
+	assert serve(request1)! == http_ok_response
+	assert serve(request2)! == request2_response
+	assert serve(request3)! == http_created_response
+	assert serve(request4)! == response.tiny_bad_request_response
+}
+
+// serve adapts the raw-handler contract (writes into a caller-owned buffer) to
+// the return-a-buffer shape the assertions expect.
+fn serve(req []u8) ![]u8 {
+	mut out := []u8{}
+	handle_request(req, -1, mut out)!
+	return out
 }

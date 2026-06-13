@@ -1,10 +1,11 @@
 module http_server
 
-fn dummy_handler(req []u8, _ int) ![]u8 {
+fn dummy_handler(req []u8, _ int, mut out []u8) ! {
 	if req.bytestr().contains('/notfound') {
-		return 'HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found'.bytes()
+		out << 'HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found'.bytes()
+		return
 	}
-	return 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK'.bytes()
+	out << 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK'.bytes()
 }
 
 fn test_server_end_to_end() ! {

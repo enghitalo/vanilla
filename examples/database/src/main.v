@@ -5,7 +5,7 @@ import http_server.http1_1.response
 import http_server.http1_1.request_parser
 import db.pg
 
-fn handle_request(req_buffer []u8, client_conn_fd int, mut pool ConnectionPool) ![]u8 {
+fn handle_request(req_buffer []u8, client_conn_fd int, mut out []u8, mut pool ConnectionPool) ! {
 	req := request_parser.decode_http_request(req_buffer)!
 
 	method := unsafe { tos(&req.buffer[req.method.start], req.method.len) }
@@ -13,20 +13,24 @@ fn handle_request(req_buffer []u8, client_conn_fd int, mut pool ConnectionPool) 
 
 	if method == 'GET' {
 		if path == '/' {
-			return home_controller([])
+			out << home_controller([])!
+			return
 		} else if path.starts_with('/user/') {
 			id := path[6..]
-			return get_user_controller([id], mut pool)
+			out << get_user_controller([id], mut pool)!
+			return
 		} else if path == '/user' {
-			return get_users_controller([], mut pool)
+			out << get_users_controller([], mut pool)!
+			return
 		}
 	} else if method == 'POST' {
 		if path == '/user' {
-			return create_user_controller([], mut pool)
+			out << create_user_controller([], mut pool)!
+			return
 		}
 	}
 
-	return response.tiny_bad_request_response
+	out << response.tiny_bad_request_response
 }
 
 fn main() {
@@ -49,8 +53,8 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: unsafe { http_server.IOBackend(0) }
-		request_handler: fn [mut pool] (req_buffer []u8, client_conn_fd int) ![]u8 {
-			return handle_request(req_buffer, client_conn_fd, mut pool)
+		request_handler: fn [mut pool] (req_buffer []u8, client_conn_fd int, mut out []u8) ! {
+			handle_request(req_buffer, client_conn_fd, mut out, mut pool)!
 		}
 	})!
 

@@ -24,18 +24,26 @@ fn test_unsafe_methods_gated() {
 
 fn test_post_without_token_forbidden() ! {
 	req := 'POST /save HTTP/1.1\r\nContent-Length: 0\r\n\r\n'.bytes()
-	assert handle(req, -1)!.bytestr().contains('403 Forbidden')
+	assert serve(req)!.bytestr().contains('403 Forbidden')
+}
+
+// serve adapts the raw-handler contract (writes into a caller-owned buffer) to
+// the return-a-buffer shape the assertions expect.
+fn serve(req []u8) ![]u8 {
+	mut out := []u8{}
+	handle(req, -1, mut out)!
+	return out
 }
 
 fn test_post_with_matching_token_ok() ! {
 	tok := 'deadbeefcafe'
 	req :=
 		'POST /save HTTP/1.1\r\nCookie: csrf=${tok}\r\nX-CSRF-Token: ${tok}\r\nContent-Length: 0\r\n\r\n'.bytes()
-	assert handle(req, -1)!.bytestr().contains('200 OK')
+	assert serve(req)!.bytestr().contains('200 OK')
 }
 
 fn test_post_with_mismatched_token_forbidden() ! {
 	req :=
 		'POST /save HTTP/1.1\r\nCookie: csrf=aaaa\r\nX-CSRF-Token: bbbb\r\nContent-Length: 0\r\n\r\n'.bytes()
-	assert handle(req, -1)!.bytestr().contains('403 Forbidden')
+	assert serve(req)!.bytestr().contains('403 Forbidden')
 }

@@ -17,7 +17,9 @@ fn test_block_unblock_roundtrip() {
 fn test_allowed_ip_gets_200() ! {
 	mut b := Blocklist{}
 	// fd -1 => socket.peer_addr returns '' (not in the list) => allowed.
-	out := handle('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), -1, mut b)!.bytestr()
+	mut resp := []u8{}
+	handle('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), -1, mut resp, mut b)!
+	out := resp.bytestr()
 	assert out.contains('200 OK')
 	assert out.contains('allowed')
 }
@@ -26,6 +28,7 @@ fn test_blocked_ip_gets_403() ! {
 	mut b := Blocklist{}
 	// peer_addr('' for fd -1) — block that to drive the deny path through handle.
 	b.block('')
-	out := handle('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), -1, mut b)!.bytestr()
-	assert out.contains('403 Forbidden')
+	mut resp := []u8{}
+	handle('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), -1, mut resp, mut b)!
+	assert resp.bytestr().contains('403 Forbidden')
 }

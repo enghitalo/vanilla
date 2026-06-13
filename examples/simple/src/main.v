@@ -4,7 +4,7 @@ import http_server
 import http_server.http1_1.response
 import http_server.http1_1.request_parser
 
-fn handle_request(req_buffer []u8, client_conn_fd int) ![]u8 {
+fn handle_request(req_buffer []u8, client_conn_fd int, mut out []u8) ! {
 	req := request_parser.decode_http_request(req_buffer)!
 
 	method := unsafe { tos(&req.buffer[req.method.start], req.method.len) }
@@ -12,18 +12,21 @@ fn handle_request(req_buffer []u8, client_conn_fd int) ![]u8 {
 
 	if method == 'GET' {
 		if path == '/' {
-			return home_controller([])
+			out << home_controller([])!
+			return
 		} else if path.starts_with('/user/') {
 			id := path[6..]
-			return get_user_controller([id])
+			out << get_user_controller([id])!
+			return
 		}
 	} else if method == 'POST' {
 		if path == '/user' {
-			return create_user_controller([])
+			out << create_user_controller([])!
+			return
 		}
 	}
 
-	return response.tiny_bad_request_response
+	out << response.tiny_bad_request_response
 }
 
 fn main() {

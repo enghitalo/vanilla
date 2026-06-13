@@ -96,8 +96,8 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: fn [cache] (req_buffer []u8, fd int) ![]u8 {
-			return handle(req_buffer, fd, cache)
+		request_handler: fn [cache] (req_buffer []u8, fd int, mut out []u8) ! {
+			out << handle(req_buffer, fd, cache)!
 		}
 	})!
 	println('Date-header demo on http://localhost:3000/  (cached, refreshed 1x/s)')

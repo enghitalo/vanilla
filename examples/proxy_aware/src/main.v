@@ -73,7 +73,7 @@ fn real_client_ip(req request_parser.HttpRequest, fd int) string {
 	return hops.first()
 }
 
-fn handle(req_buffer []u8, fd int) ![]u8 {
+fn handle(req_buffer []u8, fd int, mut out []u8) ! {
 	req := request_parser.decode_http_request(req_buffer)!
 	client := real_client_ip(req, fd)
 	proto := if p := req.get_header_value_slice('X-Forwarded-Proto') {
@@ -82,7 +82,7 @@ fn handle(req_buffer []u8, fd int) ![]u8 {
 		'http'
 	}
 	body := '{"client_ip":"${client}","scheme":"${proto}"}'
-	return 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${body.len}\r\n\r\n${body}'.bytes()
+	out << 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${body.len}\r\n\r\n${body}'.bytes()
 }
 
 fn main() {

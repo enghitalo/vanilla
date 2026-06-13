@@ -12,7 +12,7 @@ pub mut:
 	db_pool ?pool.ConnectionPool
 }
 
-fn (app App) handle_request(req_buffer []u8, client_conn_fd int) ![]u8 {
+fn (app App) handle_request(req_buffer []u8, client_conn_fd int, mut out []u8) ! {
 	req := request_parser.decode_http_request(req_buffer)!
 
 	method := unsafe { tos(&req.buffer[req.method.start], req.method.len) }
@@ -20,17 +20,20 @@ fn (app App) handle_request(req_buffer []u8, client_conn_fd int) ![]u8 {
 
 	if method == 'GET' {
 		if path == '/' {
-			return app.home_controller(req)
+			out << app.home_controller(req)!
+			return
 		} else if path.starts_with('/user/') {
-			return app.get_user_controller(req)
+			out << app.get_user_controller(req)!
+			return
 		}
 	} else if method == 'POST' {
 		if path == '/user' {
-			return app.create_user_controller(req)
+			out << app.create_user_controller(req)!
+			return
 		}
 	}
 
-	return response.tiny_bad_request_response
+	out << response.tiny_bad_request_response
 }
 
 fn main() {
@@ -53,8 +56,8 @@ fn main() {
 
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
-		request_handler: fn [app] (req_buffer []u8, client_conn_fd int) ![]u8 {
-			return app.handle_request(req_buffer, client_conn_fd)
+		request_handler: fn [app] (req_buffer []u8, client_conn_fd int, mut out []u8) ! {
+			app.handle_request(req_buffer, client_conn_fd, mut out)!
 		}
 		io_multiplexing: unsafe { http_server.IOBackend(0) }
 	})!

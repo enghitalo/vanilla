@@ -25,8 +25,12 @@
 ```v
 import http_server
 
-fn handle_request(req_buffer []u8, client_conn_fd int) ![]u8 {
-  // ...parse request and return response...
+fn handle_request(req_buffer []u8, client_conn_fd int, mut out []u8) ! {
+  // ...parse the request and APPEND the complete raw HTTP response
+  // (status line + headers + body) to `out`. The server owns `out`,
+  // reuses it across requests and batches pipelined responses into a
+  // single send — never free or keep it.
+  out << 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'.bytes()
 }
 
 fn main() {
@@ -50,7 +54,9 @@ fn main() {
 ```v
 fn test_simple_without_init_the_server() {
   request := 'GET / HTTP/1.1\r\n\r\n'.bytes()
-  assert handle_request(request, -1)! == http_ok_response
+  mut out := []u8{}
+  handle_request(request, -1, mut out)!
+  assert out == http_ok_response
 }
 ```
 
@@ -110,8 +116,9 @@ v -prod run examples/database
 **Example handler:**
 
 ```v
-fn handle_request(req_buffer []u8, client_conn_fd int, mut pool ConnectionPool) ![]u8 {
-  // Use pool.acquire() and pool.release() for DB access
+fn handle_request(req_buffer []u8, client_conn_fd int, mut out []u8, mut pool ConnectionPool) ! {
+  // Use pool.acquire() and pool.release() for DB access;
+  // append the raw HTTP response to `out`.
 }
 ```
 

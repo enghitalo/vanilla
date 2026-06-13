@@ -4,8 +4,9 @@ module main
 // chain() folds a list of them into one, ONCE at startup. No registry, no DI,
 // no per-request dispatch — Invariant 2 (zero abstraction).
 
-// Handler is the frozen core contract: bytes in (+ fd), bytes out.
-type Handler = fn ([]u8, int) ![]u8
+// Handler is the frozen core contract: bytes in (+ fd), response bytes
+// APPENDED to `out`.
+type Handler = fn (req []u8, fd int, mut out []u8) !
 
 // Middleware takes the next handler and returns a wrapping handler.
 type Middleware = fn (Handler) Handler

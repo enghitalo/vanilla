@@ -12,7 +12,7 @@ module main
 //                multipart/x-mixed-replace. One capture thread fans frames out to
 //                every viewer fd — no thread per viewer (see capture.v).
 //
-// Both keep the project's contract: the handler is still fn ([]u8, int) ![]u8.
+// Both keep the project's contract: the handler is still fn ([]u8, int, mut []u8) !.
 // /video returns the response bytes (the core streams large ones via EPOLLOUT
 // back-pressure); /webcam registers the fd and a single broadcaster owns it.
 import http_server
@@ -169,8 +169,8 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: fn [mut viewers] (req_buffer []u8, fd int) ![]u8 {
-			return handle(req_buffer, fd, mut viewers)
+		request_handler: fn [mut viewers] (req_buffer []u8, fd int, mut out []u8) ! {
+			out << handle(req_buffer, fd, mut viewers)!
 		}
 		limits:          http_server.Limits{
 			max_header_bytes: 16 * 1024

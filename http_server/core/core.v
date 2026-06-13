@@ -11,6 +11,19 @@ import runtime
 // counter array sizing) and the backend (worker fan-out) need this count.
 pub const max_thread_pool_size = runtime.nr_cpus()
 
+// RequestHandler is the raw, zero-allocation handler contract: it receives the
+// complete request bytes (a view into the connection's read buffer — copy
+// anything that must outlive the call) and APPENDS the complete raw HTTP
+// response (status line + headers + body) to `out`, the connection's
+// persistent write buffer. The server owns `out`: it batches everything
+// appended during one readiness event into a single send and reuses the
+// buffer across requests — the handler must never free or keep it.
+//
+// Static routes append a precomputed `const ... .bytes()`; dynamic routes
+// append a const prefix, the Content-Length digits, '\r\n\r\n' and the body.
+// Returning an error sends 400 and closes the connection.
+pub type RequestHandler = fn (req []u8, fd int, mut out []u8) !
+
 // Counter is a single i64 padded to a full cache line, so independent counters
 // (per-worker in-flight, global active-connections) never false-share. Mutated
 // via atomic add, read via atomic load (sync.stdatomic free funcs on &n).

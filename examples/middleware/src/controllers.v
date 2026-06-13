@@ -19,9 +19,9 @@ const home_response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCont
 
 // route decodes the request and dispatches by path. This is the handler passed to
 // chain(); the global decorators wrap it.
-fn route(req_buffer []u8, _ int) ![]u8 {
+fn route(req_buffer []u8, _ int, mut out []u8) ! {
 	req := request_parser.decode_http_request(req_buffer)!
-	return match req.path.to_string(req.buffer) {
+	out << match req.path.to_string(req.buffer) {
 		'/' { handle_home(req) }
 		'/me' { handle_profile(req) }
 		'/admin' { handle_admin(req) }

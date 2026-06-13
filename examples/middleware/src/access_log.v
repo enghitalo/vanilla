@@ -48,10 +48,10 @@ fn new_access_log(path string) !&AccessLog {
 // captured by pointer and shared across all workers.
 fn access_log_mw(log &AccessLog) Middleware {
 	return fn [log] (next Handler) Handler {
-		return fn [log, next] (req_buffer []u8, fd int) ![]u8 {
-			resp := next(req_buffer, fd)!
-			log.record(req_buffer, resp)
-			return resp
+		return fn [log, next] (req_buffer []u8, fd int, mut out []u8) ! {
+			start := out.len
+			next(req_buffer, fd, mut out)!
+			log.record(req_buffer, out[start..])
 		}
 	}
 }

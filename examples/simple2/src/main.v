@@ -4,7 +4,7 @@ import http_server
 import http_server.http1_1.request_parser
 import http_server.http1_1.response
 
-fn handle_request(req_buffer []u8, client_conn_fd int) ![]u8 {
+fn handle_request(req_buffer []u8, client_conn_fd int, mut out []u8) ! {
 	req := request_parser.decode_http_request(req_buffer)!
 	method := req.method.to_string(req.buffer)
 	path := req.path.to_string(req.buffer)
@@ -13,32 +13,37 @@ fn handle_request(req_buffer []u8, client_conn_fd int) ![]u8 {
 		'GET' {
 			match path {
 				'/' {
-					return home_controller([])
+					out << home_controller([])!
+					return
 				}
 				'/users' {
-					return get_users_controller([])
+					out << get_users_controller([])!
+					return
 				}
 				else {
 					if path.starts_with('/user/') {
 						id := path[6..]
-						return get_user_controller([id])
+						out << get_user_controller([id])!
+						return
 					}
-					return response.tiny_bad_request_response
+					out << response.tiny_bad_request_response
+					return
 				}
 			}
 		}
 		'POST' {
 			if path == '/user' {
-				return create_user_controller([])
+				out << create_user_controller([])!
+				return
 			}
-			return response.tiny_bad_request_response
+			out << response.tiny_bad_request_response
+			return
 		}
 		else {
-			return response.tiny_bad_request_response
+			out << response.tiny_bad_request_response
+			return
 		}
 	}
-
-	return response.tiny_bad_request_response
 }
 
 fn main() {

@@ -84,7 +84,7 @@ fn build_response(content_type string, body []u8, encoding string) []u8 {
 	return sb
 }
 
-fn handle(req_buffer []u8, _ int) ![]u8 {
+fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 	req := request_parser.decode_http_request(req_buffer)!
 	accept := if s := req.get_header_value_slice('Accept-Encoding') {
 		s.to_string(req.buffer)
@@ -98,7 +98,7 @@ fn handle(req_buffer []u8, _ int) ![]u8 {
 		'"items":[1,2,3,4,5,6,7,8,9,10],"note":"repeated text compresses well ' +
 		'repeated text compresses well repeated text compresses well"}').bytes()
 
-	return build_response('application/json', body, encoding)
+	out << build_response('application/json', body, encoding)
 }
 
 fn main() {
