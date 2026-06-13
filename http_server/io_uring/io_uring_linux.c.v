@@ -1,3 +1,10 @@
+// sudo apt update && sudo apt upgrade -y linux-generic
+// git clone git@github.com:axboe/liburing.git
+// cd liburing
+// ./configure
+// make
+// sudo make install
+
 module io_uring
 
 #include <liburing.h>

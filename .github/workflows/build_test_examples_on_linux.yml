@@ -33,7 +33,7 @@ jobs:
       - name: Install dependencies
         shell: bash
         run: |
-          sudo apt-get update
+          sudo apt update && sudo apt upgrade -y linux-generic
           sudo apt-get install -y libsqlite3-dev liburing-dev linux-libc-dev
       - name: Build ${{ matrix.folder }}
         shell: bash
