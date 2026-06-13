@@ -13,17 +13,17 @@ fn handle_request(req_buffer []u8, client_conn_fd int, mut out []u8) ! {
 		'GET' {
 			match path {
 				'/' {
-					out << home_controller([])
+					out << home_controller([])!
 					return
 				}
 				'/users' {
-					out << get_users_controller([])
+					out << get_users_controller([])!
 					return
 				}
 				else {
 					if path.starts_with('/user/') {
 						id := path[6..]
-						out << get_user_controller([id])
+						out << get_user_controller([id])!
 						return
 					}
 					out << response.tiny_bad_request_response
@@ -33,7 +33,7 @@ fn handle_request(req_buffer []u8, client_conn_fd int, mut out []u8) ! {
 		}
 		'POST' {
 			if path == '/user' {
-				out << create_user_controller([])
+				out << create_user_controller([])!
 				return
 			}
 			out << response.tiny_bad_request_response

@@ -20,15 +20,15 @@ fn (app App) handle_request(req_buffer []u8, client_conn_fd int, mut out []u8) !
 
 	if method == 'GET' {
 		if path == '/' {
-			out << app.home_controller(req)
+			out << app.home_controller(req)!
 			return
 		} else if path.starts_with('/user/') {
-			out << app.get_user_controller(req)
+			out << app.get_user_controller(req)!
 			return
 		}
 	} else if method == 'POST' {
 		if path == '/user' {
-			out << app.create_user_controller(req)
+			out << app.create_user_controller(req)!
 			return
 		}
 	}

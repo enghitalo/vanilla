@@ -23,6 +23,7 @@ fn C.close(fd int) int
 // read of 0 bytes) cleans up when the client goes away. This matches the
 // `Connection: keep-alive` the example handlers advertise — the previous
 // close-per-request behaviour both lied to clients and crippled throughput.
+@[manualfree]
 fn handle_readable_fd(handler fn (req []u8, fd int, mut out []u8) !, kq_fd int, client_fd int, limits Limits) {
 	request_buffer := request.read_request(client_fd, limits.max_header_bytes,
 		limits.max_body_bytes) or {

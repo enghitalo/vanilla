@@ -80,9 +80,11 @@ fn state_for(mut st PlainState, fd int) &ConnState {
 		for new_len <= fd {
 			new_len *= 2
 		}
-		for st.conns.len < new_len {
-			st.conns << unsafe { nil }
+		mut grown := []&ConnState{len: new_len, init: unsafe { nil }}
+		for i in 0 .. st.conns.len {
+			grown[i] = st.conns[i]
 		}
+		st.conns = grown
 	}
 	if unsafe { st.conns[fd] == nil } {
 		st.conns[fd] = &ConnState{

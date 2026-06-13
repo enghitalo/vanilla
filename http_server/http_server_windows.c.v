@@ -124,6 +124,7 @@ fn handle_accept_completion(io_data &iocp.IOData, handler fn (req []u8, fd int, 
 	// (We need to get the listening socket from somewhere - stored in context)
 }
 
+@[manualfree]
 fn handle_read_completion(io_data &iocp.IOData, handler fn (req []u8, fd int, mut out []u8) !,
 	mut ctx WorkerContext) {
 	socket_fd := io_data.socket_fd
