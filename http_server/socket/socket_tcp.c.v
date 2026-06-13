@@ -4,6 +4,14 @@ import net.conv
 
 pub const max_connection_size = 1024
 
+// listen() backlog: the depth of the kernel's queue of established-but-not-yet-
+// accepted connections. The kernel silently clamps this to
+// /proc/sys/net/core/somaxconn, so we pass a large value and let the OS cap it —
+// a small backlog drops SYNs during accept bursts (e.g. a benchmark ramping up
+// hundreds of connections at once). rust-epoll, the reference epoll server, uses
+// the same 65536.
+pub const listen_backlog = 65536
+
 #include <fcntl.h>
 #include <sys/socket.h>
 
@@ -229,7 +237,7 @@ pub fn create_server_socket(port int) int {
 		exit(1)
 	}
 
-	if C.listen(server_fd, max_connection_size) < 0 {
+	if C.listen(server_fd, listen_backlog) < 0 {
 		eprintln(@LOCATION)
 		C.perror(c'Listen failed')
 		close_socket(server_fd)

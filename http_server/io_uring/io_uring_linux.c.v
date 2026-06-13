@@ -215,10 +215,13 @@ pub mut:
 	response_buffer []u8
 	bytes_sent      int
 
-	// Monotonic-ns deadline, >0 while a partial request is mid-read (read_timeout).
-	// The timeout sweep half-closes (shutdown) past-deadline connections; the
-	// in-flight recv then completes and the normal path frees the slot.
-	read_deadline u64
+	// Monotonic-ns deadlines, >0 while the corresponding direction is mid-transfer:
+	// read_deadline while a partial request is mid-read (read_timeout), write_deadline
+	// while a response batch has not finished sending (write_timeout). The timeout
+	// sweep half-closes (shutdown) past-deadline connections; the in-flight recv/send
+	// then completes with an error and the normal path frees the slot.
+	read_deadline  u64
+	write_deadline u64
 
 	// Set when the pending batch ends a malformed/oversized request: once it has
 	// been sent, release the connection instead of posting the next recv.
@@ -277,6 +280,7 @@ pub fn pool_acquire(mut w Worker, fd int) &Connection {
 	c.bytes_sent = 0
 	c.close_after_send = false
 	c.read_deadline = 0
+	c.write_deadline = 0
 	// Fresh persistent buffers for this connection's lifetime. Uninitialised
 	// (noscan) capacity — recv fills read_buf, the handler fills response_buffer.
 	c.read_buf = []u8{len: 0, cap: read_buf_cap}
@@ -303,6 +307,7 @@ pub fn pool_release(mut w Worker, mut c Connection) {
 	c.bytes_sent = 0
 	c.close_after_send = false
 	c.read_deadline = 0
+	c.write_deadline = 0
 	c.owner = unsafe { nil }
 	unsafe {
 		idx := int(u64(&c) - u64(&w.conns[0])) / int(sizeof(Connection))

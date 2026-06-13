@@ -126,7 +126,7 @@ pub fn create_server_socket_on_windows(port int) int {
 		exit(1)
 	}
 
-	if C.listen(u64(server_fd), max_connection_size) == socket_error {
+	if C.listen(u64(server_fd), listen_backlog) == socket_error {
 		eprintln(@LOCATION + ' Listen failed: ${C.WSAGetLastError()}')
 		close_socket(server_fd)
 		exit(1)
