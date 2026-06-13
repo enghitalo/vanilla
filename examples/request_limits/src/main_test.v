@@ -8,7 +8,15 @@ module main
 
 fn test_handler_is_trivial_200() ! {
 	req := 'POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n0123456789'.bytes()
-	assert handle(req, -1)!.bytestr().contains('200 OK')
+	assert serve(req)!.bytestr().contains('200 OK')
+}
+
+// serve adapts the raw-handler contract (writes into a caller-owned buffer) to
+// the return-a-buffer shape the assertions expect.
+fn serve(req []u8) ![]u8 {
+	mut out := []u8{}
+	handle(req, -1, mut out)!
+	return out
 }
 
 /*

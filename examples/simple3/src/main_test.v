@@ -13,8 +13,16 @@ fn test_simple_without_init_the_server() {
 
 	app := App{}
 
-	assert app.handle_request(request1, -1)! == http_ok_response
-	assert app.handle_request(request2, -1)! == request2_response
-	assert app.handle_request(request3, -1)! == http_created_response
-	assert app.handle_request(request4, -1)! == response.tiny_bad_request_response
+	assert serve(app, request1)! == http_ok_response
+	assert serve(app, request2)! == request2_response
+	assert serve(app, request3)! == http_created_response
+	assert serve(app, request4)! == response.tiny_bad_request_response
+}
+
+// serve adapts the raw-handler contract (writes into a caller-owned buffer) to
+// the return-a-buffer shape the assertions expect.
+fn serve(app App, req []u8) ![]u8 {
+	mut out := []u8{}
+	app.handle_request(req, -1, mut out)!
+	return out
 }

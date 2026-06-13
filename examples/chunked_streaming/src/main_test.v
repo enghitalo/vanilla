@@ -24,10 +24,18 @@ fn test_decode_chunked_truncated_errors() {
 }
 
 fn test_response_uses_chunked_framing() ! {
-	out := handle('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), -1)!.bytestr()
+	out := serve('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes())!.bytestr()
 	assert out.contains('Transfer-Encoding: chunked')
 	assert !out.contains('Content-Length') // chunked => no Content-Length
 	assert out.ends_with('0\r\n\r\n') // terminating chunk present
+}
+
+// serve adapts the raw-handler contract (writes into a caller-owned buffer) to
+// the return-a-buffer shape the assertions expect.
+fn serve(req []u8) ![]u8 {
+	mut out := []u8{}
+	handle(req, -1, mut out)!
+	return out
 }
 
 /*
