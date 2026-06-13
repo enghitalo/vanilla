@@ -12,16 +12,16 @@ fn handle_request(req_buffer []u8, client_conn_fd int, mut out []u8) ! {
 
 	if method == 'GET' {
 		if path == '/' {
-			out << home_controller([])
+			out << home_controller([])!
 			return
 		} else if path.starts_with('/user/') {
 			id := path[6..]
-			out << get_user_controller([id])
+			out << get_user_controller([id])!
 			return
 		}
 	} else if method == 'POST' {
 		if path == '/user' {
-			out << create_user_controller([])
+			out << create_user_controller([])!
 			return
 		}
 	}
