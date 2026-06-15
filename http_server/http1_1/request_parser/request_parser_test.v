@@ -461,3 +461,26 @@ fn test_frame_limits_zero_is_unlimited() {
 	assert frame_request_length_lim(req, 0, 0)! == req.len
 	assert frame_request_length(req)! == req.len
 }
+
+fn test_frame_expected_total() {
+	// Full message: total == header end + Content-Length.
+	full := 'POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello'.bytes()
+	assert frame_expected_total(full) == full.len
+
+	// The key case: headers are complete but only part of the body has arrived.
+	// The total must already be known so the read loop can pre-size in one alloc.
+	partial := 'POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\nhel'.bytes()
+	assert frame_expected_total(partial) == (partial.len - 3) + 1000
+
+	// Header section not yet terminated -> not determinable.
+	no_end := 'POST /u HTTP/1.1\r\nContent-Length: 5\r\n'.bytes()
+	assert frame_expected_total(no_end) == -1
+
+	// Chunked body -> length unknown until the terminator.
+	chunked := 'POST /u HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n'.bytes()
+	assert frame_expected_total(chunked) == -1
+
+	// No Content-Length, no body -> nothing to pre-size against.
+	nobody := 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+	assert frame_expected_total(nobody) == -1
+}
