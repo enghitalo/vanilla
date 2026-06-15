@@ -338,19 +338,27 @@ fn io_uring_worker_main(listener int, cpu_id int, handler fn (req []u8, fd int, 
 	mut worker := &io_uring.Worker{}
 	worker.cpu_id = cpu_id
 	worker.socket_fd = listener
-	// Multishot accept (kernel 5.19+). The re-arm logic in the accept handler
-	// also handles the single-shot case, so this is safe either way.
-	worker.use_multishot = true
 	// Graceful-shutdown plumbing: this worker's own in-flight counter and the
 	// shared draining flag (see Server.shutdown / handle_io_uring_accept).
 	worker.inflight = inflight
 	worker.draining = draining
 	io_uring.pool_init(mut worker)
 
-	if !iou_init_ring(&worker.ring) {
-		eprintln('Failed to initialize io_uring for worker ${cpu_id}')
+	ring_entries := iou_init_ring(&worker.ring) or {
+		eprintln('Failed to initialize io_uring for worker ${cpu_id}: ${err.msg()}')
 		exit(1)
 	}
+	if ring_entries < io_uring.default_ring_entries {
+		// Fell back to a smaller ring (likely a tight RLIMIT_MEMLOCK). The
+		// connection pool is still sized for default_ring_entries, so under a
+		// burst the SQ can fill and accept re-arming can be skipped — surface it
+		// instead of silently degrading.
+		eprintln('io_uring worker ${cpu_id}: using ${ring_entries} SQ entries (fell back from ${io_uring.default_ring_entries})')
+	}
+	// Multishot accept needs kernel 5.19+; on older kernels stay single-shot
+	// (the re-arm in handle_io_uring_accept covers it). Detected per worker at
+	// startup — one uname() call, off the hot path.
+	worker.use_multishot = iou_multishot_accept_supported()
 	// Skip the per-enter fget/fput on the ring fd.
 	C.io_uring_register_ring_fd(&worker.ring)
 
@@ -418,22 +426,58 @@ fn io_uring_worker_loop(worker &io_uring.Worker, handler fn (req []u8, fd int, m
 
 // iou_init_ring sets the ring up with the best available flag combo, trying in
 // order: SINGLE_ISSUER|DEFER_TASKRUN (kernel 6.0+, the recommended setup),
-// SINGLE_ISSUER|COOP_TASKRUN (5.19+), then plain flags. SQPOLL is intentionally
-// never used. Returns true on success.
-fn iou_init_ring(ring &C.io_uring) bool {
-	entries := u32(io_uring.default_ring_entries)
-	mut p := C.io_uring_params{}
-	p.flags = io_uring.setup_single_issuer | io_uring.setup_defer_taskrun
-	if C.io_uring_queue_init_params(entries, ring, &p) == 0 {
-		return true
+// SINGLE_ISSUER|COOP_TASKRUN (5.19+), then plain flags. For each combo it walks
+// the SQ size down from default_ring_entries so a host with a tight
+// RLIMIT_MEMLOCK still gets a working ring. SQPOLL is intentionally never used.
+// Returns the negotiated SQ entry count; errors only if every entry/flag
+// combination fails.
+fn iou_init_ring(ring &C.io_uring) !u32 {
+	entry_candidates := [u32(io_uring.default_ring_entries), u32(8192), u32(4096), u32(2048),
+		u32(1024), u32(512), u32(256)]
+	for entries in entry_candidates {
+		mut p := C.io_uring_params{}
+		p.flags = io_uring.setup_single_issuer | io_uring.setup_defer_taskrun
+		if C.io_uring_queue_init_params(entries, ring, &p) == 0 {
+			return entries
+		}
+
+		p = C.io_uring_params{}
+		p.flags = io_uring.setup_single_issuer | io_uring.setup_coop_taskrun
+		if C.io_uring_queue_init_params(entries, ring, &p) == 0 {
+			return entries
+		}
+
+		p = C.io_uring_params{}
+		if C.io_uring_queue_init_params(entries, ring, &p) == 0 {
+			return entries
+		}
 	}
-	p = C.io_uring_params{}
-	p.flags = io_uring.setup_single_issuer | io_uring.setup_coop_taskrun
-	if C.io_uring_queue_init_params(entries, ring, &p) == 0 {
-		return true
+	return error('io_uring_queue_init_params failed for all ring entry/flag combinations')
+}
+
+// iou_multishot_accept_supported reports whether the running kernel supports
+// multishot accept (IORING_OP_ACCEPT + IORING_ACCEPT_MULTISHOT, kernel 5.19+).
+// There is NO params.features bit for it and no way to probe the multishot
+// *flavour* of accept (plain accept has been a supported opcode since 5.5), so
+// the kernel release is the only reliable signal. Requesting multishot on an
+// older kernel makes every accept SQE fail with -EINVAL, and the re-arm in
+// handle_io_uring_accept would respin it forever, so this gate must be correct.
+fn iou_multishot_accept_supported() bool {
+	return iou_release_supports_multishot(os.uname().release)
+}
+
+// iou_release_supports_multishot parses a `uname -r` release string
+// ("6.8.0-41-generic") and returns true for kernel >= 5.19. Split out so it can
+// be unit-tested without a live kernel. A backported kernel that reports an
+// older release simply falls back to single-shot accept: correct, only slower.
+fn iou_release_supports_multishot(release string) bool {
+	parts := release.split('.')
+	if parts.len < 2 {
+		return false
 	}
-	p = C.io_uring_params{}
-	return C.io_uring_queue_init_params(entries, ring, &p) == 0
+	major := parts[0].int()
+	minor := parts[1].int()
+	return major > 5 || (major == 5 && minor >= 19)
 }
 
 // run_io_uring_backend spawns one shared-nothing worker per core, each owning
