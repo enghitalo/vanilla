@@ -292,6 +292,16 @@ pub fn pool_acquire(mut w Worker, fd int) &Connection {
 	// (noscan) capacity — recv fills read_buf, the handler fills response_buffer.
 	c.read_buf = []u8{len: 0, cap: read_buf_cap}
 	c.response_buffer = []u8{len: 0, cap: write_buf_cap}
+	// Keep both buffers in a no-scan GC block ACROSS growth. A large response
+	// (e.g. a 300 KiB static asset) grows response_buffer past write_buf_cap, and
+	// without this flag grow_cap reallocates as a *scanned* block — thousands of
+	// such multi-hundred-KB buffers at high keep-alive conn counts make GC
+	// scanning + stop-the-world dominate (the "static cliff"). The flag is
+	// preserved across resize, so the buffer stays atomic however large it grows.
+	unsafe {
+		c.read_buf.flags.set(.noscan_data)
+		c.response_buffer.flags.set(.noscan_data)
+	}
 	return c
 }
 
