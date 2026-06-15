@@ -467,6 +467,53 @@ pub fn frame_request_length_lim(buf []u8, max_header int, max_body int) !int {
 	return -1
 }
 
+// frame_expected_total returns the full HTTP/1.1 message length (headers + body)
+// as soon as it is determinable from the bytes buffered so far: the header
+// section must be complete AND the body length known via Content-Length. Returns
+// -1 when not yet determinable — headers incomplete, a chunked body (length
+// unknown until the terminator), or no Content-Length at all.
+//
+// This is a pure sizing HINT for the read loop: it lets a large upload grow its
+// recv buffer to the exact message size in ONE allocation instead of doubling
+// toward it (8K→16K→…→32M is ~12 reallocs + tens of MB of memcpy per request).
+// The authoritative framing and limit checks stay in frame_request_length_lim,
+// which the read loop still runs once the bytes have actually arrived.
+@[direct_array_access]
+pub fn frame_expected_total(buf []u8) int {
+	if buf.len < 4 {
+		return -1
+	}
+	rl := find_byte(&buf[0], buf.len, lf_char) or { return -1 }
+	mut pos := rl + 1
+	mut content_length := -1
+	for {
+		if pos >= buf.len {
+			return -1
+		}
+		// Blank line => end of header section.
+		if buf[pos] == cr_char {
+			if pos + 1 >= buf.len {
+				return -1
+			}
+			if buf[pos + 1] == lf_char {
+				body_start := pos + 2
+				if content_length >= 0 {
+					return body_start + content_length
+				}
+				return -1 // chunked or bodyless — nothing to pre-size against
+			}
+		}
+		line_lf := find_byte(&buf[pos], buf.len - pos, lf_char) or { return -1 }
+		line_start := pos
+		line_len := line_lf - 1 // bytes before the CR
+		pos = line_start + line_lf + 1
+		if v := line_header_value(buf, line_start, line_len, 'Content-Length') {
+			content_length = parse_content_length(buf, v) or { return -1 }
+		}
+	}
+	return -1
+}
+
 // line_header_value returns the value Slice if a header line (line_len bytes
 // before CRLF, starting at line_start) has the case-insensitive name `name`
 // immediately followed by ':'. Used by the single-pass framer.
