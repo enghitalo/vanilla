@@ -66,8 +66,6 @@ pub const op_write = u8(3)
 
 // IO uring CQE flags
 pub const ioring_cqe_f_more = u32(1 << 1)
-// io_uring features
-pub const ioring_feat_accept_multishot = u32(1 << 19)
 
 // io_uring setup flags (include/uapi/linux/io_uring.h). SQPOLL is deliberately
 // NOT used: one kernel poll thread per worker oversubscribes the cores the

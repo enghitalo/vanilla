@@ -16,6 +16,25 @@ fn iou_dummy_handler(req []u8, _ int, mut out []u8) ! {
 	out << 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK'.bytes()
 }
 
+// Guards the multishot-accept gate: the previous code keyed off a non-existent
+// params.features bit (1 << 19), which is never set, so multishot was silently
+// disabled on every kernel. Detection now keys off the kernel release.
+fn test_iou_release_supports_multishot() {
+	// >= 5.19 → supported
+	assert iou_release_supports_multishot('5.19.0-generic')
+	assert iou_release_supports_multishot('6.8.0-41-generic')
+	assert iou_release_supports_multishot('6.0.0')
+	assert iou_release_supports_multishot('10.2.1-custom')
+	// < 5.19 → single-shot fallback
+	assert !iou_release_supports_multishot('5.18.0-generic')
+	assert !iou_release_supports_multishot('5.4.0-200-generic')
+	assert !iou_release_supports_multishot('4.19.255')
+	// Malformed / unparseable → safe default (no multishot)
+	assert !iou_release_supports_multishot('garbage')
+	assert !iou_release_supports_multishot('6')
+	assert !iou_release_supports_multishot('')
+}
+
 fn test_io_uring_end_to_end() ! {
 	$if !linux {
 		eprintln('[test] io_uring backend is Linux-only; skipping')
