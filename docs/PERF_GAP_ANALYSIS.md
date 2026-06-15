@@ -6,6 +6,55 @@ Analysis of six reference implementations — HttpArena **tokio**, **minima-sync
 **liburing** library/examples (proxy.c, releases 2.9–2.14) — compared against
 vanilla's epoll and io_uring backends.
 
+## Status (2026-06) — what landed and what it measured
+
+Most of the gaps below are **closed**. Both backends now have persistent
+per-connection buffers, a flat fd-indexed state table, HTTP/1.1 pipelining with a
+single batched send, and the raw append-into-`out []u8` handler contract; the
+io_uring backend uses `SINGLE_ISSUER | DEFER_TASKRUN`, a single
+`submit_and_wait` + batch CQ drain, multishot accept, and recv-at-offset framing;
+the epoll backend uses the adaptive busy-poll `epoll_wait` timeout. The recv
+buffer also now **pre-sizes to `Content-Length`** in one allocation
+(`request_parser.frame_expected_total`) instead of doubling — fixing the upload
+profile's pathological realloc churn.
+
+### Validated on the 64-core HttpArena
+
+The decisive lesson is **#5 (zero hot-path allocation)**. Per-request allocation
+is invisible on a laptop but **compounds catastrophically under V's Boehm GC at
+high core counts** — the GC's stop-the-world serializes all workers, so fewer
+cores do useful work. Removing per-request allocation let CPU utilisation (and
+throughput) scale across all cores. Measured deltas (vanilla-epoll, the framework
+handler riding this lib):
+
+| change | profile | before → after |
+|---|---|---|
+| handler appends into `out` (was `out << build()`) | json | 115K → **485K** (+322%) |
+| + remove the last per-request alloc (router `all_before('?')`) | pipelined | 2.4M → **34.9M** (+1365%) |
+| cache the gzip output per `(count,m)` | json-comp | ~57K → **857K** (now leads the profile) |
+| precomputed `const []u8` query keys, in-place int parse | baseline | → **691K** (+48%) |
+
+Takeaway: keep handlers at **literally zero allocations**; every `[]u8`/`string`
+built per request is a tax that explodes under load. The append-into-`out`
+contract (item #9) is the most important decision in this list, not the last.
+
+### Still open
+
+- **#1 (epoll per-worker `SO_REUSEPORT` accept)** — ATTEMPTED, not shipped. The
+  per-worker accept is correct for a single long-lived server, but the test suite
+  creates/destroys many servers in one process, which races fd reuse + worker
+  lifecycle against per-worker listeners (EBADF on listener registration,
+  segfaults from cross-thread `epoll` fd close, `unable to join thread`). A clean
+  multi-server shutdown lifecycle is needed first. Deprioritized: the arena showed
+  accept was **not** the bottleneck (GC/allocation was, and that is fixed).
+- **DB profiles (async-db, crud, fortunes)** are bound by the stdlib `db.pg`
+  driver (text protocol, lazy pool, no persistent prepared statements/pipelining).
+  `veb` on the same stack is *slower* than vanilla, so vanilla already maxes the
+  driver. Prepared statements (`PQprepare`/`PQexecPrepared`, lazily prepared per
+  pooled connection) give a small win (~+9% async-db); single-pass `escape_html`
+  gives +27% fortunes — but the gap to the top (native binary-protocol drivers)
+  only closes with a faster pg driver, a separate project.
+
 ## What ALL the fast servers have in common
 
 Every one of these servers, regardless of language or backend, shares the same
@@ -114,6 +163,11 @@ Ordered by expected impact. All consistent with the three rules (no slowdown,
 minimal abstraction, keep it simple) and BEST_PRACTICES.md.
 
 ### 1. epoll: kill the accept thread — per-worker `SO_REUSEPORT` listeners
+
+> **Status: attempted, NOT shipped** — see "Still open" at the top. Correct for a
+> single server, but the multi-server test suite races fd reuse + worker lifecycle
+> against per-worker listeners. Deprioritized (arena proved accept isn't the
+> bottleneck). The items below this one are **done**.
 
 Each worker creates its own listening socket (`SO_REUSEADDR + SO_REUSEPORT +
 TCP_NODELAY`, nonblocking), registers it in its own epoll, and runs an
@@ -284,17 +338,25 @@ GC makes the gap larger, in vanilla's favor of the raw contract.
 
 ## Suggested order of work
 
-| Step | Change | Backend | Risk | Expected gain |
+| Step | Change | Backend | Status | Measured gain |
 |---|---|---|---|---|
-| 1 | Per-worker reuseport listeners | epoll | low | large |
-| 2 | Persistent buffers + flat fd table | both | low | large |
-| 3 | Pipelining + batched send | both | medium | very large (pipelined), moderate (plain) |
-| 4 | Batched submit/drain loop | io_uring | low | large |
-| 5 | Drop SQPOLL → DEFER_TASKRUN/SINGLE_ISSUER | io_uring | low | large |
-| 6 | Multishot accept + partial-read fix | io_uring | low | correctness + moderate |
-| 7 | Adaptive epoll timeout | epoll | trivial | moderate |
-| 8 | CPU pinning | both | trivial | small–moderate |
-| 9 | Raw write-buffer handler contract (no writer abstraction) | both | medium | small alone; enables 3 |
+| 1 | Per-worker reuseport listeners | epoll | ⚠️ attempted, blocked | — (accept not the bottleneck) |
+| 2 | Persistent buffers + flat fd table | both | ✅ done | large |
+| 3 | Pipelining + batched send | both | ✅ done | very large (pipelined) |
+| 4 | Batched submit/drain loop | io_uring | ✅ done | large |
+| 5 | Drop SQPOLL → DEFER_TASKRUN/SINGLE_ISSUER | io_uring | ✅ done | large |
+| 6 | Multishot accept + partial-read fix | io_uring | ✅ done | correctness + moderate |
+| 7 | Adaptive epoll timeout | epoll | ✅ done | moderate |
+| 8 | CPU pinning | both | ✅ opt-in (`VANILLA_PIN_CPUS`, off by default) | small–moderate |
+| 9 | **Zero-alloc append-into-`out` handler contract** | both | ✅ done | **the single biggest lever at scale** (json +322%, pipelined +1365%) |
+| 10 | Pre-size recv buffer to Content-Length | both | ✅ done | large on upload (kills doubling-realloc churn) |
 
-Benchmark each step in isolation with `-prod` (wrk/rewrk, plain + pipelined
-profiles) and verify with helgrind, per CONTRIBUTING.md.
+> Item #9 was originally rated "small alone" — the 64-core arena proved the
+> opposite: removing per-request allocation is the dominant win (see the Status
+> section at the top). Allocation cost is hidden at low core counts and explodes
+> under GC at scale.
+
+Benchmark each step in isolation with `-prod` (wrk/rewrk/gcannon, plain +
+pipelined profiles) and verify with helgrind, per CONTRIBUTING.md. Note: a couple
+of small allocs per request look like noise at 4–16 cores but can be a multiple-x
+swing at 64 — confirm perf changes on a high-core run, not just a laptop.
