@@ -107,10 +107,20 @@ fn state_for(mut st PlainState, fd int) &ConnState {
 		st.conns = grown
 	}
 	if unsafe { st.conns[fd] == nil } {
-		st.conns[fd] = &ConnState{
+		mut cs := &ConnState{
 			read_buf:  []u8{len: 0, cap: read_buf_cap}
 			write_buf: []u8{len: 0, cap: write_buf_cap}
 		}
+		// Keep both buffers in a no-scan GC block ACROSS growth. A large response
+		// grows write_buf past write_buf_cap; without this flag grow_cap reallocates
+		// as a *scanned* block, and thousands of big per-conn buffers at high
+		// keep-alive conn counts turn GC scanning + stop-the-world into the
+		// bottleneck (the "static cliff"). The flag survives resize.
+		unsafe {
+			cs.read_buf.flags.set(.noscan_data)
+			cs.write_buf.flags.set(.noscan_data)
+		}
+		st.conns[fd] = cs
 	}
 	return st.conns[fd]
 }
