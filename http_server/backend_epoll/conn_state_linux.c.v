@@ -116,9 +116,18 @@ fn state_for(mut st PlainState, fd int) &ConnState {
 		// as a *scanned* block, and thousands of big per-conn buffers at high
 		// keep-alive conn counts turn GC scanning + stop-the-world into the
 		// bottleneck (the "static cliff"). The flag survives resize.
-		unsafe {
-			cs.read_buf.flags.set(.noscan_data)
-			cs.write_buf.flags.set(.noscan_data)
+		//
+		// `.noscan_data` only exists on V after the 0.5.1 release, so it is gated
+		// behind `-d vanilla_noscan` to keep the library buildable on the 0.5.1
+		// release. (`$if flag ? {}` is comptime-eliminated when the flag is unset,
+		// so the enum value is never type-checked there.) Enable it once a V
+		// release ships `.noscan_data` without the unrelated codegen slowdown that
+		// currently makes post-0.5.1 master far slower (vlang/v#27468).
+		$if vanilla_noscan ? {
+			unsafe {
+				cs.read_buf.flags.set(.noscan_data)
+				cs.write_buf.flags.set(.noscan_data)
+			}
 		}
 		st.conns[fd] = cs
 	}
