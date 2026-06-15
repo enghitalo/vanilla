@@ -137,7 +137,18 @@ fn handle_readable_plain(request_handler core.RequestHandler, epoll_fd int, fd i
 	// cap applies to a single (partial) request, not to the whole burst.
 	for {
 		if cs.read_buf.len == cs.read_buf.cap {
-			unsafe { cs.read_buf.grow_cap(cs.read_buf.cap) }
+			// Pre-size to the exact message length when Content-Length is already
+			// known (one allocation), instead of doubling toward it. A 20 MiB
+			// upload otherwise grows 8K→16K→…→32M: ~12 reallocs, tens of MB of
+			// memcpy, and a buffer that overshoots the body by up to 2×. A hostile
+			// or chunked/unknown length (target -1 or > req_cap) falls back to
+			// doubling, so the existing req_cap/413 guard still trips normally.
+			target := request_parser.frame_expected_total(cs.read_buf)
+			if target > cs.read_buf.cap && target <= req_cap {
+				unsafe { cs.read_buf.grow_cap(target - cs.read_buf.cap) }
+			} else {
+				unsafe { cs.read_buf.grow_cap(cs.read_buf.cap) }
+			}
 		}
 		spare := cs.read_buf.cap - cs.read_buf.len
 		n := C.recv(fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, usize(spare), 0)

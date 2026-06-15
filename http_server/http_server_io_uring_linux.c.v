@@ -187,7 +187,21 @@ fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn
 		}, usize(conn.response_buffer.len - conn.bytes_sent), limits)
 	} else {
 		// Nothing complete yet — read more into the same buffer (arming/refreshing
-		// the read deadline since a partial request is now buffered).
+		// the read deadline since a partial request is now buffered). When the body
+		// length is already known (Content-Length), pre-size read_buf to the exact
+		// message length in ONE allocation; otherwise prepare_recv doubles toward it
+		// (8K→16K→…→32M for a 20 MiB upload: ~12 reallocs + tens of MB of memcpy).
+		if conn.read_buf.len == conn.read_buf.cap {
+			req_cap := if limits.max_request_bytes > 0 {
+				limits.max_request_bytes
+			} else {
+				iou_max_request_bytes
+			}
+			target := request_parser.frame_expected_total(conn.read_buf)
+			if target > conn.read_buf.cap && target <= req_cap {
+				unsafe { conn.read_buf.grow_cap(target - conn.read_buf.cap) }
+			}
+		}
 		iou_arm_recv(worker, mut *conn, limits)
 	}
 }
