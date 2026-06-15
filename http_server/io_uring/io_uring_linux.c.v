@@ -298,9 +298,17 @@ pub fn pool_acquire(mut w Worker, fd int) &Connection {
 	// such multi-hundred-KB buffers at high keep-alive conn counts make GC
 	// scanning + stop-the-world dominate (the "static cliff"). The flag is
 	// preserved across resize, so the buffer stays atomic however large it grows.
-	unsafe {
-		c.read_buf.flags.set(.noscan_data)
-		c.response_buffer.flags.set(.noscan_data)
+	//
+	// Gated behind `-d vanilla_noscan`: `.noscan_data` only exists on V after the
+	// 0.5.1 release, and `$if flag ? {}` is comptime-eliminated (and not
+	// type-checked) when the flag is unset, so the library still builds on 0.5.1.
+	// Enable once a V release ships `.noscan_data` without the post-0.5.1 codegen
+	// slowdown (vlang/v#27468).
+	$if vanilla_noscan ? {
+		unsafe {
+			c.read_buf.flags.set(.noscan_data)
+			c.response_buffer.flags.set(.noscan_data)
+		}
 	}
 	return c
 }
