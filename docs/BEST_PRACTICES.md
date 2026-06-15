@@ -14,21 +14,37 @@ Everything below is a concrete way to honor those rules.
 
 ---
 
-## 1. Handlers are pure functions
+## 1. Handlers append into the connection's write buffer (zero-alloc)
 
-A request handler is a **total function of `(request) -> (response)`**. It must
-not touch the socket, read globals, or perform hidden I/O.
+A request handler is a **pure function of the request that APPENDS the complete
+raw response into `out`** — the connection's persistent, server-owned write
+buffer. It returns nothing, must not touch the socket, read globals, or perform
+hidden I/O.
 
 ```v
-fn handle(req request_parser.HttpRequest) []u8 {
-    // read req fields, build bytes, return. Nothing else.
+// out is the connection's reused write buffer. Append the full response
+// (status line + headers + body) into it; the server batches everything
+// appended during one readiness event into a single send. Never free or keep it.
+fn handle(req []u8, fd int, mut out []u8) ! {
+    // parse req, append bytes into out. Nothing else.
 }
 ```
+
+> **Why append instead of returning `[]u8`?** Returning a freshly-built `[]u8`
+> per request is one heap allocation (plus a copy into `out`) per request. That
+> is invisible on a laptop but **compounds catastrophically under V's GC at high
+> core counts**: on the 64-core HttpArena, switching the handler from
+> `out << build()` to appending directly into `out` took **json from 115K→485K
+> req/s (+322%)** and, once the *last* per-request allocation (the router's
+> `all_before('?')`) was also removed, **pipelined from 2.4M→34.9M (+1365%)**.
+> Per-request allocation is the single biggest performance lever at scale —
+> keep the hot path at **zero allocations**.
 
 **Do**
 
 - Treat the parsed request as immutable input.
-- Build the full response in memory and return it as `[]u8`.
+- Append the full response **into `out`** (status line + headers + body); let
+  the core batch and send it.
 - Keep all framing decisions (Content-Length, chunking) in the core, not in
   the handler.
 
@@ -80,27 +96,34 @@ const status_413_response = 'HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0
 
 No allocation, no formatting — ever.
 
-### 3b. Dynamic responses → pre-sized builder, write parts separately
+### 3b. Dynamic responses → append parts straight into `out`
 
-For responses with dynamic values, use `strings.new_builder` seeded with a
-capacity estimate (grows at most once), write the **literal segments as string
-constants**, and write integers with `write_decimal` — which formats into a
-stack buffer with **no intermediate string allocation**.
+For responses with dynamic values, append the literal segments and the integers
+**directly into `out`** — no intermediate `strings.Builder`, no return-then-copy.
+Two tiny no-alloc helpers are all you need: one that pushes a string's bytes, and
+one that writes an integer's decimal digits (itoa into a stack scratch).
 
 ```v
-fn json_response(status int, reason string, body string) []u8 {
-    mut sb := strings.new_builder(96 + body.len) // header overhead + body
-    sb.write_string('HTTP/1.1 ')
-    sb.write_decimal(status)        // no .str(), no alloc
-    sb.write_u8(` `)
-    sb.write_string(reason)
-    sb.write_string('\r\nContent-Type: application/json\r\nContent-Length: ')
-    sb.write_decimal(body.len)
-    sb.write_string('\r\nConnection: keep-alive\r\n\r\n')
-    sb.write_string(body)
-    return sb
+@[inline]
+fn ws(mut out []u8, s string) {
+    unsafe { out.push_many(s.str, s.len) } // append bytes, no allocation
+}
+
+fn wi(mut out []u8, n i64) { /* itoa into a stack buffer, append digits */ }
+
+fn write_json(mut out []u8, body string) {
+    ws(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ')
+    wi(mut out, i64(body.len)) // no .str(), no alloc
+    ws(mut out, '\r\nConnection: keep-alive\r\n\r\n')
+    ws(mut out, body)
 }
 ```
+
+A `strings.new_builder` (seeded with `header_overhead + body.len`, written via
+`write_string`/`write_decimal`) is still fine where you genuinely need a `string`
+result — but on the response hot path, appending into `out` avoids the builder
+allocation *and* the builder→`out` copy. **Fully static** responses should be a
+precomputed `const ... .bytes()` appended with `out << the_const`.
 
 Compare to the slow form — every `${}` here allocates:
 

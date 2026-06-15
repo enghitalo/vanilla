@@ -55,6 +55,14 @@ Already used here for the per-worker epoll fd arrays
   big ones on the hot path.
 - `recv` into spare capacity to avoid a scratch buffer + second copy:
   `recv(fd, &u8(buf.data) + buf.len, buf.cap - buf.len)` then `unsafe { buf.len += n }`.
+- **Allocation cost is hidden at low core counts and explodes under GC at scale.**
+  On the 64-core arena, eliminating per-request allocation in the handler was a
+  multiple-x swing (json **+322%**, pipelined **+1365%**) where the *same* change
+  measured within noise at 16 cores — Boehm's stop-the-world serializes every
+  worker, so churn caps how many cores do useful work. Treat any per-request
+  `[]u8` / `string` / `.bytes()` / `all_before()` / builder as a scaling tax:
+  precompute `const` keys, parse ints in place, and append into a reused buffer.
+  Corollary: confirm perf changes on a high-core run, not just a laptop.
 
 ## Pure C escape hatch
 
