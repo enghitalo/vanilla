@@ -33,7 +33,12 @@ jobs:
       - name: Install dependencies
         shell: bash
         run: |
-          sudo apt update && sudo apt upgrade -y linux-generic
+          # Just the build deps. The previous `apt upgrade -y linux-generic` pulled a
+          # full kernel package set (linux-image/headers/firmware) on every run — slow
+          # and flaky (dpkg "cannot perform the following tasks"), and pointless for
+          # building examples: liburing-dev is userspace and linux-libc-dev already
+          # ships the io_uring headers, neither needs a running-kernel upgrade.
+          sudo apt-get update
           sudo apt-get install -y libsqlite3-dev liburing-dev linux-libc-dev
       - name: Build ${{ matrix.folder }}
         shell: bash
