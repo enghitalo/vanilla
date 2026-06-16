@@ -91,8 +91,12 @@ fn async_handle_readable(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd
 	async_serve(h, mut reactor, epoll_fd, fd, limits, active_conns, mut st, mut cs, state)
 }
 
-// async_serve drains the socket into the read buffer (edge-triggered: to EAGAIN),
-// then answers every complete request (pipelining), flushing the batch at the end.
+// async_serve drains the socket into the read buffer (edge-triggered), answers
+// every complete request as it arrives (pipelining), and flushes the batch at
+// the end. It carries the same large-body handling as the synchronous path: a
+// body past sm_stream_body_above is STREAMED (head answered, body drained +
+// discarded) instead of buffered, and a handler that hands a file off for
+// sendfile(2) has it streamed by flush_batch. Stops reading when a request parks.
 @[direct_array_access; manualfree]
 fn async_serve(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) {
 	req_cap := if limits.max_request_bytes > 0 {
@@ -101,8 +105,46 @@ fn async_serve(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd i
 		sm_max_request_bytes
 	}
 	for {
+		// Streaming-drain: a large body detected below is consumed off the socket
+		// and DISCARDED (the head was already answered) — keeps a big upload at
+		// O(buffer) memory instead of growing read_buf into a scanned GC block.
+		if cs.body_drain > 0 {
+			want := if cs.body_drain < i64(cs.read_buf.cap) {
+				int(cs.body_drain)
+			} else {
+				cs.read_buf.cap
+			}
+			dn := C.recv(fd, cs.read_buf.data, usize(want), 0)
+			if dn < 0 {
+				if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
+					break
+				}
+				close_conn(epoll_fd, fd, active_conns, mut st)
+				return
+			}
+			if dn == 0 {
+				close_conn(epoll_fd, fd, active_conns, mut st)
+				return
+			}
+			cs.body_drain -= dn
+			continue
+		}
 		if cs.read_buf.len == cs.read_buf.cap {
-			unsafe { cs.read_buf.grow_cap(cs.read_buf.cap) }
+			target := request_parser.frame_expected_total(cs.read_buf)
+			// A body too large to buffer is STREAMED: answer from the head, then drain.
+			if target > sm_stream_body_above && target <= req_cap {
+				match async_start_body_drain(h, mut reactor, epoll_fd, fd, limits, active_conns, mut
+					st, mut cs, state, target) {
+					1 { continue } // draining started; keep reading the body
+					2 { return } // connection closed
+					else {} // head not complete yet → fall through to grow
+				}
+			}
+			if target > cs.read_buf.cap && target <= req_cap {
+				unsafe { cs.read_buf.grow_cap(target - cs.read_buf.cap) }
+			} else {
+				unsafe { cs.read_buf.grow_cap(cs.read_buf.cap) }
+			}
 		}
 		spare := cs.read_buf.cap - cs.read_buf.len
 		n := C.recv(fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, usize(spare), 0)
@@ -120,20 +162,68 @@ fn async_serve(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd i
 		unsafe {
 			cs.read_buf.len += n
 		}
-	}
-	if cs.read_buf.len > req_cap {
-		cs.write_buf << response.status_413_response
-		if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-			close_conn(epoll_fd, fd, active_conns, mut st)
+		if !async_drain(h, mut reactor, epoll_fd, fd, limits, active_conns, mut st, mut cs, state) {
+			return
 		}
-		return
-	}
-	if !async_drain(h, mut reactor, epoll_fd, fd, limits, active_conns, mut st, mut cs, state) {
-		return
+		if cs.awaiting_fd >= 0 {
+			break // a request parked on a watch — stop reading until it resumes
+		}
+		if cs.read_buf.len > req_cap {
+			cs.write_buf << response.status_413_response
+			if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
+				close_conn(epoll_fd, fd, active_conns, mut st)
+			}
+			return
+		}
 	}
 	if cs.write_buf.len > cs.write_off || cs.file_remaining > 0 {
 		flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs)
 	}
+}
+
+// async_start_body_drain answers a large-body request from its HEAD alone, then
+// puts the connection into streaming-drain mode for the body (the cs.body_drain
+// branch above). The async counterpart of start_body_drain — such handlers must
+// answer by Content-Length and complete synchronously (.done); a head handler
+// that suspends mid-large-body is not supported in v1 and drops the connection.
+// Returns 1 = draining started, 2 = connection closed, 0 = head not complete yet.
+@[direct_array_access]
+fn async_start_body_drain(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr, total int) int {
+	head_len := request_parser.frame_head_len(cs.read_buf)
+	if head_len <= 0 || head_len > cs.read_buf.len {
+		return 0 // head not complete in the buffer yet — grow/recv more
+	}
+	content_length := total - head_len
+	head := unsafe { cs.read_buf[0..head_len] }
+	mut ac := core.AsyncCtx{
+		client_fd: fd
+		state:     state
+		loop_fd:   epoll_fd
+		reactor:   unsafe { voidptr(&reactor) }
+		register:  async_register
+	}
+	if h(head, mut cs.write_buf, mut ac) != .done {
+		// suspend/close on a streamed-body request is unsupported in v1 — answer
+		// 400 and drop, rather than leave a half-drained connection parked.
+		cs.write_buf << response.tiny_bad_request_response
+		if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
+			close_conn(epoll_fd, fd, active_conns, mut st)
+		}
+		return 2
+	}
+	if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
+		close_conn(epoll_fd, fd, active_conns, mut st)
+		return 2
+	}
+	body_in_buf := cs.read_buf.len - head_len
+	cs.body_drain = i64(content_length) - i64(body_in_buf)
+	if cs.body_drain < 0 {
+		cs.body_drain = 0
+	}
+	unsafe {
+		cs.read_buf.len = 0 // head (and any buffered body bytes) consumed
+	}
+	return 1
 }
 
 // async_drain answers every complete request currently buffered, appending each
@@ -162,6 +252,14 @@ fn async_drain(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd i
 		if total < 0 {
 			break // incomplete — wait for more bytes
 		}
+		// A file deferred by an earlier request in this batch must be emitted (as
+		// bytes, in order) BEFORE this next response is appended — same ordering
+		// rule as the synchronous drain_requests.
+		if cs.file_remaining > 0 {
+			append_file_region(mut cs.write_buf, cs.file_fd, cs.file_off, cs.file_remaining)
+			cs.file_fd = -1
+			cs.file_remaining = 0
+		}
 		req := unsafe { cs.read_buf[pos..pos + total] }
 		mut ac := core.AsyncCtx{
 			client_fd: fd
@@ -173,7 +271,15 @@ fn async_drain(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd i
 		step := h(req, mut cs.write_buf, mut ac)
 		pos += total
 		match step {
-			.done {} // response appended; answer the next buffered request
+			.done {
+				// Handler may have appended headers + handed its body off for
+				// sendfile(2); it streams after write_buf drains (flush_batch).
+				if qf := core.take_queued_file() {
+					cs.file_fd = qf.file_fd
+					cs.file_off = qf.off
+					cs.file_remaining = qf.len
+				}
+			}
 			.suspend {
 				cs.awaiting_fd = ac.last_watched // park; leftover stays buffered for resume
 			}
