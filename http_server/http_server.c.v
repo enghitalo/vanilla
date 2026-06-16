@@ -22,7 +22,11 @@ pub:
 	tls_config      &tls.Config = unsafe { nil } // nil ⇒ plain HTTP; set ⇒ HTTPS
 pub mut:
 	threads         []thread = []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
-	request_handler core.RequestHandler @[required]
+	request_handler core.RequestHandler = unsafe { nil }
+	// Per-thread state path (epoll only); see ServerConfig. make_state runs once
+	// per worker thread, stateful_handler receives its result on every request.
+	stateful_handler core.StatefulHandler = unsafe { nil }
+	make_state       fn () voidptr        = unsafe { nil }
 	// Per-worker in-flight request counters (one per worker, each on its own
 	// cache line — written only by its worker, so no contention/false sharing).
 	// shutdown() sums them to drain precisely.
@@ -221,13 +225,36 @@ pub struct ServerConfig {
 pub:
 	port            int       = 3000
 	io_multiplexing IOBackend = unsafe { IOBackend(0) }
-	request_handler core.RequestHandler @[required]
-	certificates    Certificates
-	limits          Limits
-	tls_config      &tls.Config = unsafe { nil } // set for HTTPS (e.g. tls.new_self_signed())
+	// Provide EITHER request_handler (stateless) OR stateful_handler+make_state
+	// (per-thread state). new_server enforces exactly one is set.
+	request_handler core.RequestHandler = unsafe { nil }
+	// stateful_handler + make_state opt into lock-free per-thread state: each
+	// epoll worker calls make_state ONCE (so the value is thread-local), then every
+	// request on that worker is dispatched through stateful_handler with it. Used to
+	// give each worker its own DB connection — no shared pool, no mutex. Linux/epoll
+	// only; ignored by other backends. See core.StatefulHandler.
+	stateful_handler core.StatefulHandler = unsafe { nil }
+	make_state       fn () voidptr        = unsafe { nil }
+	certificates     Certificates
+	limits           Limits
+	tls_config       &tls.Config = unsafe { nil } // set for HTTPS (e.g. tls.new_self_signed())
 }
 
 pub fn new_server(config ServerConfig) !Server {
+	// Exactly one handler path. The per-thread path needs both halves; otherwise a
+	// plain request_handler is required (it would crash on the first call if nil).
+	stateful := config.make_state != unsafe { nil }
+	if stateful {
+		if config.stateful_handler == unsafe { nil } {
+			return error('make_state requires stateful_handler')
+		}
+		$if !linux {
+			return error('per-thread state (make_state) is only supported on the Linux epoll backend')
+		}
+	} else if config.request_handler == unsafe { nil } {
+		return error('request_handler is required (or set make_state + stateful_handler)')
+	}
+
 	socket_fd := socket.create_server_socket(config.port)
 
 	// Set default backend based on OS
@@ -261,13 +288,15 @@ pub fn new_server(config ServerConfig) !Server {
 	}
 
 	return Server{
-		port:            config.port
-		io_multiplexing: config.io_multiplexing
-		socket_fd:       socket_fd
-		request_handler: config.request_handler
-		limits:          config.limits
-		tls_config:      config.tls_config
-		threads:         []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
-		listener_fds:    listener_fds
+		port:             config.port
+		io_multiplexing:  config.io_multiplexing
+		socket_fd:        socket_fd
+		request_handler:  config.request_handler
+		stateful_handler: config.stateful_handler
+		make_state:       config.make_state
+		limits:           config.limits
+		tls_config:       config.tls_config
+		threads:          []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
+		listener_fds:     listener_fds
 	}
 }
