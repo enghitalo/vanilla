@@ -23,7 +23,16 @@ pub:
 pub struct PgConn {
 mut:
 	sock     &net.TcpConn = unsafe { nil }
+	fd       int          = -1 // the raw socket fd (for the non-blocking path; see conn_async.v)
 	recv_buf []u8
+	// In-flight non-blocking query state (one query per connection at a time).
+	send_buf        []u8
+	send_off        int
+	q_frames        []u8
+	q_error         string
+	q_sqlstate      string
+	q_rows_affected u64
+	q_active        bool
 }
 
 struct Msg {
@@ -37,6 +46,7 @@ pub fn PgConn.connect(cfg ConnConfig) !PgConn {
 	mut sock := net.dial_tcp('${cfg.host}:${cfg.port}')!
 	mut c := PgConn{
 		sock:     sock
+		fd:       sock.sock.handle
 		recv_buf: []u8{cap: 16 * 1024}
 	}
 	c.handshake(cfg)!
