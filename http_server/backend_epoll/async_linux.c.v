@@ -2,9 +2,13 @@ module backend_epoll
 
 // Opt-in async runtime for the epoll worker.
 //
-// This is an ISOLATED worker path: when ServerConfig.async_handler is set, the
-// server spawns `process_events_async` instead of the synchronous
-// `process_events_plain`, so the synchronous hot path is untouched.
+// There is ONE worker (process_events_plain in worker_linux.c.v). When
+// ServerConfig.async_handler is set it additionally owns an AsyncReactor and
+// routes watched-fd readiness + client reads through the helpers in this file;
+// when it is not set, a single per-worker `has_async` bool skips all of this, so
+// the synchronous hot path (and all its optimizations: pipelining, the busy-poll
+// hybrid, large-body streaming-drain, sendfile, EPOLLOUT backpressure) is shared
+// by the async path for free and is byte-for-byte unchanged when async is off.
 //
 // The model is a small single-threaded reactor. A handler that needs to wait on
 // something (a DB socket, an upstream connection, a timerfd, the client becoming
@@ -23,7 +27,6 @@ module backend_epoll
 // timeouts, and pool-owned (non-closing) watched fds are follow-ups.
 import http_server.core
 import http_server.epoll
-import http_server.socket
 import http_server.http1_1.request_parser
 import http_server.http1_1.response
 
@@ -62,58 +65,11 @@ fn async_register(mut ac core.AsyncCtx, ext_fd int, events u32, cont core.WakeFn
 	ac.last_watched = ext_fd
 }
 
-// process_events_async is the async worker loop. It owns its connection table
-// (reusing ConnState + the flush/close helpers) and its watch registry. Client
-// fds and watched external fds share this one epoll instance.
-@[direct_array_access; manualfree]
-fn process_events_async(worker_id int, epoll_fd int, async_handler core.AsyncHandler, make_state fn () voidptr, limits core.Limits, counter &core.Counter, active_conns &core.Counter) {
-	maybe_pin_worker(worker_id)
-	core.enable_sendfile()
-	mut state := voidptr(unsafe { nil })
-	if make_state != unsafe { nil } {
-		state = make_state()
-	}
-	mut reactor := AsyncReactor{
-		watches: map[int]WatchEntry{}
-	}
-	mut events := [socket.max_connection_size]C.epoll_event{}
-	mut st := new_plain_state()
-	for {
-		num_events := C.epoll_wait(epoll_fd, &events[0], socket.max_connection_size, -1)
-		if num_events < 0 {
-			if C.errno == C.EINTR {
-				continue
-			}
-			C.perror(c'epoll_wait')
-			break
-		}
-		for i in 0 .. num_events {
-			fd := epoll.event_fd(events[i])
-			ev := events[i].events
-			// Is this a watched external fd? Run its continuation.
-			if entry := reactor.watches[fd] {
-				async_on_ready(async_handler, mut reactor, epoll_fd, fd, entry, limits, counter,
-					active_conns, mut st, state)
-				continue
-			}
-			// Otherwise it is a client connection.
-			if ev & u32(C.EPOLLHUP | C.EPOLLERR) != 0 {
-				async_close(mut reactor, epoll_fd, fd, active_conns, mut st)
-				continue
-			}
-			if ev & u32(C.EPOLLOUT) != 0 {
-				// A parked response batch finished draining: reuse the plain writer.
-				if !handle_writable_plain(epoll_fd, fd, active_conns, mut st) {
-					continue
-				}
-			}
-			if ev & u32(C.EPOLLIN) != 0 {
-				async_handle_readable(async_handler, mut reactor, epoll_fd, fd, limits, counter,
-					active_conns, mut st, state)
-			}
-		}
-	}
-}
+// The async runtime is driven by the ONE plain worker (process_events_plain in
+// worker_linux.c.v): when async_handler is set it owns an AsyncReactor and routes
+// watched-fd readiness to async_on_ready and client reads to async_handle_readable
+// (below). This file holds only those async helpers — the event loop, accept, the
+// busy-poll hybrid and the timeout sweep are all shared with the synchronous path.
 
 // async_handle_readable reads the request, calls the async handler ONCE, and
 // reads the socket, answers every complete request, and parks only when a
