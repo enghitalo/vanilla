@@ -85,6 +85,10 @@ mut:
 	// head was already answered, this many body bytes are still to be consumed
 	// off the socket before the connection is ready for its next request.
 	body_drain i64
+	// Async runtime only (unused by the synchronous path): the external fd this
+	// connection is parked on while awaiting a watch (-1 = not parked). Lets the
+	// async worker tear the watch down if the client closes mid-await.
+	awaiting_fd int = -1
 }
 
 // PlainState is the per-worker connection table. `parked` counts connections

@@ -113,32 +113,39 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 	}
 }
 
-// build_handler resolves the effective per-worker handler. With no make_state it
-// is just the stateless request_handler. With make_state it runs ONCE on the
-// calling (worker) thread to build that thread's state, then returns a stateless
-// closure that forwards every request through stateful_handler with that state —
-// so the rest of the hot path stays a plain RequestHandler and the state is
-// thread-local (no sharing, no lock). Must be called from inside the worker.
-fn build_handler(request_handler core.RequestHandler, stateful_handler core.StatefulHandler, make_state fn () voidptr) core.RequestHandler {
-	if make_state == unsafe { nil } {
+// build_handler resolves the effective synchronous per-worker handler. With no
+// stateful_handler it is just the stateless request_handler; otherwise it binds
+// this worker's `state` into a plain RequestHandler closure so the hot path stays
+// a plain RequestHandler and the state is thread-local (no sharing, no lock).
+fn build_handler(request_handler core.RequestHandler, stateful_handler core.StatefulHandler, state voidptr) core.RequestHandler {
+	if stateful_handler == unsafe { nil } {
 		return request_handler
 	}
-	state := make_state()
 	return fn [state, stateful_handler] (req []u8, fd int, mut out []u8) ! {
 		stateful_handler(req, fd, mut out, state)!
 	}
 }
 
 // Plain (HTTP) worker: owns the per-fd connection state table (persistent
-// buffers, cross-edge reads, EPOLLOUT writes).
+// buffers, cross-edge reads, EPOLLOUT writes). ONE worker for both the
+// synchronous and the async-runtime paths: with an async_handler it also owns a
+// watch registry and resumes parked requests when a watched fd fires; otherwise
+// the async branches are skipped entirely (a single per-worker `has_async` bool)
+// so the synchronous hot path is byte-for-byte unchanged.
 @[direct_array_access; manualfree]
-fn process_events_plain(worker_id int, epoll_fd int, request_handler core.RequestHandler, stateful_handler core.StatefulHandler, make_state fn () voidptr, limits core.Limits, counter &core.Counter, active_conns &core.Counter) {
+fn process_events_plain(worker_id int, epoll_fd int, request_handler core.RequestHandler, stateful_handler core.StatefulHandler, async_handler core.AsyncHandler, make_state fn () voidptr, limits core.Limits, counter &core.Counter, active_conns &core.Counter) {
 	maybe_pin_worker(worker_id)
-	// Per-thread state path: build THIS worker's state once, then bind it into a
-	// plain RequestHandler closure so the rest of the hot path is unchanged. The
-	// state is constructed here, inside the spawned worker, so it is thread-local
-	// (e.g. this worker's own DB connection) — no sharing, no lock.
-	handler := build_handler(request_handler, stateful_handler, make_state)
+	// Build THIS worker's per-thread state once (e.g. its own DB connection) — used
+	// by the stateful sync handler closure AND passed to async handlers via AsyncCtx.
+	mut state := voidptr(unsafe { nil })
+	if make_state != unsafe { nil } {
+		state = make_state()
+	}
+	has_async := async_handler != unsafe { nil }
+	handler := build_handler(request_handler, stateful_handler, state) // sync path
+	mut reactor := AsyncReactor{
+		watches: map[int]WatchEntry{}
+	} // async path: ext_fd -> parked request
 	// This worker can stream file bodies with sendfile(2): let handlers hand a
 	// file off via core.queue_file instead of copying it through write_buf.
 	core.enable_sendfile()
@@ -175,8 +182,20 @@ fn process_events_plain(worker_id int, epoll_fd int, request_handler core.Reques
 		for i in 0 .. num_events {
 			fd := epoll.event_fd(events[i])
 			ev := events[i].events
+			// Async only: a watched external fd became ready → run its continuation.
+			if has_async {
+				if entry := reactor.watches[fd] {
+					async_on_ready(async_handler, mut reactor, epoll_fd, fd, entry, limits,
+						counter, active_conns, mut st, state)
+					continue
+				}
+			}
 			if ev & u32(C.EPOLLHUP | C.EPOLLERR) != 0 {
-				close_conn(epoll_fd, fd, active_conns, mut st)
+				if has_async {
+					async_close(mut reactor, epoll_fd, fd, active_conns, mut st) // tear any watch down first
+				} else {
+					close_conn(epoll_fd, fd, active_conns, mut st)
+				}
 				continue
 			}
 			if ev & u32(C.EPOLLOUT) != 0 {
@@ -185,7 +204,13 @@ fn process_events_plain(worker_id int, epoll_fd int, request_handler core.Reques
 				}
 			}
 			if ev & u32(C.EPOLLIN) != 0 {
-				handle_readable_plain(handler, epoll_fd, fd, limits, counter, active_conns, mut st)
+				if has_async {
+					async_handle_readable(async_handler, mut reactor, epoll_fd, fd, limits,
+						counter, active_conns, mut st, state)
+				} else {
+					handle_readable_plain(handler, epoll_fd, fd, limits, counter, active_conns, mut
+						st)
+				}
 			}
 		}
 		// After handling this batch (or a timeout wake with num_events == 0),
@@ -238,7 +263,7 @@ fn process_events_tls(worker_id int, epoll_fd int, request_handler core.RequestH
 	}
 }
 
-pub fn run_epoll_backend(socket_fd int, request_handler core.RequestHandler, stateful_handler core.StatefulHandler, make_state fn () voidptr, port int, limits core.Limits, inflight []&core.Counter, active_conns &core.Counter, tls_config &tls.Config, mut threads []thread) {
+pub fn run_epoll_backend(socket_fd int, request_handler core.RequestHandler, stateful_handler core.StatefulHandler, async_handler core.AsyncHandler, make_state fn () voidptr, port int, limits core.Limits, inflight []&core.Counter, active_conns &core.Counter, tls_config &tls.Config, mut threads []thread) {
 	if socket_fd < 0 {
 		return
 	}
@@ -283,8 +308,10 @@ pub fn run_epoll_backend(socket_fd int, request_handler core.RequestHandler, sta
 			threads[i] = spawn process_events_tls(i, epoll_fds[i], request_handler,
 				stateful_handler, make_state, limits, counter, active_conns, tls_config)
 		} else {
+			// ONE plain worker for both sync and async (async_handler opts in); it skips
+			// all async code via a per-worker bool, so the sync hot path is unchanged.
 			threads[i] = spawn process_events_plain(i, epoll_fds[i], request_handler,
-				stateful_handler, make_state, limits, counter, active_conns)
+				stateful_handler, async_handler, make_state, limits, counter, active_conns)
 		}
 	}
 

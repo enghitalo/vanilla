@@ -24,6 +24,60 @@ pub const max_thread_pool_size = runtime.nr_cpus()
 // Returning an error sends 400 and closes the connection.
 pub type RequestHandler = fn (req []u8, fd int, mut out []u8) !
 
+// --- Async runtime (opt-in) -------------------------------------------------
+//
+// AsyncStep is what an async handler / continuation returns to the worker:
+//   .done    — the response is in `out`; the worker sends it and unparks the conn
+//   .suspend — the handler/continuation registered a watch (ac.watch); the conn
+//              stays parked until that fd is ready (multi-step chains re-suspend)
+//   .close   — error; the worker drops the connection
+pub enum AsyncStep {
+	done
+	suspend
+	close
+}
+
+// WakeFn is a continuation: it runs when a watched fd (ac.ready_fd) becomes
+// ready, may append the response to `out`, and returns the next AsyncStep.
+pub type WakeFn = fn (mut out []u8, mut ac AsyncCtx) AsyncStep
+
+// AsyncHandler is the opt-in async request handler. Like RequestHandler it gets
+// the request bytes and the connection write buffer, but instead of always
+// producing a response it can PARK the request on any fd via `ac.watch(...)` and
+// return .suspend — the worker resumes the registered continuation when that fd
+// is ready, all in the same epoll loop. The DB driver, a reverse proxy, timers,
+// and SSE/WebSocket backpressure are all consumers of this one primitive.
+pub type AsyncHandler = fn (req []u8, mut out []u8, mut ac AsyncCtx) AsyncStep
+
+// AsyncCtx is the per-invocation handle a handler/continuation uses to await an
+// fd. The backend fills it in and installs `register`; handlers only call
+// watch()/ready_fd()/udata()/state(). It is the layering bridge: `core` owns the
+// type and the handler contract, the epoll backend owns the registration logic
+// (added via the `register` fn pointer), so `core` stays backend-free.
+pub struct AsyncCtx {
+pub mut:
+	client_fd    int
+	ready_fd     int = -1 // the fd that woke this continuation (-1 on the initial call)
+	udata        voidptr // consumer context carried from watch() to the continuation
+	state        voidptr // this worker's per-thread state (see StatefulHandler/make_state)
+	epoll_fd     int     // backend-filled: the worker's epoll instance
+	reactor      voidptr // backend-filled: the worker's watch registry
+	last_watched int = -1 // backend-filled: the fd passed to the most recent watch()
+	register     fn (mut ac AsyncCtx, ext_fd int, events u32, cont WakeFn, udata voidptr) = unsafe { nil }
+}
+
+// watch parks the current request and asks the worker to call `cont` when
+// `ext_fd` is ready for `events` (EPOLLIN/EPOLLOUT). `udata` is handed back to
+// the continuation via ac.udata. After calling watch, return .suspend.
+pub fn (mut ac AsyncCtx) watch(ext_fd int, events u32, cont WakeFn, udata voidptr) {
+	ac.register(mut ac, ext_fd, events, cont, udata)
+}
+
+// ready_fd is the fd that woke the running continuation (-1 on the initial call).
+pub fn (ac &AsyncCtx) ready_fd() int {
+	return ac.ready_fd
+}
+
 // StatefulHandler is the per-thread-state variant of RequestHandler. It receives
 // the same arguments PLUS an opaque `state voidptr` — the value the server's
 // `make_state` callback returned for THIS worker thread (and only this one). It
