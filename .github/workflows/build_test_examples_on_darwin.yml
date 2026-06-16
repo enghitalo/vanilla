@@ -14,6 +14,7 @@ jobs:
       fail-fast: false # Continue other jobs if one fails
       matrix:
         folder:
+          - examples/async_pipe/src
           - examples/database/src
           - examples/etag/src
           - examples/hexagonal/src

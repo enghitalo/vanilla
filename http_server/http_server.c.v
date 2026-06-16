@@ -269,16 +269,32 @@ pub fn new_server(config ServerConfig) !Server {
 	if has_stateful && config.make_state == unsafe { nil } {
 		return error('stateful_handler requires make_state')
 	}
-	if has_stateful || has_async {
-		// epoll-only for now. The `.epoll` enum value exists only in the Linux
-		// IOBackend, so the check must live inside `$if linux` — otherwise this
-		// all-platform file fails to compile on macOS (.kqueue) / Windows (.iocp).
+	// Each backend's IOBackend enum has different values (.epoll on Linux,
+	// .kqueue on macOS, .iocp on Windows), so a value is only ever referenced
+	// inside the matching `$if` — otherwise this all-platform file fails to
+	// compile on the other targets.
+	if has_stateful {
+		// stateful_handler (sync per-thread state) is Linux/epoll only for now.
 		$if linux {
 			if config.io_multiplexing != .epoll {
-				return error('stateful_handler / async_handler require the epoll backend')
+				return error('stateful_handler requires the epoll backend')
 			}
 		} $else {
-			return error('stateful_handler / async_handler are only supported on the Linux epoll backend')
+			return error('stateful_handler is only supported on the Linux epoll backend')
+		}
+	}
+	if has_async {
+		// async_handler runs on the Linux epoll worker and the macOS kqueue worker.
+		$if linux {
+			if config.io_multiplexing != .epoll {
+				return error('async_handler requires the epoll backend')
+			}
+		} $else $if darwin {
+			if config.io_multiplexing != .kqueue {
+				return error('async_handler requires the kqueue backend')
+			}
+		} $else {
+			return error('async_handler is supported on the Linux epoll and macOS kqueue backends')
 		}
 	}
 

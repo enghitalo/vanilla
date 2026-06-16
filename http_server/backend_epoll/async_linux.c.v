@@ -54,14 +54,15 @@ mut:
 // ultimately calls. It records the watch and adds the external fd to this
 // worker's epoll (level-triggered: simplest correct default for arbitrary
 // consumer fds). Runs on the worker thread, so no synchronization is needed.
-fn async_register(mut ac core.AsyncCtx, ext_fd int, events u32, cont core.WakeFn, udata voidptr) {
+fn async_register(mut ac core.AsyncCtx, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
 	mut r := unsafe { &AsyncReactor(ac.reactor) }
 	r.watches[ext_fd] = WatchEntry{
 		client_fd: ac.client_fd
 		cont:      cont
 		udata:     udata
 	}
-	epoll.add_fd_to_epoll(ac.epoll_fd, ext_fd, events)
+	events := if interest == .writable { u32(C.EPOLLOUT) } else { u32(C.EPOLLIN) }
+	epoll.add_fd_to_epoll(ac.loop_fd, ext_fd, events)
 	ac.last_watched = ext_fd
 }
 
@@ -165,7 +166,7 @@ fn async_drain(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd i
 		mut ac := core.AsyncCtx{
 			client_fd: fd
 			state:     state
-			epoll_fd:  epoll_fd
+			loop_fd:   epoll_fd
 			reactor:   unsafe { voidptr(&reactor) }
 			register:  async_register
 		}
@@ -232,7 +233,7 @@ fn async_on_ready(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, e
 		ready_fd:  ext_fd
 		udata:     entry.udata
 		state:     state
-		epoll_fd:  epoll_fd
+		loop_fd:   epoll_fd
 		reactor:   unsafe { voidptr(&reactor) }
 		register:  async_register
 	}
