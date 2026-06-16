@@ -24,6 +24,22 @@ pub const max_thread_pool_size = runtime.nr_cpus()
 // Returning an error sends 400 and closes the connection.
 pub type RequestHandler = fn (req []u8, fd int, mut out []u8) !
 
+// StatefulHandler is the per-thread-state variant of RequestHandler. It receives
+// the same arguments PLUS an opaque `state voidptr` — the value the server's
+// `make_state` callback returned for THIS worker thread (and only this one). It
+// lets a handler reach per-thread resources (e.g. its own DB connection) with no
+// lock: each worker owns its state, so nothing is shared across threads.
+//
+// The server never inspects `state`; it hands back exactly the pointer make_state
+// produced, so the handler's `unsafe { &MyCtx(state) }` cast is sound. This is the
+// same opaque-context contract as picoev's `cb_arg` or libuv's `data` void*.
+//
+// Wiring: set `make_state` + `stateful_handler` on ServerConfig instead of
+// `request_handler`. Each worker calls make_state ONCE, then every request on that
+// worker is dispatched through stateful_handler with that state. RequestHandler is
+// untouched, so stateless handlers and the other backends are unaffected.
+pub type StatefulHandler = fn (req []u8, fd int, mut out []u8, state voidptr) !
+
 // Counter is a single i64 padded to a full cache line, so independent counters
 // (per-worker in-flight, global active-connections) never false-share. Mutated
 // via atomic add, read via atomic load (sync.stdatomic free funcs on &n).

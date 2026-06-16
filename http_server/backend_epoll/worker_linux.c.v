@@ -113,11 +113,32 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 	}
 }
 
+// build_handler resolves the effective per-worker handler. With no make_state it
+// is just the stateless request_handler. With make_state it runs ONCE on the
+// calling (worker) thread to build that thread's state, then returns a stateless
+// closure that forwards every request through stateful_handler with that state —
+// so the rest of the hot path stays a plain RequestHandler and the state is
+// thread-local (no sharing, no lock). Must be called from inside the worker.
+fn build_handler(request_handler core.RequestHandler, stateful_handler core.StatefulHandler, make_state fn () voidptr) core.RequestHandler {
+	if make_state == unsafe { nil } {
+		return request_handler
+	}
+	state := make_state()
+	return fn [state, stateful_handler] (req []u8, fd int, mut out []u8) ! {
+		stateful_handler(req, fd, mut out, state)!
+	}
+}
+
 // Plain (HTTP) worker: owns the per-fd connection state table (persistent
 // buffers, cross-edge reads, EPOLLOUT writes).
 @[direct_array_access; manualfree]
-fn process_events_plain(worker_id int, epoll_fd int, request_handler core.RequestHandler, limits core.Limits, counter &core.Counter, active_conns &core.Counter) {
+fn process_events_plain(worker_id int, epoll_fd int, request_handler core.RequestHandler, stateful_handler core.StatefulHandler, make_state fn () voidptr, limits core.Limits, counter &core.Counter, active_conns &core.Counter) {
 	maybe_pin_worker(worker_id)
+	// Per-thread state path: build THIS worker's state once, then bind it into a
+	// plain RequestHandler closure so the rest of the hot path is unchanged. The
+	// state is constructed here, inside the spawned worker, so it is thread-local
+	// (e.g. this worker's own DB connection) — no sharing, no lock.
+	handler := build_handler(request_handler, stateful_handler, make_state)
 	// This worker can stream file bodies with sendfile(2): let handlers hand a
 	// file off via core.queue_file instead of copying it through write_buf.
 	core.enable_sendfile()
@@ -164,8 +185,7 @@ fn process_events_plain(worker_id int, epoll_fd int, request_handler core.Reques
 				}
 			}
 			if ev & u32(C.EPOLLIN) != 0 {
-				handle_readable_plain(request_handler, epoll_fd, fd, limits, counter, active_conns, mut
-					st)
+				handle_readable_plain(handler, epoll_fd, fd, limits, counter, active_conns, mut st)
 			}
 		}
 		// After handling this batch (or a timeout wake with num_events == 0),
@@ -178,8 +198,9 @@ fn process_events_plain(worker_id int, epoll_fd int, request_handler core.Reques
 
 // TLS (HTTPS) worker: owns the per-fd TLS session map (handshake + ssl read/write).
 @[direct_array_access; manualfree]
-fn process_events_tls(worker_id int, epoll_fd int, request_handler core.RequestHandler, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config) {
+fn process_events_tls(worker_id int, epoll_fd int, request_handler core.RequestHandler, stateful_handler core.StatefulHandler, make_state fn () voidptr, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config) {
 	maybe_pin_worker(worker_id)
+	handler := build_handler(request_handler, stateful_handler, make_state)
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut sessions := map[int]&TlsConn{}
 	sweep_on := limits.read_timeout_ms > 0 || limits.write_timeout_ms > 0
@@ -207,8 +228,8 @@ fn process_events_tls(worker_id int, epoll_fd int, request_handler core.RequestH
 				}
 			}
 			if ev & u32(C.EPOLLIN) != 0 {
-				handle_readable_fd_tls(request_handler, epoll_fd, fd, limits, counter,
-					active_conns, cfg, mut sessions)
+				handle_readable_fd_tls(handler, epoll_fd, fd, limits, counter, active_conns, cfg, mut
+					sessions)
 			}
 		}
 		if sweep_on && sessions.len > 0 {
@@ -217,7 +238,7 @@ fn process_events_tls(worker_id int, epoll_fd int, request_handler core.RequestH
 	}
 }
 
-pub fn run_epoll_backend(socket_fd int, request_handler core.RequestHandler, port int, limits core.Limits, inflight []&core.Counter, active_conns &core.Counter, tls_config &tls.Config, mut threads []thread) {
+pub fn run_epoll_backend(socket_fd int, request_handler core.RequestHandler, stateful_handler core.StatefulHandler, make_state fn () voidptr, port int, limits core.Limits, inflight []&core.Counter, active_conns &core.Counter, tls_config &tls.Config, mut threads []thread) {
 	if socket_fd < 0 {
 		return
 	}
@@ -259,11 +280,11 @@ pub fn run_epoll_backend(socket_fd int, request_handler core.RequestHandler, por
 		// has no TLS code at all, so the plain hot path carries zero TLS cost.
 		counter := inflight[i] // this worker's own in-flight counter
 		if tls_config != unsafe { nil } {
-			threads[i] = spawn process_events_tls(i, epoll_fds[i], request_handler, limits,
-				counter, active_conns, tls_config)
+			threads[i] = spawn process_events_tls(i, epoll_fds[i], request_handler,
+				stateful_handler, make_state, limits, counter, active_conns, tls_config)
 		} else {
-			threads[i] = spawn process_events_plain(i, epoll_fds[i], request_handler, limits,
-				counter, active_conns)
+			threads[i] = spawn process_events_plain(i, epoll_fds[i], request_handler,
+				stateful_handler, make_state, limits, counter, active_conns)
 		}
 	}
 
