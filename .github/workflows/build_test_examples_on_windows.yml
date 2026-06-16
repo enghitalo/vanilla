@@ -26,7 +26,7 @@ jobs:
       - name: Set up V
         uses: vlang/setup-v@v1.4
         with:
-          stable: true
+          version: '0.5.1'
       - name: Remove Vlang folder to avoid conflicts
         shell: bash
         run: |
