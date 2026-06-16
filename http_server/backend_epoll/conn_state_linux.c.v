@@ -54,6 +54,14 @@ const sm_max_pending_write = 8 * 1024 * 1024
 const read_buf_cap = 8 * 1024
 const write_buf_cap = 16 * 1024
 const conn_table_min = 1024
+// A request whose framed size exceeds this is STREAMED, not buffered: the head
+// is answered and the body is drained (recv'd into the fixed buffer and
+// discarded) instead of growing read_buf into a multi-MB scanned block — the
+// difference between buffering a 20 MiB upload and handling it in O(buffer)
+// memory. Realistic request bodies (JSON, form posts) stay well under this and
+// take the normal buffered path; only large uploads drain, and their handlers
+// answer by Content-Length (request_parser.HttpRequest.content_length).
+const sm_stream_body_above = 1024 * 1024
 
 // ConnState is allocated once per connection (on its first event) and reused
 // until the connection closes. The buffers keep their capacity across
@@ -73,6 +81,10 @@ mut:
 	file_fd        int = -1
 	file_off       i64
 	file_remaining i64
+	// >0 while a large request body is being streamed (drained + discarded): the
+	// head was already answered, this many body bytes are still to be consumed
+	// off the socket before the connection is ready for its next request.
+	body_drain i64
 }
 
 // PlainState is the per-worker connection table. `parked` counts connections
@@ -134,6 +146,46 @@ fn state_for(mut st PlainState, fd int) &ConnState {
 	return st.conns[fd]
 }
 
+// start_body_drain answers a large-body request from its HEAD alone, then puts
+// the connection into streaming-drain mode for the body (see the cs.body_drain
+// branch in handle_readable_plain). The handler is given only the head — no body
+// is buffered — so such handlers must answer by Content-Length (request_parser's
+// HttpRequest.content_length()); the upload profile is exactly this shape.
+// Returns: 1 = draining started (keep reading the body), 2 = connection closed,
+// 0 = head not fully buffered yet (caller keeps buffering normally).
+@[direct_array_access]
+fn start_body_drain(request_handler core.RequestHandler, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, total int) int {
+	head_len := request_parser.frame_head_len(cs.read_buf)
+	if head_len <= 0 || head_len > cs.read_buf.len {
+		return 0 // head not complete in the buffer yet — grow/recv more
+	}
+	content_length := total - head_len
+	head := unsafe { cs.read_buf[0..head_len] }
+	request_handler(head, fd, mut cs.write_buf) or {
+		cs.write_buf << response.tiny_bad_request_response
+		if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
+			close_conn(epoll_fd, fd, active_conns, mut st)
+		}
+		return 2
+	}
+	if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
+		close_conn(epoll_fd, fd, active_conns, mut st)
+		return 2
+	}
+	// Body bytes already received after the head count toward the drain. For a
+	// body past sm_stream_body_above detected at a full (small) read buffer,
+	// body_in_buf is always < content_length, so no next-request bytes are lost.
+	body_in_buf := cs.read_buf.len - head_len
+	cs.body_drain = i64(content_length) - i64(body_in_buf)
+	if cs.body_drain < 0 {
+		cs.body_drain = 0
+	}
+	unsafe {
+		cs.read_buf.len = 0 // head (and any buffered body bytes) consumed
+	}
+	return 1
+}
+
 // handle_readable_plain drains the socket into the connection's persistent
 // read buffer, answers EVERY complete request as it goes (pipelining), and
 // flushes all accumulated responses in one batched send at the end of the
@@ -155,6 +207,31 @@ fn handle_readable_plain(request_handler core.RequestHandler, epoll_fd int, fd i
 	// Edge-triggered: read to EAGAIN. Parse after every recv so the request
 	// cap applies to a single (partial) request, not to the whole burst.
 	for {
+		// Streaming-drain: once a large body has been detected (below), consume it
+		// off the socket into the fixed buffer and DISCARD it — the head was
+		// already answered. Keeps a multi-MB upload at O(buffer) memory instead of
+		// growing read_buf into a big scanned GC block.
+		if cs.body_drain > 0 {
+			want := if cs.body_drain < i64(cs.read_buf.cap) {
+				int(cs.body_drain)
+			} else {
+				cs.read_buf.cap
+			}
+			dn := C.recv(fd, cs.read_buf.data, usize(want), 0)
+			if dn < 0 {
+				if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
+					break // body not fully arrived yet; resume on the next edge
+				}
+				close_conn(epoll_fd, fd, active_conns, mut st)
+				return
+			}
+			if dn == 0 {
+				close_conn(epoll_fd, fd, active_conns, mut st)
+				return
+			}
+			cs.body_drain -= dn
+			continue
+		}
 		if cs.read_buf.len == cs.read_buf.cap {
 			// Pre-size to the exact message length when Content-Length is already
 			// known (one allocation), instead of doubling toward it. A 20 MiB
@@ -163,6 +240,16 @@ fn handle_readable_plain(request_handler core.RequestHandler, epoll_fd int, fd i
 			// or chunked/unknown length (target -1 or > req_cap) falls back to
 			// doubling, so the existing req_cap/413 guard still trips normally.
 			target := request_parser.frame_expected_total(cs.read_buf)
+			// A body too large to be worth buffering is STREAMED instead: answer it
+			// from its head, then drain the body (keeps memory O(buffer)).
+			if target > sm_stream_body_above && target <= req_cap {
+				match start_body_drain(request_handler, epoll_fd, fd, limits, active_conns, mut st, mut
+					cs, target) {
+					1 { continue } // draining started; keep reading the body
+					2 { return } // connection closed
+					else {} // head not complete yet → fall through to grow
+				}
+			}
 			if target > cs.read_buf.cap && target <= req_cap {
 				unsafe { cs.read_buf.grow_cap(target - cs.read_buf.cap) }
 			} else {

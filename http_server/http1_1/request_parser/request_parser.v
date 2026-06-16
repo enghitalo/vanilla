@@ -514,6 +514,43 @@ pub fn frame_expected_total(buf []u8) int {
 	return -1
 }
 
+// frame_head_len returns the byte offset where the body begins — the length of
+// the request head (request line + header section + the terminating CRLFCRLF) —
+// or -1 if the head is not yet complete in `buf`. Used by the engine to stream
+// (drain) a large body instead of buffering it: head stays, body is discarded.
+@[direct_array_access]
+pub fn frame_head_len(buf []u8) int {
+	if buf.len < 4 {
+		return -1
+	}
+	rl := find_byte(&buf[0], buf.len, lf_char) or { return -1 }
+	mut pos := rl + 1
+	for {
+		if pos >= buf.len {
+			return -1
+		}
+		if buf[pos] == cr_char {
+			if pos + 1 >= buf.len {
+				return -1
+			}
+			if buf[pos + 1] == lf_char {
+				return pos + 2 // past the blank line's CRLF => body start
+			}
+		}
+		line_lf := find_byte(&buf[pos], buf.len - pos, lf_char) or { return -1 }
+		pos = pos + line_lf + 1
+	}
+	return -1
+}
+
+// content_length returns the request's Content-Length header value, or -1 if it
+// is absent or unparseable. Lets a handler answer by declared length even when
+// the engine drained (never buffered) the body.
+pub fn (req HttpRequest) content_length() int {
+	s := req.get_header_value_slice('Content-Length') or { return -1 }
+	return parse_content_length(req.buffer, s) or { -1 }
+}
+
 // line_header_value returns the value Slice if a header line (line_len bytes
 // before CRLF, starting at line_start) has the case-insensitive name `name`
 // immediately followed by ':'. Used by the single-pass framer.
