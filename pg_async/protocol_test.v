@@ -99,7 +99,7 @@ fn test_next_message_framing() {
 	put_u32(mut buf, 100)
 	hdr := next_message(buf) or { panic('expected a complete first message') }
 	assert hdr.typ == bt_ready_for_query
-	rest := buf[hdr.total..]
+	rest := unsafe { buf[hdr.total..] }
 	if _ := next_message(rest) {
 		assert false, 'partial second message must not frame'
 	}
