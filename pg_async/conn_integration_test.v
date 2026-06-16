@@ -146,3 +146,51 @@ fn test_async_db_workload() {
 
 	c.query('drop table if exists pg_async_test_items', []?[]u8{})!
 }
+
+// Per-worker pool: bring-up of N connections, acquire/release bookkeeping
+// (including exhaustion), and running a query through a pooled connection via
+// the non-blocking pump.
+fn test_pool_acquire_release_and_query() {
+	cfg := pg_test_cfg() or { return }
+	mut pool := PgPool.connect(cfg, 2)!
+	defer {
+		pool.close()
+	}
+	assert pool.size() == 2
+
+	// Acquire both, confirm exhaustion, release one, re-acquire the same slot.
+	a := pool.acquire() or { panic('acquire 0') }
+	b := pool.acquire() or { panic('acquire 1') }
+	assert a != b
+	if _ := pool.acquire() {
+		assert false, 'pool should be exhausted with both connections busy'
+	}
+	pool.release(a)
+	got := pool.acquire() or { panic('re-acquire after release') }
+	assert got == a
+
+	// Run a query through the pooled connection via the non-blocking pump.
+	mut conn := pool.conn(got)
+	conn.async_submit(r'select $1::int4', [?[]u8('123'.bytes())])
+	mut sent := false
+	for _ in 0 .. 10000 {
+		if conn.async_flush()! {
+			sent = true
+			break
+		}
+	}
+	assert sent
+	mut result := ?Result(none)
+	for _ in 0 .. 200000 {
+		poll := conn.async_on_readable()!
+		if poll.ready {
+			result = poll.result
+			break
+		}
+	}
+	res := result or { panic('pooled query did not complete') }
+	mut it := res.rows()
+	row := it.next() or { panic('expected a row') }
+	assert row.int4(0)! == 123
+	pool.release(got)
+}
