@@ -2,14 +2,41 @@ module core
 
 import runtime
 
+#include <sched.h>
+
+fn C.sched_getaffinity(pid int, cpusetsize usize, mask voidptr) int
+
 // Shared, dependency-free types used by both the public `http_server` facade and
 // the backend implementations (e.g. `backend_epoll`). Keeping them in a leaf
 // module breaks what would otherwise be a cycle: `http_server` imports a backend
 // to run it, and the backend needs these types — so neither can own them.
 
-// One worker thread per core (thread-per-core model). Both the facade (thread /
-// counter array sizing) and the backend (worker fan-out) need this count.
-pub const max_thread_pool_size = runtime.nr_cpus()
+// usable_cpus returns how many CPUs this process may actually run on — its
+// cpuset/affinity mask — rather than the host's online-CPU count. Under a cpuset
+// (e.g. the HttpArena api-N benchmark pinning the server to N cores) the libc
+// sysconf that runtime.nr_cpus() uses over-reports the host count, so the server
+// would spawn far more worker threads than usable cores. Falls back to nr_cpus()
+// if the syscall is unavailable.
+fn usable_cpus() int {
+	mut mask := [16]u64{} // 1024 bits — more than any real core count
+	if C.sched_getaffinity(0, usize(sizeof(mask)), &mask[0]) != 0 {
+		return runtime.nr_cpus()
+	}
+	mut n := 0
+	for w in mask {
+		mut x := w
+		for x != 0 {
+			n += int(x & 1)
+			x >>= 1
+		}
+	}
+	return if n >= 1 { n } else { runtime.nr_cpus() }
+}
+
+// One worker thread per usable core (thread-per-core model). Both the facade
+// (thread / counter array sizing) and the backend (worker fan-out) need this
+// count. Cpuset-aware so a pinned server doesn't oversubscribe its cores.
+pub const max_thread_pool_size = usable_cpus()
 
 // RequestHandler is the raw, zero-allocation handler contract: it receives the
 // complete request bytes (a view into the connection's read buffer — copy
