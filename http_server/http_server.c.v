@@ -26,6 +26,7 @@ pub mut:
 	// Per-thread state path (epoll only); see ServerConfig. make_state runs once
 	// per worker thread, stateful_handler receives its result on every request.
 	stateful_handler core.StatefulHandler = unsafe { nil }
+	async_handler    core.AsyncHandler    = unsafe { nil }
 	make_state       fn () voidptr        = unsafe { nil }
 	// Per-worker in-flight request counters (one per worker, each on its own
 	// cache line — written only by its worker, so no contention/false sharing).
@@ -235,24 +236,46 @@ pub:
 	// only; ignored by other backends. See core.StatefulHandler.
 	stateful_handler core.StatefulHandler = unsafe { nil }
 	make_state       fn () voidptr        = unsafe { nil }
-	certificates     Certificates
-	limits           Limits
-	tls_config       &tls.Config = unsafe { nil } // set for HTTPS (e.g. tls.new_self_signed())
+	// async_handler opts into the async runtime: the handler may PARK a request on
+	// any fd via ac.watch(...) and return .suspend, resumed by a continuation when
+	// that fd is ready — all in the worker's epoll loop (DB sockets, upstreams,
+	// timers, EPOLLOUT backpressure). Optional make_state gives each worker its own
+	// state. Linux/epoll only; ignored by other backends. See core.AsyncHandler.
+	async_handler core.AsyncHandler = unsafe { nil }
+	certificates  Certificates
+	limits        Limits
+	tls_config    &tls.Config = unsafe { nil } // set for HTTPS (e.g. tls.new_self_signed())
 }
 
 pub fn new_server(config ServerConfig) !Server {
-	// Exactly one handler path. The per-thread path needs both halves; otherwise a
-	// plain request_handler is required (it would crash on the first call if nil).
-	stateful := config.make_state != unsafe { nil }
-	if stateful {
-		if config.stateful_handler == unsafe { nil } {
-			return error('make_state requires stateful_handler')
-		}
+	// Exactly one handler path: stateless request_handler, per-thread
+	// stateful_handler (+make_state), or async_handler (+optional make_state).
+	has_sync := config.request_handler != unsafe { nil }
+	has_stateful := config.stateful_handler != unsafe { nil }
+	has_async := config.async_handler != unsafe { nil }
+	mut n_handlers := 0
+	if has_sync {
+		n_handlers++
+	}
+	if has_stateful {
+		n_handlers++
+	}
+	if has_async {
+		n_handlers++
+	}
+	if n_handlers != 1 {
+		return error('provide exactly one of request_handler / stateful_handler / async_handler')
+	}
+	if has_stateful && config.make_state == unsafe { nil } {
+		return error('stateful_handler requires make_state')
+	}
+	if has_stateful || has_async {
 		$if !linux {
-			return error('per-thread state (make_state) is only supported on the Linux epoll backend')
+			return error('stateful_handler / async_handler are only supported on the Linux epoll backend')
 		}
-	} else if config.request_handler == unsafe { nil } {
-		return error('request_handler is required (or set make_state + stateful_handler)')
+		if config.io_multiplexing != .epoll {
+			return error('stateful_handler / async_handler require the epoll backend')
+		}
 	}
 
 	socket_fd := socket.create_server_socket(config.port)
@@ -293,6 +316,7 @@ pub fn new_server(config ServerConfig) !Server {
 		socket_fd:        socket_fd
 		request_handler:  config.request_handler
 		stateful_handler: config.stateful_handler
+		async_handler:    config.async_handler
 		make_state:       config.make_state
 		limits:           config.limits
 		tls_config:       config.tls_config

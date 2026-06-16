@@ -238,7 +238,7 @@ fn process_events_tls(worker_id int, epoll_fd int, request_handler core.RequestH
 	}
 }
 
-pub fn run_epoll_backend(socket_fd int, request_handler core.RequestHandler, stateful_handler core.StatefulHandler, make_state fn () voidptr, port int, limits core.Limits, inflight []&core.Counter, active_conns &core.Counter, tls_config &tls.Config, mut threads []thread) {
+pub fn run_epoll_backend(socket_fd int, request_handler core.RequestHandler, stateful_handler core.StatefulHandler, async_handler core.AsyncHandler, make_state fn () voidptr, port int, limits core.Limits, inflight []&core.Counter, active_conns &core.Counter, tls_config &tls.Config, mut threads []thread) {
 	if socket_fd < 0 {
 		return
 	}
@@ -282,6 +282,10 @@ pub fn run_epoll_backend(socket_fd int, request_handler core.RequestHandler, sta
 		if tls_config != unsafe { nil } {
 			threads[i] = spawn process_events_tls(i, epoll_fds[i], request_handler,
 				stateful_handler, make_state, limits, counter, active_conns, tls_config)
+		} else if async_handler != unsafe { nil } {
+			// Opt-in async runtime: isolated worker, synchronous path untouched.
+			threads[i] = spawn process_events_async(i, epoll_fds[i], async_handler, make_state,
+				limits, counter, active_conns)
 		} else {
 			threads[i] = spawn process_events_plain(i, epoll_fds[i], request_handler,
 				stateful_handler, make_state, limits, counter, active_conns)
