@@ -12,10 +12,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Set up V
-        uses: vlang/setup-v@v1.4
-        with:
-          version: '0.5.1'
+      - name: Set up V 0.5.1 (prebuilt release)
+        shell: bash
+        # Prebuilt 0.5.1 binary (not setup-v, which source-builds): master drifts
+        # the fmt rules and the 0.5.1 tag won't source-build (`unknown ident native`).
+        run: |
+          curl -fsSL https://github.com/vlang/v/releases/download/0.5.1/v_linux.zip -o /tmp/v.zip
+          unzip -q /tmp/v.zip -d "$HOME"
+          echo "$HOME/v" >> "$GITHUB_PATH"
       - name: Remove Vlang folder to avoid conflicts
         shell: bash
         run: |
