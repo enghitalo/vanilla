@@ -39,7 +39,7 @@ fn handle(req []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 		spec[2] = i64(ms / 1000)
 		spec[3] = i64(ms % 1000) * 1_000_000
 		C.timerfd_settime(tfd, 0, voidptr(&spec[0]), unsafe { nil })
-		ac.watch(tfd, u32(C.EPOLLIN), timer_done, unsafe { nil })
+		ac.watch(tfd, .readable, timer_done, unsafe { nil })
 		return .suspend
 	}
 	out << resp_ok

@@ -37,6 +37,15 @@ pub enum AsyncStep {
 	close
 }
 
+// WatchInterest is the platform-agnostic readiness a watch waits for. The
+// backend maps it to its native flag (epoll EPOLLIN/EPOLLOUT on Linux, kqueue
+// EVFILT_READ/EVFILT_WRITE on macOS) — so handlers stay portable and never name
+// a platform constant.
+pub enum WatchInterest {
+	readable
+	writable
+}
+
 // WakeFn is a continuation: it runs when a watched fd (ac.ready_fd) becomes
 // ready, may append the response to `out`, and returns the next AsyncStep.
 pub type WakeFn = fn (mut out []u8, mut ac AsyncCtx) AsyncStep
@@ -60,17 +69,17 @@ pub mut:
 	ready_fd     int = -1 // the fd that woke this continuation (-1 on the initial call)
 	udata        voidptr // consumer context carried from watch() to the continuation
 	state        voidptr // this worker's per-thread state (see StatefulHandler/make_state)
-	epoll_fd     int     // backend-filled: the worker's epoll instance
+	loop_fd      int     // backend-filled: the worker's event-loop fd (epoll on Linux, kqueue on macOS)
 	reactor      voidptr // backend-filled: the worker's watch registry
 	last_watched int = -1 // backend-filled: the fd passed to the most recent watch()
-	register     fn (mut ac AsyncCtx, ext_fd int, events u32, cont WakeFn, udata voidptr) = unsafe { nil }
+	register     fn (mut ac AsyncCtx, ext_fd int, interest WatchInterest, cont WakeFn, udata voidptr) = unsafe { nil }
 }
 
 // watch parks the current request and asks the worker to call `cont` when
-// `ext_fd` is ready for `events` (EPOLLIN/EPOLLOUT). `udata` is handed back to
-// the continuation via ac.udata. After calling watch, return .suspend.
-pub fn (mut ac AsyncCtx) watch(ext_fd int, events u32, cont WakeFn, udata voidptr) {
-	ac.register(mut ac, ext_fd, events, cont, udata)
+// `ext_fd` becomes ready for `interest` (readable/writable). `udata` is handed
+// back to the continuation via ac.udata. After calling watch, return .suspend.
+pub fn (mut ac AsyncCtx) watch(ext_fd int, interest WatchInterest, cont WakeFn, udata voidptr) {
+	ac.register(mut ac, ext_fd, interest, cont, udata)
 }
 
 // ready_fd is the fd that woke the running continuation (-1 on the initial call).

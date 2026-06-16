@@ -6,6 +6,7 @@ import kqueue
 import socket
 import http1_1.response
 import http1_1.request
+import http_server.core
 
 // Backend selection
 pub enum IOBackend {
@@ -25,8 +26,7 @@ fn C.close(fd int) int
 // close-per-request behaviour both lied to clients and crippled throughput.
 @[manualfree]
 fn handle_readable_fd(handler fn (req []u8, fd int, mut out []u8) !, kq_fd int, client_fd int, limits Limits) {
-	request_buffer := request.read_request(client_fd, limits.max_header_bytes,
-		limits.max_body_bytes) or {
+	request_buffer := request.read_request(client_fd, limits.max_header_bytes, limits.max_body_bytes) or {
 		match err.code() {
 			413 {
 				response.send_status_413_response(client_fd)
@@ -104,7 +104,7 @@ fn handle_accept_loop(socket_fd int, main_kq int, worker_kqs []int) {
 	}
 }
 
-pub fn run_kqueue_backend(socket_fd int, handler fn (req []u8, fd int, mut out []u8) !, port int, limits Limits, mut threads []thread) {
+pub fn run_kqueue_backend(socket_fd int, handler fn (req []u8, fd int, mut out []u8) !, async_handler core.AsyncHandler, make_state fn () voidptr, port int, limits Limits, mut threads []thread) {
 	main_kq := kqueue.create_kqueue_fd()
 	if main_kq < 0 {
 		return
@@ -129,13 +129,19 @@ pub fn run_kqueue_backend(socket_fd int, handler fn (req []u8, fd int, mut out [
 		}
 		worker_kqs[i] = kq
 
-		callbacks := kqueue.KqueueEventCallbacks{
-			on_read:  fn [handler, kq, limits] (fd int) {
-				handle_readable_fd(handler, kq, fd, limits)
+		if async_handler != unsafe { nil } {
+			// Opt-in async runtime: this worker owns a watch registry and resumes
+			// parked requests when a watched fd fires (see async_darwin.c.v).
+			threads[i] = spawn process_kqueue_async(kq, async_handler, make_state, limits)
+		} else {
+			callbacks := kqueue.KqueueEventCallbacks{
+				on_read:  fn [handler, kq, limits] (fd int) {
+					handle_readable_fd(handler, kq, fd, limits)
+				}
+				on_write: fn (_ int) {}
 			}
-			on_write: fn (_ int) {}
+			threads[i] = spawn kqueue.process_kqueue_events(callbacks, kq)
 		}
-		threads[i] = spawn kqueue.process_kqueue_events(callbacks, kq)
 	}
 
 	println('listening on http://localhost:${port}/ (kqueue)')
@@ -148,8 +154,8 @@ pub fn run_kqueue_backend(socket_fd int, handler fn (req []u8, fd int, mut out [
 fn run_selected_backend(server Server, mut threads []thread) {
 	match server.io_multiplexing {
 		.kqueue {
-			run_kqueue_backend(server.socket_fd, server.request_handler, server.port,
-				server.limits, mut threads)
+			run_kqueue_backend(server.socket_fd, server.request_handler, server.async_handler,
+				server.make_state, server.port, server.limits, mut threads)
 		}
 	}
 }
