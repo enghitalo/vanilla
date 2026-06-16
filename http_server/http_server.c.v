@@ -270,11 +270,15 @@ pub fn new_server(config ServerConfig) !Server {
 		return error('stateful_handler requires make_state')
 	}
 	if has_stateful || has_async {
-		$if !linux {
+		// epoll-only for now. The `.epoll` enum value exists only in the Linux
+		// IOBackend, so the check must live inside `$if linux` — otherwise this
+		// all-platform file fails to compile on macOS (.kqueue) / Windows (.iocp).
+		$if linux {
+			if config.io_multiplexing != .epoll {
+				return error('stateful_handler / async_handler require the epoll backend')
+			}
+		} $else {
 			return error('stateful_handler / async_handler are only supported on the Linux epoll backend')
-		}
-		if config.io_multiplexing != .epoll {
-			return error('stateful_handler / async_handler require the epoll backend')
 		}
 	}
 
