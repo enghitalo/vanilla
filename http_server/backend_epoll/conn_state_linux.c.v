@@ -391,7 +391,7 @@ fn park_write(epoll_fd int, fd int, limits core.Limits, mut st PlainState, mut c
 		cs.write_deadline = time.sys_mono_now() + u64(limits.write_timeout_ms) * 1_000_000
 		st.parked++
 	}
-	epoll.mod_fd_in_epoll(epoll_fd, fd, u32(C.EPOLLIN | C.EPOLLOUT | C.EPOLLET))
+	epoll.mod_fd_in_epoll(epoll_fd, fd, (u32(C.EPOLLIN) | u32(C.EPOLLOUT) | u32(C.EPOLLET)))
 }
 
 // append_file_region reads [off, off+len) from a borrowed file fd into `buf`.
@@ -509,7 +509,7 @@ fn handle_writable_plain(epoll_fd int, fd int, active_conns &core.Counter, mut s
 	}
 	if cs.write_off >= cs.write_buf.len && cs.file_remaining <= 0 {
 		// Spurious wake — nothing parked; stop watching writability.
-		epoll.mod_fd_in_epoll(epoll_fd, fd, u32(C.EPOLLIN | C.EPOLLET))
+		epoll.mod_fd_in_epoll(epoll_fd, fd, (u32(C.EPOLLIN) | u32(C.EPOLLET)))
 		return true
 	}
 	// Phase 1: finish the buffered bytes.
@@ -546,7 +546,7 @@ fn handle_writable_plain(epoll_fd int, fd int, active_conns &core.Counter, mut s
 		cs.write_deadline = 0
 		st.parked--
 	}
-	epoll.mod_fd_in_epoll(epoll_fd, fd, u32(C.EPOLLIN | C.EPOLLET)) // stop watching writability
+	epoll.mod_fd_in_epoll(epoll_fd, fd, (u32(C.EPOLLIN) | u32(C.EPOLLET))) // stop watching writability
 	return true
 }
 

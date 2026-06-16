@@ -102,7 +102,8 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 				$if verbose ? {
 					eprintln('[epoll] Adding client fd ${client_conn_fd} to worker epoll fd ${epoll_fd}')
 				}
-				if epoll.add_fd_to_epoll(epoll_fd, client_conn_fd, u32(C.EPOLLIN | C.EPOLLET)) < 0 {
+				if epoll.add_fd_to_epoll(epoll_fd, client_conn_fd,
+					(u32(C.EPOLLIN) | u32(C.EPOLLET))) < 0 {
 					socket.close_socket(client_conn_fd)
 					continue
 				}
@@ -190,7 +191,7 @@ fn process_events_plain(worker_id int, epoll_fd int, request_handler core.Reques
 					continue
 				}
 			}
-			if ev & u32(C.EPOLLHUP | C.EPOLLERR) != 0 {
+			if ev & (u32(C.EPOLLHUP) | u32(C.EPOLLERR)) != 0 {
 				if has_async {
 					async_close(mut reactor, epoll_fd, fd, active_conns, mut st) // tear any watch down first
 				} else {
@@ -242,7 +243,7 @@ fn process_events_tls(worker_id int, epoll_fd int, request_handler core.RequestH
 		for i in 0 .. num_events {
 			fd := epoll.event_fd(events[i])
 			ev := events[i].events
-			if ev & u32(C.EPOLLHUP | C.EPOLLERR) != 0 {
+			if ev & (u32(C.EPOLLHUP) | u32(C.EPOLLERR)) != 0 {
 				close_tls(epoll_fd, fd, active_conns, mut sessions)
 				continue
 			}

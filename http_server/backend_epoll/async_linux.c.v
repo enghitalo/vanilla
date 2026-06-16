@@ -105,8 +105,7 @@ fn async_serve(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd i
 			unsafe { cs.read_buf.grow_cap(cs.read_buf.cap) }
 		}
 		spare := cs.read_buf.cap - cs.read_buf.len
-		n := C.recv(fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, usize(spare),
-			0)
+		n := C.recv(fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, usize(spare), 0)
 		if n < 0 {
 			if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
 				break
@@ -129,8 +128,7 @@ fn async_serve(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd i
 		}
 		return
 	}
-	if !async_drain(h, mut reactor, epoll_fd, fd, limits, active_conns, mut st, mut cs,
-		state) {
+	if !async_drain(h, mut reactor, epoll_fd, fd, limits, active_conns, mut st, mut cs, state) {
 		return
 	}
 	if cs.write_buf.len > cs.write_off || cs.file_remaining > 0 {
@@ -147,8 +145,8 @@ fn async_serve(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd i
 fn async_drain(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) bool {
 	mut pos := 0
 	for pos < cs.read_buf.len && cs.awaiting_fd < 0 {
-		total := request_parser.frame_request_length_lim(cs.read_buf[pos..], limits.max_header_bytes,
-			limits.max_body_bytes) or {
+		total := request_parser.frame_request_length_lim(cs.read_buf[pos..],
+			limits.max_header_bytes, limits.max_body_bytes) or {
 			match err.code() {
 				413 { cs.write_buf << response.status_413_response }
 				431 { cs.write_buf << response.status_431_response }
@@ -243,8 +241,8 @@ fn async_on_ready(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, e
 		.done {
 			// Send this response and drain any requests that were pipelined behind it
 			// (and read anything that arrived while parked) — one batched flush.
-			async_serve(h, mut reactor, epoll_fd, client_fd, limits, active_conns, mut
-				st, mut cs, state)
+			async_serve(h, mut reactor, epoll_fd, client_fd, limits, active_conns, mut st, mut cs,
+				state)
 		}
 		.suspend {
 			cs.awaiting_fd = ac.last_watched // re-armed (multi-step); stay parked

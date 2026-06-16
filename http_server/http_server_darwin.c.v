@@ -26,7 +26,8 @@ fn C.close(fd int) int
 // close-per-request behaviour both lied to clients and crippled throughput.
 @[manualfree]
 fn handle_readable_fd(handler fn (req []u8, fd int, mut out []u8) !, kq_fd int, client_fd int, limits Limits) {
-	request_buffer := request.read_request(client_fd, limits.max_header_bytes, limits.max_body_bytes) or {
+	request_buffer := request.read_request(client_fd, limits.max_header_bytes,
+		limits.max_body_bytes) or {
 		match err.code() {
 			413 {
 				response.send_status_413_response(client_fd)

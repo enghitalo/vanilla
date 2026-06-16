@@ -24,18 +24,8 @@ jobs:
           - examples/sse/src
     steps:
       - uses: actions/checkout@v4
-      - name: Set up V 0.5.1 (prebuilt release)
-        shell: bash
-        # Install the official prebuilt 0.5.1 binary directly, NOT via setup-v.
-        # setup-v always source-builds: its default (latest master) currently
-        # regresses `u32(C.EPOLLIN | C.EPOLLET)` and breaks every epoll example,
-        # and source-building the 0.5.1 *tag* fails with `unknown ident native`
-        # (the make/latest_vc mismatch). The prebuilt release is what the
-        # Dockerfiles ship and builds the lib cleanly.
-        run: |
-          curl -fsSL https://github.com/vlang/v/releases/download/0.5.1/v_linux.zip -o /tmp/v.zip
-          unzip -q /tmp/v.zip -d "$HOME"
-          echo "$HOME/v" >> "$GITHUB_PATH"
+      - name: Set up V
+        uses: vlang/setup-v@v1.4
       - name: Remove Vlang folder to avoid conflicts
         shell: bash
         run: |

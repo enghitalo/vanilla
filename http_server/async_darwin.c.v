@@ -119,6 +119,7 @@ fn kq_handle_request(h core.AsyncHandler, mut reactor KqReactor, kq int, fd int,
 				}
 			}
 		}
+
 		kq_close(mut reactor, kq, fd)
 		return
 	}
