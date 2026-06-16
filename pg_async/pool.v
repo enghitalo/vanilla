@@ -43,9 +43,29 @@ fn close_all(mut conns []PgConn) {
 	}
 }
 
+// new_pool brings up a pool and returns it on the heap — convenient for a
+// make_state callback that hands the pool back to the worker as an opaque
+// voidptr (the StatefulHandler / async state contract).
+pub fn new_pool(cfg ConnConfig, size int) !&PgPool {
+	pool := PgPool.connect(cfg, size)!
+	return &pool
+}
+
 // size is the number of connections in the pool.
 pub fn (p &PgPool) size() int {
 	return p.conns.len
+}
+
+// idx_of_fd maps a socket fd back to its connection index — used by a resume
+// continuation to find which connection woke it (ac.ready_fd) without threading
+// the index through udata.
+pub fn (p &PgPool) idx_of_fd(fd int) ?int {
+	for i in 0 .. p.conns.len {
+		if p.conns[i].fd == fd {
+			return i
+		}
+	}
+	return none
 }
 
 // acquire returns the index of an idle connection (marking it busy), or none if
