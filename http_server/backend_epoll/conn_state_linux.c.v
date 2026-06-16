@@ -84,7 +84,7 @@ mut:
 	// >0 while a large request body is being streamed (drained + discarded): the
 	// head was already answered, this many body bytes are still to be consumed
 	// off the socket before the connection is ready for its next request.
-	body_drain     i64
+	body_drain i64
 }
 
 // PlainState is the per-worker connection table. `parked` counts connections
@@ -243,9 +243,8 @@ fn handle_readable_plain(request_handler core.RequestHandler, epoll_fd int, fd i
 			// A body too large to be worth buffering is STREAMED instead: answer it
 			// from its head, then drain the body (keeps memory O(buffer)).
 			if target > sm_stream_body_above && target <= req_cap {
-				match start_body_drain(request_handler, epoll_fd, fd, limits, active_conns, mut st, mut cs,
-					target)
-				{
+				match start_body_drain(request_handler, epoll_fd, fd, limits, active_conns, mut st, mut
+					cs, target) {
 					1 { continue } // draining started; keep reading the body
 					2 { return } // connection closed
 					else {} // head not complete yet → fall through to grow
