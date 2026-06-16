@@ -142,6 +142,29 @@ fn test_extended_query_pipeline_builds() {
 	assert rest.len == 0
 }
 
+// Framing must be correct when bytes arrive one at a time — exactly the
+// partial-read regime the non-blocking async worker runs in. next_message must
+// return none until a whole message is buffered, then frame it precisely.
+fn test_framing_under_byte_by_byte_fragmentation() {
+	mut full := []u8{}
+	append_msg(mut full, bt_data_row, build_data_row([?[]u8([u8(0), 0, 0, 7])]))
+	append_msg(mut full, bt_command_complete, 'SELECT 1\0'.bytes())
+	append_msg(mut full, bt_ready_for_query, [u8(`I`)])
+
+	mut buf := []u8{}
+	mut framed := []u8{} // the message type of each framed message, in order
+	for i in 0 .. full.len {
+		buf << full[i]
+		for {
+			hdr := next_message(buf) or { break }
+			framed << hdr.typ
+			buf.delete_many(0, hdr.total)
+		}
+	}
+	assert framed == [bt_data_row, bt_command_complete, bt_ready_for_query]
+	assert buf.len == 0 // every byte consumed, nothing left dangling
+}
+
 fn test_startup_message_has_no_type_byte_and_self_lengths() {
 	mut buf := []u8{}
 	write_startup(mut buf, 'bench', 'bench')
