@@ -21,7 +21,6 @@ module backend_epoll
 // (no pipelining-while-suspended), request-owned watched fds (the continuation
 // or close path owns ext_fd's lifetime). Pipelining-while-suspended, parked-conn
 // timeouts, and pool-owned (non-closing) watched fds are follow-ups.
-
 import http_server.core
 import http_server.epoll
 import http_server.socket
@@ -109,8 +108,8 @@ fn process_events_async(worker_id int, epoll_fd int, async_handler core.AsyncHan
 				}
 			}
 			if ev & u32(C.EPOLLIN) != 0 {
-				async_handle_readable(async_handler, mut reactor, epoll_fd, fd, limits,
-					counter, active_conns, mut st, state)
+				async_handle_readable(async_handler, mut reactor, epoll_fd, fd, limits, counter,
+					active_conns, mut st, state)
 			}
 		}
 	}
@@ -132,7 +131,11 @@ fn async_handle_readable(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd
 		}
 		return
 	}
-	req_cap := if limits.max_request_bytes > 0 { limits.max_request_bytes } else { sm_max_request_bytes }
+	req_cap := if limits.max_request_bytes > 0 {
+		limits.max_request_bytes
+	} else {
+		sm_max_request_bytes
+	}
 	for {
 		if cs.read_buf.len == cs.read_buf.cap {
 			unsafe { cs.read_buf.grow_cap(cs.read_buf.cap) }
@@ -171,13 +174,14 @@ fn async_handle_readable(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd
 			431 { cs.write_buf << response.status_431_response }
 			else { cs.write_buf << response.tiny_bad_request_response }
 		}
+
 		if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
 			close_conn(epoll_fd, fd, active_conns, mut st)
 		}
 		return
 	}
 	if total < 0 {
-		return // incomplete — wait for the next edge
+		return
 	}
 	req := unsafe { cs.read_buf[0..total] }
 	mut ac := core.AsyncCtx{
@@ -209,7 +213,7 @@ fn async_on_ready(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, e
 	}
 	mut cs := st.conns[client_fd]
 	if unsafe { cs == nil } {
-		return // client went away
+		return
 	}
 	cs.awaiting_fd = -1
 	mut ac := core.AsyncCtx{

@@ -58,10 +58,10 @@ pub struct AsyncCtx {
 pub mut:
 	client_fd    int
 	ready_fd     int = -1 // the fd that woke this continuation (-1 on the initial call)
-	udata        voidptr  // consumer context carried from watch() to the continuation
-	state        voidptr  // this worker's per-thread state (see StatefulHandler/make_state)
-	epoll_fd     int      // backend-filled: the worker's epoll instance
-	reactor      voidptr  // backend-filled: the worker's watch registry
+	udata        voidptr // consumer context carried from watch() to the continuation
+	state        voidptr // this worker's per-thread state (see StatefulHandler/make_state)
+	epoll_fd     int     // backend-filled: the worker's epoll instance
+	reactor      voidptr // backend-filled: the worker's watch registry
 	last_watched int = -1 // backend-filled: the fd passed to the most recent watch()
 	register     fn (mut ac AsyncCtx, ext_fd int, events u32, cont WakeFn, udata voidptr) = unsafe { nil }
 }
