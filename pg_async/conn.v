@@ -1,7 +1,5 @@
 module pg_async
 
-import net
-
 // PgConn is a single PostgreSQL connection: the TCP socket plus the v3 startup /
 // SCRAM-SHA-256 handshake and extended-query execution.
 //
@@ -10,6 +8,62 @@ import net
 // and SCRAM layers against a live server. The non-blocking, reactor-driven
 // query path that the async worker uses is built on the same wire encoding
 // (protocol.v) — only the I/O pump differs.
+
+// pg_async deliberately does NOT import V's `net`: `net` declares `C.socket`
+// with TYPED enum params on some V versions, and V merges C declarations
+// globally — so importing `net` clashes with the plain-`int` `C.socket` that
+// http_server's socket module declares and breaks the build (e.g. on the V 0.5.1
+// tag). The connection is opened with libc directly, using the same signatures
+// http_server.socket uses. C.recv/C.send/C.fcntl live in conn_async.v.
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+
+// Full addrinfo layout (matches V's net module) so sizeof is correct and every
+// field is zeroed — a partial decl leaves ai_flags as stack garbage and
+// getaddrinfo fails.
+struct C.addrinfo {
+mut:
+	ai_family    int
+	ai_socktype  int
+	ai_flags     int
+	ai_protocol  int
+	ai_addrlen   int
+	ai_addr      voidptr
+	ai_canonname voidptr
+	ai_next      voidptr
+}
+
+fn C.socket(domain int, typ int, protocol int) int
+fn C.connect(sockfd int, addr voidptr, addrlen u32) int
+fn C.close(fd int) int
+fn C.getaddrinfo(node &char, service &char, hints &C.addrinfo, res &&C.addrinfo) int
+fn C.freeaddrinfo(res &C.addrinfo)
+
+// dial resolves host:port (getaddrinfo) and opens a blocking TCP connection.
+fn dial(host string, port int) !int {
+	mut hints := C.addrinfo{}
+	unsafe { vmemset(&hints, 0, int(sizeof(hints))) }
+	hints.ai_family = C.AF_UNSPEC
+	hints.ai_socktype = C.SOCK_STREAM
+	port_str := port.str()
+	mut res := &C.addrinfo(unsafe { nil })
+	if C.getaddrinfo(&char(host.str), &char(port_str.str), &hints, &res) != 0 {
+		return error('pg: getaddrinfo failed for ${host}:${port}')
+	}
+	defer {
+		C.freeaddrinfo(res)
+	}
+	fd := C.socket(res.ai_family, res.ai_socktype, res.ai_protocol)
+	if fd < 0 {
+		return error('pg: socket() failed')
+	}
+	if C.connect(fd, res.ai_addr, u32(res.ai_addrlen)) != 0 {
+		C.close(fd)
+		return error('pg: connect to ${host}:${port} failed')
+	}
+	return fd
+}
 
 pub struct ConnConfig {
 pub:
@@ -22,8 +76,7 @@ pub:
 
 pub struct PgConn {
 mut:
-	sock     &net.TcpConn = unsafe { nil }
-	fd       int          = -1 // the raw socket fd (for the non-blocking path; see conn_async.v)
+	fd       int = -1 // the raw socket fd
 	recv_buf []u8
 	// In-flight non-blocking query state (one query per connection at a time).
 	send_buf        []u8
@@ -43,10 +96,9 @@ struct Msg {
 // PgConn.connect opens a TCP connection and runs the startup + SCRAM-SHA-256
 // handshake, returning once the server reports ReadyForQuery.
 pub fn PgConn.connect(cfg ConnConfig) !PgConn {
-	mut sock := net.dial_tcp('${cfg.host}:${cfg.port}')!
+	fd := dial(cfg.host, cfg.port)!
 	mut c := PgConn{
-		sock:     sock
-		fd:       sock.sock.handle
+		fd:       fd
 		recv_buf: []u8{cap: 16 * 1024}
 	}
 	c.handshake(cfg)!
@@ -58,13 +110,13 @@ pub fn (mut c PgConn) close() {
 	mut out := []u8{}
 	write_terminate(mut out)
 	c.send(out) or {}
-	c.sock.close() or {}
+	C.close(c.fd)
 }
 
 fn (mut c PgConn) send(data []u8) ! {
 	mut sent := 0
 	for sent < data.len {
-		n := c.sock.write(data[sent..])!
+		n := C.send(c.fd, unsafe { &u8(data.data) + sent }, usize(data.len - sent), C.MSG_NOSIGNAL)
 		if n <= 0 {
 			return error('pg: send failed')
 		}
@@ -86,7 +138,7 @@ fn (mut c PgConn) read_msg() !Msg {
 			}
 		}
 		mut tmp := []u8{len: 16 * 1024}
-		n := c.sock.read(mut tmp)!
+		n := C.recv(c.fd, tmp.data, usize(tmp.len), 0)
 		if n <= 0 {
 			return error('pg: connection closed by server')
 		}
