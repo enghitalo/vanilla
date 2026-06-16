@@ -116,21 +116,28 @@ fn process_events_async(worker_id int, epoll_fd int, async_handler core.AsyncHan
 }
 
 // async_handle_readable reads the request, calls the async handler ONCE, and
-// acts on the returned step. v1 serves one request per connection at a time.
+// reads the socket, answers every complete request, and parks only when a
+// handler actually suspends.
 @[direct_array_access; manualfree]
 fn async_handle_readable(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, state voidptr) {
 	mut cs := state_for(mut st, fd)
-	// Parked on a watch: a readable edge here means the client sent more or hung
-	// up. v1 doesn't pipeline while suspended — peek to detect a close and tear
-	// the watch down; otherwise ignore until the in-flight watch completes.
+	// Already parked on a watch: a readable edge here is either the client hanging
+	// up or pipelining ahead. Peek to detect a close (tear the watch down); any
+	// data stays in the socket buffer and is read once the in-flight watch resumes.
 	if cs.awaiting_fd >= 0 {
 		mut probe := [1]u8{}
-		r := C.recv(fd, &probe[0], 1, C.MSG_PEEK)
-		if r == 0 {
+		if C.recv(fd, &probe[0], 1, C.MSG_PEEK) == 0 {
 			async_close(mut reactor, epoll_fd, fd, active_conns, mut st)
 		}
 		return
 	}
+	async_serve(h, mut reactor, epoll_fd, fd, limits, active_conns, mut st, mut cs, state)
+}
+
+// async_serve drains the socket into the read buffer (edge-triggered: to EAGAIN),
+// then answers every complete request (pipelining), flushing the batch at the end.
+@[direct_array_access; manualfree]
+fn async_serve(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) {
 	req_cap := if limits.max_request_bytes > 0 {
 		limits.max_request_bytes
 	} else {
@@ -157,9 +164,6 @@ fn async_handle_readable(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd
 			cs.read_buf.len += n
 		}
 	}
-	if cs.read_buf.len == 0 {
-		return
-	}
 	if cs.read_buf.len > req_cap {
 		cs.write_buf << response.status_413_response
 		if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
@@ -167,40 +171,89 @@ fn async_handle_readable(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd
 		}
 		return
 	}
-	total := request_parser.frame_request_length_lim(cs.read_buf, limits.max_header_bytes,
-		limits.max_body_bytes) or {
-		match err.code() {
-			413 { cs.write_buf << response.status_413_response }
-			431 { cs.write_buf << response.status_431_response }
-			else { cs.write_buf << response.tiny_bad_request_response }
-		}
+	if !async_drain(h, mut reactor, epoll_fd, fd, limits, active_conns, mut st, mut cs, state) {
+		return // connection closed inside the drain
+	}
+	if cs.write_buf.len > cs.write_off || cs.file_remaining > 0 {
+		flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs)
+	}
+}
 
-		if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-			close_conn(epoll_fd, fd, active_conns, mut st)
+// async_drain answers every complete request currently buffered, appending each
+// response to write_buf, and STOPS at the first request that suspends (it parks;
+// the rest stay buffered and are drained when the watch resumes). Mirrors the
+// synchronous drain_requests but with the async step contract. Returns false if
+// the connection was closed (the caller must not touch it).
+@[direct_array_access; manualfree]
+fn async_drain(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) bool {
+	mut pos := 0
+	for pos < cs.read_buf.len && cs.awaiting_fd < 0 {
+		total := request_parser.frame_request_length_lim(cs.read_buf[pos..], limits.max_header_bytes,
+			limits.max_body_bytes) or {
+			match err.code() {
+				413 { cs.write_buf << response.status_413_response }
+				431 { cs.write_buf << response.status_431_response }
+				else { cs.write_buf << response.tiny_bad_request_response }
+			}
+			async_compact(mut cs, pos)
+			if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
+				close_conn(epoll_fd, fd, active_conns, mut st)
+			}
+			return false
 		}
+		if total < 0 {
+			break // incomplete — wait for more bytes
+		}
+		req := unsafe { cs.read_buf[pos..pos + total] }
+		mut ac := core.AsyncCtx{
+			client_fd: fd
+			state:     state
+			epoll_fd:  epoll_fd
+			reactor:   unsafe { voidptr(&reactor) }
+			register:  async_register
+		}
+		step := h(req, mut cs.write_buf, mut ac)
+		pos += total
+		match step {
+			.done {} // response appended; answer the next buffered request
+			.suspend {
+				cs.awaiting_fd = ac.last_watched // park; leftover stays buffered for resume
+			}
+			.close {
+				async_compact(mut cs, pos)
+				if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
+					close_conn(epoll_fd, fd, active_conns, mut st)
+				}
+				return false
+			}
+		}
+		// Peer pipelines without reading responses: bail before the batch is unbounded.
+		if cs.write_buf.len - cs.write_off > sm_max_pending_write {
+			async_compact(mut cs, pos)
+			if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
+				close_conn(epoll_fd, fd, active_conns, mut st)
+			}
+			return false
+		}
+	}
+	async_compact(mut cs, pos)
+	return true
+}
+
+// async_compact drops the first `pos` consumed bytes, keeping the leftover
+// (partial / not-yet-answered) request at the buffer front.
+@[direct_array_access; inline]
+fn async_compact(mut cs ConnState, pos int) {
+	if pos <= 0 {
 		return
 	}
-	if total < 0 {
-		return
-	}
-	req := unsafe { cs.read_buf[0..total] }
-	mut ac := core.AsyncCtx{
-		client_fd: fd
-		state:     state
-		epoll_fd:  epoll_fd
-		reactor:   unsafe { voidptr(&reactor) }
-		register:  async_register
-	}
-	step := h(req, mut cs.write_buf, mut ac)
-	// Consume the request from the read buffer (compact leftover to the front).
-	leftover := cs.read_buf.len - total
+	leftover := cs.read_buf.len - pos
 	if leftover > 0 {
-		unsafe { C.memmove(cs.read_buf.data, &u8(cs.read_buf.data) + total, usize(leftover)) }
+		unsafe { C.memmove(cs.read_buf.data, &u8(cs.read_buf.data) + pos, usize(leftover)) }
 	}
 	unsafe {
 		cs.read_buf.len = leftover
 	}
-	async_apply_step(step, mut ac, epoll_fd, fd, limits, active_conns, mut st, mut cs)
 }
 
 // async_on_ready runs a parked request's continuation when its watched fd fires.
@@ -225,24 +278,18 @@ fn async_on_ready(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, e
 		reactor:   unsafe { voidptr(&reactor) }
 		register:  async_register
 	}
-	step := entry.cont(mut cs.write_buf, mut ac)
-	async_apply_step(step, mut ac, epoll_fd, client_fd, limits, active_conns, mut st, mut cs)
-}
-
-// async_apply_step performs the worker action for a handler/continuation result.
-@[inline]
-fn async_apply_step(step core.AsyncStep, mut ac core.AsyncCtx, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState) {
-	match step {
+	match entry.cont(mut cs.write_buf, mut ac) {
 		.done {
-			if cs.write_buf.len > cs.write_off || cs.file_remaining > 0 {
-				flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs)
-			}
+			// Send this response and drain any requests that were pipelined behind it
+			// (and read anything that arrived while parked) — one batched flush.
+			async_serve(h, mut reactor, epoll_fd, client_fd, limits, active_conns, mut st, mut
+				cs, state)
 		}
 		.suspend {
-			cs.awaiting_fd = ac.last_watched // parked; resumed when that fd fires
+			cs.awaiting_fd = ac.last_watched // re-armed (multi-step); stay parked
 		}
 		.close {
-			close_conn(epoll_fd, fd, active_conns, mut st)
+			close_conn(epoll_fd, client_fd, active_conns, mut st)
 		}
 	}
 }
