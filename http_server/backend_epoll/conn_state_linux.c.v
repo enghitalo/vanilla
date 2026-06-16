@@ -44,6 +44,49 @@ fn C.memmove(__dest voidptr, __src voidptr, __n usize) voidptr
 fn C.sendfile(out_fd int, in_fd int, offset &i64, count usize) isize
 fn C.pread(fd int, buf voidptr, count usize, offset i64) isize
 
+// Boehm's no-scan (atomic) allocator: blocks it returns are never traced for
+// pointers. GC_realloc preserves that kind, so a buffer stays no-scan as it grows.
+fn C.GC_malloc_atomic(n usize) voidptr
+fn C.GC_realloc(ptr voidptr, n usize) voidptr
+
+// noscan_alloc returns a []u8 whose backing store the GC never scans. A large
+// per-connection buffer (a multi-MB upload's read_buf, a multi-hundred-KB static
+// asset's write_buf) as a *scanned* GC block makes Boehm's mark phase + its
+// stop-the-world pauses dominate at high keep-alive connection counts — the
+// "cliff" that capped upload and static throughput. Allocating the backing
+// atomic removes those bytes from every GC scan. Works on any V (no dependency
+// on the post-0.5.1 `.noscan_data` ArrayFlag); with `-gc none` there is no GC to
+// scan, so a plain allocation is already untraced.
+@[inline]
+fn noscan_alloc(cap int) []u8 {
+	mut a := []u8{}
+	$if gcboehm ? {
+		unsafe {
+			a.data = C.GC_malloc_atomic(usize(cap))
+			a.cap = cap
+			a.len = 0
+			a.element_size = 1
+		}
+	} $else {
+		a = []u8{len: 0, cap: cap}
+	}
+	return a
+}
+
+// noscan_grow resizes a noscan_alloc'd buffer to `newcap` while keeping it
+// no-scan (GC_realloc preserves the atomic kind and copies the old contents).
+@[inline]
+fn noscan_grow(mut a []u8, newcap int) {
+	$if gcboehm ? {
+		unsafe {
+			a.data = C.GC_realloc(a.data, usize(newcap))
+			a.cap = newcap
+		}
+	} $else {
+		a.ensure_cap(newcap)
+	}
+}
+
 const sm_max_request_bytes = 8 * 1024 * 1024
 // Bound a single sendfile(2) call so one connection can't monopolize the worker;
 // the remainder streams on the next writable edge.
@@ -107,27 +150,16 @@ fn state_for(mut st PlainState, fd int) &ConnState {
 		st.conns = grown
 	}
 	if unsafe { st.conns[fd] == nil } {
+		// Both buffers are allocated NO-SCAN (see noscan_alloc): a large read_buf
+		// (multi-MB upload) or write_buf (large static asset) as a scanned GC block
+		// is what made Boehm's mark + stop-the-world dominate at high conn counts.
+		// read_buf stays no-scan across growth (it grows only via noscan_grow in
+		// the recv path). write_buf stays no-scan while a response fits its current
+		// capacity; large bodies that don't fit should be streamed via core's
+		// borrowed-send paths (queue_file / queue_buffer) rather than grown.
 		mut cs := &ConnState{
-			read_buf:  []u8{len: 0, cap: read_buf_cap}
-			write_buf: []u8{len: 0, cap: write_buf_cap}
-		}
-		// Keep both buffers in a no-scan GC block ACROSS growth. A large response
-		// grows write_buf past write_buf_cap; without this flag grow_cap reallocates
-		// as a *scanned* block, and thousands of big per-conn buffers at high
-		// keep-alive conn counts turn GC scanning + stop-the-world into the
-		// bottleneck (the "static cliff"). The flag survives resize.
-		//
-		// `.noscan_data` only exists on V after the 0.5.1 release, so it is gated
-		// behind `-d vanilla_noscan` to keep the library buildable on the 0.5.1
-		// release. (`$if flag ? {}` is comptime-eliminated when the flag is unset,
-		// so the enum value is never type-checked there.) Enable it once a V
-		// release ships `.noscan_data` without the unrelated codegen slowdown that
-		// currently makes post-0.5.1 master far slower (vlang/v#27468).
-		$if vanilla_noscan ? {
-			unsafe {
-				cs.read_buf.flags.set(.noscan_data)
-				cs.write_buf.flags.set(.noscan_data)
-			}
+			read_buf:  noscan_alloc(read_buf_cap)
+			write_buf: noscan_alloc(write_buf_cap)
 		}
 		st.conns[fd] = cs
 	}
@@ -164,9 +196,9 @@ fn handle_readable_plain(request_handler core.RequestHandler, epoll_fd int, fd i
 			// doubling, so the existing req_cap/413 guard still trips normally.
 			target := request_parser.frame_expected_total(cs.read_buf)
 			if target > cs.read_buf.cap && target <= req_cap {
-				unsafe { cs.read_buf.grow_cap(target - cs.read_buf.cap) }
+				noscan_grow(mut cs.read_buf, target)
 			} else {
-				unsafe { cs.read_buf.grow_cap(cs.read_buf.cap) }
+				noscan_grow(mut cs.read_buf, cs.read_buf.cap * 2)
 			}
 		}
 		spare := cs.read_buf.cap - cs.read_buf.len
