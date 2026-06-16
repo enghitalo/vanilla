@@ -1,7 +1,5 @@
 module socket
 
-import net.conv
-
 pub const max_connection_size = 1024
 
 // listen() backlog: the depth of the kernel's queue of established-but-not-yet-
@@ -238,7 +236,7 @@ pub fn create_server_socket(port int) int {
 	println('[socket] Binding to 0.0.0.0:${port}')
 	server_addr := C.sockaddr_in{
 		sin_family: u16(C.AF_INET)
-		sin_port:   conv.hton16(u16(port))
+		sin_port:   C.htons(u16(port))
 		sin_addr:   C.in_addr{u32(C.INADDR_ANY)} // 0.0.0.0
 	}
 
