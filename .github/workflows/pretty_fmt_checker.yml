@@ -14,6 +14,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Set up V
         uses: vlang/setup-v@v1.4
+        # Pin to the latest V *release* (0.5.1), not master: the lib ships on
+        # 0.5.1 (HttpArena & the-benchmarker pin it) and master carries codegen/GC
+        # regressions (vlang/v#27468) the library must not be tested against.
+        with:
+          stable: true
       - name: Remove Vlang folder to avoid conflicts
         shell: bash
         run: |
