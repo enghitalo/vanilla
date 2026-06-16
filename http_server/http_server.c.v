@@ -21,7 +21,7 @@ pub:
 	limits          Limits
 	tls_config      &tls.Config = unsafe { nil } // nil ⇒ plain HTTP; set ⇒ HTTPS
 pub mut:
-	threads         []thread = []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
+	threads         []thread            = []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
 	request_handler core.RequestHandler = unsafe { nil }
 	// Per-thread state path (epoll only); see ServerConfig. make_state runs once
 	// per worker thread, stateful_handler receives its result on every request.

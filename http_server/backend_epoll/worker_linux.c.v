@@ -185,8 +185,7 @@ fn process_events_plain(worker_id int, epoll_fd int, request_handler core.Reques
 				}
 			}
 			if ev & u32(C.EPOLLIN) != 0 {
-				handle_readable_plain(handler, epoll_fd, fd, limits, counter, active_conns, mut
-					st)
+				handle_readable_plain(handler, epoll_fd, fd, limits, counter, active_conns, mut st)
 			}
 		}
 		// After handling this batch (or a timeout wake with num_events == 0),
@@ -229,8 +228,8 @@ fn process_events_tls(worker_id int, epoll_fd int, request_handler core.RequestH
 				}
 			}
 			if ev & u32(C.EPOLLIN) != 0 {
-				handle_readable_fd_tls(handler, epoll_fd, fd, limits, counter,
-					active_conns, cfg, mut sessions)
+				handle_readable_fd_tls(handler, epoll_fd, fd, limits, counter, active_conns, cfg, mut
+					sessions)
 			}
 		}
 		if sweep_on && sessions.len > 0 {
@@ -281,11 +280,11 @@ pub fn run_epoll_backend(socket_fd int, request_handler core.RequestHandler, sta
 		// has no TLS code at all, so the plain hot path carries zero TLS cost.
 		counter := inflight[i] // this worker's own in-flight counter
 		if tls_config != unsafe { nil } {
-			threads[i] = spawn process_events_tls(i, epoll_fds[i], request_handler, stateful_handler,
-				make_state, limits, counter, active_conns, tls_config)
+			threads[i] = spawn process_events_tls(i, epoll_fds[i], request_handler,
+				stateful_handler, make_state, limits, counter, active_conns, tls_config)
 		} else {
-			threads[i] = spawn process_events_plain(i, epoll_fds[i], request_handler, stateful_handler,
-				make_state, limits, counter, active_conns)
+			threads[i] = spawn process_events_plain(i, epoll_fds[i], request_handler,
+				stateful_handler, make_state, limits, counter, active_conns)
 		}
 	}
 
