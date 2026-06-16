@@ -51,7 +51,7 @@ mut:
 }
 
 // async_register is installed into AsyncCtx.register; it is what `ac.watch(...)`
-// ultimately calls. It records the watch and adds the external fd to this
+// ultimately calls. It records the watch and arms the external fd in this
 // worker's epoll (level-triggered: simplest correct default for arbitrary
 // consumer fds). Runs on the worker thread, so no synchronization is needed.
 fn async_register(mut ac core.AsyncCtx, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
@@ -62,7 +62,13 @@ fn async_register(mut ac core.AsyncCtx, ext_fd int, interest core.WatchInterest,
 		udata:     udata
 	}
 	events := if interest == .writable { u32(C.EPOLLOUT) } else { u32(C.EPOLLIN) }
-	epoll.add_fd_to_epoll(ac.loop_fd, ext_fd, events)
+	// Re-arm if the fd is already in this worker's epoll (a pool-owned connection
+	// re-watched across queries), otherwise add it (a fresh request-owned fd).
+	// Trying MOD first avoids an EEXIST perror on every pool-fd reuse and needs no
+	// extra bookkeeping: a fresh fd's MOD fails with ENOENT and falls through to ADD.
+	if epoll.mod_fd_in_epoll(ac.loop_fd, ext_fd, events) != 0 {
+		epoll.add_fd_to_epoll(ac.loop_fd, ext_fd, events)
+	}
 	ac.last_watched = ext_fd
 }
 
