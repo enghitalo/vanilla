@@ -145,8 +145,8 @@ fn process_events_plain(worker_id int, epoll_fd int, request_handler core.Reques
 	has_async := async_handler != unsafe { nil }
 	handler := build_handler(request_handler, stateful_handler, state) // sync path
 	mut reactor := AsyncReactor{
-		watches: map[int]WatchEntry{}
-	} // async path: ext_fd -> parked request
+		watches: []WatchEntry{len: conn_table_min}
+	} // async path: flat fd-indexed table of parked requests (grows by doubling)
 	// This worker can stream file bodies with sendfile(2): let handlers hand a
 	// file off via core.queue_file instead of copying it through write_buf.
 	core.enable_sendfile()
@@ -185,9 +185,9 @@ fn process_events_plain(worker_id int, epoll_fd int, request_handler core.Reques
 			ev := events[i].events
 			// Async only: a watched external fd became ready → run its continuation.
 			if has_async {
-				if entry := reactor.watches[fd] {
-					async_on_ready(async_handler, mut reactor, epoll_fd, fd, entry, limits,
-						counter, active_conns, mut st, state)
+				if fd < reactor.watches.len && reactor.watches[fd].active {
+					async_on_ready(async_handler, mut reactor, epoll_fd, fd, reactor.watches[fd],
+						limits, counter, active_conns, mut st, state)
 					continue
 				}
 			}
