@@ -83,7 +83,8 @@ fn process_kqueue_async(kq int, async_handler core.AsyncHandler, make_state fn (
 			// A watched ext fd became ready → run its continuation.
 			if w := reactor.watches[fd] {
 				reactor.watches.delete(fd)
-				kq_run_cont(mut reactor, kq, w, fd, state)
+				rerr := (events[i].flags & (kqueue.ev_eof | kqueue.ev_error)) != 0
+				kq_run_cont(mut reactor, kq, w, fd, rerr, state)
 				continue
 			}
 			// Client connection.
@@ -158,12 +159,13 @@ fn kq_handle_request(h core.AsyncHandler, mut reactor KqReactor, kq int, fd int,
 }
 
 // kq_run_cont resumes a parked request when its watched fd fires.
-fn kq_run_cont(mut reactor KqReactor, kq int, w KqWatch, ext_fd int, state voidptr) {
+fn kq_run_cont(mut reactor KqReactor, kq int, w KqWatch, ext_fd int, ready_err bool, state voidptr) {
 	mut conn := reactor.conns[w.client_fd] or { return } // client went away
 	conn.awaiting_fd = -1
 	mut ac := core.AsyncCtx{
 		client_fd: w.client_fd
 		ready_fd:  ext_fd
+		ready_err: ready_err
 		udata:     w.udata
 		state:     state
 		loop_fd:   kq
