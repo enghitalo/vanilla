@@ -379,9 +379,13 @@ fn async_compact(mut cs ConnState, pos int) {
 }
 
 // async_on_ready runs a parked request's continuation when its watched fd fires.
+// `ev` is the raw epoll event mask for this edge; an error/hangup (EPOLLERR|
+// EPOLLHUP) is surfaced to the continuation as the portable AsyncCtx.ready_err so
+// it can release a dead fd instead of re-arming it into a busy-spin.
 @[direct_array_access; manualfree]
-fn async_on_ready(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, ext_fd int, entry WatchEntry, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, state voidptr) {
+fn async_on_ready(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, ext_fd int, entry WatchEntry, ev u32, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, state voidptr) {
 	reactor.reactor_clear(ext_fd) // consumed; the continuation re-arms if it needs more
+	ready_err := ev & (u32(C.EPOLLHUP) | u32(C.EPOLLERR)) != 0
 	// Clientless background watch (armed by on_worker_start, e.g. a per-worker
 	// refresh timerfd): there is no parked connection. Run the continuation with a
 	// throwaway buffer and a -1 client_fd; ac.state is the worker state and it
@@ -398,6 +402,7 @@ fn async_on_ready(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, e
 		mut bac := core.AsyncCtx{
 			client_fd: -1
 			ready_fd:  ext_fd
+			ready_err: ready_err
 			udata:     entry.udata
 			state:     state
 			loop_fd:   epoll_fd
@@ -430,6 +435,7 @@ fn async_on_ready(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, e
 	mut ac := core.AsyncCtx{
 		client_fd: client_fd
 		ready_fd:  ext_fd
+		ready_err: ready_err
 		udata:     entry.udata
 		state:     state
 		loop_fd:   epoll_fd

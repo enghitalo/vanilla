@@ -67,6 +67,7 @@ pub struct AsyncCtx {
 pub mut:
 	client_fd    int
 	ready_fd     int = -1 // the fd that woke this continuation (-1 on the initial call)
+	ready_err    bool    // backend-filled: ready_fd woke with an error/hangup (epoll EPOLLERR|EPOLLHUP, kqueue EV_ERROR|EV_EOF), not normal readiness — the watched fd is dead, release it
 	udata        voidptr // consumer context carried from watch() to the continuation
 	state        voidptr // this worker's per-thread state (see StatefulHandler/make_state)
 	loop_fd      int     // backend-filled: the worker's event-loop fd (epoll on Linux, kqueue on macOS)
@@ -87,6 +88,17 @@ pub fn (ac &AsyncCtx) ready_fd() int {
 	return ac.ready_fd
 }
 
+// ready_err reports whether ready_fd became ready because of an error or hangup
+// (the peer/other end closed, the fd is broken) rather than normal readiness —
+// epoll EPOLLERR|EPOLLHUP, kqueue EV_ERROR|EV_EOF. A continuation that observes
+// this should stop watching the fd (return .done/.close so the runtime releases
+// it) instead of re-arming, otherwise a level-triggered watch on a dead fd
+// re-fires every loop iteration (a busy-spin). It is a portable boolean on
+// purpose: handlers never name a platform event constant (cf. WatchInterest).
+pub fn (ac &AsyncCtx) ready_err() bool {
+	return ac.ready_err
+}
+
 // WorkerStartFn runs ONCE per worker thread, right after make_state and before
 // the event loop, ON the worker thread. It receives an AsyncCtx whose client_fd
 // is -1 (there is no request): use it to arm CLIENTLESS background watches via
@@ -103,6 +115,9 @@ pub fn (ac &AsyncCtx) ready_fd() int {
 //   - Do NOT close ac.ready_fd() yourself: on .done/.close the runtime detaches
 //     AND closes it (avoiding an fd-reuse race); if you re-arm a DIFFERENT fd the
 //     runtime only detaches the old one (you still own and must close it).
+//   - Check ac.ready_err(): if the fd woke with an error/hangup, return .done or
+//     .close (do NOT re-arm) — a re-armed watch on a dead level-triggered fd
+//     busy-spins. (A timerfd never hangs up, so a refresh watch can ignore it.)
 //
 // It composes with ANY handler path (request_handler / stateful_handler /
 // async_handler): the background watch shares the worker's epoll loop with normal
