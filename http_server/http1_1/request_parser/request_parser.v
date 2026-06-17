@@ -48,6 +48,20 @@ fn find_byte(buf &u8, len int, c u8) !int {
 	}
 }
 
+// find_byte_idx is the no-Result hot-path twin of find_byte: returns the index of
+// `c`, or -1 when absent. Returning a plain int avoids the `!int` Result boxing
+// (callgrind showed find_byte's wrapper cost ~3x the underlying memchr on the
+// short request line — pure overhead per pipelined request). Used by the framing
+// + request-line parsers that run on every request.
+@[inline]
+fn find_byte_idx(buf &u8, len int, c u8) int {
+	p := unsafe { C.memchr(buf, c, len) }
+	if p == unsafe { nil } {
+		return -1
+	}
+	return int(unsafe { &u8(p) - buf })
+}
+
 @[inline]
 fn find_sequence(buf &u8, len int, bytes_ptr &u8, bytes_len int) !int {
 	unsafe {
@@ -57,6 +71,18 @@ fn find_sequence(buf &u8, len int, bytes_ptr &u8, bytes_len int) !int {
 		}
 		return int(&u8(p) - buf)
 	}
+}
+
+// find_sequence_idx is the no-Result hot-path twin of find_sequence: index of the
+// needle, or -1. Avoids the `!int` Result boxing on the per-request `\r\n\r\n`
+// scan (see find_byte_idx).
+@[inline]
+fn find_sequence_idx(buf &u8, len int, bytes_ptr &u8, bytes_len int) int {
+	p := unsafe { C.memmem(buf, len, bytes_ptr, bytes_len) }
+	if p == unsafe { nil } {
+		return -1
+	}
+	return int(unsafe { &u8(p) - buf })
 }
 
 // Fast comparison of two byte slices
@@ -92,7 +118,8 @@ pub fn parse_http1_request_line(mut req HttpRequest) !int {
 		b := &buf[0]
 
 		// Find first SP: end of method
-		method_len := find_byte(b, len, empty_space) or {
+		method_len := find_byte_idx(b, len, empty_space)
+		if method_len < 0 {
 			return error('Missing space after method')
 		}
 		if method_len == 0 {
@@ -109,10 +136,14 @@ pub fn parse_http1_request_line(mut req HttpRequest) !int {
 		}
 
 		// Find next SP or CR (whichever comes first)
-		sp_pos := find_byte(&buf[pos], len - pos, empty_space) or {
+		sp_pos := find_byte_idx(&buf[pos], len - pos, empty_space)
+		if sp_pos < 0 {
 			return error('Missing space after request-target')
 		}
-		cr_pos := find_byte(&buf[pos], len - pos, cr_char) or { return error('Missing CR') }
+		cr_pos := find_byte_idx(&buf[pos], len - pos, cr_char)
+		if cr_pos < 0 {
+			return error('Missing CR')
+		}
 
 		path_end := if sp_pos < cr_pos { pos + sp_pos } else { pos + cr_pos }
 		req.path = Slice{pos, path_end - pos}
@@ -128,7 +159,8 @@ pub fn parse_http1_request_line(mut req HttpRequest) !int {
 
 		// Otherwise: version follows the second SP
 		version_start := path_end + 1
-		cr_after_version := find_byte(&buf[version_start], len - version_start, cr_char) or {
+		cr_after_version := find_byte_idx(&buf[version_start], len - version_start, cr_char)
+		if cr_after_version < 0 {
 			return error('Missing CR')
 		}
 		req.version = Slice{version_start, cr_after_version}
@@ -142,13 +174,17 @@ pub fn parse_http1_request_line(mut req HttpRequest) !int {
 	}
 }
 
-pub fn decode_http_request(buffer []u8) !HttpRequest {
-	mut req := HttpRequest{
-		buffer: buffer
-	}
+// decode_into parses the request head INTO `req` and reports whether it is well
+// formed. Returning a bool instead of `!HttpRequest` avoids boxing the big
+// HttpRequest struct in a Result on every call — callgrind flagged that
+// memset+copy as ~13% of the per-request parse cost. This is the hot-path entry
+// point (worker / handler); decode_http_request is the Result-returning wrapper.
+@[direct_array_access]
+pub fn decode_into(mut req HttpRequest) bool {
+	buffer := req.buffer // caller sets req.buffer (it is immutable after construction)
 
 	// header_start is the byte index immediately after the request line's \r\n
-	header_start := parse_http1_request_line(mut req)!
+	header_start := parse_http1_request_line(mut req) or { return false }
 
 	// RFC 9112 §2.1: the header section is `*( field-line CRLF )` and MAY be
 	// empty. An empty section means the terminating blank-line CRLF sits right
@@ -170,12 +206,13 @@ pub fn decode_http_request(buffer []u8) !HttpRequest {
 		} else {
 			Slice{0, 0}
 		}
-		return req
+		return true
 	}
 
-	header_len := find_sequence(&buffer[header_start], buffer.len - header_start, &double_crlf[0],
-		double_crlf.len) or {
-		return error('Missing header-body delimiter (no blank line terminating the header section)')
+	header_len := find_sequence_idx(&buffer[header_start], buffer.len - header_start,
+		&double_crlf[0], double_crlf.len)
+	if header_len < 0 {
+		return false
 	}
 
 	if header_len + header_start + double_crlf.len == buffer.len {
@@ -185,7 +222,6 @@ pub fn decode_http_request(buffer []u8) !HttpRequest {
 			len:   header_len
 		}
 		req.body = Slice{0, 0}
-		return req
 	} else {
 		// Body present
 		req.header_fields = Slice{
@@ -197,10 +233,21 @@ pub fn decode_http_request(buffer []u8) !HttpRequest {
 			start: body_start
 			len:   buffer.len - body_start
 		}
+	}
+	return true
+}
+
+// decode_http_request is the Result-returning wrapper around decode_into, kept for
+// tests and ergonomic callers. The hot path should call decode_into directly to
+// avoid the HttpRequest-in-Result boxing.
+pub fn decode_http_request(buffer []u8) !HttpRequest {
+	mut req := HttpRequest{
+		buffer: buffer
+	}
+	if decode_into(mut req) {
 		return req
 	}
-
-	return req
+	return error('malformed request head')
 }
 
 // Helper function to convert Slice to string for debugging
@@ -410,7 +457,10 @@ pub fn frame_request_length_lim(buf []u8, max_header int, max_body int) !int {
 		return -1
 	}
 	// End of the request line (first LF). Headers start right after it.
-	rl := find_byte(&buf[0], buf.len, lf_char) or { return -1 }
+	rl := find_byte_idx(&buf[0], buf.len, lf_char)
+	if rl < 0 {
+		return -1
+	}
 	mut pos := rl + 1
 
 	// ONE pass over the header lines: locate the blank-line terminator AND
@@ -444,7 +494,10 @@ pub fn frame_request_length_lim(buf []u8, max_header int, max_body int) !int {
 				return body_start
 			}
 		}
-		line_lf := find_byte(&buf[pos], buf.len - pos, lf_char) or { return -1 }
+		line_lf := find_byte_idx(&buf[pos], buf.len - pos, lf_char)
+		if line_lf < 0 {
+			return -1
+		}
 		line_start := pos
 		line_len := line_lf - 1 // bytes before the CR
 		pos = line_start + line_lf + 1
