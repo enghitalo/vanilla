@@ -28,6 +28,7 @@ pub mut:
 	stateful_handler core.StatefulHandler = unsafe { nil }
 	async_handler    core.AsyncHandler    = unsafe { nil }
 	make_state       fn () voidptr        = unsafe { nil }
+	on_worker_start  core.WorkerStartFn   = unsafe { nil }
 	// Per-worker in-flight request counters (one per worker, each on its own
 	// cache line — written only by its worker, so no contention/false sharing).
 	// shutdown() sums them to drain precisely.
@@ -242,9 +243,14 @@ pub:
 	// timers, EPOLLOUT backpressure). Optional make_state gives each worker its own
 	// state. Linux/epoll only; ignored by other backends. See core.AsyncHandler.
 	async_handler core.AsyncHandler = unsafe { nil }
-	certificates  Certificates
-	limits        Limits
-	tls_config    &tls.Config = unsafe { nil } // set for HTTPS (e.g. tls.new_self_signed())
+	// on_worker_start runs once per worker (after make_state, before the loop) to
+	// arm CLIENTLESS background watches — e.g. a periodic timerfd that refreshes
+	// per-worker state with no shared state and no extra thread. Composes with any
+	// handler path. Linux/epoll only. See core.WorkerStartFn.
+	on_worker_start core.WorkerStartFn = unsafe { nil }
+	certificates    Certificates
+	limits          Limits
+	tls_config      &tls.Config = unsafe { nil } // set for HTTPS (e.g. tls.new_self_signed())
 }
 
 pub fn new_server(config ServerConfig) !Server {
@@ -268,6 +274,20 @@ pub fn new_server(config ServerConfig) !Server {
 	}
 	if has_stateful && config.make_state == unsafe { nil } {
 		return error('stateful_handler requires make_state')
+	}
+	// on_worker_start arms clientless background watches on the epoll worker's
+	// reactor; the TLS worker has none, so it is epoll + plaintext only for now.
+	if config.on_worker_start != unsafe { nil } {
+		$if linux {
+			if config.io_multiplexing != .epoll {
+				return error('on_worker_start requires the epoll backend')
+			}
+		} $else {
+			return error('on_worker_start is only supported on the Linux epoll backend')
+		}
+		if config.tls_config != unsafe { nil } {
+			return error('on_worker_start is not yet supported with TLS')
+		}
 	}
 	// Each backend's IOBackend enum has different values (.epoll on Linux,
 	// .kqueue on macOS, .iocp on Windows), so a value is only ever referenced
@@ -338,6 +358,7 @@ pub fn new_server(config ServerConfig) !Server {
 		stateful_handler: config.stateful_handler
 		async_handler:    config.async_handler
 		make_state:       config.make_state
+		on_worker_start:  config.on_worker_start
 		limits:           config.limits
 		tls_config:       config.tls_config
 		threads:          []thread{len: max_thread_pool_size, cap: max_thread_pool_size}

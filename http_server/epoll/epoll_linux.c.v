@@ -70,8 +70,15 @@ pub fn mod_fd_in_epoll(epoll_fd int, fd int, events u32) int {
 	return C.epoll_ctl(epoll_fd, C.EPOLL_CTL_MOD, fd, &ev)
 }
 
-// Remove a file descriptor from an epoll instance.
+// Remove a file descriptor from an epoll instance AND close it.
 pub fn remove_fd_from_epoll(epoll_fd int, fd int) {
 	C.epoll_ctl(epoll_fd, C.EPOLL_CTL_DEL, fd, C.NULL)
 	C.close(fd)
+}
+
+// Detach a file descriptor from an epoll instance WITHOUT closing it — for fds
+// the caller still owns (e.g. an application-owned background fd the watch is
+// stepping away from). A DEL on an fd not in the set just returns ENOENT.
+pub fn detach_fd_from_epoll(epoll_fd int, fd int) {
+	C.epoll_ctl(epoll_fd, C.EPOLL_CTL_DEL, fd, C.NULL)
 }
