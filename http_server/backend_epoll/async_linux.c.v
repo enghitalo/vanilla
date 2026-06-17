@@ -36,18 +36,60 @@ import http_server.http1_1.response
 
 // WatchEntry records one parked request: which client connection is waiting, the
 // continuation to run when the watched fd is ready, and the consumer's opaque
-// context handed back via AsyncCtx.udata.
+// context handed back via AsyncCtx.udata. `active` is the slot's occupancy flag:
+// the table is indexed by fd (a flat array, not a hashmap), so a cleared slot is
+// just `active = false` rather than an erased key.
 struct WatchEntry {
+mut:
+	active    bool
 	client_fd int
 	cont      core.WakeFn = unsafe { nil }
 	udata     voidptr
 }
 
-// AsyncReactor is the per-worker watch registry: external fd -> parked request.
-// One per worker thread (so it needs no lock).
+// AsyncReactor is the per-worker watch registry: a flat array indexed by the
+// external fd (NOT a hashmap) — the same fd-indexed, doubling-grown layout the
+// synchronous path already uses for `PlainState.conns`. Watch/resume/clear are
+// then plain array writes with no hashing or per-request allocation (the event
+// loop's hot lookup is `watches[fd].active`). One per worker thread, no lock.
 struct AsyncReactor {
 mut:
-	watches map[int]WatchEntry
+	watches []WatchEntry
+}
+
+// reactor_watch records (or rearms) the watch for ext_fd, growing the flat table
+// by doubling if the fd is past the current bound — mirroring state_for's growth
+// so high fd numbers stay O(1)-indexed with no hashing.
+@[direct_array_access]
+fn (mut r AsyncReactor) reactor_watch(ext_fd int, client_fd int, cont core.WakeFn, udata voidptr) {
+	if ext_fd >= r.watches.len {
+		mut new_len := if r.watches.len == 0 { conn_table_min } else { r.watches.len }
+		for new_len <= ext_fd {
+			new_len *= 2
+		}
+		mut grown := []WatchEntry{len: new_len}
+		for i in 0 .. r.watches.len {
+			grown[i] = r.watches[i]
+		}
+		r.watches = grown
+	}
+	r.watches[ext_fd] = WatchEntry{
+		active:    true
+		client_fd: client_fd
+		cont:      cont
+		udata:     udata
+	}
+}
+
+// reactor_clear marks ext_fd's slot free. The fd itself stays in epoll (a
+// pool-owned connection is re-armed by the next watch); only the parked-request
+// record is dropped, so a stale readiness edge finds `active == false` and is
+// ignored.
+@[direct_array_access; inline]
+fn (mut r AsyncReactor) reactor_clear(ext_fd int) {
+	if ext_fd >= 0 && ext_fd < r.watches.len {
+		r.watches[ext_fd].active = false
+	}
 }
 
 // async_register is installed into AsyncCtx.register; it is what `ac.watch(...)`
@@ -56,11 +98,7 @@ mut:
 // consumer fds). Runs on the worker thread, so no synchronization is needed.
 fn async_register(mut ac core.AsyncCtx, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
 	mut r := unsafe { &AsyncReactor(ac.reactor) }
-	r.watches[ext_fd] = WatchEntry{
-		client_fd: ac.client_fd
-		cont:      cont
-		udata:     udata
-	}
+	r.reactor_watch(ext_fd, ac.client_fd, cont, udata)
 	events := if interest == .writable { u32(C.EPOLLOUT) } else { u32(C.EPOLLIN) }
 	// Re-arm if the fd is already in this worker's epoll (a pool-owned connection
 	// re-watched across queries), otherwise add it (a fresh request-owned fd).
@@ -330,7 +368,7 @@ fn async_compact(mut cs ConnState, pos int) {
 // async_on_ready runs a parked request's continuation when its watched fd fires.
 @[direct_array_access; manualfree]
 fn async_on_ready(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, ext_fd int, entry WatchEntry, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, state voidptr) {
-	reactor.watches.delete(ext_fd) // consumed; the continuation re-arms if it needs more
+	reactor.reactor_clear(ext_fd) // consumed; the continuation re-arms if it needs more
 	client_fd := entry.client_fd
 	if client_fd >= st.conns.len {
 		return
@@ -357,6 +395,17 @@ fn async_on_ready(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, e
 				state)
 		}
 		.suspend {
+			// Stream-as-you-go: a continuation that appended bytes before re-arming
+			// (e.g. one SSE event) has them sent NOW, not buffered until .done — that
+			// is what makes incremental streaming work. We only flush when something
+			// is pending (the DB-style "park, write later" case appends nothing here).
+			// flush_batch returns false only if it already closed the conn (peer gone /
+			// write error) — then we must NOT re-park it.
+			if cs.write_buf.len > cs.write_off {
+				if !flush_batch(epoll_fd, client_fd, limits, active_conns, mut st, mut cs) {
+					return // connection already torn down by flush_batch
+				}
+			}
 			cs.awaiting_fd = ac.last_watched // re-armed (multi-step); stay parked
 		}
 		.close {
@@ -372,7 +421,7 @@ fn async_close(mut reactor AsyncReactor, epoll_fd int, fd int, active_conns &cor
 	if fd < st.conns.len {
 		cs := st.conns[fd]
 		if unsafe { cs != nil } && cs.awaiting_fd >= 0 {
-			reactor.watches.delete(cs.awaiting_fd)
+			reactor.reactor_clear(cs.awaiting_fd)
 			epoll.remove_fd_from_epoll(epoll_fd, cs.awaiting_fd) // DEL + close the ext fd
 		}
 	}
