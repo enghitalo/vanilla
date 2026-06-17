@@ -509,6 +509,13 @@ fn iou_release_supports_multishot(release string) bool {
 // inflight counters to drain. The accept handler stops re-arming once draining,
 // so every worker quits accepting and the process can exit cleanly.
 pub fn run_io_uring_backend(server Server, mut threads []thread) {
+	// on_worker_start (clientless background watches) is an epoll-reactor feature;
+	// new_server rejects it for io_uring at config time. Assert defensively so a
+	// future refactor (or a Server built directly, bypassing new_server) fails loud
+	// instead of silently dropping the hook.
+	if server.on_worker_start != unsafe { nil } {
+		panic('on_worker_start is not supported on the io_uring backend')
+	}
 	num_workers := max_thread_pool_size
 
 	for i in 0 .. num_workers {

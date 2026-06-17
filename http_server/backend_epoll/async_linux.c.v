@@ -97,6 +97,12 @@ fn (mut r AsyncReactor) reactor_clear(ext_fd int) {
 // worker's epoll (level-triggered: simplest correct default for arbitrary
 // consumer fds). Runs on the worker thread, so no synchronization is needed.
 fn async_register(mut ac core.AsyncCtx, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
+	if ext_fd < 0 {
+		// A consumer handed us a failed fd (e.g. timerfd_create returned -1); never
+		// index the flat table at a negative slot. Arm nothing.
+		ac.last_watched = -1
+		return
+	}
 	mut r := unsafe { &AsyncReactor(ac.reactor) }
 	r.reactor_watch(ext_fd, ac.client_fd, cont, udata)
 	events := if interest == .writable { u32(C.EPOLLOUT) } else { u32(C.EPOLLIN) }
@@ -105,7 +111,14 @@ fn async_register(mut ac core.AsyncCtx, ext_fd int, interest core.WatchInterest,
 	// Trying MOD first avoids an EEXIST perror on every pool-fd reuse and needs no
 	// extra bookkeeping: a fresh fd's MOD fails with ENOENT and falls through to ADD.
 	if epoll.mod_fd_in_epoll(ac.loop_fd, ext_fd, events) != 0 {
-		epoll.add_fd_to_epoll(ac.loop_fd, ext_fd, events)
+		if epoll.add_fd_to_epoll(ac.loop_fd, ext_fd, events) < 0 {
+			// The fd could not be armed (bad fd, epoll limits): don't leave a slot
+			// marked active that the loop would never actually fire — clear it so the
+			// watch is genuinely absent rather than silently dead.
+			r.reactor_clear(ext_fd)
+			ac.last_watched = -1
+			return
+		}
 	}
 	ac.last_watched = ext_fd
 }
@@ -369,6 +382,42 @@ fn async_compact(mut cs ConnState, pos int) {
 @[direct_array_access; manualfree]
 fn async_on_ready(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, ext_fd int, entry WatchEntry, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, state voidptr) {
 	reactor.reactor_clear(ext_fd) // consumed; the continuation re-arms if it needs more
+	// Clientless background watch (armed by on_worker_start, e.g. a per-worker
+	// refresh timerfd): there is no parked connection. Run the continuation with a
+	// throwaway buffer and a -1 client_fd; ac.state is the worker state and it
+	// re-arms via ac.watch. The slot was already cleared above, so the ONLY way the
+	// watch stays alive is the continuation re-arming THIS SAME fd and suspending
+	// (the periodic-refresh case). Any other outcome means the continuation stopped
+	// watching ext_fd; we must then ensure ext_fd is neither active nor left in
+	// this worker's epoll, otherwise a later readiness edge on it falls through to
+	// the client read path and is mistaken for a connection (fabricating a phantom
+	// conn and skewing active_conns). The fd OBJECT is the app's: it created it and
+	// closes it — except on a clean .done/.close, where the runtime owns teardown.
+	if entry.client_fd < 0 {
+		mut scratch := []u8{}
+		mut bac := core.AsyncCtx{
+			client_fd: -1
+			ready_fd:  ext_fd
+			udata:     entry.udata
+			state:     state
+			loop_fd:   epoll_fd
+			reactor:   unsafe { voidptr(&reactor) }
+			register:  async_register
+		}
+		step := entry.cont(mut scratch, mut bac)
+		if step == .suspend && bac.last_watched == ext_fd {
+			return
+		}
+		reactor.reactor_clear(ext_fd) // re-arm-then-.done could have re-set active
+		if step == .suspend {
+			// Stepped to a DIFFERENT fd (now armed): detach ext_fd from epoll but do
+			// NOT close it — the app still owns it and may reuse it later.
+			epoll.detach_fd_from_epoll(epoll_fd, ext_fd)
+		} else {
+			epoll.remove_fd_from_epoll(epoll_fd, ext_fd) // done (.done/.close): DEL + close
+		}
+		return
+	}
 	client_fd := entry.client_fd
 	if client_fd >= st.conns.len {
 		return
@@ -403,7 +452,7 @@ fn async_on_ready(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, e
 			// write error) — then we must NOT re-park it.
 			if cs.write_buf.len > cs.write_off {
 				if !flush_batch(epoll_fd, client_fd, limits, active_conns, mut st, mut cs) {
-					return // connection already torn down by flush_batch
+					return
 				}
 			}
 			cs.awaiting_fd = ac.last_watched // re-armed (multi-step); stay parked

@@ -87,6 +87,28 @@ pub fn (ac &AsyncCtx) ready_fd() int {
 	return ac.ready_fd
 }
 
+// WorkerStartFn runs ONCE per worker thread, right after make_state and before
+// the event loop, ON the worker thread. It receives an AsyncCtx whose client_fd
+// is -1 (there is no request): use it to arm CLIENTLESS background watches via
+// ac.watch — e.g. a periodic timerfd that refreshes per-worker state, a signalfd,
+// or an inotify fd. Such a watch's continuation later runs on this worker's loop
+// with the same -1 client_fd and is handed a scratch (ignored) `out` buffer.
+// ac.state is this worker's make_state value, or nil when no make_state is set
+// (a stateless watch is fine; a stateful one must configure make_state).
+//
+// CONTRACT for a clientless continuation (a core.WakeFn):
+//   - To keep the watch alive, re-arm THE SAME fd (`ac.watch(ac.ready_fd(), ...)`)
+//     and return .suspend — the periodic-refresh pattern; the fd then lives for
+//     the worker's whole lifetime and is never timed out or torn down as a conn.
+//   - Do NOT close ac.ready_fd() yourself: on .done/.close the runtime detaches
+//     AND closes it (avoiding an fd-reuse race); if you re-arm a DIFFERENT fd the
+//     runtime only detaches the old one (you still own and must close it).
+//
+// It composes with ANY handler path (request_handler / stateful_handler /
+// async_handler): the background watch shares the worker's epoll loop with normal
+// request handling. epoll backend only.
+pub type WorkerStartFn = fn (mut ac AsyncCtx)
+
 // StatefulHandler is the per-thread-state variant of RequestHandler. It receives
 // the same arguments PLUS an opaque `state voidptr` — the value the server's
 // `make_state` callback returned for THIS worker thread (and only this one). It
