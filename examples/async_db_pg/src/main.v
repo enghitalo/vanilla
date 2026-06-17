@@ -64,7 +64,12 @@ fn handler(req []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 		return .done
 	}
 	mut conn := pool.conn(idx)
-	conn.async_submit(r'select id, name from pg_async_demo order by id', []?[]u8{})
+	if !conn.async_submit(r'select id, name from pg_async_demo order by id', []?[]u8{}) {
+		// Connection saturated (pipeline full) — shed.
+		pool.release(idx)
+		out << resp_503
+		return .done
+	}
 	flushed := conn.async_flush() or {
 		pool.release(idx)
 		out << resp_500

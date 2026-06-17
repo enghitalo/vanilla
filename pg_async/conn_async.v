@@ -18,6 +18,29 @@ fn C.recv(fd int, buf voidptr, len usize, flags int) int
 fn C.send(fd int, buf voidptr, len usize, flags int) int
 fn C.fcntl(fd int, cmd int, arg int) int
 
+// max_inflight bounds the per-connection pipeline depth. Postgres has no wire
+// limit; this caps memory (one PendingQuery accumulator each) and bounds how much
+// one readable edge can complete. The caller sheds when a connection is full.
+const max_inflight = 8
+
+// send_buf_cap is the fixed per-connection send-buffer size. Allocated once and
+// never reallocated, so a pipelined send in flight never sees its backing store
+// move. 64 KiB holds hundreds of the small extended-
+// protocol queries vanilla issues; append_send sheds if a frame won't fit.
+const send_buf_cap = 64 * 1024
+
+// PendingQuery is one pipelined query's reply accumulator: its framed backend
+// messages (ParseComplete..ReadyForQuery), the rows-affected count, and any
+// server error. It lives on the connection's in-flight FIFO until ReadyForQuery
+// completes it, at which point async_on_readable pops it and yields its Result.
+struct PendingQuery {
+mut:
+	frames        []u8
+	error         string
+	sqlstate      string
+	rows_affected u64
+}
+
 // set_nonblocking flips the connection socket to non-blocking. Call once, after
 // the connection is ready (connect + handshake done blocking).
 pub fn (mut c PgConn) set_nonblocking() ! {
@@ -30,42 +53,101 @@ pub fn (mut c PgConn) set_nonblocking() ! {
 	}
 }
 
-// is_busy reports whether a query is in flight on this connection.
+// is_busy reports whether any query is in flight on this connection.
 pub fn (c &PgConn) is_busy() bool {
-	return c.q_active
+	return c.inflight.len > 0
 }
 
-// async_submit serializes one extended-protocol query (binary results) into the
-// send buffer and marks a query in flight. Pair with async_flush (on writable)
-// and async_on_readable (on readable). One in-flight query per connection.
-pub fn (mut c PgConn) async_submit(query_text string, params []?[]u8) {
-	c.send_buf = []u8{cap: 256}
-	write_parse(mut c.send_buf, '', query_text)
-	write_bind(mut c.send_buf, '', '', params)
-	write_describe_portal(mut c.send_buf, '')
-	write_execute(mut c.send_buf, '', 0)
-	write_sync(mut c.send_buf)
-	c.send_off = 0
-	c.q_frames = []u8{cap: 8 * 1024}
-	c.q_error = ''
-	c.q_sqlstate = ''
-	c.q_rows_affected = 0
-	c.q_active = true
+// inflight_count is the current pipeline depth (submitted, not yet drained). The
+// reactor uses it for shortest-queue routing across a small pool.
+pub fn (c &PgConn) inflight_count() int {
+	return c.inflight.len
+}
+
+// can_submit reports whether the connection can accept another pipelined query
+// (pipeline depth below max_inflight). The caller sheds when this is false on
+// every pooled connection.
+pub fn (c &PgConn) can_submit() bool {
+	return c.inflight.len < max_inflight
+}
+
+// async_submit serializes one extended-protocol query (binary results) and
+// APPENDS it to the fixed send buffer, pushing a PendingQuery onto the in-flight
+// FIFO. Up to max_inflight queries may be pipelined back-to-back; each carries
+// its own Sync so Postgres replies in submit order. Returns false (and submits
+// nothing) when the connection is saturated — the ring is full or the send
+// buffer cannot fit the frame — so the caller must shed. Pair with async_flush
+// (on writable) and async_on_readable (on readable).
+pub fn (mut c PgConn) async_submit(query_text string, params []?[]u8) bool {
+	if c.inflight.len >= max_inflight {
+		return false
+	}
+	// Serialize into a small scratch frame, then copy it into the fixed buffer.
+	// (The write_* helpers append via `<<`, which would reallocate the fixed
+	// buffer; the scratch keeps the buffer's backing store pinned.)
+	mut frame := []u8{cap: 256}
+	write_parse(mut frame, '', query_text)
+	write_bind(mut frame, '', '', params)
+	write_describe_portal(mut frame, '')
+	write_execute(mut frame, '', 0)
+	write_sync(mut frame)
+	if !c.append_send(frame) {
+		return false
+	}
+	c.inflight << PendingQuery{
+		frames: []u8{cap: 8 * 1024}
+	}
+	return true
+}
+
+// append_send copies one serialized query frame into the fixed-capacity send
+// buffer, compacting the unsent region to the front first so the buffer never
+// marches forward. The buffer is allocated once and
+// never reallocated. Returns false if the frame will not fit — the connection is
+// saturated and the caller must shed.
+fn (mut c PgConn) append_send(frame []u8) bool {
+	if c.send_buf.len < send_buf_cap {
+		c.send_buf = []u8{len: send_buf_cap}
+		c.send_off = 0
+		c.send_len = 0
+	}
+	if c.send_off == c.send_len {
+		// Fully drained — reset to the front.
+		c.send_off = 0
+		c.send_len = 0
+	} else if c.send_off > 0 {
+		// Slide the still-unsent tail [send_off, send_len) down to the front. A
+		// forward byte copy is overlap-safe (dst index <= src index).
+		n := c.send_len - c.send_off
+		for i in 0 .. n {
+			c.send_buf[i] = c.send_buf[c.send_off + i]
+		}
+		c.send_off = 0
+		c.send_len = n
+	}
+	if c.send_len + frame.len > send_buf_cap {
+		return false
+	}
+	for i in 0 .. frame.len {
+		c.send_buf[c.send_len + i] = frame[i]
+	}
+	c.send_len += frame.len
+	return true
 }
 
 // async_wants_write reports whether request bytes are still pending (so the
 // reactor should keep writable interest armed).
 pub fn (c &PgConn) async_wants_write() bool {
-	return c.send_off < c.send_buf.len
+	return c.send_off < c.send_len
 }
 
 // async_flush sends as much of the pending request as the socket will take.
 // Returns true once the whole request is sent; false on EAGAIN (leave writable
 // interest armed and call again when writable).
 pub fn (mut c PgConn) async_flush() !bool {
-	for c.send_off < c.send_buf.len {
+	for c.send_off < c.send_len {
 		n := C.send(c.fd, unsafe { &u8(c.send_buf.data) + c.send_off },
-			usize(c.send_buf.len - c.send_off), C.MSG_NOSIGNAL)
+			usize(c.send_len - c.send_off), C.MSG_NOSIGNAL)
 		if n > 0 {
 			c.send_off += n
 			continue
@@ -75,6 +157,9 @@ pub fn (mut c PgConn) async_flush() !bool {
 		}
 		return error('pg: async send failed (errno ${C.errno})')
 	}
+	// Fully drained — reset so the next append starts at the front of the buffer.
+	c.send_off = 0
+	c.send_len = 0
 	return true
 }
 
@@ -87,12 +172,15 @@ pub:
 	result Result
 }
 
-// async_on_readable drains the socket to EAGAIN, frames complete backend
-// messages, and returns a ready QueryPoll once ReadyForQuery arrives — at which
-// point the connection is idle again and reusable. Returns a not-ready poll if
-// more data is needed (stay parked). A server ErrorResponse is surfaced as an
-// error AFTER the stream is drained through ReadyForQuery, so the connection
-// stays in sync for reuse.
+// async_on_readable drains the socket to EAGAIN and frames complete backend
+// messages into the FRONT in-flight query. When that query's ReadyForQuery
+// arrives it is popped and returned as a ready QueryPoll; replies arrive in
+// submit order, so the front of the FIFO is always the current target. Call
+// repeatedly to drain all queries that one readable edge completed — each call
+// returns the next finished query in FIFO order, then a not-ready poll once the
+// new front needs more bytes (stay parked). A server ErrorResponse fails only
+// its own query (surfaced after that query's ReadyForQuery, keeping the stream
+// in sync); pipelined siblings still complete on subsequent calls.
 pub fn (mut c PgConn) async_on_readable() !QueryPoll {
 	for {
 		mut tmp := []u8{len: 16 * 1024}
@@ -109,38 +197,41 @@ pub fn (mut c PgConn) async_on_readable() !QueryPoll {
 		}
 		return error('pg: async recv failed (errno ${C.errno})')
 	}
-	for {
+	for c.inflight.len > 0 {
 		hdr := next_message(c.recv_buf) or { break }
 		typ := c.recv_buf[0]
 		payload := c.recv_buf[5..hdr.total]
 		match typ {
 			bt_command_complete {
-				c.q_rows_affected = parse_command_complete(payload)
+				c.inflight[0].rows_affected = parse_command_complete(payload)
 			}
 			bt_error_response {
 				info := parse_error_response(payload)
-				c.q_error = info.message.bytestr()
-				c.q_sqlstate = info.code.bytestr()
+				c.inflight[0].error = info.message.bytestr()
+				c.inflight[0].sqlstate = info.code.bytestr()
 			}
 			else {}
 		}
 
-		c.q_frames << c.recv_buf[..hdr.total]
+		c.inflight[0].frames << c.recv_buf[..hdr.total]
 		is_ready := typ == bt_ready_for_query
 		c.recv_buf.delete_many(0, hdr.total)
 		if is_ready {
-			c.q_active = false
-			if c.q_error != '' {
-				return error('pg: query failed: ${c.q_error} (SQLSTATE ${c.q_sqlstate})')
+			// Pop the completed front query. Its frames buffer is now owned
+			// solely by `done`, so it is handed off without cloning.
+			done := c.inflight[0]
+			c.inflight.delete(0)
+			if done.error != '' {
+				return error('pg: query failed: ${done.error} (SQLSTATE ${done.sqlstate})')
 			}
 			return QueryPoll{
 				ready:  true
 				result: Result{
-					frames:        c.q_frames.clone()
-					rows_affected: c.q_rows_affected
+					frames:        done.frames
+					rows_affected: done.rows_affected
 				}
 			}
 		}
 	}
-	return QueryPoll{} // not ready — need more bytes
+	return QueryPoll{} // not ready — front query needs more bytes (or none in flight)
 }
