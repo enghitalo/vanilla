@@ -87,6 +87,34 @@ pub fn (mut p PgPool) release(idx int) {
 	}
 }
 
+// acquire_pipelined returns the index of the connection with the FEWEST in-flight
+// queries (the shortest pipeline), or none if every connection is already at the
+// max_inflight cap (the caller sheds). Unlike acquire(), it does NOT take a
+// connection exclusively: a connection multiplexes up to max_inflight queries, so
+// several parked requests share one. Depth is read straight from the connection
+// (no idle bookkeeping), and an idle connection (depth 0) is taken immediately.
+// This is the pooling shape for cross-request pipelining: with only a few
+// connections per worker, N in-flight queries each lifts the per-worker DB
+// concurrency ceiling to conns×N without needing a large pool.
+pub fn (mut p PgPool) acquire_pipelined() ?int {
+	mut best := -1
+	mut best_depth := max_inflight
+	for i in 0 .. p.conns.len {
+		d := p.conns[i].inflight_count()
+		if d == 0 {
+			return i // idle connection — optimal, take it now
+		}
+		if d < best_depth {
+			best = i
+			best_depth = d
+		}
+	}
+	if best < 0 {
+		return none
+	}
+	return best
+}
+
 // conn returns a mutable reference to connection `idx`. The connection array is
 // fixed after connect(), so the reference stays valid for the pool's lifetime.
 pub fn (mut p PgPool) conn(idx int) &PgConn {
