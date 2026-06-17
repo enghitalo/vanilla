@@ -73,6 +73,18 @@ fn find_sequence(buf &u8, len int, bytes_ptr &u8, bytes_len int) !int {
 	}
 }
 
+// find_sequence_idx is the no-Result hot-path twin of find_sequence: index of the
+// needle, or -1. Avoids the `!int` Result boxing on the per-request `\r\n\r\n`
+// scan (see find_byte_idx).
+@[inline]
+fn find_sequence_idx(buf &u8, len int, bytes_ptr &u8, bytes_len int) int {
+	p := unsafe { C.memmem(buf, len, bytes_ptr, bytes_len) }
+	if p == unsafe { nil } {
+		return -1
+	}
+	return int(unsafe { &u8(p) - buf })
+}
+
 // Fast comparison of two byte slices
 @[inline]
 fn bytes_equal(a &u8, a_len int, b &u8, b_len int) bool {
@@ -162,13 +174,17 @@ pub fn parse_http1_request_line(mut req HttpRequest) !int {
 	}
 }
 
-pub fn decode_http_request(buffer []u8) !HttpRequest {
-	mut req := HttpRequest{
-		buffer: buffer
-	}
+// decode_into parses the request head INTO `req` and reports whether it is well
+// formed. Returning a bool instead of `!HttpRequest` avoids boxing the big
+// HttpRequest struct in a Result on every call — callgrind flagged that
+// memset+copy as ~13% of the per-request parse cost. This is the hot-path entry
+// point (worker / handler); decode_http_request is the Result-returning wrapper.
+@[direct_array_access]
+pub fn decode_into(mut req HttpRequest) bool {
+	buffer := req.buffer // caller sets req.buffer (it is immutable after construction)
 
 	// header_start is the byte index immediately after the request line's \r\n
-	header_start := parse_http1_request_line(mut req)!
+	header_start := parse_http1_request_line(mut req) or { return false }
 
 	// RFC 9112 §2.1: the header section is `*( field-line CRLF )` and MAY be
 	// empty. An empty section means the terminating blank-line CRLF sits right
@@ -190,12 +206,13 @@ pub fn decode_http_request(buffer []u8) !HttpRequest {
 		} else {
 			Slice{0, 0}
 		}
-		return req
+		return true
 	}
 
-	header_len := find_sequence(&buffer[header_start], buffer.len - header_start, &double_crlf[0],
-		double_crlf.len) or {
-		return error('Missing header-body delimiter (no blank line terminating the header section)')
+	header_len := find_sequence_idx(&buffer[header_start], buffer.len - header_start,
+		&double_crlf[0], double_crlf.len)
+	if header_len < 0 {
+		return false
 	}
 
 	if header_len + header_start + double_crlf.len == buffer.len {
@@ -205,7 +222,6 @@ pub fn decode_http_request(buffer []u8) !HttpRequest {
 			len:   header_len
 		}
 		req.body = Slice{0, 0}
-		return req
 	} else {
 		// Body present
 		req.header_fields = Slice{
@@ -217,10 +233,21 @@ pub fn decode_http_request(buffer []u8) !HttpRequest {
 			start: body_start
 			len:   buffer.len - body_start
 		}
+	}
+	return true
+}
+
+// decode_http_request is the Result-returning wrapper around decode_into, kept for
+// tests and ergonomic callers. The hot path should call decode_into directly to
+// avoid the HttpRequest-in-Result boxing.
+pub fn decode_http_request(buffer []u8) !HttpRequest {
+	mut req := HttpRequest{
+		buffer: buffer
+	}
+	if decode_into(mut req) {
 		return req
 	}
-
-	return req
+	return error('malformed request head')
 }
 
 // Helper function to convert Slice to string for debugging
