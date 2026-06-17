@@ -205,7 +205,7 @@ fn process_events_plain(worker_id int, epoll_fd int, request_handler core.Reques
 			if has_watches {
 				if fd < reactor.watches.len && reactor.watches[fd].active {
 					async_on_ready(async_handler, mut reactor, epoll_fd, fd, reactor.watches[fd],
-						limits, counter, active_conns, mut st, state)
+						ev, limits, counter, active_conns, mut st, state)
 					continue
 				}
 			}
