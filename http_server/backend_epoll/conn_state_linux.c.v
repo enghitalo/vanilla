@@ -96,8 +96,16 @@ mut:
 // something is actually mid-transfer.
 pub struct PlainState {
 mut:
-	conns  []&ConnState
-	parked int
+	conns []&ConnState
+	// free_conns is a per-worker free-list of retired ConnStates, each keeping its
+	// 8K read_buf + 16K write_buf. close_conn resets a connection and pushes it
+	// here instead of freeing; state_for pops from here instead of allocating.
+	// Under -gc none, freeing + re-allocating those buffers on every reconnect
+	// (load generators churn tens of thousands of connections per run) leaves
+	// retained allocator arena that grows RSS run-over-run — pooling bounds memory
+	// to the worker's peak concurrent connection count. Per-worker: no locking.
+	free_conns []&ConnState
+	parked     int
 }
 
 pub fn new_plain_state() PlainState {
@@ -123,6 +131,12 @@ fn state_for(mut st PlainState, fd int) &ConnState {
 		st.conns = grown
 	}
 	if unsafe { st.conns[fd] == nil } {
+		// Reuse a retired ConnState (buffers retained, fields reset by close_conn)
+		// before allocating — see PlainState.free_conns.
+		if st.free_conns.len > 0 {
+			st.conns[fd] = st.free_conns.pop()
+			return st.conns[fd]
+		}
 		mut cs := &ConnState{
 			read_buf:  []u8{len: 0, cap: read_buf_cap}
 			write_buf: []u8{len: 0, cap: write_buf_cap}
@@ -579,7 +593,7 @@ fn sweep_timeouts(epoll_fd int, active_conns &core.Counter, mut st PlainState) {
 @[direct_array_access; manualfree]
 fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainState) {
 	if fd < st.conns.len {
-		cs := st.conns[fd]
+		mut cs := st.conns[fd]
 		if unsafe { cs != nil } {
 			if cs.read_deadline != 0 {
 				st.parked--
@@ -587,11 +601,27 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			if cs.write_deadline != 0 {
 				st.parked--
 			}
+			// Reuse instead of free: reset to a pristine state and return to the
+			// per-worker pool, KEEPING the read/write buffers (just length-zeroed,
+			// capacity retained). Freeing + re-allocating them per reconnect leaks
+			// allocator arena under -gc none — see PlainState.free_conns. Every
+			// field a fresh ConnState would have must be reset here so no stale
+			// state (deadlines, sendfile offsets, body_drain, awaiting_fd) bleeds
+			// into the next connection that reuses this slot.
 			unsafe {
-				cs.read_buf.free()
-				cs.write_buf.free()
+				cs.read_buf.len = 0
+				cs.write_buf.len = 0
 			}
+			cs.write_off = 0
+			cs.read_deadline = 0
+			cs.write_deadline = 0
+			cs.file_fd = -1
+			cs.file_off = 0
+			cs.file_remaining = 0
+			cs.body_drain = 0
+			cs.awaiting_fd = -1
 			st.conns[fd] = unsafe { nil }
+			st.free_conns << cs
 		}
 	}
 	release_conn(epoll_fd, fd, active_conns)
