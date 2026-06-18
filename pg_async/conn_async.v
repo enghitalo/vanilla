@@ -182,11 +182,36 @@ pub:
 // its own query (surfaced after that query's ReadyForQuery, keeping the stream
 // in sync); pipelined siblings still complete on subsequent calls.
 pub fn (mut c PgConn) async_on_readable() !QueryPoll {
+	// Everything received so far has been framed → reset the cursor to the front so
+	// recv_buf doesn't ratchet upward (the common between-edges state).
+	if c.recv_pos > 0 && c.recv_pos >= c.recv_buf.len {
+		c.recv_pos = 0
+		unsafe { c.recv_buf.len = 0 }
+	}
+	// Drain the socket to EAGAIN, recv-ing STRAIGHT into recv_buf's spare tail — no
+	// per-iteration 16 KiB scratch alloc + copy. recv_buf is persistent + reused; only
+	// when the tail is full do we compact the framed prefix, then grow by doubling.
 	for {
-		mut tmp := []u8{len: 16 * 1024}
-		n := C.recv(c.fd, tmp.data, usize(tmp.len), 0)
+		if c.recv_buf.len == c.recv_buf.cap {
+			if c.recv_pos > 0 {
+				rem := c.recv_buf.len - c.recv_pos
+				if rem > 0 {
+					unsafe { C.memmove(c.recv_buf.data, &u8(c.recv_buf.data) + c.recv_pos, usize(rem)) }
+				}
+				unsafe { c.recv_buf.len = rem }
+				c.recv_pos = 0
+			}
+			if c.recv_buf.len == c.recv_buf.cap {
+				// Grow by the current cap (doubling), or a 16 KiB floor when cap is 0
+				// (recv_buf comes back cap-0 after the blocking handshake — grow_cap(0)
+				// would be a no-op, leaving spare=0 and recv reading nothing forever).
+				unsafe { c.recv_buf.grow_cap(if c.recv_buf.cap > 0 { c.recv_buf.cap } else { 16 * 1024 }) }
+			}
+		}
+		spare := c.recv_buf.cap - c.recv_buf.len
+		n := C.recv(c.fd, unsafe { &u8(c.recv_buf.data) + c.recv_buf.len }, usize(spare), 0)
 		if n > 0 {
-			c.recv_buf << tmp[..n]
+			unsafe { c.recv_buf.len += n }
 			continue
 		}
 		if n == 0 {
@@ -198,9 +223,9 @@ pub fn (mut c PgConn) async_on_readable() !QueryPoll {
 		return error('pg: async recv failed (errno ${C.errno})')
 	}
 	for c.inflight.len > 0 {
-		hdr := next_message(c.recv_buf) or { break }
-		typ := c.recv_buf[0]
-		payload := c.recv_buf[5..hdr.total]
+		hdr := next_message_at(c.recv_buf, c.recv_pos) or { break }
+		typ := c.recv_buf[c.recv_pos]
+		payload := c.recv_buf[c.recv_pos + 5..c.recv_pos + hdr.total]
 		match typ {
 			bt_command_complete {
 				c.inflight[0].rows_affected = parse_command_complete(payload)
@@ -213,9 +238,9 @@ pub fn (mut c PgConn) async_on_readable() !QueryPoll {
 			else {}
 		}
 
-		c.inflight[0].frames << c.recv_buf[..hdr.total]
+		c.inflight[0].frames << c.recv_buf[c.recv_pos..c.recv_pos + hdr.total]
 		is_ready := typ == bt_ready_for_query
-		c.recv_buf.delete_many(0, hdr.total)
+		c.recv_pos += hdr.total
 		if is_ready {
 			// Pop the completed front query. Its frames buffer is now owned
 			// solely by `done`, so it is handed off without cloning.

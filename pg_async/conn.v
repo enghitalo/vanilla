@@ -78,6 +78,7 @@ pub struct PgConn {
 mut:
 	fd       int = -1 // the raw socket fd
 	recv_buf []u8
+	recv_pos int // async read cursor: [recv_pos, recv_buf.len) is received-but-unframed
 	// In-flight non-blocking query state. The connection pipelines up to
 	// max_inflight queries: async_submit appends each query's wire bytes to the
 	// fixed send buffer and pushes a PendingQuery onto the FIFO; async_on_readable

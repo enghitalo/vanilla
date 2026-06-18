@@ -82,6 +82,28 @@ pub fn next_message(buf []u8) ?MsgHeader {
 	}
 }
 
+// next_message_at is next_message starting at offset `pos` — for an advancing read
+// cursor over a buffer appended-to at the tail and consumed from the front WITHOUT
+// memmove per message. Returns none if a full message is not buffered at pos.
+@[direct_array_access]
+pub fn next_message_at(buf []u8, pos int) ?MsgHeader {
+	if buf.len - pos < 5 {
+		return none
+	}
+	msg_len := int(binary.big_endian_u32(buf[pos + 1..pos + 5]))
+	if msg_len < 4 {
+		return none
+	}
+	total := 1 + msg_len
+	if buf.len - pos < total {
+		return none
+	}
+	return MsgHeader{
+		typ:   buf[pos]
+		total: total
+	}
+}
+
 // Frame is one parsed backend message (type + borrowed payload).
 pub struct Frame {
 pub:
