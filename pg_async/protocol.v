@@ -204,7 +204,7 @@ pub fn (r Row) col(i int) !DataValue {
 	if r.payload.len < 2 {
 		return error('datarow: short payload')
 	}
-	ncols := int(i16(binary.big_endian_u16(r.payload[0..2])))
+	ncols := int(i16(binary.big_endian_u16_at(r.payload, 0)))
 	if i < 0 || i >= ncols {
 		return error('datarow: col ${i} out of range (${ncols} cols)')
 	}
@@ -213,7 +213,10 @@ pub fn (r Row) col(i int) !DataValue {
 		if pos + 4 > r.payload.len {
 			return error('datarow: truncated length')
 		}
-		clen := int(i32(binary.big_endian_u32(r.payload[pos..pos + 4])))
+		// read the 4-byte length at offset WITHOUT slicing the payload — the slice
+		// (array descriptor alloc) per length-read dominated the row-decode CPU
+		// (~31% of the async-db per-request profile, O(ncols) per col access).
+		clen := int(i32(binary.big_endian_u32_at(r.payload, pos)))
 		pos += 4
 		if clen < 0 {
 			if idx == i {
