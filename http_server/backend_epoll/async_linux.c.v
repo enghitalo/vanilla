@@ -109,11 +109,19 @@ fn (mut r AsyncReactor) reactor_watch(ext_fd int, client_fd int, cont core.WakeF
 	}
 	if !r.watches[ext_fd].active {
 		// Fresh watch — the single-watch fast path (timerfd / SSE / one query).
-		r.watches[ext_fd] = WatchEntry{
-			active:    true
-			client_fd: client_fd
-			cont:      cont
-			udata:     udata
+		// Reset the fields in place and REUSE the slot's (already-empty) queue
+		// rather than assigning a `WatchEntry{}` literal: the literal default-inits
+		// the omitted `queue []ParkSlot` to a fresh empty array — one heap
+		// allocation per park, which leaks under `-gc none`. Semantics are
+		// identical to the literal (persistent reset to false; async_register
+		// re-stamps it right after when the fd is pool-owned).
+		r.watches[ext_fd].active = true
+		r.watches[ext_fd].client_fd = client_fd
+		r.watches[ext_fd].cont = cont
+		r.watches[ext_fd].udata = udata
+		r.watches[ext_fd].persistent = false
+		unsafe {
+			r.watches[ext_fd].queue.len = 0
 		}
 		return
 	}
@@ -128,14 +136,17 @@ fn (mut r AsyncReactor) reactor_watch(ext_fd int, client_fd int, cont core.WakeF
 			r.watches[ext_fd].udata = udata
 			return
 		}
-		// Promote: move the existing head into the queue, then append the newcomer.
-		r.watches[ext_fd].queue = [
-			ParkSlot{
-				client_fd: r.watches[ext_fd].client_fd
-				cont:      r.watches[ext_fd].cont
-				udata:     r.watches[ext_fd].udata
-			},
-		]
+		// Promote: move the existing head into the queue (len is 0 here), then the
+		// dedup loop below appends the newcomer. Push into the slot's RETAINED
+		// buffer rather than assigning a `[ParkSlot{...}]` literal: the literal
+		// reallocates the queue every promote cycle, which leaks under -gc none.
+		// The buffer grows once to the max pipeline depth and is reused thereafter
+		// (drain resets len to 0 without freeing).
+		r.watches[ext_fd].queue << ParkSlot{
+			client_fd: r.watches[ext_fd].client_fd
+			cont:      r.watches[ext_fd].cont
+			udata:     r.watches[ext_fd].udata
+		}
 	}
 	for i in 0 .. r.watches[ext_fd].queue.len {
 		if r.watches[ext_fd].queue[i].client_fd == client_fd {
@@ -198,14 +209,16 @@ fn (mut r AsyncReactor) reactor_orphan_single(ext_fd int, client_fd int) bool {
 	if e.queue.len != 0 || !e.persistent || !e.active {
 		return false
 	}
-	r.watches[ext_fd].queue = [
-		ParkSlot{
-			client_fd: client_fd
-			cont:      e.cont
-			udata:     e.udata
-			dead:      true
-		},
-	]
+	// Tombstone the orphaned single watch as a one-slot queue. Push into the
+	// slot's retained buffer (len is 0 here) rather than assigning a literal, so
+	// the pool-owned fd's queue is never reallocated — a per-disconnect leak under
+	// -gc none.
+	r.watches[ext_fd].queue << ParkSlot{
+		client_fd: client_fd
+		cont:      e.cont
+		udata:     e.udata
+		dead:      true
+	}
 	return true
 }
 
@@ -676,9 +689,12 @@ fn drain_pipelined(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, 
 	}
 	// Queue emptied: revert the fd to the inactive single-watch state. The fd itself
 	// stays in this worker's epoll (pool-owned); the next park re-activates it.
+	// KEEP the drained queue's buffer (len is already 0 from the delete(0)s) — do
+	// NOT reassign []ParkSlot{}: the next pipeline cycle on this pool-owned fd
+	// refills it without reallocating. A fresh empty array per drain leaks under
+	// -gc none (this is the dominant pipelined-load residual).
 	if reactor.watches[ext_fd].queue.len == 0 {
 		reactor.watches[ext_fd].active = false
-		reactor.watches[ext_fd].queue = []ParkSlot{}
 	}
 }
 
