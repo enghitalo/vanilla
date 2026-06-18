@@ -78,14 +78,17 @@ pub struct PgConn {
 mut:
 	fd       int = -1 // the raw socket fd
 	recv_buf []u8
-	// In-flight non-blocking query state (one query per connection at a time).
-	send_buf        []u8
-	send_off        int
-	q_frames        []u8
-	q_error         string
-	q_sqlstate      string
-	q_rows_affected u64
-	q_active        bool
+	recv_pos int // async read cursor: [recv_pos, recv_buf.len) is received-but-unframed
+	// In-flight non-blocking query state. The connection pipelines up to
+	// max_inflight queries: async_submit appends each query's wire bytes to the
+	// fixed send buffer and pushes a PendingQuery onto the FIFO; async_on_readable
+	// frames replies (Postgres returns them in submit order) into the front
+	// PendingQuery and pops it at ReadyForQuery. One query in flight is just the
+	// degenerate N=1 case.
+	send_buf []u8 // fixed-capacity (send_buf_cap), allocated once, never realloc'd
+	send_off int  // [0, send_off) already sent
+	send_len int  // [send_off, send_len) written, still to send
+	inflight []PendingQuery
 }
 
 struct Msg {

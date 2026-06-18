@@ -39,12 +39,37 @@ import http_server.http1_1.response
 // context handed back via AsyncCtx.udata. `active` is the slot's occupancy flag:
 // the table is indexed by fd (a flat array, not a hashmap), so a cleared slot is
 // just `active = false` rather than an erased key.
+//
+// `queue` is EMPTY for the overwhelming common case of one watch per fd (a
+// timerfd, an SSE stream, a single in-flight query): the active/client_fd/cont/
+// udata fields drive everything and there is no extra allocation. It is populated
+// only when a SECOND distinct client parks on an already-active fd — i.e. a
+// pg_async connection carrying pipelined queries (see async_db cross-request
+// pipelining). Then `queue` is the FIFO of parked clients, `client_fd/cont/udata`
+// are unused, and async_on_ready drains it in submission order.
 struct WatchEntry {
 mut:
 	active    bool
 	client_fd int
 	cont      core.WakeFn = unsafe { nil }
 	udata     voidptr
+	queue     []ParkSlot // empty = single watch; non-empty = pipelined (multi-client) fd
+}
+
+// ParkSlot is one parked client on a pipelined fd: the same (client, continuation,
+// udata) triple a single WatchEntry holds, but queued so that one readable edge on
+// a multiplexed pg connection can complete several requests in submission order.
+// `dead` marks a client that disconnected while still parked: its slot STAYS in the
+// queue (removing it would desync the queue from the connection's in-flight FIFO,
+// and the freed client_fd could be reused by a new connection — ABA), but its
+// continuation is run against a throwaway buffer so its query result is still
+// consumed in order and the response discarded.
+struct ParkSlot {
+mut:
+	client_fd int
+	cont      core.WakeFn = unsafe { nil }
+	udata     voidptr
+	dead      bool
 }
 
 // AsyncReactor is the per-worker watch registry: a flat array indexed by the
@@ -73,8 +98,42 @@ fn (mut r AsyncReactor) reactor_watch(ext_fd int, client_fd int, cont core.WakeF
 		}
 		r.watches = grown
 	}
-	r.watches[ext_fd] = WatchEntry{
-		active:    true
+	if !r.watches[ext_fd].active {
+		// Fresh watch — the single-watch fast path (timerfd / SSE / one query).
+		r.watches[ext_fd] = WatchEntry{
+			active:    true
+			client_fd: client_fd
+			cont:      cont
+			udata:     udata
+		}
+		return
+	}
+	// The fd already has a parked watch. A SECOND distinct client on the same fd
+	// means it is multiplexing (a pipelined pg connection): promote to a queue and
+	// fan the readiness out in submission order. A re-arm by an ALREADY-parked
+	// client (the front continuation asking for more bytes) updates in place — never
+	// a duplicate append.
+	if r.watches[ext_fd].queue.len == 0 {
+		if r.watches[ext_fd].client_fd == client_fd {
+			r.watches[ext_fd].cont = cont
+			r.watches[ext_fd].udata = udata
+			return
+		}
+		// Promote: move the existing head into the queue, then append the newcomer.
+		r.watches[ext_fd].queue = [ParkSlot{
+			client_fd: r.watches[ext_fd].client_fd
+			cont:      r.watches[ext_fd].cont
+			udata:     r.watches[ext_fd].udata
+		}]
+	}
+	for i in 0 .. r.watches[ext_fd].queue.len {
+		if r.watches[ext_fd].queue[i].client_fd == client_fd {
+			r.watches[ext_fd].queue[i].cont = cont
+			r.watches[ext_fd].queue[i].udata = udata
+			return
+		}
+	}
+	r.watches[ext_fd].queue << ParkSlot{
 		client_fd: client_fd
 		cont:      cont
 		udata:     udata
@@ -89,6 +148,24 @@ fn (mut r AsyncReactor) reactor_watch(ext_fd int, client_fd int, cont core.WakeF
 fn (mut r AsyncReactor) reactor_clear(ext_fd int) {
 	if ext_fd >= 0 && ext_fd < r.watches.len {
 		r.watches[ext_fd].active = false
+	}
+}
+
+// reactor_mark_dead tombstones the queued slot for client_fd on a pipelined ext_fd
+// (the client disconnected mid-pipeline). The slot is kept so the queue stays
+// aligned with the connection's in-flight FIFO; drain_pipelined consumes its
+// result in order and discards it. Identified by client_fd, never re-looked-up
+// against st.conns, so a reused fd cannot be mistaken for the dead client.
+@[direct_array_access]
+fn (mut r AsyncReactor) reactor_mark_dead(ext_fd int, client_fd int) {
+	if ext_fd < 0 || ext_fd >= r.watches.len {
+		return
+	}
+	for i in 0 .. r.watches[ext_fd].queue.len {
+		if r.watches[ext_fd].queue[i].client_fd == client_fd {
+			r.watches[ext_fd].queue[i].dead = true
+			return
+		}
 	}
 }
 
@@ -384,6 +461,14 @@ fn async_compact(mut cs ConnState, pos int) {
 // it can release a dead fd instead of re-arming it into a busy-spin.
 @[direct_array_access; manualfree]
 fn async_on_ready(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, ext_fd int, entry WatchEntry, ev u32, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, state voidptr) {
+	// A pipelined fd (multiple parked clients on one multiplexed pg connection):
+	// fan this readiness edge out to the queued continuations in submission order.
+	// The single-watch path below is left byte-identical for every other consumer.
+	if entry.queue.len > 0 {
+		drain_pipelined(h, mut reactor, epoll_fd, ext_fd, ev, limits, active_conns, mut st,
+			state)
+		return
+	}
 	reactor.reactor_clear(ext_fd) // consumed; the continuation re-arms if it needs more
 	ready_err := ev & (u32(C.EPOLLHUP) | u32(C.EPOLLERR)) != 0
 	// Clientless background watch (armed by on_worker_start, e.g. a per-worker
@@ -469,6 +554,89 @@ fn async_on_ready(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, e
 	}
 }
 
+// drain_pipelined fans one readiness edge on a multiplexed pg connection out to
+// the clients queued on it, in submission order. The queue head aligns with the
+// connection's front in-flight query (each request did async_submit then watch as
+// one step), so the head's continuation calls async_on_readable() and gets ITS
+// query's result. We run heads until one cannot complete yet (.suspend): by FIFO,
+// if the front query is not ready no later one is either, so we stop. Each .done
+// is sent (and HTTP pipelined behind it on that client drained) before the next.
+@[direct_array_access; manualfree]
+fn drain_pipelined(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, ext_fd int, ev u32, limits core.Limits, active_conns &core.Counter, mut st PlainState, state voidptr) {
+	ready_err := ev & (u32(C.EPOLLHUP) | u32(C.EPOLLERR)) != 0
+	for reactor.watches[ext_fd].queue.len > 0 {
+		slot := reactor.watches[ext_fd].queue[0]
+		client_fd := slot.client_fd
+		// A tombstoned client (disconnected mid-pipeline): run its continuation
+		// against a throwaway buffer purely to CONSUME its in-flight query result in
+		// order (keeping the queue aligned with the connection's FIFO), then discard
+		// it. Never re-look-up st.conns for a dead slot — the fd may have been reused.
+		if slot.dead || client_fd < 0 || client_fd >= st.conns.len
+			|| unsafe { st.conns[client_fd] == nil } {
+			mut scratch := []u8{}
+			mut dac := core.AsyncCtx{
+				client_fd: client_fd
+				ready_fd:  ext_fd
+				ready_err: ready_err
+				udata:     slot.udata
+				state:     state
+				loop_fd:   epoll_fd
+				reactor:   unsafe { voidptr(&reactor) }
+				register:  async_register
+			}
+			if slot.cont(mut scratch, mut dac) == .suspend {
+				break // result not ready yet — the tombstone stays at the head
+			}
+			reactor.watches[ext_fd].queue.delete(0)
+			continue
+		}
+		mut cs := st.conns[client_fd]
+		cs.awaiting_fd = -1
+		mut ac := core.AsyncCtx{
+			client_fd: client_fd
+			ready_fd:  ext_fd
+			ready_err: ready_err
+			udata:     slot.udata
+			state:     state
+			loop_fd:   epoll_fd
+			reactor:   unsafe { voidptr(&reactor) }
+			register:  async_register
+		}
+		match slot.cont(mut cs.write_buf, mut ac) {
+			.done {
+				// Pop BEFORE serving: async_serve may read a request pipelined behind
+				// this one and re-park the client on ext_fd (appended at the tail).
+				reactor.watches[ext_fd].queue.delete(0)
+				async_serve(h, mut reactor, epoll_fd, client_fd, limits, active_conns, mut st,
+					mut cs, state)
+			}
+			.suspend {
+				// Front query not ready yet. The continuation re-armed ext_fd in place
+				// (reactor_watch found it already queued — no duplicate). Send anything it
+				// streamed, keep it at the head, and stop: nothing behind it is ready.
+				if cs.write_buf.len > cs.write_off {
+					if !flush_batch(epoll_fd, client_fd, limits, active_conns, mut st, mut cs) {
+						reactor.watches[ext_fd].queue.delete(0) // conn closed on write
+						continue
+					}
+				}
+				cs.awaiting_fd = ext_fd
+				break
+			}
+			.close {
+				reactor.watches[ext_fd].queue.delete(0)
+				close_conn(epoll_fd, client_fd, active_conns, mut st)
+			}
+		}
+	}
+	// Queue emptied: revert the fd to the inactive single-watch state. The fd itself
+	// stays in this worker's epoll (pool-owned); the next park re-activates it.
+	if reactor.watches[ext_fd].queue.len == 0 {
+		reactor.watches[ext_fd].active = false
+		reactor.watches[ext_fd].queue = []ParkSlot{}
+	}
+}
+
 // async_close tears down a connection, first removing any watch it is parked on
 // (which closes that request-owned fd, e.g. a timerfd) so nothing leaks.
 @[direct_array_access; manualfree]
@@ -476,8 +644,18 @@ fn async_close(mut reactor AsyncReactor, epoll_fd int, fd int, active_conns &cor
 	if fd < st.conns.len {
 		cs := st.conns[fd]
 		if unsafe { cs != nil } && cs.awaiting_fd >= 0 {
-			reactor.reactor_clear(cs.awaiting_fd)
-			epoll.remove_fd_from_epoll(epoll_fd, cs.awaiting_fd) // DEL + close the ext fd
+			ext_fd := cs.awaiting_fd
+			if ext_fd < reactor.watches.len && reactor.watches[ext_fd].queue.len > 0 {
+				// The fd is a SHARED, pipelined pg connection: detaching this one client
+				// must not clear the slot (siblings are still parked) nor close the pooled
+				// connection. Tombstone this client's slot — it stays in the queue so the
+				// connection's in-flight FIFO stays aligned and its result is consumed
+				// (and discarded) in order by drain_pipelined.
+				reactor.reactor_mark_dead(ext_fd, fd)
+			} else {
+				reactor.reactor_clear(ext_fd)
+				epoll.remove_fd_from_epoll(epoll_fd, ext_fd) // DEL + close the ext fd
+			}
 		}
 	}
 	close_conn(epoll_fd, fd, active_conns, mut st)

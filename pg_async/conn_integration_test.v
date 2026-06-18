@@ -171,7 +171,7 @@ fn test_pool_acquire_release_and_query() {
 
 	// Run a query through the pooled connection via the non-blocking pump.
 	mut conn := pool.conn(got)
-	conn.async_submit(r'select $1::int4', [?[]u8('123'.bytes())])
+	assert conn.async_submit(r'select $1::int4', [?[]u8('123'.bytes())])
 	mut sent := false
 	for _ in 0 .. 10000 {
 		if conn.async_flush()! {
