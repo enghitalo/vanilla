@@ -29,16 +29,27 @@ const max_inflight = 8
 // protocol queries vanilla issues; append_send sheds if a frame won't fit.
 const send_buf_cap = 64 * 1024
 
+// frame_buf_cap is the per-accumulator reply-buffer size in the per-connection
+// frames pool (see PgConn.frame_pool). Sized to hold a typical query's full reply
+// (RowDescription + a LIMIT-bounded set of DataRows + CommandComplete) without a
+// realloc; a larger reply still grows via `<<` and the grown buffer is written
+// back to its pool slot, so growth is kept and never re-allocated per query.
+const frame_buf_cap = 16 * 1024
+
 // PendingQuery is one pipelined query's reply accumulator: its framed backend
 // messages (ParseComplete..ReadyForQuery), the rows-affected count, and any
 // server error. It lives on the connection's in-flight FIFO until ReadyForQuery
 // completes it, at which point async_on_readable pops it and yields its Result.
+// `frames` is BORROWED from the connection's frame_pool (reused round-robin), not
+// allocated per query; `frame_slot` is the pool index it borrows so the buffer
+// can be returned (and any growth captured) on completion.
 struct PendingQuery {
 mut:
 	frames        []u8
 	error         string
 	sqlstate      string
 	rows_affected u64
+	frame_slot    int
 }
 
 // set_nonblocking flips the connection socket to non-blocking. Call once, after
@@ -94,8 +105,27 @@ pub fn (mut c PgConn) async_submit(query_text string, params []?[]u8) bool {
 	if !c.append_send(frame) {
 		return false
 	}
+	// Borrow a reply accumulator from the per-connection pool instead of allocating
+	// one per query (which would leak under `-gc none`). The pool holds max_inflight
+	// buffers reused round-robin; a slot is only reused after a full ring cycle, by
+	// which time the query that last used it has been drained AND rendered (at most
+	// max_inflight queries are in flight, enforced by the guard above), so the borrow
+	// can never alias a still-in-use reply.
+	if c.frame_pool.len < max_inflight {
+		c.frame_pool = [][]u8{cap: max_inflight}
+		for _ in 0 .. max_inflight {
+			c.frame_pool << []u8{cap: frame_buf_cap}
+		}
+	}
+	slot := c.frame_ring
+	c.frame_ring = (c.frame_ring + 1) % max_inflight
+	mut fbuf := c.frame_pool[slot]
+	unsafe {
+		fbuf.len = 0
+	}
 	c.inflight << PendingQuery{
-		frames: []u8{cap: 8 * 1024}
+		frames:     fbuf
+		frame_slot: slot
 	}
 	return true
 }
@@ -186,7 +216,9 @@ pub fn (mut c PgConn) async_on_readable() !QueryPoll {
 	// recv_buf doesn't ratchet upward (the common between-edges state).
 	if c.recv_pos > 0 && c.recv_pos >= c.recv_buf.len {
 		c.recv_pos = 0
-		unsafe { c.recv_buf.len = 0 }
+		unsafe {
+			c.recv_buf.len = 0
+		}
 	}
 	// Drain the socket to EAGAIN, recv-ing STRAIGHT into recv_buf's spare tail — no
 	// per-iteration 16 KiB scratch alloc + copy. recv_buf is persistent + reused; only
@@ -196,22 +228,34 @@ pub fn (mut c PgConn) async_on_readable() !QueryPoll {
 			if c.recv_pos > 0 {
 				rem := c.recv_buf.len - c.recv_pos
 				if rem > 0 {
-					unsafe { C.memmove(c.recv_buf.data, &u8(c.recv_buf.data) + c.recv_pos, usize(rem)) }
+					unsafe {
+						C.memmove(c.recv_buf.data, &u8(c.recv_buf.data) + c.recv_pos, usize(rem))
+					}
 				}
-				unsafe { c.recv_buf.len = rem }
+				unsafe {
+					c.recv_buf.len = rem
+				}
 				c.recv_pos = 0
 			}
 			if c.recv_buf.len == c.recv_buf.cap {
 				// Grow by the current cap (doubling), or a 16 KiB floor when cap is 0
 				// (recv_buf comes back cap-0 after the blocking handshake — grow_cap(0)
 				// would be a no-op, leaving spare=0 and recv reading nothing forever).
-				unsafe { c.recv_buf.grow_cap(if c.recv_buf.cap > 0 { c.recv_buf.cap } else { 16 * 1024 }) }
+				unsafe {
+					c.recv_buf.grow_cap(if c.recv_buf.cap > 0 {
+						c.recv_buf.cap
+					} else {
+						16 * 1024
+					})
+				}
 			}
 		}
 		spare := c.recv_buf.cap - c.recv_buf.len
 		n := C.recv(c.fd, unsafe { &u8(c.recv_buf.data) + c.recv_buf.len }, usize(spare), 0)
 		if n > 0 {
-			unsafe { c.recv_buf.len += n }
+			unsafe {
+				c.recv_buf.len += n
+			}
 			continue
 		}
 		if n == 0 {
@@ -246,6 +290,13 @@ pub fn (mut c PgConn) async_on_readable() !QueryPoll {
 			// solely by `done`, so it is handed off without cloning.
 			done := c.inflight[0]
 			c.inflight.delete(0)
+			// Return the (possibly grown) accumulator to its pool slot so any growth
+			// is kept and the slot is reused next ring cycle — no per-query alloc. The
+			// Result borrows the same backing; it is consumed by the resume callback
+			// before the slot can be reused (a full ring cycle away).
+			if done.frame_slot >= 0 && done.frame_slot < c.frame_pool.len {
+				c.frame_pool[done.frame_slot] = done.frames
+			}
 			if done.error != '' {
 				return error('pg: query failed: ${done.error} (SQLSTATE ${done.sqlstate})')
 			}
