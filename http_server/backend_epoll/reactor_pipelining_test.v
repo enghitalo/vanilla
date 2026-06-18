@@ -101,6 +101,56 @@ fn test_mark_dead_tombstones_slot() {
 	assert !r.watches[10].queue[2].dead
 }
 
+// A client disconnecting while parked ALONE on a PERSISTENT (pool-owned) fd does
+// NOT close the fd: the single watch is converted into a one-slot DEAD tombstone so
+// the orphaned in-flight reply is drained in order and the connection is reused.
+// (Before this fix the single-watch teardown closed the pooled connection, forcing
+// a reconnect + a fresh auth handshake on the next borrow.)
+fn test_orphan_single_persistent_tombstones_not_closes() {
+	mut r := AsyncReactor{}
+	r.reactor_watch(10, 100, noop_cont, voidptr(usize(1)))
+	r.watches[10].persistent = true // armed via watch_persistent (a pool fd)
+	tombstoned := r.reactor_orphan_single(10, 100)
+	assert tombstoned // caller must leave the fd open
+	assert r.watches[10].active // still armed in epoll for the orphaned reply
+	assert r.watches[10].queue.len == 1
+	assert r.watches[10].queue[0].dead
+	assert r.watches[10].queue[0].client_fd == 100
+	assert r.watches[10].queue[0].udata == voidptr(usize(1)) // carried from the single watch
+}
+
+// A request-owned (non-persistent) fd is NOT tombstoned: reactor_orphan_single
+// returns false so the caller closes it as before (no leak of a per-request
+// timerfd / pipe).
+fn test_orphan_single_nonpersistent_closes() {
+	mut r := AsyncReactor{}
+	r.reactor_watch(10, 100, noop_cont, voidptr(usize(1)))
+	// persistent defaults to false (a plain watch()).
+	assert !r.reactor_orphan_single(10, 100)
+	assert r.watches[10].queue.len == 0 // untouched; caller will clear + close
+}
+
+// reactor_orphan_single never tombstones a fd that already has a queue (that is the
+// pipelined case, handled by reactor_mark_dead), an inactive slot, or an
+// out-of-range fd — it returns false so the caller falls through to close.
+fn test_orphan_single_declines_queue_inactive_and_oob() {
+	mut r := AsyncReactor{}
+	// Already a queue (pipelined) — decline even if persistent.
+	r.reactor_watch(10, 100, noop_cont, voidptr(usize(1)))
+	r.reactor_watch(10, 200, noop_cont, voidptr(usize(2)))
+	r.watches[10].persistent = true
+	assert !r.reactor_orphan_single(10, 100)
+	// Inactive persistent slot — decline.
+	mut r2 := AsyncReactor{}
+	r2.reactor_watch(11, 100, noop_cont, voidptr(usize(1)))
+	r2.watches[11].persistent = true
+	r2.reactor_clear(11) // active = false
+	assert !r2.reactor_orphan_single(11, 100)
+	assert r2.watches[11].queue.len == 0
+	// Out-of-range fd — decline, no panic.
+	assert !r2.reactor_orphan_single(99999, 100)
+}
+
 // The flat table grows by doubling for a high fd, like the connection table.
 fn test_table_grows_for_high_fd() {
 	mut r := AsyncReactor{}

@@ -73,7 +73,15 @@ pub mut:
 	loop_fd      int     // backend-filled: the worker's event-loop fd (epoll on Linux, kqueue on macOS)
 	reactor      voidptr // backend-filled: the worker's watch registry
 	last_watched int = -1 // backend-filled: the fd passed to the most recent watch()
-	register     fn (mut ac AsyncCtx, ext_fd int, interest WatchInterest, cont WakeFn, udata voidptr) = unsafe { nil }
+	// persistent: set by watch_persistent for the duration of the register call to
+	// flag the watched fd as a long-lived, caller-owned resource (e.g. a pooled DB
+	// connection). The runtime then must NOT close that fd if the client parked on
+	// it disconnects mid-wait — it drops the parked request and leaves the fd open
+	// for reuse (closing it would force a reconnect + re-handshake). register reads
+	// and resets it; a plain watch() leaves it false (the fd is request-owned and
+	// closed on disconnect, e.g. a per-request timerfd or pipe).
+	persistent bool
+	register   fn (mut ac AsyncCtx, ext_fd int, interest WatchInterest, cont WakeFn, udata voidptr) = unsafe { nil }
 }
 
 // watch parks the current request and asks the worker to call `cont` when
@@ -81,6 +89,19 @@ pub mut:
 // back to the continuation via ac.udata. After calling watch, return .suspend.
 pub fn (mut ac AsyncCtx) watch(ext_fd int, interest WatchInterest, cont WakeFn, udata voidptr) {
 	ac.register(mut ac, ext_fd, interest, cont, udata)
+}
+
+// watch_persistent is watch() for an fd the CALLER owns and reuses across
+// requests (a pooled connection): if the parked client disconnects before the
+// fd is ready, the runtime drops the request but leaves the fd OPEN for reuse,
+// instead of closing it (which on a pooled DB connection would force a reconnect
+// and a fresh auth handshake). Use it only for fds whose lifetime you manage;
+// per-request fds (timerfd, pipe) must use watch() so they are closed on
+// disconnect and do not leak.
+pub fn (mut ac AsyncCtx) watch_persistent(ext_fd int, interest WatchInterest, cont WakeFn, udata voidptr) {
+	ac.persistent = true
+	ac.register(mut ac, ext_fd, interest, cont, udata)
+	ac.persistent = false
 }
 
 // ready_fd is the fd that woke the running continuation (-1 on the initial call).
