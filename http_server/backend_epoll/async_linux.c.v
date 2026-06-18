@@ -21,10 +21,12 @@ module backend_epoll
 //
 // The DB driver, reverse-proxy/upstream calls, timers, and SSE/WebSocket
 // backpressure are all CONSUMERS of this one `watch` primitive — see the
-// async-runtime umbrella issue. v1 scope: one in-flight watch per connection
-// (no pipelining-while-suspended), request-owned watched fds (the continuation
-// or close path owns ext_fd's lifetime). Pipelining-while-suspended, parked-conn
-// timeouts, and pool-owned (non-closing) watched fds are follow-ups.
+// async-runtime umbrella issue. v1 scope was one in-flight watch per connection
+// with request-owned watched fds (the continuation or close path owns ext_fd's
+// lifetime). Cross-request pipelining (a per-fd FIFO) and pool-owned, non-closing
+// watched fds (watch_persistent — a client disconnect tombstones the parked
+// request and leaves the fd open for reuse) have since landed. Parked-connection
+// timeouts remain a follow-up.
 import http_server.core
 import http_server.epoll
 import http_server.http1_1.request_parser
@@ -54,6 +56,13 @@ mut:
 	cont      core.WakeFn = unsafe { nil }
 	udata     voidptr
 	queue     []ParkSlot // empty = single watch; non-empty = pipelined (multi-client) fd
+	// persistent: the fd is a long-lived, caller-owned resource (a pooled DB
+	// connection), armed via watch_persistent. When the client parked on it
+	// disconnects mid-query the runtime must NOT close it — it tombstones the parked
+	// request (drains + discards the orphaned reply in order) and leaves the fd open
+	// for reuse, instead of forcing a reconnect + re-handshake. Sticky once set, so a
+	// re-arm cycle that momentarily reverts the slot to single-watch keeps it.
+	persistent bool
 }
 
 // ParkSlot is one parked client on a pipelined fd: the same (client, continuation,
@@ -120,11 +129,13 @@ fn (mut r AsyncReactor) reactor_watch(ext_fd int, client_fd int, cont core.WakeF
 			return
 		}
 		// Promote: move the existing head into the queue, then append the newcomer.
-		r.watches[ext_fd].queue = [ParkSlot{
-			client_fd: r.watches[ext_fd].client_fd
-			cont:      r.watches[ext_fd].cont
-			udata:     r.watches[ext_fd].udata
-		}]
+		r.watches[ext_fd].queue = [
+			ParkSlot{
+				client_fd: r.watches[ext_fd].client_fd
+				cont:      r.watches[ext_fd].cont
+				udata:     r.watches[ext_fd].udata
+			},
+		]
 	}
 	for i in 0 .. r.watches[ext_fd].queue.len {
 		if r.watches[ext_fd].queue[i].client_fd == client_fd {
@@ -169,6 +180,35 @@ fn (mut r AsyncReactor) reactor_mark_dead(ext_fd int, client_fd int) {
 	}
 }
 
+// reactor_orphan_single handles a client disconnecting while parked ALONE (single
+// watch, no queue) on a fd. For a PERSISTENT, pool-owned connection (a DB conn
+// armed via watch_persistent) the fd must NOT be closed — closing it would force a
+// reconnect and a fresh auth handshake on the next borrow. Instead the single watch
+// is converted into a one-slot DEAD tombstone, reusing the pipelined drain: the
+// orphaned in-flight reply is consumed (and discarded) in order when it arrives,
+// keeping the connection in sync, and the fd is left armed + open for reuse. Returns
+// true when it tombstoned (the caller leaves the fd alone). Returns false for a
+// request-owned fd (not persistent), an inactive watch, an out-of-range fd, or one
+// that already has a queue — the caller then clears the watch and closes the fd.
+fn (mut r AsyncReactor) reactor_orphan_single(ext_fd int, client_fd int) bool {
+	if ext_fd < 0 || ext_fd >= r.watches.len {
+		return false
+	}
+	e := r.watches[ext_fd]
+	if e.queue.len != 0 || !e.persistent || !e.active {
+		return false
+	}
+	r.watches[ext_fd].queue = [
+		ParkSlot{
+			client_fd: client_fd
+			cont:      e.cont
+			udata:     e.udata
+			dead:      true
+		},
+	]
+	return true
+}
+
 // async_register is installed into AsyncCtx.register; it is what `ac.watch(...)`
 // ultimately calls. It records the watch and arms the external fd in this
 // worker's epoll (level-triggered: simplest correct default for arbitrary
@@ -182,6 +222,12 @@ fn async_register(mut ac core.AsyncCtx, ext_fd int, interest core.WatchInterest,
 	}
 	mut r := unsafe { &AsyncReactor(ac.reactor) }
 	r.reactor_watch(ext_fd, ac.client_fd, cont, udata)
+	if ac.persistent {
+		// Pool-owned fd (watch_persistent): mark the slot so a client disconnect won't
+		// close it. Sticky — reactor_watch zeroes the entry on a fresh single watch, so
+		// this re-stamps it every park; promotion to a queue preserves it.
+		r.watches[ext_fd].persistent = true
+	}
 	events := if interest == .writable { u32(C.EPOLLOUT) } else { u32(C.EPOLLIN) }
 	// Re-arm if the fd is already in this worker's epoll (a pool-owned connection
 	// re-watched across queries), otherwise add it (a fresh request-owned fd).
@@ -465,8 +511,7 @@ fn async_on_ready(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, e
 	// fan this readiness edge out to the queued continuations in submission order.
 	// The single-watch path below is left byte-identical for every other consumer.
 	if entry.queue.len > 0 {
-		drain_pipelined(h, mut reactor, epoll_fd, ext_fd, ev, limits, active_conns, mut st,
-			state)
+		drain_pipelined(h, mut reactor, epoll_fd, ext_fd, ev, limits, active_conns, mut st, state)
 		return
 	}
 	reactor.reactor_clear(ext_fd) // consumed; the continuation re-arms if it needs more
@@ -607,8 +652,8 @@ fn drain_pipelined(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, 
 				// Pop BEFORE serving: async_serve may read a request pipelined behind
 				// this one and re-park the client on ext_fd (appended at the tail).
 				reactor.watches[ext_fd].queue.delete(0)
-				async_serve(h, mut reactor, epoll_fd, client_fd, limits, active_conns, mut st,
-					mut cs, state)
+				async_serve(h, mut reactor, epoll_fd, client_fd, limits, active_conns, mut st, mut
+					cs, state)
 			}
 			.suspend {
 				// Front query not ready yet. The continuation re-armed ext_fd in place
@@ -652,7 +697,10 @@ fn async_close(mut reactor AsyncReactor, epoll_fd int, fd int, active_conns &cor
 				// connection's in-flight FIFO stays aligned and its result is consumed
 				// (and discarded) in order by drain_pipelined.
 				reactor.reactor_mark_dead(ext_fd, fd)
-			} else {
+			} else if !reactor.reactor_orphan_single(ext_fd, fd) {
+				// Request-owned fd (or an inactive watch): DEL + close it. A persistent,
+				// pool-owned fd was tombstoned in place by reactor_orphan_single and is left
+				// armed + open for reuse (closing it would force a reconnect + re-handshake).
 				reactor.reactor_clear(ext_fd)
 				epoll.remove_fd_from_epoll(epoll_fd, ext_fd) // DEL + close the ext fd
 			}
