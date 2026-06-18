@@ -4,6 +4,30 @@ Notes verified against the installed V source (`vlib/builtin/`) and emitted C
 (`v -prod -o out.c`). The guiding rule: **settle codegen/perf questions by
 reading the generated C, not by guessing.**
 
+## The two build modes: default GC vs `-gc none`
+
+vanilla can run either way, and the rules flip between them:
+
+- **Default (`-prod`, Boehm GC).** Allocations are reclaimed, but the GC's
+  stop-the-world serializes all workers, so per-request allocation is **GC
+  pressure** that caps how many cores do useful work. The "Allocation facts"
+  below (noscan, scan-on-grow) are this mode.
+- **`-prod -gc none` (the arena/production build).** No GC, **nothing is ever
+  freed**. A per-request allocation is therefore a permanent **leak** — RSS grows
+  linearly with requests served. Allocations are plain libc `malloc`/`calloc`
+  (so tools like callgrind/heaptrack see them, unlike Boehm's `GC_malloc`). This
+  is the build to optimize for; the hot paths must be **literally allocation-free**.
+
+Why `-gc none` at all: on a thread-per-core server the shared GC doesn't scale —
+a microbenchmark showed default-GC aggregate allocation throughput flat from 1→16
+threads (16 cores ≈ 1 core; [vlang/v#27488](https://github.com/vlang/v/issues/27488)).
+
+> **Measuring a leak under `-gc none`:** a rising RSS line is *not* proof — a
+> Boehm build of the same server also grows (glibc arena, connection buffers,
+> thread stacks). Build both, drive identical load, and report
+> **`gc_none_growth − boehm_growth`**. That difference is the genuinely
+> collectable per-request allocation; everything else is the unavoidable floor.
+
 ## Inspecting what V actually emits
 
 - `v -prod -o out.c ./examples/<name>` — write the C without compiling; `grep` it.
@@ -78,3 +102,60 @@ Arrays aren't the only structure. Consider: `map`, fixed `[N]T` (stack), channel
 and custom layouts — ring buffers, arenas, `@[packed]` structs over raw C memory
 — when array alloc/grow semantics don't fit. The request read path's target is a
 **per-worker arena / reusable buffer** so the hot path allocates nothing.
+
+## Profiling allocations (under `-gc none`)
+
+Two harnesses, one rule. (Both spin a throwaway, seeded Postgres and clean up;
+recipes are reproducible.)
+
+**callgrind — allocations per request, by call site.** The scalpel: it answers
+*which function allocates and how many times per request*. The recipe that makes
+it usable:
+
+- **Build with `-cc gcc`, not the default tcc** — callgrind can't resolve V app
+  symbols from tcc's debug info (everything shows as a hex address); gcc emits
+  DWARF, so `main__*` / `pg_async__*` are named.
+- **`--instr-atstart=no`, then `callgrind_control -i on` *after* a hard warmup** —
+  so pool bring-up + SCRAM + buffers reaching high-water run uninstrumented and
+  only steady-state per-request work is counted.
+- **Don't dump with a live `callgrind_control -d`** — it hangs when every worker
+  is parked in `epoll_wait`. **`SIGTERM`** the valgrind process: the signal
+  interrupts the syscall and callgrind flushes its dump on `fini`.
+- **Parse the raw dump for allocator call counts** — build the id→name map, sum
+  `calls=` to each V allocator entry (`vcalloc`, `malloc_uninit`, `memdup`, …)
+  by immediate caller, divide by measured requests. (The self-cost table doesn't
+  show call counts, and allocators are cheap-but-frequent, so they never surface
+  there.)
+- **Drive the load shape that exposes the bug:** per-request allocs show under
+  any load; **pipeline-queue** allocs need *concurrent* load with `clients > pool
+  conns`; **per-connection** allocs need *connection churn* (many short-lived
+  connections — what real load generators do, reconnecting tens of thousands of
+  times per run).
+
+**RSS slope — the leak in bytes/request.** Build `-gc none` **and** Boehm, run
+each under load for a fixed window sampling `VmRSS`, report bytes/request + the
+trajectory (linear climb = real leak; jump-then-flat = one-time setup). Subtract
+the Boehm floor. A **hard RSS cap** kills a runaway so it's safe unattended.
+
+**heaptrack caveat:** it sees `-gc none` allocations, but attributes from process
+start, so one-time bring-up (SCRAM/PBKDF2, lazy init) blurs the per-request
+signal. callgrind with post-warmup instrumentation is the disambiguator.
+
+## V allocation gotchas (filed upstream)
+
+- **Empty/zero-length array literals allocate.** `[]T{}` (and a default-init `[]T`
+  struct field) call `alloc_array_data(0)` → `vcalloc(header)` even at `len == 0,
+  cap == 0`. Under `-gc none` each is a permanent leak. Append elements or use a
+  module `const` instead. ([vlang/v#27487](https://github.com/vlang/v/issues/27487))
+- **Allocation does not scale across cores** under the default GC (the reason for
+  `-gc none`). ([vlang/v#27488](https://github.com/vlang/v/issues/27488))
+- **`error()` boxes a `MessageError`** — even when the caller discards it with
+  `or {}`. So a `!int` "not found" allocates per call; prefer a `-1`-returning
+  variant (`find_byte_idx`, not `find_byte`) on hot paths.
+- **`int.str()` / `${}` allocate** — format integers into a reused buffer with an
+  itoa helper (`wi`/`emit_int`), never `.str()` on the response hot path.
+- **`runtime.nr_cpus()` ignores CPU affinity** (`sched_getaffinity`) — `taskset
+  -c 0` still reports every core; keep in mind when pinning for profiling.
+- **`&Struct{}` as an `if`-*expression* branch** has miscompiled to invalid C in
+  some build modes — use the statement form
+  (`mut x := &T(unsafe{nil}); if … { x = … } else { x = &T{…} }`).

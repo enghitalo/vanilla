@@ -155,37 +155,72 @@ sb.write_string('Content-Length: ${body.len}\r\n')
 
 ---
 
-## 4. Allocate on the hot path with intent
+## 4. Allocate on the hot path with intent — under `-gc none`, not at all
 
-See [V_PERF_TOOLBOX.md](V_PERF_TOOLBOX.md) and the memory notes for detail. Key
-points:
+The production build is **`-prod -gc none`**: there is no garbage collector and
+**nothing is ever freed**. A per-request allocation is not "GC pressure" — it is
+a permanent **leak** that grows RSS linearly with traffic. So the hot paths must
+be *literally allocation-free*. See [V_PERF_TOOLBOX.md](V_PERF_TOOLBOX.md) and the
+[wiki](https://github.com/enghitalo/vanilla/wiki/Memory-Management-under-gc-none).
 
-- `[]u8{len: n}` is **zeroed**; `[]u8{cap: n}` is **uninitialized (noscan)** —
-  use the `cap` form and append/read into the spare capacity when you'll
-  overwrite the bytes anyway.
-- A large `cap` is not free: it adds GC pressure. Size to the realistic case,
-  not the worst case.
-- Reuse buffers per-connection instead of allocating per-request where the
-  lifetime allows it.
+The recurring zero-allocation patterns:
+
+- **Reuse a per-worker buffer** — reset `len=0`, grow to a high-water mark, keep
+  it. The worker is single-threaded, so one buffer is safe across requests (this
+  is what the per-worker render scratch does). This is the single most important
+  pattern.
+- **Borrow, don't copy** — return `tos`/slice views into the read buffer; defer
+  `.clone()`/`.bytes()` until bytes must outlive the buffer (they rarely do —
+  responses are built synchronously before the buffer is recycled).
+- **Append bytes directly** — `unsafe { out.push_many(s.str, s.len) }`; never
+  build an intermediate `string`/`[]u8` just to append it.
+- **Pool structs on a free-list** — reuse a heap object across requests, resetting
+  its fields on release (the per-worker `ConnState` and per-request `Stash` pools
+  do this), instead of `&T{}` per request.
+- **No error-boxing on the hot path** — `error()` allocates a `MessageError` even
+  when discarded by `or {}`; use a `-1`-returning "not found" (`find_byte_idx`).
+- **No empty/transient array literals** — `buf << [u8(0),0,0,0]` (and even `[]T{}`)
+  heap-allocate a temporary array; append the elements, or use a module `const`.
+- **Sizing (default-GC builds only):** `[]u8{cap: n}` is uninitialized/noscan,
+  `{len: n}` is zeroed, and a large `cap` is GC pressure. Under `-gc none` it is
+  the *reuse* that matters, not the flag — a fresh buffer of any size leaks.
 
 ---
 
-## 5. Side effects go through pools, off the hot path
+## 5. Side effects go through the async runtime + pools, off the hot path
 
 Databases, upstreams, and other blocking resources must not stall the event
-loop.
+loop. The async runtime exists exactly for this: a handler that must wait calls
+`ac.watch(ext_fd, interest, continuation, udata)` and returns `.suspend`; the
+worker parks the connection, serves others, and runs the continuation when
+`ext_fd` is ready. The DB driver (`pg_async`), upstream calls, and timers are all
+consumers of this one primitive — see the
+[wiki](https://github.com/enghitalo/vanilla/wiki/Async-Postgres-and-Pipelining).
+
+For Postgres specifically, `pg_async` is a native (no-libpq) wire client with a
+per-worker pool and **cross-request pipelining** (`max_inflight` queries per
+connection). Pool connections are **persistent** (`watch_persistent`): a client
+disconnecting mid-query tombstones the parked request rather than closing the
+connection, so the pooled conn (and its SCRAM handshake) survives client churn.
 
 **Do**
 
-- Use a **connection pool** (see [examples/database](../examples/database)).
-- Keep the pool sized to the worker/thread model; don't open a connection per
-  request.
-- Return a clean `503` / `504` when a resource is exhausted rather than blocking
-  indefinitely.
+- Use the **pool**, not a connection per request; build params/queries into
+  reused per-worker buffers (the DB path is allocation-free under `-gc none`).
+- Under saturation, **shed with the honest status**: `503 Service Unavailable`
+  when the pool is momentarily full, not `400`/`404`. A backpressure shed is not
+  a client error — misreporting it as `4xx` showed up as spurious failures in the
+  benchmark (see the wiki's *Gotchas* page). Genuine `400` (bad body) / `404`
+  (missing row) stay as they are.
+- Keep the pool sized to the worker/thread model.
 
 **Don't**
 
-- Open and close a socket/connection inside every handler invocation.
+- Open/close a socket or connection inside every handler invocation.
+- Block the worker on a DB/upstream call — `watch` + `.suspend` instead.
+- Return `200` with empty data for a *write* that was shed (it's a lie about a
+  mutation) — `503` is the honest answer. (The backpressure policy is tracked in
+  [vanilla#51](https://github.com/enghitalo/vanilla/issues/51).)
 - Log synchronously to disk on the hot path — batch or hand off (see
   [examples/middleware](../examples/middleware) access log).
 
@@ -278,20 +313,30 @@ Performance claims must be measured, not assumed.
 
 **Do**
 
-- Wipe caches and free the port between runs; sandboxed `wrk` is noisy — prefer
-  A/B comparisons or a micro-benchmark.
-- Build with `-prod` for any timing run.
+- Wipe caches (`v wipe-cache`) and free the port between runs; sandboxed `wrk` is
+  noisy — prefer A/B comparisons or a micro-benchmark.
+- Build with `-prod` for any timing run; build `-prod -gc none` to match
+  production.
 
   ```sh
-  v -prod .
+  v -prod -gc none .
   wrk -H 'Connection: keep-alive' --connections 512 --threads 16 \
       --duration 10s http://localhost:3000
   ```
+
+- For any change that touches allocation, **also check the RSS slope under `-gc
+  none`** (it must be flat) — measure the growth *in excess of a Boehm build's*,
+  and use callgrind to attribute any residual per-request allocation by call
+  site. See [V_PERF_TOOLBOX.md](V_PERF_TOOLBOX.md) ("Profiling allocations").
+- Confirm perf changes on a **high-core** run, not just a laptop: a couple of
+  small per-request allocs look like noise at 4–16 cores but can be a multiple-x
+  swing at 64 (and under `-gc none`, a runaway leak at scale).
 
 **Don't**
 
 - Compare a `-prod` build against a debug build.
 - Report a single noisy run as a result.
+- Trust a flat RSS line alone — subtract the Boehm floor first (see above).
 
 ---
 

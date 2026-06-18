@@ -6,6 +6,48 @@ Analysis of six reference implementations — HttpArena **tokio**, **minima-sync
 **liburing** library/examples (proxy.c, releases 2.9–2.14) — compared against
 vanilla's epoll and io_uring backends.
 
+## Update (2026-06, late) — native async DB + `-gc none` zero-alloc
+
+Two things changed the picture after the analysis below was written. The
+[project wiki](https://github.com/enghitalo/vanilla/wiki) carries the full
+narrative; the short version:
+
+1. **The arena build moved to `-prod -gc none` (no garbage collector).** A
+   per-thread allocation microbenchmark showed the default Boehm GC's aggregate
+   throughput *flat across cores* (16 cores ≈ 1 core; filed
+   [vlang/v#27488](https://github.com/vlang/v/issues/27488)), so a thread-per-core
+   server cannot let a shared GC gate allocation. The catch: under `-gc none`
+   **nothing is ever freed**, so a per-request allocation is no longer "GC
+   pressure" — it is a permanent **leak** that grows RSS without bound. The
+   metric that matters becomes RSS growth *in excess of a Boehm build's* (the GC
+   floor); see [V_PERF_TOOLBOX.md](V_PERF_TOOLBOX.md).
+
+2. **The DB gap is closed — vanilla has a native Postgres client.** `pg_async`
+   speaks the v3 wire protocol directly (no libpq): SCRAM-SHA-256 auth, the
+   extended query protocol, binary result rows decoded without copying, and
+   **cross-request pipelining** (`max_inflight = 8` queries per connection) over
+   a small park/resume **async reactor** with **persistent pooled connections**
+   (`watch_persistent` — a client disconnect tombstones the parked request and
+   keeps the pooled conn open). This replaces the stdlib `db.pg` text-protocol
+   driver the "Still open" note below was written against.
+
+A staged zero-allocation campaign then drove the DB request path to **~0
+allocations/request** under `-gc none` (verified by callgrind):
+
+| metric | before | after |
+|---|---|---|
+| async-db per-request DB leak (excess over the Boehm floor) | 11,971 B/req | **~0** |
+| arena async-db RSS | 27–44 GiB | **~1.2 GiB** |
+| per-reconnect allocations (ConnState free-list) | 3 | **~0** |
+
+The general/plaintext path got the same treatment (`emit_int` instead of
+`n.str()`), and a per-worker `ConnState` free-list eliminated the
+connection-churn allocations that load generators (which reconnect tens of
+thousands of times per run) provoke. Backpressure under pool saturation now
+sheds with an honest `503` on the crud write paths (was `400`/`404`). See the
+wiki's *Memory Management under gc none*, *Async Postgres and Pipelining*, and
+*Gotchas and Lessons Learned* pages.
+
 ## Status (2026-06) — what landed and what it measured
 
 Most of the gaps below are **closed**. Both backends now have persistent
@@ -47,13 +89,12 @@ contract (item #9) is the most important decision in this list, not the last.
   segfaults from cross-thread `epoll` fd close, `unable to join thread`). A clean
   multi-server shutdown lifecycle is needed first. Deprioritized: the arena showed
   accept was **not** the bottleneck (GC/allocation was, and that is fixed).
-- **DB profiles (async-db, crud, fortunes)** are bound by the stdlib `db.pg`
-  driver (text protocol, lazy pool, no persistent prepared statements/pipelining).
-  `veb` on the same stack is *slower* than vanilla, so vanilla already maxes the
-  driver. Prepared statements (`PQprepare`/`PQexecPrepared`, lazily prepared per
-  pooled connection) give a small win (~+9% async-db); single-pass `escape_html`
-  gives +27% fortunes — but the gap to the top (native binary-protocol drivers)
-  only closes with a faster pg driver, a separate project.
+- **DB profiles (async-db, crud, fortunes)** — **CLOSED.** This used to read
+  "bound by the stdlib `db.pg` driver … only closes with a faster pg driver, a
+  separate project." That project shipped: `pg_async` is a native v3
+  binary-protocol client with cross-request pipelining over the async reactor
+  (see the *Update* section at the top). The remaining DB cost is the database
+  itself (and, for writes, the DB ceiling), not the client.
 
 ## What ALL the fast servers have in common
 
