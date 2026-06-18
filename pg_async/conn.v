@@ -89,6 +89,18 @@ mut:
 	send_off int  // [0, send_off) already sent
 	send_len int  // [send_off, send_len) written, still to send
 	inflight []PendingQuery
+	// Per-connection reply-accumulator pool: max_inflight buffers (frame_buf_cap each)
+	// allocated ONCE and reused round-robin via frame_ring, so a pipelined query never
+	// allocates its accumulator per submit — essential under `-gc none`, where a
+	// per-query allocation would leak. async_on_readable writes the (possibly grown)
+	// buffer back to its slot on completion so growth is preserved across reuse.
+	frame_pool [][]u8
+	frame_ring int
+	// Per-connection reusable wire-frame scratch for async_submit: one query's
+	// Parse+Bind+Describe+Execute+Sync is serialized here, then copied into send_buf.
+	// Allocated once (lazy), reset to len 0 each submit, grows to a high-water mark —
+	// so a submit never allocates a throwaway frame (which would leak under -gc none).
+	submit_scratch []u8
 }
 
 struct Msg {

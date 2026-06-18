@@ -386,8 +386,14 @@ fn put_u32(mut buf []u8, v u32) {
 	buf << u8(v)
 }
 
-fn put_cstr(mut buf []u8, s []u8) {
-	buf << s
+// put_cstr_s appends a NUL-terminated C string by copying the string's bytes
+// DIRECTLY (push_many from s.str/s.len), never `s.bytes()` — `.bytes()` allocates a
+// throwaway []u8 copy on every call, which leaks under `-gc none` (the SQL text + the
+// empty portal/stmt names are serialized on every async_submit). Wire output is
+// byte-identical: the same bytes followed by a NUL.
+@[direct_array_access]
+fn put_cstr_s(mut buf []u8, s string) {
+	unsafe { buf.push_many(s.str, s.len) }
 	buf << u8(0)
 }
 
@@ -398,11 +404,11 @@ pub fn write_startup(mut buf []u8, user string, database string) {
 	lenpos := buf.len
 	buf << [u8(0), 0, 0, 0]
 	put_u32(mut buf, 0x0003_0000)
-	put_cstr(mut buf, 'user'.bytes())
-	put_cstr(mut buf, user.bytes())
+	put_cstr_s(mut buf, 'user')
+	put_cstr_s(mut buf, user)
 	if database.len > 0 {
-		put_cstr(mut buf, 'database'.bytes())
-		put_cstr(mut buf, database.bytes())
+		put_cstr_s(mut buf, 'database')
+		put_cstr_s(mut buf, database)
 	}
 	buf << u8(0) // end of parameters
 	msg_len := u32(buf.len - lenpos)
@@ -416,8 +422,8 @@ pub fn write_startup(mut buf []u8, user string, database string) {
 // oids (let the server infer all parameter types).
 pub fn write_parse(mut buf []u8, stmt_name string, query_text string) {
 	lp := begin_msg(mut buf, `P`)
-	put_cstr(mut buf, stmt_name.bytes())
-	put_cstr(mut buf, query_text.bytes())
+	put_cstr_s(mut buf, stmt_name)
+	put_cstr_s(mut buf, query_text)
 	put_u16(mut buf, 0)
 	finish_msg(mut buf, lp)
 }
@@ -426,8 +432,8 @@ pub fn write_parse(mut buf []u8, stmt_name string, query_text string) {
 // binary-format results out (one result-format-code 1 applied to all columns).
 pub fn write_bind(mut buf []u8, portal string, stmt_name string, params []?[]u8) {
 	lp := begin_msg(mut buf, `B`)
-	put_cstr(mut buf, portal.bytes())
-	put_cstr(mut buf, stmt_name.bytes())
+	put_cstr_s(mut buf, portal)
+	put_cstr_s(mut buf, stmt_name)
 	put_u16(mut buf, 0) // 0 parameter format codes ⇒ all params are text
 	put_u16(mut buf, u16(params.len))
 	for p in params {
@@ -448,14 +454,14 @@ pub fn write_bind(mut buf []u8, portal string, stmt_name string, params []?[]u8)
 pub fn write_describe_portal(mut buf []u8, portal string) {
 	lp := begin_msg(mut buf, `D`)
 	buf << u8(`P`)
-	put_cstr(mut buf, portal.bytes())
+	put_cstr_s(mut buf, portal)
 	finish_msg(mut buf, lp)
 }
 
 // write_execute appends an Execute ('E'): portal and a max-rows cap (0 = all).
 pub fn write_execute(mut buf []u8, portal string, max_rows int) {
 	lp := begin_msg(mut buf, `E`)
-	put_cstr(mut buf, portal.bytes())
+	put_cstr_s(mut buf, portal)
 	put_u32(mut buf, u32(max_rows))
 	finish_msg(mut buf, lp)
 }
@@ -477,7 +483,7 @@ pub fn write_terminate(mut buf []u8) {
 // the Int32-length-prefixed client-first message.
 pub fn write_sasl_initial(mut buf []u8, mechanism string, client_first []u8) {
 	lp := begin_msg(mut buf, `p`)
-	put_cstr(mut buf, mechanism.bytes())
+	put_cstr_s(mut buf, mechanism)
 	put_u32(mut buf, u32(client_first.len))
 	buf << client_first
 	finish_msg(mut buf, lp)
