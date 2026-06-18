@@ -382,8 +382,12 @@ pub fn (req HttpRequest) get_query_slice(key []u8) ?Slice {
 	path_start := req.path.start
 	path_len := req.path.len
 
-	// Find '?' in path using memchr
-	q_pos := find_byte(&req.buffer[path_start], path_len, question_mark_u8) or {
+	// Find '?' in path using memchr. find_byte_idx (no `!int` Result) instead of
+	// find_byte: every not-found return from find_byte calls error(), which allocates a
+	// MessageError — a per-request leak under `-gc none` (query parsing runs on every
+	// request, several lookups each).
+	q_pos := find_byte_idx(&req.buffer[path_start], path_len, question_mark_u8)
+	if q_pos < 0 {
 		return none // No query string
 	}
 
@@ -394,7 +398,8 @@ pub fn (req HttpRequest) get_query_slice(key []u8) ?Slice {
 	// Parse query string: key1=val1&key2=val2
 	for pos < path_end {
 		// Find '=' for this key
-		eq_pos := find_byte(&req.buffer[pos], path_end - pos, equal_u8) or {
+		eq_pos := find_byte_idx(&req.buffer[pos], path_end - pos, equal_u8)
+		if eq_pos < 0 {
 			break // No '=' found, malformed query
 		}
 
@@ -406,9 +411,10 @@ pub fn (req HttpRequest) get_query_slice(key []u8) ?Slice {
 			value_start := pos + eq_pos + 1
 
 			// Find '&' or end of path using memchr
-			value_len := find_byte(&req.buffer[value_start], path_end - value_start, amperstand_u8) or {
-				// Last parameter, no '&' found
-				path_end - value_start
+			mut value_len := find_byte_idx(&req.buffer[value_start], path_end - value_start,
+				amperstand_u8)
+			if value_len < 0 {
+				value_len = path_end - value_start // last parameter, no '&'
 			}
 
 			return Slice{
@@ -418,7 +424,8 @@ pub fn (req HttpRequest) get_query_slice(key []u8) ?Slice {
 		}
 
 		// Skip to next parameter (find '&')
-		amp_pos := find_byte(&req.buffer[pos], path_end - pos, amperstand_u8) or {
+		amp_pos := find_byte_idx(&req.buffer[pos], path_end - pos, amperstand_u8)
+		if amp_pos < 0 {
 			break // Last parameter, no match
 		}
 		pos += amp_pos + 1

@@ -96,6 +96,11 @@ mut:
 	// buffer back to its slot on completion so growth is preserved across reuse.
 	frame_pool [][]u8
 	frame_ring int
+	// Per-connection reusable wire-frame scratch for async_submit: one query's
+	// Parse+Bind+Describe+Execute+Sync is serialized here, then copied into send_buf.
+	// Allocated once (lazy), reset to len 0 each submit, grows to a high-water mark —
+	// so a submit never allocates a throwaway frame (which would leak under -gc none).
+	submit_scratch []u8
 }
 
 struct Msg {

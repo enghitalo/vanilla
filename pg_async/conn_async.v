@@ -93,16 +93,23 @@ pub fn (mut c PgConn) async_submit(query_text string, params []?[]u8) bool {
 	if c.inflight.len >= max_inflight {
 		return false
 	}
-	// Serialize into a small scratch frame, then copy it into the fixed buffer.
-	// (The write_* helpers append via `<<`, which would reallocate the fixed
-	// buffer; the scratch keeps the buffer's backing store pinned.)
-	mut frame := []u8{cap: 256}
-	write_parse(mut frame, '', query_text)
-	write_bind(mut frame, '', '', params)
-	write_describe_portal(mut frame, '')
-	write_execute(mut frame, '', 0)
-	write_sync(mut frame)
-	if !c.append_send(frame) {
+	// Serialize into the per-connection reusable scratch, then copy it into the fixed
+	// send buffer. The scratch (1) keeps send_buf's backing pinned (write_* append via
+	// `<<`, which would reallocate send_buf) and (2) is reused across submits — a fresh
+	// `[]u8{cap: 256}` per submit would leak under -gc none. Reset to len 0 each submit;
+	// grows to a high-water mark if a query frame ever exceeds 512 bytes.
+	if c.submit_scratch.cap == 0 {
+		c.submit_scratch = []u8{cap: 512}
+	}
+	unsafe {
+		c.submit_scratch.len = 0
+	}
+	write_parse(mut c.submit_scratch, '', query_text)
+	write_bind(mut c.submit_scratch, '', '', params)
+	write_describe_portal(mut c.submit_scratch, '')
+	write_execute(mut c.submit_scratch, '', 0)
+	write_sync(mut c.submit_scratch)
+	if !c.append_send(c.submit_scratch) {
 		return false
 	}
 	// Borrow a reply accumulator from the per-connection pool instead of allocating
