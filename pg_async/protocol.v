@@ -362,7 +362,13 @@ pub fn parse_command_complete(payload []u8) u64 {
 fn begin_msg(mut buf []u8, typ u8) int {
 	buf << typ
 	lenpos := buf.len
-	buf << [u8(0), 0, 0, 0] // length placeholder, backpatched by finish_msg
+	// 4-byte length placeholder, backpatched by finish_msg. Appended a byte at a
+	// time on purpose: the literal `[u8(0), 0, 0, 0]` heap-allocates a temporary
+	// array on every call (4 per query — P/B/D/E), which leaks under `-gc none`.
+	buf << u8(0)
+	buf << u8(0)
+	buf << u8(0)
+	buf << u8(0)
 	return lenpos
 }
 
