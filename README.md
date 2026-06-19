@@ -1,20 +1,24 @@
 <img src="./logo.png" alt="vanilla Logo" width="100">
 
-# HTTP Server
+# vanilla
+
+A minimalist, high-performance HTTP server written in [V](https://vlang.io).
 
 ## Features
 
-- **Fast**: Multi-threaded, non-blocking I/O, lock-free, copy-free, I/O multiplexing, SO_REUSEPORT (native load balancing on Linux)
+- **Fast**: Multi-threaded, non-blocking I/O, lock-free, copy-free, I/O multiplexing, `SO_REUSEPORT` (native load balancing on Linux)
 - **Modular**: Easy to extend with custom controllers and handlers.
 - **Memory Safety**: No race conditions.
 - **No Magic**: Transparent and straightforward.
-- **E2E Testing**: Allows end-to-end testing and scripting without running the server. Pass raw requests to `handle_request()`.
-- **SSE Friendly**: Built-in Server-Sent Events support.
-- **ETag Friendly**: Conditional GETs with ETag and `If-None-Match` headers.
+- **E2E Testing**: End-to-end testing without running a persistent server — pass raw requests directly to `handle_request()` or use `server.test(...)`.
+- **SSE Friendly**: Built-in Server-Sent Events support (sync and async).
+- **ETag Friendly**: Conditional GETs with `ETag` and `If-None-Match` headers.
 - **Database Friendly**: Example with PostgreSQL connection pool.
-- **Graceful Shutdown**: Automatic shutdown after test mode or on signal (W.I.P.).
-- **Multiple Backends**: epoll, io_uring, kqueue (platform-dependent).
-- **Compliant with HTTP standards**: It follows [RFC9112](https://datatracker.ietf.org/doc/rfc9112/) and [IANA Field Name Registry](https://www.iana.org/assignments/http-fields/http-fields.xhtml)
+- **Graceful Shutdown**: Drain in-flight requests on `SIGTERM`/`SIGINT` via `server.shutdown(grace_ms)`.
+- **Multiple Backends**: epoll, io_uring (Linux), kqueue (macOS), IOCP (Windows).
+- **Async Handler**: Suspend/resume requests on any fd (DB sockets, timers, upstream proxies) — all in the worker's event loop, zero extra threads.
+- **Stateful Handler**: Lock-free per-worker state (e.g. a per-thread DB connection — no shared pool, no mutex).
+- **Compliant with HTTP standards**: Follows [RFC 9112](https://datatracker.ietf.org/doc/rfc9112/) and the [IANA Field Name Registry](https://www.iana.org/assignments/http-fields/http-fields.xhtml).
 
 ---
 
@@ -26,186 +30,273 @@
 import http_server
 
 fn handle_request(req_buffer []u8, client_conn_fd int, mut out []u8) ! {
-  // ...parse the request and APPEND the complete raw HTTP response
-  // (status line + headers + body) to `out`. The server owns `out`,
-  // reuses it across requests and batches pipelined responses into a
-  // single send — never free or keep it.
-  out << 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'.bytes()
+	// Parse the request and APPEND the complete raw HTTP response
+	// (status line + headers + body) to `out`. The server owns `out`,
+	// reuses it across requests and batches pipelined responses into a
+	// single send — never free or keep it.
+	out << 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'.bytes()
 }
 
 fn main() {
-  mut server := http_server.new_server(http_server.ServerConfig{
-    port: 3000
-    request_handler: handle_request
-    io_multiplexing: $if linux {
-			.epoll
-		} $else $if darwin {
-			.kqueue
-		} $else {
-			.iocp
-		}
-  })
-  server.run()
+	mut backend := unsafe { http_server.IOBackend(0) }
+	$if linux {
+		backend = http_server.IOBackend.epoll
+	}
+	$if darwin {
+		backend = http_server.IOBackend.kqueue
+	}
+	mut server := http_server.new_server(http_server.ServerConfig{
+		port:            3000
+		request_handler: handle_request
+		io_multiplexing: backend
+	})!
+	server.run()
 }
 ```
 
 ### 2. End-to-End Testing
 
+Call the handler directly — no server needed:
+
 ```v
-fn test_simple_without_init_the_server() {
-  request := 'GET / HTTP/1.1\r\n\r\n'.bytes()
-  mut out := []u8{}
-  handle_request(request, -1, mut out)!
-  assert out == http_ok_response
+fn test_handle_request() {
+	request := 'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
+	mut out := []u8{}
+	handle_request(request, -1, mut out)!
+	assert out.starts_with('HTTP/1.1 200 OK'.bytes())
 }
 ```
 
-Or use the server’s test mode:
+Or use the server's built-in test mode:
 
 ```v
-mut server := http_server.new_server(http_server.ServerConfig{ ... })
+mut server := http_server.new_server(http_server.ServerConfig{ ... })!
 responses := server.test([request1, request2]) or { panic(err) }
 ```
 
-### 3. Server-Sent Events (SSE)
+### 3. Graceful Shutdown
 
-**Server:**
+```v
+import http_server
+import os
+
+fn main() {
+	mut server := http_server.new_server(http_server.ServerConfig{ ... })!
+
+	os.signal_opt(.term, fn [server] (_ os.Signal) {
+		server.shutdown(2000) // drain up to 2 s, then exit
+		exit(0)
+	}) or {}
+
+	server.run()
+}
+```
+
+### 4. Server-Sent Events (SSE)
+
+**Run the example:**
 
 ```sh
 v -prod run examples/sse
 ```
 
-**Front-end:**
+**Subscribe (front-end):**
 
 ```html
 <script>
-  const eventSource = new EventSource("http://localhost:3001/sse");
-  eventSource.onmessage = function (event) {
-    document.body.innerHTML += `<p>${event.data}</p>`;
-  };
+  const es = new EventSource("http://localhost:3000/events");
+  es.onmessage = e => document.body.innerHTML += `<p>${e.data}</p>`;
 </script>
 ```
 
-**Send notification:**
+**Broadcast a message:**
 
 ```sh
-curl -X POST http://localhost:3001/notification
+curl -X POST http://localhost:3000/broadcast
 ```
 
-### 4. ETag Support
+### 5. ETag Support
 
 ```sh
-curl -v http://localhost:3001/user/1
-curl -v -H "If-None-Match: c4ca4238a0b923820dcc509a6f75849b" http://localhost:3001/user/1
+curl -v http://localhost:3000/user/1
+curl -v -H "If-None-Match: c4ca4238a0b923820dcc509a6f75849b" http://localhost:3000/user/1
 ```
 
-### 5. Database Example (PostgreSQL)
+### 6. Database Example (PostgreSQL)
 
-**Start database:**
+**Start the database:**
 
 ```sh
 docker-compose -f examples/database/docker-compose.yml up -d
 ```
 
-**Run server:**
+**Run the server:**
 
 ```sh
 v -prod run examples/database
 ```
 
-**Example handler:**
+**Example handler (pool captured via closure):**
 
 ```v
-fn handle_request(req_buffer []u8, client_conn_fd int, mut out []u8, mut pool ConnectionPool) ! {
-  // Use pool.acquire() and pool.release() for DB access;
-  // append the raw HTTP response to `out`.
+fn main() {
+	mut pool := new_connection_pool(pg.Config{ ... }, 5) or { panic(err) }
+
+	mut server := http_server.new_server(http_server.ServerConfig{
+		port:            3000
+		io_multiplexing: backend
+		request_handler: fn [mut pool] (req_buffer []u8, fd int, mut out []u8) ! {
+			// Use pool.acquire() / pool.release() for DB access;
+			// append the raw HTTP response to `out`.
+		}
+	})!
+	server.run()
 }
-```
-
----
-
-## Benchmarking
-
-```sh
-wrk -t16 -c512 -d30s http://localhost:3001
-wrk -t16 -c512 -d30s -H "If-None-Match: c4ca4238a0b923820dcc509a6f75849b" http://localhost:3001/user/1
 ```
 
 ---
 
 ## More Examples
 
-- `examples/simple/` – Basic CRUD
-- `examples/etag/` – ETag and conditional requests
-- `examples/sse/` – Server-Sent Events
-- `examples/database/` – PostgreSQL integration
-- `examples/hexagonal/` – Hexagonal architecture
-- `examples/static_files/` – Static file serving (MIME, Range, ETag, traversal safety)
-- `examples/static_assets/` – Serve a CSR/WASM SPA bundle via the `http_server.static_assets` module (`application/wasm`, `.br`/`.gz` negotiation, immutable caching, SPA fallback)
+| Directory | Description |
+|---|---|
+| `examples/tiny/` | Minimal "Hello, World!" — the benchmark target |
+| `examples/simple/` | Basic CRUD routing |
+| `examples/simple2/` | CRUD with helper utilities |
+| `examples/simple3/` | CRUD with a response builder |
+| `examples/auth/` | Password hashing, JWT (HMAC-SHA256), API key auth |
+| `examples/chunked_streaming/` | Chunked transfer encoding |
+| `examples/compression/` | gzip response compression |
+| `examples/cookies_sessions/` | Cookie-based sessions |
+| `examples/cors/` | CORS preflight and origin allowlist |
+| `examples/csrf/` | CSRF token protection |
+| `examples/database/` | PostgreSQL connection pool |
+| `examples/date_header/` | RFC 7231 `Date` header |
+| `examples/etag/` | ETag and conditional requests |
+| `examples/graceful_shutdown/` | SIGTERM/SIGINT drain |
+| `examples/hexagonal/` | Hexagonal architecture |
+| `examples/ip_block/` | IP allowlist / blocklist |
+| `examples/json_api/` | JSON API with multipart upload |
+| `examples/middleware/` | Middleware chain (auth, RBAC, 404) |
+| `examples/observability/` | `/healthz`, `/readyz`, `/metrics` |
+| `examples/proxy_aware/` | `X-Forwarded-For` / real-IP extraction |
+| `examples/rate_limit/` | Token-bucket rate limiting |
+| `examples/redirects/` | 301/303/308 redirects |
+| `examples/request_limits/` | 413/431 body and header size limits |
+| `examples/security_headers/` | HSTS, CSP, and other security headers |
+| `examples/sse/` | Server-Sent Events (sync broadcast) |
+| `examples/static_assets/` | CSR/WASM SPA bundle (`application/wasm`, `.br`/`.gz`, immutable caching, SPA fallback) |
+| `examples/static_files/` | Static file serving (MIME, Range, ETag, traversal safety) |
+| `examples/url_form/` | Query-string and URL-encoded form parsing |
+| `examples/veb_like/` | veb-style declarative routing |
+| `examples/video_stream/` | HTTP video streaming |
+| `examples/async_sse/` | SSE via async handler (suspend/resume on fd) |
+| `examples/async_db_pg/` | PostgreSQL queries via async handler |
+| `examples/async_timer/` | Async per-request timer |
+| `examples/io_uring_demo/` | io_uring backend demonstration (Linux) |
 
 ---
 
 ## Test Mode
 
-The `Server` provides a test method that accepts an array of raw HTTP requests, sends them directly to the socket, and processes each one sequentially. After receiving the response for the last request, the loop ends and the server shuts down automatically. This enables efficient end-to-end testing without running a persistent server process longer that needed.
+`Server.test` accepts an array of raw HTTP requests, sends them directly to the server socket, and processes each one sequentially. After receiving the response for the last request, the server shuts down automatically. This enables efficient end-to-end testing without running a persistent server process.
+
+---
 
 ## Installation
 
-### From Root Directory
+### From the Repository Root
 
-1. Create the required directories:
+1. Create the target directory:
 
 ```bash
 mkdir -p ~/.vmodules/enghitalo/vanilla
 ```
 
-2. Copy the `vanilla` directory to the target location:
+2. Copy this repository into it:
 
 ```bash
 cp -r ./ ~/.vmodules/enghitalo/vanilla
 ```
 
-3. Run the example:
+3. Run an example:
 
 ```bash
 v -prod crun examples/simple
 ```
 
-This sets up the module in your `~/.vmodules` directory for use.
-
-### From Repository
-
-Install directly from the repository:
+### Via `v install`
 
 ```bash
 v install https://github.com/enghitalo/vanilla
 ```
 
+---
+
 ## Benchmarking
 
-Run the following commands to benchmark the server:
+```sh
+# Basic throughput
+wrk -H 'Connection: keep-alive' --connections 512 --threads 16 --duration 30s http://localhost:3000
 
-1. Test with `curl`:
-
-```bash
-curl -v http://localhost:3001
+# Conditional GET (ETag)
+wrk -t16 -c512 -d30s -H "If-None-Match: c4ca4238a0b923820dcc509a6f75849b" http://localhost:3000/user/1
 ```
 
-2. Test with `wrk`:
+See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark results on Apple M4.
 
-```bash
-wrk -H 'Connection: "keep-alive"' --connection 512 --threads 16 --duration 60s http://localhost:3001
-```
+---
 
-Example output:
+## Documentation
 
-```plaintext
-Running 1m test @ http://localhost:3001
-  16 threads and 512 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-   Latency     1.25ms    1.46ms  35.70ms   84.67%
-   Req/Sec    32.08k     2.47k   57.85k    71.47%
-  30662010 requests in 1.00m, 2.68GB read
-Requests/sec: 510197.97
-Transfer/sec:     45.74MB
-```
+| Resource | Description |
+|---|---|
+| [Wiki](https://github.com/enghitalo/vanilla/wiki) | Architecture deep-dives, async reactor, memory management under `-gc none`, Postgres pipelining, and lessons learned |
+| [docs/BEST_PRACTICES.md](docs/BEST_PRACTICES.md) | How to write handlers, build responses, allocate, handle concurrency, security, testing, and benchmarking |
+| [docs/V_PERF_TOOLBOX.md](docs/V_PERF_TOOLBOX.md) | V performance attributes, array flags, the C escape hatch, profiling allocations, and known gotchas |
+| [docs/PERF_GAP_ANALYSIS.md](docs/PERF_GAP_ANALYSIS.md) | Comparison against the fastest HTTP servers (tokio, io_uring C, Zig, Rust) and what was done to close the gaps |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Rules, raw-request testing with netcat/socat, benchmarking commands |
+| [CHECKLIST.md](CHECKLIST.md) | Full improvement backlog with phases, priorities, and progress tracking |
+
+---
+
+## Roadmap
+
+### vanilla — future improvements
+
+- [ ] Per-worker `SO_REUSEPORT` accept on epoll (eliminate the single shared accept thread; blocked by clean multi-server shutdown lifecycle)
+- [ ] Dynamic route matching (`/user/:id`) with a trie or radix tree
+- [ ] Query-string parser (`?key=value&…`) as a zero-copy slice view
+- [ ] Case-insensitive header lookup (IANA registry compliance)
+- [ ] `Host` header validation (RFC 9112 §7.2)
+- [ ] Request timeouts (idle read / total request deadline)
+- [ ] Chunked transfer-encoding in the request parser
+- [ ] HTTP/2 support (multiplexing, HPACK, server push)
+- [ ] WebSocket upgrade (framing, ping/pong, close handshake)
+- [ ] TLS/HTTPS — complete V TLS bindings and integrate into the backends
+- [ ] HTTPS example (`examples/https/`)
+- [ ] Per-connection request-count limit and body-size cap exposed via `ServerConfig`
+- [ ] Response caching layer (ETag + `Last-Modified` auto-generation)
+- [ ] Logging middleware example (`examples/logging/`)
+- [ ] API documentation (godoc-style, inline)
+- [ ] Architecture documentation (per-module design notes)
+- [ ] Security best-practices guide (injection, timing, header limits)
+- [ ] Performance tuning guide (`-gc none`, `taskset`, `ulimit`, kernel parameters)
+- [ ] Example READMEs for every `examples/` directory
+- [ ] Backend stress tests (high-concurrency, FD exhaustion, partial send/recv)
+- [ ] Request-parser edge-case tests (malformed requests, split TCP segments)
+- [ ] End-to-end integration test suite across all backends
+
+### V language — upstream improvements needed
+
+These are limitations in the V compiler and standard library that affect vanilla directly.
+They are tracked as upstream issues.
+
+- [ ] **`[]T{}` allocates even at `len == 0, cap == 0`** — `alloc_array_data(0)` is called unconditionally; under `-gc none` every default-initialized array field is a permanent leak ([vlang/v#27487](https://github.com/vlang/v/issues/27487))
+- [ ] **GC allocation does not scale across cores** — the default Boehm GC is effectively single-threaded for allocation; 16 workers perform the same as 1 ([vlang/v#27488](https://github.com/vlang/v/issues/27488))
+- [ ] **`error()` boxes a `MessageError` on every call** — even when the result is discarded with `or {}`; a "not found" fast path that returns `!T` still allocates per call on the hot path
+- [ ] **`int.str()` and `${}` string interpolation allocate** — there is no zero-alloc integer-to-slice formatter in the stdlib; callers must reach for custom helpers (`write_decimal`, `emit_int`)
+- [ ] **`runtime.nr_cpus()` ignores CPU affinity** — `sched_getaffinity` is not consulted; `taskset -c 0` still reports all cores, making CPU-pinning profiles misleading
+- [ ] **`&Struct{}` in an `if`-expression branch miscompiles in some build modes** — the generated C is invalid; the workaround is to use the statement form with a `mut x := &T(unsafe{nil})` pre-declaration
+- [ ] **No `write_decimal` / `itoa` in the stdlib `strings.Builder`** — `write_string(n.str())` allocates; a built-in zero-alloc decimal writer would remove the need for project-local helpers
+- [ ] **No built-in `argon2id` or `bcrypt` binding** — password hashing requires external C bindings; the stdlib has no memory-hard KDF
