@@ -199,7 +199,7 @@ fn main() {
 
 ## Test Mode
 
-`Server.test` accepts an array of raw HTTP requests, sends them directly to the server socket, and processes each one sequentially. After receiving the response for the last request the server shuts down automatically. This enables efficient end-to-end testing without running a persistent server process.
+`Server.test` accepts an array of raw HTTP requests, sends them directly to the server socket, and processes each one sequentially. After receiving the response for the last request, the server shuts down automatically. This enables efficient end-to-end testing without running a persistent server process.
 
 ---
 
