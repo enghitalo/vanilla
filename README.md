@@ -292,7 +292,7 @@ See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark 
 These are limitations in the V compiler and standard library that affect vanilla directly.
 They are tracked as upstream issues.
 
-- [ ] **`[]T{}` allocates even at `len == 0, cap == 0`** — `alloc_array_data(0)` is called unconditionally; under `-gc none` every default-init array field is a permanent leak ([vlang/v#27487](https://github.com/vlang/v/issues/27487))
+- [ ] **`[]T{}` allocates even at `len == 0, cap == 0`** — `alloc_array_data(0)` is called unconditionally; under `-gc none` every default-initialized array field is a permanent leak ([vlang/v#27487](https://github.com/vlang/v/issues/27487))
 - [ ] **GC allocation does not scale across cores** — the default Boehm GC is effectively single-threaded for allocation; 16 workers perform the same as 1 ([vlang/v#27488](https://github.com/vlang/v/issues/27488))
 - [ ] **`error()` boxes a `MessageError` on every call** — even when the result is discarded with `or {}`; a "not found" fast path that returns `!T` still allocates per call on the hot path
 - [ ] **`int.str()` and `${}` string interpolation allocate** — there is no zero-alloc integer-to-slice formatter in the stdlib; callers must reach for custom helpers (`write_decimal`, `emit_int`)
