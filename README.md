@@ -244,3 +244,59 @@ wrk -t16 -c512 -d30s -H "If-None-Match: c4ca4238a0b923820dcc509a6f75849b" http:/
 ```
 
 See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark results on Apple M4.
+
+---
+
+## Documentation
+
+| Resource | Description |
+|---|---|
+| [Wiki](https://github.com/enghitalo/vanilla/wiki) | Architecture deep-dives, async reactor, memory management under `-gc none`, Postgres pipelining, and lessons learned |
+| [docs/BEST_PRACTICES.md](docs/BEST_PRACTICES.md) | How to write handlers, build responses, allocate, handle concurrency, security, testing, and benchmarking |
+| [docs/V_PERF_TOOLBOX.md](docs/V_PERF_TOOLBOX.md) | V performance attributes, array flags, the C escape hatch, profiling allocations, and known gotchas |
+| [docs/PERF_GAP_ANALYSIS.md](docs/PERF_GAP_ANALYSIS.md) | Comparison against the fastest HTTP servers (tokio, io_uring C, Zig, Rust) and what was done to close the gaps |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Rules, raw-request testing with netcat/socat, benchmarking commands |
+| [CHECKLIST.md](CHECKLIST.md) | Full improvement backlog with phases, priorities, and progress tracking |
+
+---
+
+## Roadmap
+
+### vanilla — future improvements
+
+- [ ] Per-worker `SO_REUSEPORT` accept on epoll (eliminate the single shared accept thread; blocked by clean multi-server shutdown lifecycle)
+- [ ] Dynamic route matching (`/user/:id`) with a trie or radix tree
+- [ ] Query-string parser (`?key=value&…`) as a zero-copy slice view
+- [ ] Case-insensitive header lookup (IANA registry compliance)
+- [ ] `Host` header validation (RFC 9112 §7.2)
+- [ ] Request timeouts (idle read / total request deadline)
+- [ ] Chunked transfer-encoding in the request parser
+- [ ] HTTP/2 support (multiplexing, HPACK, server push)
+- [ ] WebSocket upgrade (framing, ping/pong, close handshake)
+- [ ] TLS/HTTPS — complete V TLS bindings and integrate into the backends
+- [ ] HTTPS example (`examples/https/`)
+- [ ] Per-connection request-count limit and body-size cap exposed via `ServerConfig`
+- [ ] Response caching layer (ETag + `Last-Modified` auto-generation)
+- [ ] Logging middleware example (`examples/logging/`)
+- [ ] API documentation (godoc-style, inline)
+- [ ] Architecture documentation (per-module design notes)
+- [ ] Security best-practices guide (injection, timing, header limits)
+- [ ] Performance tuning guide (`-gc none`, `taskset`, `ulimit`, kernel parameters)
+- [ ] Example READMEs for every `examples/` directory
+- [ ] Backend stress tests (high-concurrency, FD exhaustion, partial send/recv)
+- [ ] Request-parser edge-case tests (malformed requests, split TCP segments)
+- [ ] End-to-end integration test suite across all backends
+
+### V language — upstream improvements needed
+
+These are limitations in the V compiler and standard library that affect vanilla directly.
+They are tracked as upstream issues.
+
+- [ ] **`[]T{}` allocates even at `len == 0, cap == 0`** — `alloc_array_data(0)` is called unconditionally; under `-gc none` every default-init array field is a permanent leak ([vlang/v#27487](https://github.com/vlang/v/issues/27487))
+- [ ] **GC allocation does not scale across cores** — the default Boehm GC is effectively single-threaded for allocation; 16 workers perform the same as 1 ([vlang/v#27488](https://github.com/vlang/v/issues/27488))
+- [ ] **`error()` boxes a `MessageError` on every call** — even when the result is discarded with `or {}`; a "not found" fast path that returns `!T` still allocates per call on the hot path
+- [ ] **`int.str()` and `${}` string interpolation allocate** — there is no zero-alloc integer-to-slice formatter in the stdlib; callers must reach for custom helpers (`write_decimal`, `emit_int`)
+- [ ] **`runtime.nr_cpus()` ignores CPU affinity** — `sched_getaffinity` is not consulted; `taskset -c 0` still reports all cores, making CPU-pinning profiles misleading
+- [ ] **`&Struct{}` in an `if`-expression branch miscompiles in some build modes** — the generated C is invalid; the workaround is to use the statement form with a `mut x := &T(unsafe{nil})` pre-declaration
+- [ ] **No `write_decimal` / `itoa` in the stdlib `strings.Builder`** — `write_string(n.str())` allocates; a built-in zero-alloc decimal writer would remove the need for project-local helpers
+- [ ] **No built-in `argon2id` or `bcrypt` binding** — password hashing requires external C bindings; the stdlib has no memory-hard KDF
