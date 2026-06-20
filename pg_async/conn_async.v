@@ -209,6 +209,13 @@ pub:
 	result Result
 }
 
+// not_ready is the singleton returned on the (very common) not-ready path. A fresh
+// `QueryPoll{}` literal default-inits its `Result.frames` to `[]u8{}`, which under
+// `-gc none` allocates a (never-freed) array header EVERY call — ~1 per request on
+// the drain loop's terminating not-ready return (vlang/v#27487). The const allocates
+// that header once; returning it by value just copies the (ready=false) struct.
+const not_ready = QueryPoll{}
+
 // async_on_readable drains the socket to EAGAIN and frames complete backend
 // messages into the FRONT in-flight query. When that query's ReadyForQuery
 // arrives it is popped and returned as a ready QueryPoll; replies arrive in
@@ -316,5 +323,5 @@ pub fn (mut c PgConn) async_on_readable() !QueryPoll {
 			}
 		}
 	}
-	return QueryPoll{} // not ready — front query needs more bytes (or none in flight)
+	return not_ready // front query needs more bytes (or none in flight) — see `not_ready`
 }
