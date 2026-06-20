@@ -147,6 +147,16 @@ signal. callgrind with post-warmup instrumentation is the disambiguator.
   struct field) call `alloc_array_data(0)` → `vcalloc(header)` even at `len == 0,
   cap == 0`. Under `-gc none` each is a permanent leak. Append elements or use a
   module `const` instead. ([vlang/v#27487](https://github.com/vlang/v/issues/27487))
+- **`array.slice()` (`a[start..end]`) marks the source buffer on every call.**
+  It does an unconditional `mark_buffer_has_slices()` (a malloc data-header pointer
+  round-trip + flag write) plus bounds checks and the result-struct build — ~11% of
+  the plaintext request hot path's `-prod` instructions when slicing the read buffer
+  per request, yet pure waste for a transient read-only view (`has_slices` is only
+  consulted by `delete`/shrink, which a manually-managed reused buffer never does).
+  Fix: a non-owning window built by hand — copy the array header, repoint
+  `data`/`len`/`cap`, `unsafe { flags.clear(.managed) }` so it is never freed and a
+  sub-slice of it also skips marking (compiles to a struct copy + 3 stores, zero
+  alloc). See `backend_epoll`'s `buf_view`. ([vlang/v#27507](https://github.com/vlang/v/issues/27507))
 - **Allocation does not scale across cores** under the default GC (the reason for
   `-gc none`). ([vlang/v#27488](https://github.com/vlang/v/issues/27488))
 - **`error()` boxes a `MessageError`** — even when the caller discards it with
@@ -154,8 +164,13 @@ signal. callgrind with post-warmup instrumentation is the disambiguator.
   variant (`find_byte_idx`, not `find_byte`) on hot paths.
 - **`int.str()` / `${}` allocate** — format integers into a reused buffer with an
   itoa helper (`wi`/`emit_int`), never `.str()` on the response hot path.
-- **`runtime.nr_cpus()` ignores CPU affinity** (`sched_getaffinity`) — `taskset
-  -c 0` still reports every core; keep in mind when pinning for profiling.
+- **`runtime.nr_cpus()` ignores CPU affinity** — it is `sysconf(_SC_NPROCESSORS_ONLN)`
+  = every online *host* core, blind to `taskset`/cpuset and cgroup CPU pinning. A
+  server pinned to N cores (a profiling run, or a container capped at N CPUs on a
+  bigger host) that sizes its worker pool from `nr_cpus()` spawns host-many workers
+  and oversubscribes them N-ways. The worker count instead comes from
+  `core.worker_count()`: a `VANILLA_WORKERS` env override → else the
+  `sched_getaffinity` mask bit-count (`core/affinity_linux.c.v`) → else `nr_cpus()`.
 - **`&Struct{}` as an `if`-*expression* branch** has miscompiled to invalid C in
   some build modes — use the statement form
   (`mut x := &T(unsafe{nil}); if … { x = … } else { x = &T{…} }`).

@@ -96,6 +96,28 @@ contract (item #9) is the most important decision in this list, not the last.
   (see the *Update* section at the top). The remaining DB cost is the database
   itself (and, for writes, the DB ceiling), not the client.
 
+### Measuring locally: loopback is the ceiling, not the server
+
+A single-box `wrk`-over-loopback run does **not** measure server efficiency — the
+load generator and the loopback softirq path eat half the cores and cap throughput
+before the server does. On a 16-core box, `examples/tiny` (`-gc none`) tops out at
+**~340k req/s** with an 8-core-server / 8-core-`wrk` split, and the number is
+*identical with and without `-gc`* (the hello path barely allocates, so GC is
+irrelevant) and flat across `-c64…512` (a throughput ceiling, not latency). A
+hand-written 16-thread C epoll server (`benchmark-driven-webservers/c/epoll_simple.c`)
+hits the **same ~341k** on the same split — so vanilla is already at the
+bare-C/loopback ceiling here; local `wrk` has no more to give. Corollaries:
+  - Measure **server** efficiency by **instructions/request** (callgrind), which is
+    regime-independent, *or* on the multi-core arena with a real (non-loopback)
+    generator — not by a local loopback rps number.
+  - When you must use local rps, **balance the cores** (≈half to the generator) and
+    confirm the generator isn't the bottleneck (give it more cores; if rps rises, it
+    was generator-bound). A 12-server / 4-`wrk` split reads ~216k purely because
+    4 `wrk` cores can't push more.
+  - Worker count must track *usable* cores (`core.worker_count()` via
+    `sched_getaffinity`), or a pinned/containerized run oversubscribes and the
+    number drops — see V_PERF_TOOLBOX's `nr_cpus` note.
+
 ## What ALL the fast servers have in common
 
 Every one of these servers, regardless of language or backend, shares the same
