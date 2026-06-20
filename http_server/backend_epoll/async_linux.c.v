@@ -387,7 +387,7 @@ fn async_start_body_drain(h core.AsyncHandler, mut reactor AsyncReactor, epoll_f
 		return 0 // head not complete in the buffer yet — grow/recv more
 	}
 	content_length := total - head_len
-	head := unsafe { cs.read_buf[0..head_len] }
+	head := buf_view(cs.read_buf, 0, head_len)
 	mut ac := core.AsyncCtx{
 		client_fd: fd
 		state:     state
@@ -428,7 +428,7 @@ fn async_start_body_drain(h core.AsyncHandler, mut reactor AsyncReactor, epoll_f
 fn async_drain(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) bool {
 	mut pos := 0
 	for pos < cs.read_buf.len && cs.awaiting_fd < 0 {
-		total := request_parser.frame_request_length_lim(cs.read_buf[pos..],
+		total := request_parser.frame_request_length_lim(buf_view(cs.read_buf, pos, cs.read_buf.len - pos),
 			limits.max_header_bytes, limits.max_body_bytes) or {
 			match err.code() {
 				413 { cs.write_buf << response.status_413_response }
@@ -453,7 +453,7 @@ fn async_drain(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd i
 			cs.file_fd = -1
 			cs.file_remaining = 0
 		}
-		req := unsafe { cs.read_buf[pos..pos + total] }
+		req := buf_view(cs.read_buf, pos, total)
 		mut ac := core.AsyncCtx{
 			client_fd: fd
 			state:     state

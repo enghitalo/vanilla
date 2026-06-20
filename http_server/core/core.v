@@ -1,15 +1,41 @@
 module core
 
 import runtime
+import os
 
 // Shared, dependency-free types used by both the public `http_server` facade and
 // the backend implementations (e.g. `backend_epoll`). Keeping them in a leaf
 // module breaks what would otherwise be a cycle: `http_server` imports a backend
 // to run it, and the backend needs these types — so neither can own them.
 
-// One worker thread per core (thread-per-core model). Both the facade (thread /
-// counter array sizing) and the backend (worker fan-out) need this count.
-pub const max_thread_pool_size = runtime.nr_cpus()
+// One worker thread per USABLE core (thread-per-core model). Both the facade
+// (thread / counter array sizing) and the backend (worker fan-out) need this.
+pub const max_thread_pool_size = worker_count()
+
+// worker_count picks the worker-thread count: the number of CPUs THIS PROCESS may
+// run on — not the host's total. `runtime.nr_cpus()` is `sysconf(_SC_NPROCESSORS_ONLN)`
+// = every online host core, blind to CPU affinity (taskset) and cpuset pinning. A
+// server pinned to N cores (a benchmark, or a container limited to N CPUs on a
+// larger host) would otherwise spawn host-many workers and oversubscribe them
+// N-ways — context-switch churn that drops throughput. On Linux we count the
+// process's sched_getaffinity mask; `VANILLA_WORKERS` overrides explicitly (e.g.
+// for cgroup CPU-quota limits, which don't restrict the affinity mask).
+fn worker_count() int {
+	vw := os.getenv('VANILLA_WORKERS')
+	if vw != '' {
+		n := vw.int()
+		if n > 0 {
+			return n
+		}
+	}
+	$if linux {
+		c := linux_affinity_cpu_count()
+		if c > 0 {
+			return c
+		}
+	}
+	return runtime.nr_cpus()
+}
 
 // RequestHandler is the raw, zero-allocation handler contract: it receives the
 // complete request bytes (a view into the connection's read buffer — copy
