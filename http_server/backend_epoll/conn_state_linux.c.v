@@ -54,6 +54,30 @@ const sm_max_pending_write = 8 * 1024 * 1024
 const read_buf_cap = 8 * 1024
 const write_buf_cap = 16 * 1024
 const conn_table_min = 1024
+
+// buf_view returns a non-owning []u8 window over `buf[start..start+length]` WITHOUT
+// going through `array.slice()`. V's slice() does unconditional slice-aliasing
+// bookkeeping per call — `mark_buffer_has_slices()` (computes the malloc header,
+// sets a flag) plus the flag/`data_header` churn — which a profile shows is ~20% of
+// the plaintext hot path's instructions, yet is pure waste here: read_buf is
+// manually managed (grown via grow_cap, compacted via memmove, len reset — never
+// `array.delete`d with a live slice), so nothing ever consults `has_slices`. The
+// window shares read_buf's backing and is read-only and short-lived (the parser /
+// the request handler consume it before the next recv can move read_buf). Clearing
+// `.managed` makes it non-owning: it is never freed, and a sub-slice taken from it
+// by a handler also skips the marking. Compiles to a struct-copy + 3 field stores
+// (no allocation, no clone) — verified in the emitted C.
+@[inline]
+fn buf_view(buf []u8, start int, length int) []u8 {
+	mut v := unsafe { buf }
+	unsafe {
+		v.data = &u8(buf.data) + start
+		v.len = length
+		v.cap = length
+		v.flags.clear(.managed)
+	}
+	return v
+}
 // A request whose framed size exceeds this is STREAMED, not buffered: the head
 // is answered and the body is drained (recv'd into the fixed buffer and
 // discarded) instead of growing read_buf into a multi-MB scanned block — the
@@ -329,7 +353,7 @@ fn handle_readable_plain(request_handler core.RequestHandler, epoll_fd int, fd i
 fn drain_requests(request_handler core.RequestHandler, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState) bool {
 	mut pos := 0
 	for pos < cs.read_buf.len {
-		total := request_parser.frame_request_length_lim(cs.read_buf[pos..],
+		total := request_parser.frame_request_length_lim(buf_view(cs.read_buf, pos, cs.read_buf.len - pos),
 			limits.max_header_bytes, limits.max_body_bytes) or {
 			// Append the canned error so it lands AFTER the responses already
 			// batched for this burst, then flush and close.
@@ -347,7 +371,7 @@ fn drain_requests(request_handler core.RequestHandler, epoll_fd int, fd int, lim
 		if total < 0 {
 			break // incomplete — wait for more bytes
 		}
-		req := cs.read_buf[pos..pos + total] // zero-copy view into the read buffer
+		req := buf_view(cs.read_buf, pos, total) // zero-copy, non-marking view into read_buf
 		// A file deferred by an earlier request in this batch must be emitted (as
 		// bytes, in order) BEFORE this next response is appended. This converts
 		// the rare "pipelined response after a sendfile body" case to a buffered
