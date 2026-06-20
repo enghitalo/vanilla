@@ -162,8 +162,11 @@ signal. callgrind with post-warmup instrumentation is the disambiguator.
 - **`error()` boxes a `MessageError`** — even when the caller discards it with
   `or {}`. So a `!int` "not found" allocates per call; prefer a `-1`-returning
   variant (`find_byte_idx`, not `find_byte`) on hot paths.
+  ([vlang/v#27508](https://github.com/vlang/v/issues/27508))
 - **`int.str()` / `${}` allocate** — format integers into a reused buffer with an
   itoa helper (`wi`/`emit_int`), never `.str()` on the response hot path.
+  (`strings.Builder.write_decimal` exists for the Builder target; no `[]u8`-buffer
+  formatter does — [vlang/v#27509](https://github.com/vlang/v/issues/27509))
 - **`runtime.nr_cpus()` ignores CPU affinity** — it is `sysconf(_SC_NPROCESSORS_ONLN)`
   = every online *host* core, blind to `taskset`/cpuset and cgroup CPU pinning. A
   server pinned to N cores (a profiling run, or a container capped at N CPUs on a
@@ -174,3 +177,4 @@ signal. callgrind with post-warmup instrumentation is the disambiguator.
 - **`&Struct{}` as an `if`-*expression* branch** has miscompiled to invalid C in
   some build modes — use the statement form
   (`mut x := &T(unsafe{nil}); if … { x = … } else { x = &T{…} }`).
+  ([vlang/v#27329](https://github.com/vlang/v/issues/27329))
