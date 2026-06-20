@@ -84,6 +84,13 @@ pub type WakeFn = fn (mut out []u8, mut ac AsyncCtx) AsyncStep
 // and SSE/WebSocket backpressure are all consumers of this one primitive.
 pub type AsyncHandler = fn (req []u8, mut out []u8, mut ac AsyncCtx) AsyncStep
 
+// RegisterFn is the backend-installed watch-registration hook (see AsyncCtx.register).
+// A NAMED fn type, not an inline one on the field: on recent V (c0624b274) calling an
+// inline-fn-typed struct field mis-resolves its parameter types and errors with
+// "cannot use WatchInterest as WatchInterest" — a named alias resolves the signature
+// canonically. (A vlang/v function-pointer-field checker quirk.)
+pub type RegisterFn = fn (mut ac AsyncCtx, ext_fd int, interest WatchInterest, cont WakeFn, udata voidptr)
+
 // AsyncCtx is the per-invocation handle a handler/continuation uses to await an
 // fd. The backend fills it in and installs `register`; handlers only call
 // watch()/ready_fd()/udata()/state(). It is the layering bridge: `core` owns the
@@ -107,7 +114,7 @@ pub mut:
 	// and resets it; a plain watch() leaves it false (the fd is request-owned and
 	// closed on disconnect, e.g. a per-request timerfd or pipe).
 	persistent bool
-	register   fn (mut ac AsyncCtx, ext_fd int, interest WatchInterest, cont WakeFn, udata voidptr) = unsafe { nil }
+	register   RegisterFn = unsafe { nil }
 }
 
 // watch parks the current request and asks the worker to call `cont` when
