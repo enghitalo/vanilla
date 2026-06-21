@@ -8,30 +8,26 @@ import os
 // module breaks what would otherwise be a cycle: `http_server` imports a backend
 // to run it, and the backend needs these types — so neither can own them.
 
-// One worker thread per USABLE core (thread-per-core model). Both the facade
-// (thread / counter array sizing) and the backend (worker fan-out) need this.
+// One worker thread per core (thread-per-core model). Both the facade (thread /
+// counter array sizing) and the backend (worker fan-out) need this count.
 pub const max_thread_pool_size = worker_count()
 
-// worker_count picks the worker-thread count: the number of CPUs THIS PROCESS may
-// run on — not the host's total. `runtime.nr_cpus()` is `sysconf(_SC_NPROCESSORS_ONLN)`
-// = every online host core, blind to CPU affinity (taskset) and cpuset pinning. A
-// server pinned to N cores (a benchmark, or a container limited to N CPUs on a
-// larger host) would otherwise spawn host-many workers and oversubscribe them
-// N-ways — context-switch churn that drops throughput. On Linux we count the
-// process's sched_getaffinity mask; `VANILLA_WORKERS` overrides explicitly (e.g.
-// for cgroup CPU-quota limits, which don't restrict the affinity mask).
+// worker_count picks the worker-thread count. Default = `runtime.nr_cpus()`.
+// `VANILLA_WORKERS` overrides it explicitly.
+//
+// NOTE: this used to auto-derive the count from `sched_getaffinity` (to avoid
+// oversubscribing when pinned to fewer CPUs). That REGRESSED the DB-bound arena
+// profiles (crud/api-4/api-16): on a CPU-limited cpuset, affinity cut the worker
+// count, but a thread-per-core server with per-worker DB pools WANTS many workers
+// there — more workers = more in-flight DB requests hiding latency. Fewer workers
+// starved the pools → shedding (503) and idle CPU. So the default is nr_cpus again;
+// set VANILLA_WORKERS if you specifically need to cap workers in a constrained box.
 fn worker_count() int {
 	vw := os.getenv('VANILLA_WORKERS')
 	if vw != '' {
 		n := vw.int()
 		if n > 0 {
 			return n
-		}
-	}
-	$if linux {
-		c := linux_affinity_cpu_count()
-		if c > 0 {
-			return c
 		}
 	}
 	return runtime.nr_cpus()
