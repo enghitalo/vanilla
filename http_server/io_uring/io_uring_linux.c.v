@@ -292,19 +292,27 @@ pub fn pool_acquire(mut w Worker, fd int) &Connection {
 	// (noscan) capacity — recv fills read_buf, the handler fills response_buffer.
 	c.read_buf = []u8{len: 0, cap: read_buf_cap}
 	c.response_buffer = []u8{len: 0, cap: write_buf_cap}
-	// Keep both buffers in a no-scan GC block ACROSS growth. A large response
-	// (e.g. a 300 KiB static asset) grows response_buffer past write_buf_cap, and
-	// without this flag grow_cap reallocates as a *scanned* block — thousands of
-	// such multi-hundred-KB buffers at high keep-alive conn counts make GC
-	// scanning + stop-the-world dominate (the "static cliff"). The flag is
-	// preserved across resize, so the buffer stays atomic however large it grows.
+	// Keep both buffers in a no-scan GC block ACROSS growth — ON BY DEFAULT. A large
+	// response (e.g. a 300 KiB static asset) or a large upload body grows the buffer
+	// past its base cap, and without this flag grow_cap reallocates as a *scanned*
+	// block. At high keep-alive connection counts, thousands of such multi-hundred-KB
+	// buffers make GC scanning + stop-the-world dominate (the "static cliff"): the
+	// io_uring `static` profile collapsed from ~245K to ~8K RPS at 4096 conns (and
+	// `upload` similarly) with the CPU going idle, while the epoll backend — which
+	// sendfile()s static and never holds a big per-conn body buffer — stayed flat.
+	// The flag is preserved across resize, so the buffer stays atomic however large
+	// it grows; the buffer itself is NOT shrunk, so there is no realloc churn on the
+	// hot path (unlike a per-request shrink).
 	//
-	// Gated behind `-d vanilla_noscan`: `.noscan_data` only exists on V after the
-	// 0.5.1 release, and `$if flag ? {}` is comptime-eliminated (and not
-	// type-checked) when the flag is unset, so the library still builds on 0.5.1.
-	// Enable once a V release ships `.noscan_data` without the post-0.5.1 codegen
-	// slowdown (vlang/v#27468).
-	$if vanilla_noscan ? {
+	// `.noscan_data` only exists on V after the 0.5.1 release (it also needs the
+	// vlang/v#27468 codegen fix, shipped in #27470). The default branch below
+	// references it, so the library now requires a post-0.5.1 toolchain by default —
+	// the pinned/recommended V already satisfies this. To build on an older V, pass
+	// `-d vanilla_legacy_gc` (the `$if` branch is comptime-eliminated and not
+	// type-checked when the flag is set, so 0.5.1 still compiles).
+	$if vanilla_legacy_gc ? {
+		// legacy toolchain: leave the buffers scanned (no `.noscan_data`).
+	} $else {
 		unsafe {
 			c.read_buf.flags.set(.noscan_data)
 			c.response_buffer.flags.set(.noscan_data)
