@@ -24,6 +24,14 @@ fn C.sched_setaffinity(pid int, cpusetsize usize, mask &u64) int
 // Default ceiling on a single buffered request (headers+body) when the server
 // configures no max_request_bytes. Mirrors the epoll backend (sm_max_request_bytes).
 const iou_max_request_bytes = 8 * 1024 * 1024
+// A request body larger than this is STREAMED, not buffered: the head is answered
+// on its own and the body is drained off the socket into the fixed read buffer and
+// discarded (see start_iou_body_drain). Keeps a multi-MB upload at O(read_buf_cap)
+// memory instead of holding the whole body per connection. Mirrors the epoll
+// backend's sm_stream_body_above; handlers on this path must answer by the declared
+// Content-Length (request_parser.HttpRequest.content_length()), since no body is
+// passed to them — the /upload profile is exactly this shape.
+const iou_stream_body_above = 1024 * 1024
 // Close a peer that pipelines requests but never drains responses, before its
 // response batch grows without bound.
 const iou_max_pending_write = 8 * 1024 * 1024
@@ -75,6 +83,43 @@ fn iou_arm_send(worker &io_uring.Worker, mut conn io_uring.Connection, data &u8,
 		conn.write_deadline = time.sys_mono_now() + u64(limits.write_timeout_ms) * 1_000_000
 	}
 	return io_uring.prepare_send(&worker.ring, mut conn, data, data_len)
+}
+
+// iou_arm_drain_recv posts the next length-clamped discard-recv while a large
+// upload body is being streamed (conn.body_drain > 0). It keeps a read deadline
+// armed (gated on read_timeout_ms) so a peer that stalls mid-body is still reaped
+// — body_drain, not read_buf.len, is the "mid-read" signal here. Returns false if
+// the SQ is full.
+@[inline]
+fn iou_arm_drain_recv(worker &io_uring.Worker, mut conn io_uring.Connection, limits Limits) bool {
+	if limits.read_timeout_ms > 0 && conn.read_deadline == 0 {
+		conn.read_deadline = time.sys_mono_now() + u64(limits.read_timeout_ms) * 1_000_000
+	}
+	return io_uring.prepare_recv_n(&worker.ring, mut conn, usize(conn.body_drain))
+}
+
+// iou_flush_response arms the batched send for everything still pending in
+// response_buffer ([bytes_sent..len)), drops any read deadline (we are sending,
+// not read-stalled) and counts the in-flight response so Server.shutdown() drains
+// it. Used by every send site (normal completion, large-body drain completion, and
+// the head-only error path), so they cannot drift apart. Returns false if the SQ
+// is full.
+@[inline]
+fn iou_flush_response(worker &io_uring.Worker, mut conn io_uring.Connection, limits Limits) bool {
+	conn.read_deadline = 0
+	posted := iou_arm_send(worker, mut conn, unsafe {
+		&u8(conn.response_buffer.data) + conn.bytes_sent
+	}, usize(conn.response_buffer.len - conn.bytes_sent), limits)
+	// Count the in-flight response ONLY once the send is actually queued. If the SQ
+	// is full (posted == false) no send CQE will ever arrive, so a pre-increment
+	// would leak into worker.inflight and make Server.shutdown() wait out its whole
+	// grace period. (A full SQ still leaves the connection without an in-flight op —
+	// a pre-existing limitation shared by every prepare_* call site, reachable only
+	// on a degraded ring; the counter, at least, now stays exact.)
+	if posted && unsafe { worker.inflight != nil } {
+		stdatomic.add_i64(&worker.inflight.n, 1)
+	}
+	return posted
 }
 
 // maybe_pin_worker pins the calling worker thread to `cpu` when VANILLA_PIN_CPUS
@@ -155,55 +200,69 @@ fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn
 		iou_release(worker, mut *conn, active_conns, track)
 		return
 	}
+	// Streaming-drain: these `res` bytes are a large upload's body being consumed
+	// off the socket and DISCARDED — the head was already answered and its response
+	// is held in response_buffer. prepare_recv_n clamped the recv to the body
+	// remainder, so res never includes the next pipelined request.
+	if conn.body_drain > 0 {
+		conn.body_drain -= res
+		if conn.body_drain > 0 {
+			iou_arm_drain_recv(worker, mut *conn, limits) // more body to consume
+		} else {
+			// Whole body drained — now send the response prepared from the head.
+			iou_flush_response(worker, mut *conn, limits)
+		}
+		return
+	}
 	unsafe {
 		conn.read_buf.len += res
 	}
 	// Answer every complete request now buffered (pipelining), appending each
 	// raw response to response_buffer and compacting the partial leftover.
 	drain_iou_requests(mut conn, handler, limits)
+	req_cap := if limits.max_request_bytes > 0 {
+		limits.max_request_bytes
+	} else {
+		iou_max_request_bytes
+	}
 	// Enforce the single-request ceiling on a leftover partial that never frames
 	// (mirrors the epoll backend's req_cap check).
-	if !conn.close_after_send {
-		req_cap := if limits.max_request_bytes > 0 {
-			limits.max_request_bytes
-		} else {
-			iou_max_request_bytes
-		}
-		if conn.read_buf.len > req_cap {
-			conn.response_buffer << response.status_413_response
-			conn.close_after_send = true
-		}
+	if !conn.close_after_send && conn.read_buf.len > req_cap {
+		conn.response_buffer << response.status_413_response
+		conn.close_after_send = true
 	}
 	if conn.response_buffer.len > conn.bytes_sent {
-		// Sending now, not read-stalled: drop any read deadline. One batched send
-		// for every response produced this burst (arms the write deadline). The
-		// response is now in flight — count it so Server.shutdown() drains it.
-		conn.read_deadline = 0
-		if unsafe { worker.inflight != nil } {
-			stdatomic.add_i64(&worker.inflight.n, 1)
-		}
-		iou_arm_send(worker, mut *conn, unsafe {
-			&u8(conn.response_buffer.data) + conn.bytes_sent
-		}, usize(conn.response_buffer.len - conn.bytes_sent), limits)
-	} else {
-		// Nothing complete yet — read more into the same buffer (arming/refreshing
-		// the read deadline since a partial request is now buffered). When the body
-		// length is already known (Content-Length), pre-size read_buf to the exact
-		// message length in ONE allocation; otherwise prepare_recv doubles toward it
-		// (8K→16K→…→32M for a 20 MiB upload: ~12 reallocs + tens of MB of memcpy).
-		if conn.read_buf.len == conn.read_buf.cap {
-			req_cap := if limits.max_request_bytes > 0 {
-				limits.max_request_bytes
-			} else {
-				iou_max_request_bytes
-			}
-			target := request_parser.frame_expected_total(conn.read_buf)
-			if target > conn.read_buf.cap && target <= req_cap {
-				unsafe { conn.read_buf.grow_cap(target - conn.read_buf.cap) }
-			}
-		}
-		iou_arm_recv(worker, mut *conn, limits)
+		// One batched send for every response produced this burst (arms the write
+		// deadline, counts the in-flight response for graceful shutdown).
+		iou_flush_response(worker, mut *conn, limits)
+		return
 	}
+	// Nothing complete yet. A body too large to be worth buffering is STREAMED:
+	// answer it from the head alone, then drain+discard the body. This keeps memory
+	// at O(read_buf_cap) instead of growing read_buf into a multi-MB block and
+	// ping-ponging recv→CQE→re-arm thousands of times for a 20 MiB upload.
+	total := request_parser.frame_expected_total(conn.read_buf)
+	if total > iou_stream_body_above && total <= req_cap {
+		if start_iou_body_drain(mut conn, handler, total) {
+			if conn.close_after_send || conn.body_drain == 0 {
+				// Handler errored on the head (send the error, then close), or the
+				// whole body happened to be buffered already — either way send now.
+				iou_flush_response(worker, mut *conn, limits)
+			} else {
+				iou_arm_drain_recv(worker, mut *conn, limits) // start draining the body
+			}
+			return
+		}
+		// Head not fully buffered yet → fall through to normal buffering.
+	}
+	// Read more into the same buffer (arming the read deadline since a partial
+	// request is now buffered). When the body length is already known
+	// (Content-Length), pre-size read_buf to the exact message length in ONE
+	// allocation; otherwise prepare_recv doubles toward it.
+	if conn.read_buf.len == conn.read_buf.cap && total > conn.read_buf.cap && total <= req_cap {
+		unsafe { conn.read_buf.grow_cap(total - conn.read_buf.cap) }
+	}
+	iou_arm_recv(worker, mut *conn, limits)
 }
 
 // drain_iou_requests parses and answers every complete request in read_buf,
@@ -255,6 +314,47 @@ fn drain_iou_requests(mut conn io_uring.Connection, handler fn (req []u8, fd int
 			conn.read_buf.len = leftover
 		}
 	}
+}
+
+// start_iou_body_drain answers a large-body request from its HEAD alone and puts
+// the connection into streaming-drain mode for the body (consumed and discarded by
+// the conn.body_drain branch in handle_io_uring_read). The handler is given only
+// the head — no body is buffered — so such handlers must answer by the declared
+// Content-Length (request_parser.HttpRequest.content_length()); the /upload profile
+// is exactly this shape. The prepared response is HELD in response_buffer and sent
+// once the body has fully drained. The io_uring counterpart of the epoll backend's
+// start_body_drain. Returns true when the large body is now being handled — drain
+// armed (body_drain > 0), the head-only handler errored (close_after_send), or the
+// whole body was already buffered (body_drain == 0) — and false when the head is
+// not yet fully buffered (the caller keeps buffering normally).
+@[direct_array_access]
+fn start_iou_body_drain(mut conn io_uring.Connection, handler fn (req []u8, fd int, mut out []u8) !, total int) bool {
+	head_len := request_parser.frame_head_len(conn.read_buf)
+	if head_len <= 0 || head_len > conn.read_buf.len {
+		return false // head not complete in the buffer yet — keep buffering
+	}
+	head := conn.read_buf[0..head_len] // zero-copy view; the handler consumes it now
+	handler(head, conn.fd, mut conn.response_buffer) or {
+		conn.response_buffer << response.tiny_bad_request_response
+		conn.close_after_send = true
+		unsafe {
+			conn.read_buf.len = 0
+		}
+		return true
+	}
+	// Body bytes already received after the head count toward the drain. Detection
+	// runs before read_buf ever grows past its base cap, so body_in_buf is always
+	// < content_length (the request is still incomplete) — no next-request bytes
+	// are present to be lost.
+	body_in_buf := conn.read_buf.len - head_len
+	conn.body_drain = i64(total - head_len) - i64(body_in_buf)
+	if conn.body_drain < 0 {
+		conn.body_drain = 0
+	}
+	unsafe {
+		conn.read_buf.len = 0 // head + buffered body consumed; reuse buffer to drain
+	}
+	return true
 }
 
 fn handle_io_uring_write(worker &io_uring.Worker, cqe &C.io_uring_cqe, limits Limits, active_conns &core.Counter) {

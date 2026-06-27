@@ -543,7 +543,13 @@ pub fn frame_expected_total(buf []u8) int {
 	if buf.len < 4 {
 		return -1
 	}
-	rl := find_byte(&buf[0], buf.len, lf_char) or { return -1 }
+	// find_byte_idx (no Result), not find_byte: the not-found path of find_byte
+	// allocates a MessageError, which this per-request framer hits on every
+	// incomplete head (and leaks under -gc none). Mirrors frame_request_length_lim.
+	rl := find_byte_idx(&buf[0], buf.len, lf_char)
+	if rl < 0 {
+		return -1
+	}
 	mut pos := rl + 1
 	mut content_length := -1
 	for {
@@ -563,7 +569,10 @@ pub fn frame_expected_total(buf []u8) int {
 				return -1 // chunked or bodyless — nothing to pre-size against
 			}
 		}
-		line_lf := find_byte(&buf[pos], buf.len - pos, lf_char) or { return -1 }
+		line_lf := find_byte_idx(&buf[pos], buf.len - pos, lf_char)
+		if line_lf < 0 {
+			return -1
+		}
 		line_start := pos
 		line_len := line_lf - 1 // bytes before the CR
 		pos = line_start + line_lf + 1
@@ -583,7 +592,12 @@ pub fn frame_head_len(buf []u8) int {
 	if buf.len < 4 {
 		return -1
 	}
-	rl := find_byte(&buf[0], buf.len, lf_char) or { return -1 }
+	// find_byte_idx (no Result): see frame_expected_total — avoids the per-call
+	// MessageError allocation on the incomplete-head path.
+	rl := find_byte_idx(&buf[0], buf.len, lf_char)
+	if rl < 0 {
+		return -1
+	}
 	mut pos := rl + 1
 	for {
 		if pos >= buf.len {
@@ -597,7 +611,10 @@ pub fn frame_head_len(buf []u8) int {
 				return pos + 2 // past the blank line's CRLF => body start
 			}
 		}
-		line_lf := find_byte(&buf[pos], buf.len - pos, lf_char) or { return -1 }
+		line_lf := find_byte_idx(&buf[pos], buf.len - pos, lf_char)
+		if line_lf < 0 {
+			return -1
+		}
 		pos = pos + line_lf + 1
 	}
 	return -1

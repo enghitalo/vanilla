@@ -13,9 +13,21 @@ module http_server
 // so they assert behaviour, not exact latency.
 import net
 import time
+import http1_1.request_parser
 
 fn bb_ok_handler(req []u8, fd int, mut out []u8) ! {
 	out << 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
+}
+
+// bb_upload_handler answers a /upload by the DECLARED Content-Length only — it
+// never touches the body. This is the shape the large-body streaming path
+// requires (the head alone is passed; the body is drained + discarded), mirroring
+// the HttpArena vanilla /upload handler.
+fn bb_upload_handler(req []u8, fd int, mut out []u8) ! {
+	hr := request_parser.decode_http_request(req)!
+	cl := hr.content_length()
+	body := cl.str()
+	out << 'HTTP/1.1 200 OK\r\nContent-Length: ${body.len}\r\nConnection: keep-alive\r\n\r\n${body}'.bytes()
 }
 
 const bb_req = 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'
@@ -222,7 +234,98 @@ fn check_graceful_shutdown(backend IOBackend, port int) ! {
 	assert refused == 10, '${backend}: after shutdown all 10 new connections should be refused, got ${refused}'
 }
 
+// bb_read_one_200 reads from c (up to deadline_ms) until one '200' status line has
+// arrived, returning everything accumulated. Used to read a single upload response.
+fn bb_read_one_200(mut c net.TcpConn, deadline_ms int) []u8 {
+	c.set_read_timeout(deadline_ms * time.millisecond)
+	mut buf := []u8{len: 65536}
+	mut acc := []u8{}
+	for count_marker(acc, 'HTTP/1.1 200') < 1 {
+		nr := c.read(mut buf) or { break }
+		if nr <= 0 {
+			break
+		}
+		acc << buf[..nr]
+	}
+	return acc
+}
+
+// check_large_upload_drain drives bodies larger than the streaming threshold
+// (sm_stream_body_above / iou_stream_body_above = 1 MiB) so they take the drain
+// path: the head is answered and the body is consumed off the socket without ever
+// being buffered. It guards three distinct properties:
+//   • drain-then-respond ORDERING — upload 0 writes the head + only one body chunk
+//     and asserts that NO response has arrived yet: the answer must be withheld
+//     until the whole body is consumed. A respond-BEFORE-drain server answers here,
+//     which desyncs a response-framed client (wrk/curl: it treats the request as
+//     done and reinterprets the trailing body as the next request). This assertion
+//     fails against an early-flush server even though byte accounting is correct.
+//   • EXACT drain + keep-alive — upload 1 is a second full upload on the SAME
+//     connection; it frames only if the drain consumed EXACTLY upload 0's body (no
+//     over-read into this request, no under-read leaving the connection stuck) and
+//     keep-alive survived the drain.
+//   • the head-only handler answers by the declared Content-Length.
+fn check_large_upload_drain(backend IOBackend, port int) ! {
+	mut server := new_server(ServerConfig{
+		port:            port
+		io_multiplexing: backend
+		request_handler: bb_upload_handler
+		limits:          Limits{
+			max_request_bytes: 8 * 1024 * 1024 // headroom for the 2 MiB bodies
+		}
+	})!
+	bb_start(mut server, port)
+
+	body_len := 2 * 1024 * 1024 // 2 MiB > 1 MiB threshold ⇒ drain path
+	chunk := []u8{len: 64 * 1024, init: u8(0x61)}
+	head := 'POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: ${body_len}\r\n\r\n'.bytes()
+	mut c := net.dial_tcp('127.0.0.1:${port}')!
+
+	// ── Upload 0: ORDERING probe ──
+	// Send the head + ONE chunk (body far from complete), then assert the server
+	// stays SILENT: drain-then-respond must withhold the answer until the body is
+	// fully drained. An early answer here is the respond-before-drain bug.
+	c.write(head)!
+	c.write(chunk)!
+	c.set_read_timeout(500 * time.millisecond)
+	mut probe := []u8{len: 256}
+	pn := c.read(mut probe) or { 0 }
+	assert pn == 0, '${backend}: response arrived before the body finished — respond-before-drain (desyncs wrk/curl), got ${pn} bytes'
+	// Finish upload 0's body; now the response must arrive, echoing the declared length.
+	mut sent := chunk.len
+	for sent < body_len {
+		n := if body_len - sent < chunk.len { body_len - sent } else { chunk.len }
+		c.write(chunk[..n])!
+		sent += n
+	}
+	acc0 := bb_read_one_200(mut c, 5000)
+	assert count_marker(acc0, 'HTTP/1.1 200') == 1, '${backend}: upload 0 not answered after the body completed'
+	assert acc0.bytestr().contains('\r\n\r\n${body_len}'), '${backend}: upload 0 must echo Content-Length ${body_len}, got: ${acc0.bytestr()#[-40..]}'
+
+	// ── Upload 1: EXACT-drain + keep-alive guard ──
+	// A second full upload on the SAME connection must frame correctly.
+	c.write(head)!
+	mut sent1 := 0
+	for sent1 < body_len {
+		n := if body_len - sent1 < chunk.len { body_len - sent1 } else { chunk.len }
+		c.write(chunk[..n])!
+		sent1 += n
+	}
+	acc1 := bb_read_one_200(mut c, 5000)
+	c.close() or {}
+	assert count_marker(acc1, 'HTTP/1.1 200') == 1, '${backend}: keep-alive after a drained upload broke (drain over-read or under-read?)'
+	assert acc1.bytestr().contains('\r\n\r\n${body_len}'), '${backend}: upload 1 must echo Content-Length ${body_len}, got: ${acc1.bytestr()#[-40..]}'
+
+	server.shutdown(500)
+}
+
 // --- io_uring -------------------------------------------------------------
+
+fn test_iouring_large_upload_drain() ! {
+	$if linux {
+		check_large_upload_drain(.io_uring, 8125)!
+	}
+}
 
 fn test_iouring_pipelining_and_framing() ! {
 	$if linux {
@@ -249,6 +352,12 @@ fn test_iouring_graceful_shutdown() ! {
 }
 
 // --- epoll (default backend) ----------------------------------------------
+
+fn test_epoll_large_upload_drain() ! {
+	$if linux {
+		check_large_upload_drain(.epoll, 8135)!
+	}
+}
 
 fn test_epoll_pipelining_and_framing() ! {
 	$if linux {
