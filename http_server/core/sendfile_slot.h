@@ -22,6 +22,14 @@
 
 #if defined(_MSC_VER)
 #define VANILLA_THREAD_LOCAL __declspec(thread)
+#elif defined(__TINYC__) && defined(__APPLE__)
+// tcc on macOS (arm64) cannot codegen thread-local storage and aborts with
+// "_Thread_local is not implemented". The slot is inert on macOS anyway:
+// vanilla_sf_enable() is only ever called by the Linux epoll worker
+// (backend_epoll/worker_linux.c.v), so on macOS nothing ever writes this static
+// and a plain (non-TLS) definition is safe. tcc is a dev-only fast compiler;
+// -prod (clang/gcc) keeps real _Thread_local everywhere.
+#define VANILLA_THREAD_LOCAL
 #else
 #define VANILLA_THREAD_LOCAL _Thread_local
 #endif
