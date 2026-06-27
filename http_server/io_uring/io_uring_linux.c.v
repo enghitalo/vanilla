@@ -226,6 +226,14 @@ pub mut:
 	// Set when the pending batch ends a malformed/oversized request: once it has
 	// been sent, release the connection instead of posting the next recv.
 	close_after_send bool
+
+	// >0 while a large upload body is being STREAMED: the head was already answered
+	// (its response held in response_buffer) and the remaining `body_drain` body
+	// bytes are recv'd into read_buf's base buffer and DISCARDED — keeping a
+	// multi-MB upload at O(read_buf_cap) memory instead of buffering the whole body.
+	// recv is length-clamped to this remainder so the drain never reads past the
+	// body into the next pipelined request. Once it hits 0 the held response is sent.
+	body_drain i64
 }
 
 // ==================== Worker Structure ====================
@@ -288,6 +296,7 @@ pub fn pool_acquire(mut w Worker, fd int) &Connection {
 	c.close_after_send = false
 	c.read_deadline = 0
 	c.write_deadline = 0
+	c.body_drain = 0
 	// Fresh persistent buffers for this connection's lifetime. Uninitialised
 	// (noscan) capacity — recv fills read_buf, the handler fills response_buffer.
 	c.read_buf = []u8{len: 0, cap: read_buf_cap}
@@ -327,6 +336,7 @@ pub fn pool_release(mut w Worker, mut c Connection) {
 	c.close_after_send = false
 	c.read_deadline = 0
 	c.write_deadline = 0
+	c.body_drain = 0
 	c.owner = unsafe { nil }
 	unsafe {
 		idx := int(u64(&c) - u64(&w.conns[0])) / int(sizeof(Connection))
@@ -384,6 +394,28 @@ pub fn prepare_recv(ring &C.io_uring, mut c Connection) bool {
 	spare := c.read_buf.cap - c.read_buf.len
 	C.io_uring_prep_recv(sqe, c.fd, unsafe { &u8(c.read_buf.data) + c.read_buf.len }, usize(spare),
 		0)
+	C.io_uring_sqe_set_data64(sqe, encode_user_data(op_read, &c))
+	return true
+}
+
+// prepare_recv_n posts a recv of at most `n` bytes into read_buf's BASE buffer
+// (offset 0), used by the large-body drain to consume and DISCARD the body. It
+// never grows read_buf and never appends: read_buf.len stays 0 throughout the
+// drain (the bytes are thrown away), so the same 8 KiB buffer is reused for the
+// whole upload. `n` is the body remainder, clamped to the buffer capacity, so a
+// recv never reads past the body into the next pipelined request. Returns false
+// if the SQ is full.
+@[direct_array_access]
+pub fn prepare_recv_n(ring &C.io_uring, mut c Connection, n usize) bool {
+	sqe := C.io_uring_get_sqe(ring)
+	if unsafe { sqe == nil } {
+		return false
+	}
+	mut want := n
+	if want > usize(c.read_buf.cap) {
+		want = usize(c.read_buf.cap)
+	}
+	C.io_uring_prep_recv(sqe, c.fd, c.read_buf.data, want, 0)
 	C.io_uring_sqe_set_data64(sqe, encode_user_data(op_read, &c))
 	return true
 }
