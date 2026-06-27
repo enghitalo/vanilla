@@ -30,8 +30,10 @@ fn test_async_query_pump_against_live_pg() {
 	// Two sequential queries prove the connection returns to idle and is reusable.
 	for round in 0 .. 2 {
 		expect := round + 7
-		assert c.async_submit(r'select $1::int4, $2::text', [?[]u8('${expect}'.bytes()),
-			?[]u8('round'.bytes())])
+		assert c.async_submit(r'select $1::int4, $2::text', [
+			?[]u8('${expect}'.bytes()),
+			?[]u8('round'.bytes()),
+		])
 		assert c.is_busy()
 
 		// Flush the request (a small request goes out in one write; loop guards EAGAIN).
