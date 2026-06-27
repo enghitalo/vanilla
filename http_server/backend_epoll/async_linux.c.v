@@ -433,8 +433,8 @@ fn async_start_body_drain(h core.AsyncHandler, mut reactor AsyncReactor, epoll_f
 fn async_drain(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) bool {
 	mut pos := 0
 	for pos < cs.read_buf.len && cs.awaiting_fd < 0 {
-		total := request_parser.frame_request_length_lim(buf_view(cs.read_buf, pos, cs.read_buf.len - pos),
-			limits.max_header_bytes, limits.max_body_bytes) or {
+		total := request_parser.frame_request_length_lim(buf_view(cs.read_buf, pos,
+			cs.read_buf.len - pos), limits.max_header_bytes, limits.max_body_bytes) or {
 			match err.code() {
 				413 { cs.write_buf << response.status_413_response }
 				431 { cs.write_buf << response.status_431_response }

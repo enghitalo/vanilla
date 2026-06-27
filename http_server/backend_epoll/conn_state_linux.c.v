@@ -78,6 +78,7 @@ fn buf_view(buf []u8, start int, length int) []u8 {
 	}
 	return v
 }
+
 // A request whose framed size exceeds this is STREAMED, not buffered: the head
 // is answered and the body is drained (recv'd into the fixed buffer and
 // discarded) instead of growing read_buf into a multi-MB scanned block — the
@@ -370,8 +371,8 @@ fn handle_readable_plain(request_handler core.RequestHandler, epoll_fd int, fd i
 fn drain_requests(request_handler core.RequestHandler, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState) bool {
 	mut pos := 0
 	for pos < cs.read_buf.len {
-		total := request_parser.frame_request_length_lim(buf_view(cs.read_buf, pos, cs.read_buf.len - pos),
-			limits.max_header_bytes, limits.max_body_bytes) or {
+		total := request_parser.frame_request_length_lim(buf_view(cs.read_buf, pos,
+			cs.read_buf.len - pos), limits.max_header_bytes, limits.max_body_bytes) or {
 			// Append the canned error so it lands AFTER the responses already
 			// batched for this burst, then flush and close.
 			match err.code() {
