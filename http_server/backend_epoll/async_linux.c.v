@@ -369,7 +369,9 @@ fn async_serve(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd i
 			return
 		}
 	}
-	if cs.write_buf.len > cs.write_off || cs.file_remaining > 0 {
+	// Hold a streamed upload's response until its body is fully drained (body_drain
+	// == 0), so the client never sees the response mid-body (see async_start_body_drain).
+	if cs.body_drain == 0 && (cs.write_buf.len > cs.write_off || cs.file_remaining > 0) {
 		flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs)
 	}
 }
@@ -404,10 +406,13 @@ fn async_start_body_drain(h core.AsyncHandler, mut reactor AsyncReactor, epoll_f
 		}
 		return 2
 	}
-	if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-		close_conn(epoll_fd, fd, active_conns, mut st)
-		return 2
-	}
+	// DRAIN-THEN-RESPOND: the head response is buffered in write_buf but is NOT
+	// flushed here. The body is drained first (the cs.body_drain branch in
+	// async_serve) and only once it is fully consumed does async_serve's end-of-burst
+	// flush (gated on body_drain == 0) send it — so a client that writes the whole
+	// request before reading is never desynced by an early response. (This path was
+	// previously dead: an inverted `flush_batch` check closed the connection right
+	// after the head response, so the body was never drained.)
 	body_in_buf := cs.read_buf.len - head_len
 	cs.body_drain = i64(content_length) - i64(body_in_buf)
 	if cs.body_drain < 0 {

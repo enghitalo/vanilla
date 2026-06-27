@@ -210,10 +210,17 @@ fn start_body_drain(request_handler core.RequestHandler, epoll_fd int, fd int, l
 		}
 		return 2
 	}
-	if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-		close_conn(epoll_fd, fd, active_conns, mut st)
-		return 2
-	}
+	// DRAIN-THEN-RESPOND: the handler's response is now buffered in write_buf but is
+	// deliberately NOT flushed here. We first drain the whole body off the socket
+	// (the cs.body_drain branch in handle_readable_plain), and only once it is fully
+	// consumed (body_drain == 0) does the end-of-burst flush there send the response.
+	// Responding before the body is fully read desyncs any client that writes the
+	// entire request before reading the response (wrk and most upload clients): it
+	// would see the response mid-body, consider the request done, and stream the
+	// remaining body bytes as the start of its next request. (This whole streaming
+	// path was previously dead code — an inverted `flush_batch` check closed the
+	// connection right after the head response — so the desync was never observed.)
+	//
 	// Body bytes already received after the head count toward the drain. For a
 	// body past sm_stream_body_above detected at a full (small) read buffer,
 	// body_in_buf is always < content_length, so no next-request bytes are lost.
@@ -328,9 +335,16 @@ fn handle_readable_plain(request_handler core.RequestHandler, epoll_fd int, fd i
 		}
 	}
 
-	// Read-timeout bookkeeping: armed once when a request is mid-read,
-	// cleared when the buffer holds no partial request.
-	if cs.read_buf.len > 0 {
+	// Read-timeout bookkeeping: armed once when a request is mid-read OR a large
+	// body is mid-drain (body_drain > 0 — a peer that stalls mid-upload is still
+	// reaped), cleared when the buffer holds no partial request and no drain is in
+	// progress. NOTE: like every other read path here (normal mid-read, TLS, io_uring),
+	// the deadline is armed once and not refreshed on progress, so read_timeout_ms —
+	// when set (default 0 = off) — bounds the TOTAL time to receive a request,
+	// including a streamed body. Size it for the largest upload you accept; an
+	// idle-style refresh-on-progress would be a separate, uniform change across all
+	// read paths.
+	if cs.read_buf.len > 0 || cs.body_drain > 0 {
 		if limits.read_timeout_ms > 0 && cs.read_deadline == 0 {
 			cs.read_deadline = time.sys_mono_now() + u64(limits.read_timeout_ms) * 1_000_000
 			st.parked++
@@ -340,8 +354,11 @@ fn handle_readable_plain(request_handler core.RequestHandler, epoll_fd int, fd i
 		st.parked--
 	}
 
-	// One send for the whole batch of responses (plus any deferred file body).
-	if cs.write_buf.len > cs.write_off || cs.file_remaining > 0 {
+	// One send for the whole batch of responses (plus any deferred file body) —
+	// but NOT while a large body is still draining: a streamed upload's response is
+	// held in write_buf until its body is fully consumed (see start_body_drain), so
+	// the client never sees the response mid-body.
+	if cs.body_drain == 0 && (cs.write_buf.len > cs.write_off || cs.file_remaining > 0) {
 		flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs)
 	}
 }
@@ -544,6 +561,16 @@ fn handle_writable_plain(epoll_fd int, fd int, active_conns &core.Counter, mut s
 		// EPOLLOUT is only armed after state exists; nil means a close raced
 		// this event in the same batch.
 		return false
+	}
+	if cs.body_drain > 0 {
+		// A streamed upload's response is buffered in write_buf but MUST stay held
+		// until the body is fully drained (drain-then-respond). If an earlier batch
+		// parked on EPOLLOUT and then this connection began draining a large upload,
+		// flushing here would send the upload's held head-response mid-body and desync
+		// the client — exactly what the drain gate prevents. Stay parked; the body is
+		// still arriving on EPOLLIN edges and the body_drain==0 end-of-burst flush in
+		// handle_readable_plain sends everything once the body completes.
+		return true
 	}
 	if cs.write_off >= cs.write_buf.len && cs.file_remaining <= 0 {
 		// Spurious wake — nothing parked; stop watching writability.
