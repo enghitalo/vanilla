@@ -325,6 +325,20 @@ Performance claims must be measured, not assumed.
   noisy — prefer A/B comparisons or a micro-benchmark.
 - Build with `-prod` for any timing run; build `-prod -gc none` to match
   production.
+- To tell a real change from machine noise, drive micro-benchmarks through
+  [`bench/measure.sh`](../bench/measure.sh). It pins the work to one core, prints
+  the environment that shaped the numbers (governor, turbo, SMT sibling) with the
+  exact fix when it isn't quiesced, and reports the **minimum** across N runs — not
+  the mean. The minimum is the right estimator: every source of noise (an
+  interrupt, a migration, a turbo step-down) only makes a run *slower*, so the
+  fastest run is closest to the true cost. The reported spread is your noise floor
+  — a delta smaller than the spread is not measurable on that machine.
+
+  ```sh
+  v -prod -gc none -o /tmp/bench bench/request_parser/request_parser_bench.v
+  bench/measure.sh /tmp/bench              # min / median / spread
+  BENCH_PERF=1 bench/measure.sh /tmp/bench # + perf stat (cycles, IPC, misses)
+  ```
 
   ```sh
   v -prod -gc none .
