@@ -297,10 +297,25 @@ pub fn pool_acquire(mut w Worker, fd int) &Connection {
 	c.read_deadline = 0
 	c.write_deadline = 0
 	c.body_drain = 0
-	// Fresh persistent buffers for this connection's lifetime. Uninitialised
-	// (noscan) capacity — recv fills read_buf, the handler fills response_buffer.
-	c.read_buf = []u8{len: 0, cap: read_buf_cap}
-	c.response_buffer = []u8{len: 0, cap: write_buf_cap}
+	// Lock-free buffer REUSE: the per-worker pool is single-issuer (only this
+	// worker thread ever touches w.conns/free_stack), so a slot's buffers persist
+	// across connections with zero atomics. Reuse the pooled buffer (reset len,
+	// keep capacity); allocate only on a slot's first-ever use or after a release
+	// dropped an oversized buffer. This removes the per-connection 8K+16K
+	// malloc/free that showed up as 2 malloc + 2 free per connection under churn
+	// (the limited-conn tax), mirroring the epoll backend's free_conns pooling.
+	// Lazy (not pre-allocated in pool_init): pooled memory tracks the per-worker
+	// high-water concurrency, not max_conn_per_worker (which would be 768 MiB).
+	if unsafe { c.read_buf.data == nil } {
+		c.read_buf = []u8{len: 0, cap: read_buf_cap}
+	} else {
+		unsafe { c.read_buf.len = 0 }
+	}
+	if unsafe { c.response_buffer.data == nil } {
+		c.response_buffer = []u8{len: 0, cap: write_buf_cap}
+	} else {
+		unsafe { c.response_buffer.len = 0 }
+	}
 	// No manual `.noscan_data` here, on purpose. read_buf/response_buffer are `[]u8`
 	// (pointer-free), so under the default GC the compiler picks the no-scan array
 	// constructor (`__new_array_with_default_noscan`, gated on `gcboehm_opt`, which
@@ -326,12 +341,23 @@ pub fn pool_release(mut w Worker, mut c Connection) {
 		return
 	}
 	C.close(c.fd)
-	unsafe {
-		c.read_buf.free()
-		c.response_buffer.free()
+	// Keep base-sized buffers attached to the slot for lock-free reuse by the next
+	// connection that lands on it (see pool_acquire). Only release a buffer that
+	// GREW past its base capacity (a large upload/response grew it via grow_cap) so
+	// a one-off big request can't pin multi-MB on an otherwise idle pooled slot —
+	// pooled idle memory stays bounded at base (8K+16K) per high-water slot.
+	if c.read_buf.cap > read_buf_cap {
+		unsafe { c.read_buf.free() }
+		c.read_buf = []u8{}
+	} else {
+		unsafe { c.read_buf.len = 0 }
 	}
-	c.read_buf = []u8{}
-	c.response_buffer = []u8{}
+	if c.response_buffer.cap > write_buf_cap {
+		unsafe { c.response_buffer.free() }
+		c.response_buffer = []u8{}
+	} else {
+		unsafe { c.response_buffer.len = 0 }
+	}
 	c.bytes_sent = 0
 	c.close_after_send = false
 	c.read_deadline = 0
