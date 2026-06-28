@@ -351,13 +351,13 @@ fn (s &AssetServer) choose_variant(asset &Asset, req &request_parser.HttpRequest
 fn (s &AssetServer) build_bytes(asset &Asset, req request_parser.HttpRequest, head bool) []u8 {
 	buf := req.buffer
 	if inm := req.get_header_value_slice('If-None-Match') {
-		if etag_matches(inm.to_string(buf), asset.etag) {
+		if etag_matches_slice(buf, inm, asset.etag) {
 			return build_304(asset.etag, asset.cache_control)
 		}
 	}
 	if !head {
 		if rng := req.get_header_value_slice('Range') {
-			if start, end := parse_range(rng.to_string(buf), int(asset.body_len)) {
+			if start, end := parse_range_slice(buf, rng, int(asset.body_len)) {
 				mut b := build_206_headers(asset, start, end)
 				append_identity_region(asset, start, end - start + 1, mut b)
 				return b
@@ -382,14 +382,14 @@ fn (s &AssetServer) build_bytes(asset &Asset, req request_parser.HttpRequest, he
 fn (s &AssetServer) emit_into(asset &Asset, req request_parser.HttpRequest, head bool, mut out []u8) {
 	buf := req.buffer
 	if inm := req.get_header_value_slice('If-None-Match') {
-		if etag_matches(inm.to_string(buf), asset.etag) {
+		if etag_matches_slice(buf, inm, asset.etag) {
 			out << build_304(asset.etag, asset.cache_control)
 			return
 		}
 	}
 	if !head {
 		if rng := req.get_header_value_slice('Range') {
-			if start, end := parse_range(rng.to_string(buf), int(asset.body_len)) {
+			if start, end := parse_range_slice(buf, rng, int(asset.body_len)) {
 				length := end - start + 1
 				out << build_206_headers(asset, start, end)
 				iv := asset.variants['identity'] or { return }
@@ -682,21 +682,57 @@ fn ci_equals(buf []u8, start int, target string) bool {
 	return true
 }
 
-// etag_matches reports whether an If-None-Match value matches `etag`. Accepts a
-// comma-separated list, the `*` wildcard, and weak (`W/`) prefixes.
-fn etag_matches(inm string, etag string) bool {
-	v := inm.trim_space()
-	if v == '*' {
+// etag_matches_slice reports whether the If-None-Match value held in `buf[sl]`
+// matches `etag` (the quoted strong validator). Accepts a comma-separated list,
+// the `*` wildcard (alone), and weak (`W/`) prefixes. Parsed directly over the
+// header bytes — no allocation, no `.to_string()`, no `split`.
+@[direct_array_access]
+fn etag_matches_slice(buf []u8, sl request_parser.Slice, etag string) bool {
+	start := sl.start
+	end := sl.start + sl.len
+	// A sole `*` (after trimming OWS) is the wildcard.
+	mut ws := start
+	for ws < end && (buf[ws] == ` ` || buf[ws] == `\t`) {
+		ws++
+	}
+	mut we := end
+	for we > ws && (buf[we - 1] == ` ` || buf[we - 1] == `\t`) {
+		we--
+	}
+	if we - ws == 1 && buf[ws] == `*` {
 		return true
 	}
-	for raw in v.split(',') {
-		mut tag := raw.trim_space()
-		if tag.starts_with('W/') {
-			tag = tag[2..]
+	// Walk the comma-separated list element by element.
+	mut i := start
+	for i < end {
+		for i < end && (buf[i] == ` ` || buf[i] == `\t` || buf[i] == `,`) {
+			i++
 		}
-		if tag == etag {
-			return true
+		mut e := i
+		for e < end && buf[e] != `,` {
+			e++
 		}
+		mut te := e
+		for te > i && (buf[te - 1] == ` ` || buf[te - 1] == `\t`) {
+			te--
+		}
+		mut ts := i
+		if te - ts >= 2 && buf[ts] == `W` && buf[ts + 1] == `/` {
+			ts += 2 // strip a weak validator prefix
+		}
+		if te - ts == etag.len {
+			mut hit := true
+			for k in 0 .. etag.len {
+				if buf[ts + k] != etag[k] {
+					hit = false
+					break
+				}
+			}
+			if hit {
+				return true
+			}
+		}
+		i = e + 1
 	}
 	return false
 }
@@ -717,31 +753,77 @@ fn looks_like_asset_slice(buf []u8, start int, end int) bool {
 	return dot
 }
 
-// parse_range parses `bytes=START-END` into an inclusive, clamped range.
-fn parse_range(range_header string, size int) ?(i64, i64) {
-	if !range_header.starts_with('bytes=') {
+// parse_range_slice parses `bytes=START-END` from `buf[sl]` into an inclusive,
+// clamped range. Single range only (more than one `-` is rejected, matching the
+// old `split('-')` arity check). Parsed in place — no allocation, no split.
+@[direct_array_access]
+fn parse_range_slice(buf []u8, sl request_parser.Slice, size int) ?(i64, i64) {
+	prefix := 'bytes='
+	if sl.len < prefix.len {
 		return none
 	}
-	parts := range_header['bytes='.len..].split('-')
-	if parts.len != 2 {
+	start0 := sl.start
+	end0 := sl.start + sl.len
+	for k in 0 .. prefix.len {
+		if buf[start0 + k] != prefix[k] {
+			return none
+		}
+	}
+	// Find the single '-' separating START and END.
+	mut dash := -1
+	for p in start0 + prefix.len .. end0 {
+		if buf[p] == `-` {
+			if dash >= 0 {
+				return none // a second '-' → not a single range
+			}
+			dash = p
+		}
+	}
+	if dash < 0 {
 		return none
 	}
 	sz := i64(size)
 	mut start := i64(0)
 	mut end := sz - 1
-	if parts[0] == '' {
-		n := parts[1].i64()
+	if dash == start0 + prefix.len {
+		// Suffix range `-N`: the last N bytes.
+		n := parse_u64_window(buf, dash + 1, end0)
 		start = if n >= sz { i64(0) } else { sz - n }
 		end = sz - 1
 	} else {
-		start = parts[0].i64()
-		end = if parts[1] == '' { sz - 1 } else { parts[1].i64() }
+		start = parse_u64_window(buf, start0 + prefix.len, dash)
+		end = if dash == end0 - 1 { sz - 1 } else { parse_u64_window(buf, dash + 1, end0) }
 	}
 	if start < 0 || end >= sz || start > end {
 		return none
 	}
 	return start, end
 }
+
+// parse_u64_window reads the leading run of ASCII digits in `buf[lo..hi]` as a
+// non-negative i64 (empty / non-digit → 0). It saturates at `range_num_ceiling`
+// rather than wrapping, so an absurd value (e.g. 2^64) fails the `end >= size`
+// bounds check in the caller instead of aliasing a valid offset. `size` is an
+// `int`, so the ceiling is far above any real asset and clear of i64 overflow.
+@[direct_array_access; inline]
+fn parse_u64_window(buf []u8, lo int, hi int) i64 {
+	mut v := i64(0)
+	for i in lo .. hi {
+		c := buf[i]
+		if c < `0` || c > `9` {
+			break
+		}
+		v = v * 10 + i64(c - `0`)
+		if v >= range_num_ceiling {
+			return range_num_ceiling
+		}
+	}
+	return v
+}
+
+// Above any int-sized asset (`size` is an `int`, < 2^31) yet far below i64 max,
+// so accumulation never wraps.
+const range_num_ceiling = i64(1) << 40
 
 // glob_match matches `name` against a pattern where `*` matches any run of
 // characters and `[hash]` matches a content-hash segment (>=6 hex chars). All
