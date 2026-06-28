@@ -15,8 +15,10 @@ narrative; the short version:
 1. **The arena build moved to `-prod -gc none` (no garbage collector).** A
    per-thread allocation microbenchmark showed the default Boehm GC's aggregate
    throughput *flat across cores* (16 cores ≈ 1 core; filed
-   [vlang/v#27488](https://github.com/vlang/v/issues/27488)), so a thread-per-core
-   server cannot let a shared GC gate allocation. The catch: under `-gc none`
+   [vlang/v#27488](https://github.com/vlang/v/issues/27488)) — that allocation
+   lock is **now fixed** by thread-local allocation (in the pinned V master), so
+   the default GC scales again. `-gc none`'s remaining edge is dodging
+   stop-the-world *collection* entirely + libc-visible `malloc`. The catch: under `-gc none`
    **nothing is ever freed**, so a per-request allocation is no longer "GC
    pressure" — it is a permanent **leak** that grows RSS without bound. The
    metric that matters becomes RSS growth *in excess of a Boehm build's* (the GC
@@ -64,8 +66,10 @@ profile's pathological realloc churn.
 
 The decisive lesson is **#5 (zero hot-path allocation)**. Per-request allocation
 is invisible on a laptop but **compounds catastrophically under V's Boehm GC at
-high core counts** — the GC's stop-the-world serializes all workers, so fewer
-cores do useful work. Removing per-request allocation let CPU utilisation (and
+high core counts** — the GC's stop-the-world *collection* pauses all workers, so
+fewer cores do useful work. (Allocation throughput itself now scales — thread-local
+alloc fixed the `GC_malloc` lock — but a high alloc rate still forces frequent
+collection.) Removing per-request allocation let CPU utilisation (and
 throughput) scale across all cores. Measured deltas (vanilla-epoll, the framework
 handler riding this lib):
 
@@ -114,9 +118,10 @@ bare-C/loopback ceiling here; local `wrk` has no more to give. Corollaries:
     confirm the generator isn't the bottleneck (give it more cores; if rps rises, it
     was generator-bound). A 12-server / 4-`wrk` split reads ~216k purely because
     4 `wrk` cores can't push more.
-  - Worker count must track *usable* cores (`core.worker_count()` via
-    `sched_getaffinity`), or a pinned/containerized run oversubscribes and the
-    number drops — see V_PERF_TOOLBOX's `nr_cpus` note.
+  - Worker count is `core.worker_count()` = `VANILLA_WORKERS` → `runtime.nr_cpus()`.
+    `nr_cpus()` is blind to `taskset`/cpuset, so set `VANILLA_WORKERS` on a pinned or
+    CPU-capped run (an affinity-aware auto-count was tried and reverted — it
+    under-sized the DB profiles).
 
 ## What ALL the fast servers have in common
 

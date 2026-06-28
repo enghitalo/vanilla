@@ -137,7 +137,8 @@ sb.write_string('Content-Length: ${body.len}\r\n')
 
 - Precompute fixed responses as `const`; reuse them.
 - Keep literal header text in plain string literals, not interpolated ones.
-- Use `write_decimal` (ints), `write_u8` (single bytes), `write_string` (literals).
+- Format ints with `strconv.write_dec`/`write_dec_u` (zero-alloc, into your `[]u8`)
+  or `Builder.write_decimal`; `write_u8` (single bytes), `write_string` (literals).
 - Seed the builder with `header_overhead + body.len`.
 - Always send an accurate `Content-Length` (or `Transfer-Encoding: chunked`).
 - Set `Connection: keep-alive` unless you intend to close.
@@ -145,7 +146,7 @@ sb.write_string('Content-Length: ${body.len}\r\n')
 **Don't**
 
 - Use `${}` to assemble response lines on the hot path.
-- Call `.str()` / `int.str()` just to concatenate — `write_decimal` avoids it.
+- Call `.str()` / `int.str()` just to concatenate — `strconv.write_dec` avoids it.
 - Forget the blank line (`\r\n\r\n`) between headers and body.
 - Compute the body twice (once for the length, once for the payload).
 
@@ -155,12 +156,17 @@ sb.write_string('Content-Length: ${body.len}\r\n')
 
 ---
 
-## 4. Allocate on the hot path with intent — under `-gc none`, not at all
+## 4. Allocate on the hot path with intent
 
-The production build is **`-prod -gc none`**: there is no garbage collector and
-**nothing is ever freed**. A per-request allocation is not "GC pressure" — it is
-a permanent **leak** that grows RSS linearly with traffic. So the hot paths must
-be *literally allocation-free*. See [V_PERF_TOOLBOX.md](V_PERF_TOOLBOX.md) and the
+The build mode differs by backend: **epoll ships `-prod -gc none`** — no garbage
+collector, **nothing is ever freed**, so a per-request allocation is not "GC
+pressure" but a permanent **leak** that grows RSS linearly with traffic; the hot
+path must be *literally allocation-free*. **io_uring ships `-prod`** with the
+default Boehm GC (per-request allocs are reclaimed). On the pinned V master the
+GC's allocation lock is gone (thread-local alloc), so default-GC allocation scales
+across cores — the alloc-free patterns below still matter (they cut GC
+**collection** pauses), and remain mandatory under `-gc none`. See
+[V_PERF_TOOLBOX.md](V_PERF_TOOLBOX.md) and the
 [wiki](https://github.com/enghitalo/vanilla/wiki/Memory-Management-under-gc-none).
 
 The recurring zero-allocation patterns:
@@ -177,10 +183,12 @@ The recurring zero-allocation patterns:
 - **Pool structs on a free-list** — reuse a heap object across requests, resetting
   its fields on release (the per-worker `ConnState` and per-request `Stash` pools
   do this), instead of `&T{}` per request.
-- **No error-boxing on the hot path** — `error()` allocates a `MessageError` even
-  when discarded by `or {}`; use a `-1`-returning "not found" (`find_byte_idx`).
-- **No empty/transient array literals** — `buf << [u8(0),0,0,0]` (and even `[]T{}`)
-  heap-allocate a temporary array; append the elements, or use a module `const`.
+- **No error-boxing on the hot path** — `error("msg")` allocates a `MessageError`;
+  on a hot `!T` "not found" return the cached `error_sentinel` (alloc-free, like
+  `none` for `?T`) or a plain-int twin (`find_byte_idx`, `frame_request_length_lim_idx`).
+- **No transient array literals** — `buf << [u8(0),0,0,0]` heap-allocates a
+  temporary array; append the elements or use a module `const`. (Empty `[]T{}` at
+  `len==0,cap==0` no longer allocates on the pinned V — that leak is fixed.)
 - **Sizing (default-GC builds only):** `[]u8{cap: n}` is uninitialized/noscan,
   `{len: n}` is zeroed, and a large `cap` is GC pressure. Under `-gc none` it is
   the *reuse* that matters, not the flag — a fresh buffer of any size leaks.

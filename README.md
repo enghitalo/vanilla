@@ -264,18 +264,18 @@ See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark 
 
 ### vanilla — future improvements
 
-- [ ] Per-worker `SO_REUSEPORT` accept on epoll (eliminate the single shared accept thread; blocked by clean multi-server shutdown lifecycle)
+- [ ] Per-worker `SO_REUSEPORT` accept on epoll — eliminate the single central accept thread (the io_uring backend already does per-worker accept; epoll still round-robins fds from one acceptor). Blocked by clean multi-server shutdown lifecycle.
 - [ ] Dynamic route matching (`/user/:id`) with a trie or radix tree
 - [ ] Query-string parser (`?key=value&…`) as a zero-copy slice view
 - [ ] Case-insensitive header lookup (IANA registry compliance)
 - [ ] `Host` header validation (RFC 9112 §7.2)
-- [ ] Request timeouts (idle read / total request deadline)
-- [ ] Chunked transfer-encoding in the request parser
+- [x] Request timeouts — `Limits.read_timeout_ms` (408) / `write_timeout_ms`, enforced by the per-worker deadline sweep
+- [x] Chunked transfer-encoding in the request parser (`frame_chunked_total`)
 - [ ] HTTP/2 support (multiplexing, HPACK, server push)
 - [ ] WebSocket upgrade (framing, ping/pong, close handshake)
-- [ ] TLS/HTTPS — complete V TLS bindings and integrate into the backends
+- [x] TLS/HTTPS — epoll backend via `ServerConfig.tls_config` (e.g. `tls.new_self_signed()`); other backends are plaintext
 - [ ] HTTPS example (`examples/https/`)
-- [ ] Per-connection request-count limit and body-size cap exposed via `ServerConfig`
+- [x] Body-size cap + max-connections via `Limits` (`max_body_bytes` → 413, `max_request_bytes`, `max_connections`); a per-connection request-count limit is still open
 - [ ] Response caching layer (ETag + `Last-Modified` auto-generation)
 - [ ] Logging middleware example (`examples/logging/`)
 - [ ] API documentation (godoc-style, inline)

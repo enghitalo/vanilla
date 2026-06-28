@@ -147,6 +147,14 @@ the Boehm floor. A **hard RSS cap** kills a runaway so it's safe unattended.
 start, so one-time bring-up (SCRAM/PBKDF2, lazy init) blurs the per-request
 signal. callgrind with post-warmup instrumentation is the disambiguator.
 
+**io_uring caveat:** valgrind/callgrind does **not** emulate io_uring — an
+io_uring server boots under callgrind but never serves (the ring delivers no
+completions, so `accept`/`recv` never fire and the client hangs). Profile the
+**epoll** backend under callgrind; the request-parsing / handler / response code is
+shared, so its per-request instruction counts carry over. For the io_uring-specific
+glue, read the source or use a tool that supports the ring. (perf works too but
+needs `perf_event_paranoid ≤ 2` / sudo.)
+
 ## V allocation gotchas (filed upstream — all fixed)
 
 Every gotcha below was filed upstream and is **fixed as of the pinned V master
