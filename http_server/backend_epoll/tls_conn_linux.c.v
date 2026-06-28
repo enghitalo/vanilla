@@ -32,7 +32,8 @@ mut:
 	sess           tls.Session
 	established    bool
 	watching_out   bool // currently subscribed to EPOLLOUT (avoid redundant epoll_ctl)
-	read_buf       []u8 // partial request accumulated across edges
+	read_buf       []u8 // per-conn request buffer: a partial across edges (len>0) or an empty pooled buffer reused next request (len==0, cap>0)
+	resp_buf       []u8 // per-conn response buffer, pooled across requests (reset to len 0, reused)
 	write_buf      []u8 // response remaining to be flushed (mbedTLS retries same data)
 	write_off      int
 	read_deadline  u64 // monotonic ns; >0 while a request is mid-read
@@ -103,13 +104,17 @@ fn handle_readable_fd_tls(request_handler core.RequestHandler, epoll_fd int, fd 
 		// established — fall through: a request may already be buffered by TLS.
 	}
 
-	// 2) Read one complete request over TLS, resuming any partial from a prior edge.
-	mut buf := []u8{len: 0, cap: 256}
-	if conn.read_buf.len > 0 {
+	// 2) Read one complete request over TLS. Reuse the per-conn read buffer: a
+	// partial from a prior edge (len>0) or an empty buffer pooled from the last
+	// completed request (len==0, cap>0). Allocate only on this conn's first use.
+	mut buf := []u8{}
+	if conn.read_buf.cap > 0 {
 		unsafe {
-			buf = conn.read_buf // take ownership (move)
+			buf = conn.read_buf // move (preserves a partial; empty otherwise)
 		}
 		conn.read_buf = []u8{}
+	} else {
+		buf = []u8{len: 0, cap: 256}
 	}
 
 	for {
@@ -120,7 +125,7 @@ fn handle_readable_fd_tls(request_handler core.RequestHandler, epoll_fd int, fd 
 		n := conn.sess.read_into(unsafe { &u8(buf.data) + buf.len }, spare)
 		if n == tls.want {
 			if buf.len == 0 {
-				unsafe { buf.free() }
+				conn.read_buf = buf // nothing buffered yet — return to the pool, no deadline
 				return
 			}
 			tls_save_read(mut conn, buf, limits.read_timeout_ms) // partial — resume on EPOLLIN
@@ -172,17 +177,25 @@ fn handle_readable_fd_tls(request_handler core.RequestHandler, epoll_fd int, fd 
 	// Request complete — clear the read deadline.
 	conn.read_deadline = 0
 
-	// Server-owned response buffer: the handler appends raw response bytes.
-	// (The TLS path keeps a per-request buffer; the persistent-buffer
-	// batching is implemented on the plain path.)
-	mut resp := []u8{len: 0, cap: 4096}
+	// Per-connection response buffer, pooled across requests (reset to len 0 and
+	// reused; allocated on first use). The handler appends raw response bytes.
+	mut resp := []u8{}
+	if conn.resp_buf.cap > 0 {
+		unsafe {
+			resp = conn.resp_buf // move out of the pool
+		}
+		conn.resp_buf = []u8{}
+	} else {
+		resp = []u8{len: 0, cap: 4096}
+	}
 	request_handler(buf, fd, mut resp) or {
 		unsafe { buf.free() }
 		unsafe { resp.free() }
 		close_tls(epoll_fd, fd, active_conns, mut sessions)
 		return
 	}
-	unsafe { buf.free() }
+	unsafe { buf.len = 0 }
+	conn.read_buf = buf // pool the read buffer's capacity for the next request
 	tls_send_or_park(epoll_fd, fd, limits, active_conns, mut sessions, mut conn, resp)
 }
 
@@ -245,7 +258,9 @@ fn tls_send_or_park(epoll_fd int, fd int, limits core.Limits, active_conns &core
 		close_tls(epoll_fd, fd, active_conns, mut sessions)
 		return
 	}
-	unsafe { resp.free() }
+	mut done := unsafe { resp }
+	unsafe { done.len = 0 }
+	conn.resp_buf = done // return to the per-conn pool instead of freeing
 	tls_set_out(mut conn, epoll_fd, fd, false) // keep-alive; not waiting on writability
 }
 
@@ -287,8 +302,13 @@ fn sweep_timeouts_tls(epoll_fd int, active_conns &core.Counter, mut sessions map
 fn close_tls(epoll_fd int, fd int, active_conns &core.Counter, mut sessions map[int]&TlsConn) {
 	if mut c := sessions[fd] {
 		unsafe {
-			if c.read_buf.len > 0 {
+			// read_buf / resp_buf are pooled and may be empty-but-allocated
+			// (len 0, cap > 0), so free on capacity, not length.
+			if c.read_buf.cap > 0 {
 				c.read_buf.free()
+			}
+			if c.resp_buf.cap > 0 {
+				c.resp_buf.free()
 			}
 			if c.write_buf.len > 0 {
 				c.write_buf.free()
