@@ -33,3 +33,18 @@ examples/veb_like/veb_like
 sample.mp4
 *.mp4
 *.log
+
+# Compiled bench binaries: `v bench/<dir>/<name>.v` drops `<name>` beside the
+# source (use `v run`, or `-o /tmp/...` as ci_bench.sh does, to avoid these).
+# Sources stay tracked.
+bench/etag_hash/etag_hash
+bench/middleware/middleware_bench
+bench/request_parser/request_parser_bench
+bench/static_assets/static_assets_bench
+
+# V build / profiling artifacts
+*.tmp.c
+perf.data
+perf.data.old
+callgrind.out.*
+massif.out.*
