@@ -9,8 +9,9 @@ reading the generated C, not by guessing.**
 vanilla can run either way, and the rules flip between them:
 
 - **Default (`-prod`, Boehm GC).** Allocations are reclaimed, but the GC's
-  stop-the-world serializes all workers, so per-request allocation is **GC
-  pressure** that caps how many cores do useful work. The "Allocation facts"
+  stop-the-world **collection** pauses all workers, so heavy per-request allocation
+  is still **GC pressure** that caps how many cores do useful work. (Allocation
+  *throughput* itself now scales — see the note below.) The "Allocation facts"
   below (noscan, scan-on-grow) are this mode.
 - **`-prod -gc none` (the arena/production build).** No GC, **nothing is ever
   freed**. A per-request allocation is therefore a permanent **leak** — RSS grows
@@ -18,9 +19,14 @@ vanilla can run either way, and the rules flip between them:
   (so tools like callgrind/heaptrack see them, unlike Boehm's `GC_malloc`). This
   is the build to optimize for; the hot paths must be **literally allocation-free**.
 
-Why `-gc none` at all: on a thread-per-core server the shared GC doesn't scale —
-a microbenchmark showed default-GC aggregate allocation throughput flat from 1→16
-threads (16 cores ≈ 1 core; [vlang/v#27488](https://github.com/vlang/v/issues/27488)).
+Why `-gc none` at all: historically the shared GC didn't scale — aggregate
+allocation throughput was flat 1→16 threads (16 cores ≈ 1 core;
+[vlang/v#27488](https://github.com/vlang/v/issues/27488)). **That is now fixed**
+by thread-local allocation (`GC_malloc` no longer takes a global lock), so on the
+pinned V the default GC scales. `-gc none` is therefore no longer about the alloc
+lock; its remaining value is dodging Boehm's stop-the-world *collection* entirely
+on alloc-heavy paths, plus plain-libc `malloc` that profilers can see — and it is
+only safe where the hot path is **literally allocation-free** (otherwise it leaks).
 
 > **Measuring a leak under `-gc none`:** a rising RSS line is *not* proof — a
 > Boehm build of the same server also grows (glibc arena, connection buffers,
@@ -141,40 +147,53 @@ the Boehm floor. A **hard RSS cap** kills a runaway so it's safe unattended.
 start, so one-time bring-up (SCRAM/PBKDF2, lazy init) blurs the per-request
 signal. callgrind with post-warmup instrumentation is the disambiguator.
 
-## V allocation gotchas (filed upstream)
+## V allocation gotchas (filed upstream — all fixed)
 
-- **Empty/zero-length array literals allocate.** `[]T{}` (and a default-init `[]T`
-  struct field) call `alloc_array_data(0)` → `vcalloc(header)` even at `len == 0,
-  cap == 0`. Under `-gc none` each is a permanent leak. Append elements or use a
-  module `const` instead. ([vlang/v#27487](https://github.com/vlang/v/issues/27487))
+Every gotcha below was filed upstream and is **fixed as of the pinned V master
+build** (`badd3466…`). Each entry notes what changed and what vanilla still does.
+
+- **Empty/zero-length array literals allocated.** `[]T{}` (and a default-init `[]T`
+  field) used to call `alloc_array_data(0)` even at `len == 0, cap == 0` — a
+  permanent leak under `-gc none`. **Fixed:** `__new_array` now allocates only when
+  `cap > 0`, so a zero-len/zero-cap literal is alloc-free. (Appending or a module
+  `const` is no longer required to avoid the leak.)
+  ([vlang/v#27487](https://github.com/vlang/v/issues/27487))
 - **`array.slice()` (`a[start..end]`) marks the source buffer on every call.**
-  It does an unconditional `mark_buffer_has_slices()` (a malloc data-header pointer
-  round-trip + flag write) plus bounds checks and the result-struct build — ~11% of
-  the plaintext request hot path's `-prod` instructions when slicing the read buffer
-  per request, yet pure waste for a transient read-only view (`has_slices` is only
-  consulted by `delete`/shrink, which a manually-managed reused buffer never does).
-  Fix: a non-owning window built by hand — copy the array header, repoint
-  `data`/`len`/`cap`, `unsafe { flags.clear(.managed) }` so it is never freed and a
-  sub-slice of it also skips marking (compiles to a struct copy + 3 stores, zero
-  alloc). See `backend_epoll`'s `buf_view`. ([vlang/v#27507](https://github.com/vlang/v/issues/27507))
-- **Allocation does not scale across cores** under the default GC (the reason for
-  `-gc none`). ([vlang/v#27488](https://github.com/vlang/v/issues/27488))
-- **`error()` boxes a `MessageError`** — even when the caller discards it with
-  `or {}`. So a `!int` "not found" allocates per call; prefer a `-1`-returning
-  variant (`find_byte_idx`, not `find_byte`) on hot paths.
-  ([vlang/v#27508](https://github.com/vlang/v/issues/27508))
-- **`int.str()` / `${}` allocate** — format integers into a reused buffer with an
-  itoa helper (`wi`/`emit_int`), never `.str()` on the response hot path.
-  (`strings.Builder.write_decimal` exists for the Builder target; no `[]u8`-buffer
-  formatter does — [vlang/v#27509](https://github.com/vlang/v/issues/27509))
-- **`runtime.nr_cpus()` ignores CPU affinity** — it is `sysconf(_SC_NPROCESSORS_ONLN)`
-  = every online *host* core, blind to `taskset`/cpuset and cgroup CPU pinning. A
-  server pinned to N cores (a profiling run, or a container capped at N CPUs on a
-  bigger host) that sizes its worker pool from `nr_cpus()` spawns host-many workers
-  and oversubscribes them N-ways. The worker count instead comes from
-  `core.worker_count()`: a `VANILLA_WORKERS` env override → else the
-  `sched_getaffinity` mask bit-count (`core/affinity_linux.c.v`) → else `nr_cpus()`.
-- **`&Struct{}` as an `if`-*expression* branch** has miscompiled to invalid C in
-  some build modes — use the statement form
-  (`mut x := &T(unsafe{nil}); if … { x = … } else { x = &T{…} }`).
-  ([vlang/v#27329](https://github.com/vlang/v/issues/27329))
+  Unconditional `mark_buffer_has_slices()` (a malloc data-header round-trip + flag
+  write) + bounds checks + result-struct build — ~11% of the plaintext hot path's
+  `-prod` instructions when slicing the read buffer per request, yet pure waste for
+  a transient read-only view. **Still marks by default** on the pin (V added a
+  `.noslices` flag, but only for the `<<`-free-in-place case; `slice()` itself is
+  unchanged), so vanilla keeps the hand-built non-marking window — copy the header,
+  repoint `data`/`len`/`cap`, `unsafe { flags.clear(.managed) }` (struct copy + 3
+  stores, zero alloc). `buf_view` now lives in **both** the epoll (`backend_epoll`)
+  and io_uring backends. ([vlang/v#27507](https://github.com/vlang/v/issues/27507))
+- **Allocation did not scale across cores** under the default GC — the original
+  reason for `-gc none`. **Fixed** by thread-local allocation: `GC_malloc` no longer
+  serializes on a process-global lock, so the default Boehm GC now scales with
+  workers. Use `-gc none` only where the hot path is already alloc-free (the GC-lock
+  penalty it avoided is gone). ([vlang/v#27488](https://github.com/vlang/v/issues/27488),
+  [#27486](https://github.com/vlang/v/issues/27486))
+- **`error()` boxed a `MessageError`** — even when discarded with `or {}`, so a
+  `!int` "not found" allocated per call. **Fixed:** builtin now exports
+  `error_sentinel`, a cached allocation-free `IError`; `return error_sentinel` from a
+  hot `!T` path is alloc-free (like `none` for `?T`). A `-1`/sentinel-returning twin
+  (`find_byte_idx` vs `find_byte`; `frame_request_length_lim_idx`) is still used where
+  the **`Ok`-side** Result construction also matters — `error_sentinel` only removes
+  the error-side box. ([vlang/v#27508](https://github.com/vlang/v/issues/27508))
+- **`int.str()` / `${}` allocate.** **Fixed:** the stdlib now has a `[]u8`-buffer
+  formatter — `strconv.write_dec(n i64, mut buf []u8)` and `write_dec_u(n u64, …)`
+  write decimal digits into a caller buffer with no allocation. Use these (or
+  `strings.Builder.write_decimal` for the Builder target) instead of `.str()` on the
+  response hot path. ([vlang/v#27509](https://github.com/vlang/v/issues/27509))
+- **`runtime.nr_cpus()` ignores CPU affinity** *(unchanged upstream — handled
+  vanilla-side)*: it is `sysconf(_SC_NPROCESSORS_ONLN)` = every online *host* core,
+  blind to `taskset`/cpuset/cgroup pinning. `core.worker_count()` sizes the pool from
+  a `VANILLA_WORKERS` env override → else `nr_cpus()`. **Set `VANILLA_WORKERS`** when
+  pinned to N cores or in a CPU-capped container, or the pool over-subscribes. (An
+  earlier `sched_getaffinity`-based auto-count was reverted — it under-sized the DB
+  profiles, which need the full host count.)
+- **`&Struct{}` as an `if`-*expression* branch** miscompiled to invalid C in some
+  build modes. **Fixed** in cgen — the statement-form workaround
+  (`mut x := &T(unsafe{nil}); if … { x = … } else { x = &T{…} }`) is no longer
+  required. ([vlang/v#27329](https://github.com/vlang/v/issues/27329))

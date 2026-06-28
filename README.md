@@ -287,16 +287,48 @@ See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark 
 - [ ] Request-parser edge-case tests (malformed requests, split TCP segments)
 - [ ] End-to-end integration test suite across all backends
 
-### V language — upstream improvements needed
+### V language — upstream issues vanilla filed (all resolved)
 
-These are limitations in the V compiler and standard library that affect vanilla directly.
-They are tracked as upstream issues.
+Limitations in the V compiler and standard library that vanilla's hot paths
+exercised. We filed them upstream; as of the pinned V master build
+(`badd3466…`) **every one is fixed**. Kept here as a record — and as a guide to
+what the current pin buys and which workarounds it retires.
 
-- [ ] **`[]T{}` allocates even at `len == 0, cap == 0`** — `alloc_array_data(0)` is called unconditionally; under `-gc none` every default-initialized array field is a permanent leak ([vlang/v#27487](https://github.com/vlang/v/issues/27487))
-- [ ] **GC allocation does not scale across cores** — the default Boehm GC is effectively single-threaded for allocation; 16 workers perform the same as 1 ([vlang/v#27488](https://github.com/vlang/v/issues/27488))
-- [ ] **`error()` boxes a `MessageError` on every call** — even when the result is discarded with `or {}`; a "not found" fast path that returns `!T` still allocates per call on the hot path. Confirmed at codegen level (`error()` → `builtin___v_error` → `HEAP(MessageError, …)` → `memdup`), unlike `none` which uses a cached const ([vlang/v#27508](https://github.com/vlang/v/issues/27508))
-- [ ] **`int.str()` and `${}` string interpolation allocate** — there is no zero-alloc integer-to-`[]u8` formatter in the stdlib (`${x}` → `int_str` malloc, `${x:08d}` → `str_intp` Builder+string); callers must reach for custom helpers (`write_decimal`, `emit_int`) ([vlang/v#27509](https://github.com/vlang/v/issues/27509))
-- [ ] **`runtime.nr_cpus()` ignores CPU affinity** — `sched_getaffinity` is not consulted; `taskset -c 0` still reports all cores, making CPU-pinning profiles misleading
-- [ ] **`&Struct{}` in an `if`-expression branch miscompiles in some build modes** — the generated C is invalid (the `(T*)` cast is torn in half by `direct_heap_struct_init` hoisting inside a ternary); the workaround is the statement form with a `mut x := &T(unsafe{nil})` pre-declaration. Minimal repro + root cause confirmed on V HEAD ([vlang/v#27329](https://github.com/vlang/v/issues/27329))
-- [x] **`strings.Builder.write_decimal` already exists** — a zero-alloc `i64` decimal writer (`vlib/strings/builder.c.v`), so `write_string(n.str())` is unnecessary; use it directly. Remaining gaps: no unsigned `u64` variant and the JS backend lacks it ([vlang/v#27510](https://github.com/vlang/v/issues/27510))
-- [x] **`argon2id`, `bcrypt`, `scrypt`, `pbkdf2`, `hkdf` all ship in `vlib/crypto`** (pure-V, no C bindings) — the stdlib *does* have memory-hard KDFs (argon2, scrypt). Only gap: bcrypt/scrypt/pbkdf2 aren't documented in the crypto README ([vlang/v#27511](https://github.com/vlang/v/issues/27511))
+- [x] **`[]T{}` allocated even at `len == 0, cap == 0`** — fixed: `__new_array`
+  now guards on `cap > 0`, so a zero-length/zero-cap literal or default-initialized
+  array field no longer calls `alloc_array_data`. The append-or-`const` workaround
+  is no longer needed. ([vlang/v#27487](https://github.com/vlang/v/issues/27487))
+- [x] **GC allocation did not scale across cores** — fixed by **thread-local
+  allocation**: Boehm's `GC_malloc` no longer takes a process-global lock, so N
+  workers allocate concurrently instead of serializing (16 cores ≈ 16×, not ≈ 1×).
+  This removes the GC-lock penalty that was the main reason for `-gc none`; `-gc none`
+  is still used where the hot path is already alloc-free.
+  ([vlang/v#27488](https://github.com/vlang/v/issues/27488), [#27486](https://github.com/vlang/v/issues/27486))
+- [x] **`error()` boxed a `MessageError` on every call** — fixed: builtin now
+  exports **`error_sentinel`**, a cached allocation-free `IError`; a hot "not found"
+  `!T` path can `return error_sentinel` (like `none` for `?T`) instead of allocating.
+  (The `Ok`-side Result construction is a separate cost — addressed in vanilla by the
+  plain-`int` framing twin `frame_request_length_lim_idx`.)
+  ([vlang/v#27508](https://github.com/vlang/v/issues/27508))
+- [x] **No zero-alloc integer formatter in the stdlib** — fixed:
+  **`strconv.write_dec(n i64, mut buf []u8)`** and `write_dec_u(n u64, …)` write
+  decimal digits into a caller-provided buffer with no allocation — use these instead
+  of `.str()` / `${}` on the response hot path.
+  ([vlang/v#27509](https://github.com/vlang/v/issues/27509))
+- [x] **`array.slice()` marked the source buffer on every call** — closed: V added a
+  `.noslices` array flag, but `a[start..]` still marks by default, so vanilla keeps
+  its hand-built non-marking `buf_view` window — now used by **both** the epoll and
+  io_uring backends. ([vlang/v#27507](https://github.com/vlang/v/issues/27507))
+- [x] **`&Struct{}` in an `if`-expression branch miscompiled in some build modes** —
+  fixed in cgen; the statement-form (`mut x := &T(unsafe{nil}); if … {}`) workaround
+  is no longer required. ([vlang/v#27329](https://github.com/vlang/v/issues/27329))
+- [x] **stdlib formatter / KDF gaps** — `strings.Builder.write_decimal` gained an
+  unsigned `u64` variant + JS-backend parity ([vlang/v#27510](https://github.com/vlang/v/issues/27510));
+  bcrypt/scrypt/pbkdf2 are now documented in the crypto README
+  ([vlang/v#27511](https://github.com/vlang/v/issues/27511)).
+- **`runtime.nr_cpus()` ignores CPU affinity** *(not a V change — handled
+  vanilla-side)*: it is `sysconf`, blind to `taskset`/cpuset, so on a pinned or
+  CPU-capped host it over-counts. vanilla sizes its pool from `core.worker_count()`
+  = `VANILLA_WORKERS` → `nr_cpus()`; **set `VANILLA_WORKERS`** to pin the worker count
+  inside a cpuset or CPU-limited container. (An affinity-aware auto-count was tried
+  and reverted — it under-sized the DB profiles.)
