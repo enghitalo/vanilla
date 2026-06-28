@@ -433,9 +433,15 @@ fn async_start_body_drain(h core.AsyncHandler, mut reactor AsyncReactor, epoll_f
 fn async_drain(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) bool {
 	mut pos := 0
 	for pos < cs.read_buf.len && cs.awaiting_fd < 0 {
-		total := request_parser.frame_request_length_lim(buf_view(cs.read_buf, pos,
-			cs.read_buf.len - pos), limits.max_header_bytes, limits.max_body_bytes) or {
-			match err.code() {
+		// _idx twin: plain int, no per-request !int boxing. The error sentinel is
+		// the negated HTTP status, so `-total` recovers the old err.code() value.
+		total := request_parser.frame_request_length_lim_idx(buf_view(cs.read_buf, pos,
+			cs.read_buf.len - pos), limits.max_header_bytes, limits.max_body_bytes)
+		if total == -1 {
+			break // incomplete — wait for more bytes
+		}
+		if total < -1 {
+			match -total {
 				413 { cs.write_buf << response.status_413_response }
 				431 { cs.write_buf << response.status_431_response }
 				else { cs.write_buf << response.tiny_bad_request_response }
@@ -446,9 +452,6 @@ fn async_drain(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd i
 				close_conn(epoll_fd, fd, active_conns, mut st)
 			}
 			return false
-		}
-		if total < 0 {
-			break // incomplete — wait for more bytes
 		}
 		// A file deferred by an earlier request in this batch must be emitted (as
 		// bytes, in order) BEFORE this next response is appended — same ordering

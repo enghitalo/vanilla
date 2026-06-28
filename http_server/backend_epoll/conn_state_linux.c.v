@@ -371,11 +371,17 @@ fn handle_readable_plain(request_handler core.RequestHandler, epoll_fd int, fd i
 fn drain_requests(request_handler core.RequestHandler, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState) bool {
 	mut pos := 0
 	for pos < cs.read_buf.len {
-		total := request_parser.frame_request_length_lim(buf_view(cs.read_buf, pos,
-			cs.read_buf.len - pos), limits.max_header_bytes, limits.max_body_bytes) or {
+		// _idx twin: plain int, no per-request !int boxing. The error sentinel is
+		// the negated HTTP status, so `-total` recovers the old err.code() value.
+		total := request_parser.frame_request_length_lim_idx(buf_view(cs.read_buf, pos,
+			cs.read_buf.len - pos), limits.max_header_bytes, limits.max_body_bytes)
+		if total == -1 {
+			break // incomplete — wait for more bytes
+		}
+		if total < -1 {
 			// Append the canned error so it lands AFTER the responses already
 			// batched for this burst, then flush and close.
-			match err.code() {
+			match -total {
 				413 { cs.write_buf << response.status_413_response }
 				431 { cs.write_buf << response.status_431_response }
 				else { cs.write_buf << response.tiny_bad_request_response }
@@ -385,9 +391,6 @@ fn drain_requests(request_handler core.RequestHandler, epoll_fd int, fd int, lim
 				close_conn(epoll_fd, fd, active_conns, mut st)
 			}
 			return false
-		}
-		if total < 0 {
-			break // incomplete — wait for more bytes
 		}
 		req := buf_view(cs.read_buf, pos, total) // zero-copy, non-marking view into read_buf
 		// A file deferred by an earlier request in this batch must be emitted (as

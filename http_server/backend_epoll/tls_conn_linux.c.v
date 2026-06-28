@@ -151,19 +151,22 @@ fn handle_readable_fd_tls(request_handler core.RequestHandler, epoll_fd int, fd 
 			close_tls(epoll_fd, fd, active_conns, mut sessions)
 			return
 		}
-		total := request_parser.frame_request_length_lim(buf, limits.max_header_bytes,
-			limits.max_body_bytes) or {
-			unsafe { buf.free() }
-			close_tls(epoll_fd, fd, active_conns, mut sessions) // malformed/too-large → drop
-			return
-		}
+		// _idx twin: plain int, no per-request !int boxing. >=0 complete, -1
+		// incomplete, < -1 a framing/limit error (the TLS path drops on any error).
+		total := request_parser.frame_request_length_lim_idx(buf, limits.max_header_bytes,
+			limits.max_body_bytes)
 		if total >= 0 {
 			if buf.len > total {
 				buf.trim(total)
 			}
 			break
 		}
-		// incomplete — keep draining this burst
+		if total < -1 {
+			unsafe { buf.free() }
+			close_tls(epoll_fd, fd, active_conns, mut sessions) // malformed/too-large → drop
+			return
+		}
+		// total == -1: incomplete — keep draining this burst
 	}
 
 	// Request complete — clear the read deadline.
