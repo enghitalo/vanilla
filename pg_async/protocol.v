@@ -48,7 +48,7 @@ pub fn auth_subtype(payload []u8) u32 {
 	if payload.len < 4 {
 		return 0xFFFF_FFFF
 	}
-	return binary.big_endian_u32(payload[0..4])
+	return binary.big_endian_u32_at(payload, 0)
 }
 
 // ── backend framing ─────────────────────────────────────────────────────────
@@ -68,7 +68,7 @@ pub fn next_message(buf []u8) ?MsgHeader {
 	if buf.len < 5 {
 		return none
 	}
-	msg_len := int(binary.big_endian_u32(buf[1..5]))
+	msg_len := int(binary.big_endian_u32_at(buf, 1))
 	if msg_len < 4 {
 		return none
 	}
@@ -90,7 +90,7 @@ pub fn next_message_at(buf []u8, pos int) ?MsgHeader {
 	if buf.len - pos < 5 {
 		return none
 	}
-	msg_len := int(binary.big_endian_u32(buf[pos + 1..pos + 5]))
+	msg_len := int(binary.big_endian_u32_at(buf, pos + 1))
 	if msg_len < 4 {
 		return none
 	}
@@ -131,7 +131,7 @@ pub fn (mut it FrameIter) next() ?Frame {
 	if it.pos + 5 > it.buf.len {
 		return none
 	}
-	msg_len := int(binary.big_endian_u32(it.buf[it.pos + 1..it.pos + 5]))
+	msg_len := int(binary.big_endian_u32_at(it.buf, it.pos + 1))
 	if msg_len < 4 {
 		return none
 	}
