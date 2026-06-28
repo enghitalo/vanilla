@@ -1,139 +1,97 @@
 # HTTP Server Module
 
-A high-performance, epoll-based HTTP server implementation for V.
+`http_server` is vanilla's core: a multi-threaded, non-blocking HTTP/1.1 server
+with pluggable I/O backends. Handlers are pure — `fn (req []u8, fd int, mut out
+[]u8) !` — they receive the raw request bytes and **append** the raw response to a
+server-owned buffer; the server batches everything appended during one readiness
+event into a single send and reuses the buffer across requests.
 
-## Architecture
+## Backends
 
-The module is organized into focused components:
+Selected via `ServerConfig.io_multiplexing` (`IOBackend`). One worker thread per
+core; per-connection read/response buffers are pooled, so the hot path does no
+per-request allocation.
 
-### Core Files
+| Platform | Backend | Accept model | Handlers supported |
+|---|---|---|---|
+| Linux | `.epoll` *(default)* | one central acceptor → round-robins fds to per-worker epolls | `request_handler`, `stateful_handler`, `async_handler`, TLS |
+| Linux | `.io_uring` | per-worker `SO_REUSEPORT` listener + multishot accept (kernel 5.19+) | `request_handler` (stateless) |
+| macOS | kqueue | per-worker | `request_handler`, `async_handler` |
+| Windows | IOCP | per-worker | `request_handler` |
 
-#### `http_server.c.v`
-Main orchestration and server lifecycle management.
+## Handler paths
 
-**Key Components:**
-- `Server` struct: Main server configuration and state
-- `run()`: Server initialization, thread pool setup, and accept loop
-- `handle_accept_loop()`: Non-blocking connection acceptance with round-robin load balancing
-- `process_events()`: Epoll event loop for client connections
-- `handle_readable_fd()`: Request reading, handler invocation, and response sending
+Provide **exactly one** of:
 
-**Threading Model:**
-- Main thread: Handles `accept()` via dedicated epoll instance
-- Worker threads: One per CPU core, each with its own epoll instance for client I/O
-- Round-robin distribution of accepted connections across worker threads
+- **`request_handler`** — `fn (req []u8, fd int, mut out []u8) !`, stateless. All backends.
+- **`stateful_handler` + `make_state`** — lock-free per-worker state (e.g. a DB
+  connection): `make_state` runs once per worker, then every request on that worker
+  is dispatched with it. Linux/epoll only.
+- **`async_handler` (+ optional `make_state`)** — may PARK a request on any fd via
+  `ac.watch(...)` and resume by a continuation in the worker loop (DB sockets,
+  upstreams, timers, `EPOLLOUT` backpressure). Linux/epoll + macOS/kqueue.
 
----
+`on_worker_start` arms clientless background watches (e.g. a periodic timerfd that
+refreshes per-worker state with no extra thread). Linux/epoll, plaintext only.
 
-#### `epoll.v`
-Low-level epoll abstractions for Linux I/O multiplexing.
-
-**Exports:**
-- `EpollEventCallbacks`: Callback interface for read/write events
-  - `on_read fn(fd int)`: Invoked when socket is readable
-  - `on_write fn(fd int)`: Invoked when socket is writable
-- `create_epoll_fd() int`: Creates new epoll instance
-- `add_fd_to_epoll(epoll_fd int, fd int, events u32) int`: Registers fd with events
-- `remove_fd_from_epoll(epoll_fd int, fd int)`: Unregisters fd
-
-**Event Flags:**
-- `C.EPOLLIN`: Socket readable
-- `C.EPOLLOUT`: Socket writable
-- `C.EPOLLET`: Edge-triggered mode
-- `C.EPOLLHUP | C.EPOLLERR`: Connection errors
-
----
-
-#### `socket.v`
-Socket creation, configuration, and lifecycle management.
-
-**Exports:**
-- `create_server_socket(port int) int`: Creates non-blocking TCP server socket
-  - Enables `SO_REUSEPORT` for multi-threaded accept
-  - Binds to `INADDR_ANY`
-  - Sets listen backlog to `max_connection_size`
-- `close_socket(fd int)`: Closes socket descriptor
-- `set_blocking(fd int, blocking bool)`: Configures socket blocking mode (internal)
-
-**Constants:**
-- `max_connection_size = 1024`: Listen queue size
-
----
-
-#### `request.v`
-HTTP request reading from client sockets.
-
-**Exports:**
-- `read_request(client_fd int) ![]u8`: Reads complete HTTP request
-  - Returns error if recv fails or client closes connection
-  - Handles partial reads in non-blocking mode
-  - 140-byte buffer chunks for efficient memory usage
-
-**Error Cases:**
-- `recv failed`: System error during read
-- `client closed connection`: EOF received
-- `empty request`: No data read
-
----
-
-#### `response.v`
-HTTP response transmission utilities.
-
-**Exports:**
-- `send_response(fd int, buffer_ptr &u8, buffer_len int) !`: Sends response buffer
-  - Uses `MSG_NOSIGNAL | MSG_ZEROCOPY` for performance
-  - Returns error on send failure
-- `send_bad_request_response(fd int)`: Sends HTTP 400 response
-- `send_status_444_response(fd int)`: Sends HTTP 444 (No Response)
-
-**Constants:**
-- `tiny_bad_request_response`: Minimal 400 response bytes
-- `status_444_response`: Nginx-style connection close signal
-
----
-
-## Usage Example
+## Minimal server
 
 ```v
-import http_server
+import vanilla.http_server
 
-fn my_handler(request []u8, client_fd int) ![]u8 {
-    // Parse request, generate response
-    return 'HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!'.bytes()
+fn handle(req []u8, fd int, mut out []u8) ! {
+	out << 'HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!'.bytes()
 }
 
-mut server := http_server.Server{
-    port: 8080
-    request_handler: my_handler
+fn main() {
+	mut server := http_server.new_server(http_server.ServerConfig{
+		port:            8080
+		io_multiplexing: .epoll // or .io_uring on Linux
+		request_handler: handle
+	})!
+	server.run() // blocks
 }
-
-server.run() // Blocks until shutdown
 ```
 
-## Performance Characteristics
+`new_server(ServerConfig) !Server` validates the config (e.g. rejects more than one
+handler path, or a backend that doesn't support the chosen handler); `server.run()`
+spawns the workers and blocks; `server.shutdown(grace_ms int)` shuts the listeners
+and drains in-flight requests up to the grace period.
 
-- **Connection Handling**: O(1) epoll operations per event
-- **Memory**: 140-byte buffers per active read operation
-- **Concurrency**: N worker threads (N = CPU cores)
-- **Load Balancing**: Round-robin accept distribution
+## Request limits (`ServerConfig.limits`)
 
-## Platform Support
+`Limits` gates abusive requests at the framing/accept layer (0 = unlimited, zero-cost):
 
-- **Linux**: Full support via epoll
-- **Windows**: Not supported (use WSL)
-- **macOS**: Not supported (epoll unavailable)
+| field | effect |
+|---|---|
+| `max_header_bytes` | **431** once the header block exceeds it |
+| `max_body_bytes` | **413** from the declared `Content-Length`, before buffering the body |
+| `max_request_bytes` | ceiling on a single buffered request (headers + body) |
+| `max_connections` | refuse new connections past this many concurrent (checked at accept) |
+| `read_timeout_ms` | **408** + close a connection that can't finish its request in time |
+| `write_timeout_ms` | close a connection whose parked response can't drain in time |
 
-## Thread Safety
+## TLS
 
-- Each worker thread has isolated epoll instance
-- No shared mutable state between workers
-- Request handler must be thread-safe (receives immutable request slice)
+Set `ServerConfig.tls_config` (e.g. `tls.new_self_signed()`) and `certificates` for
+HTTPS on the **epoll** backend; the other backends are plaintext.
 
-## Error Handling
+## Internals (where to look)
 
-Connection errors trigger automatic cleanup:
-1. Remove fd from epoll
-2. Close socket
-3. Continue processing remaining events
+- `http_server.c.v` — `new_server`, `ServerConfig`, `Server`, `shutdown`.
+- `backend_epoll/` — epoll worker (`worker_linux.c.v`), connection state + buffer
+  pool (`conn_state_linux.c.v`), async reactor (`async_linux.c.v`), TLS
+  (`tls_conn_linux.c.v`).
+- `http_server_io_uring_linux.c.v` + `io_uring/` — the io_uring backend.
+- `http1_1/request_parser/` — request framing (`frame_request_length_lim`/`_idx`
+  with the non-marking `buf_view` window; chunked via `frame_chunked_total`).
+- `kqueue/`, `iocp/` — macOS / Windows backends.
 
-Request/response errors are logged but don't crash the server.
+## Performance
+
+Worker count = `VANILLA_WORKERS` env → `runtime.nr_cpus()` (set `VANILLA_WORKERS`
+inside a cpuset/CPU-capped container). The hot path is allocation-free (pooled
+per-connection buffers, zero-copy `buf_view` request windows, one batched send per
+readiness event). epoll ships `-prod -gc none`; io_uring ships `-prod` (default
+GC). See [../docs/V_PERF_TOOLBOX.md](../docs/V_PERF_TOOLBOX.md) and
+[../docs/BEST_PRACTICES.md](../docs/BEST_PRACTICES.md).
