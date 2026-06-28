@@ -68,11 +68,23 @@ Reach for the bytes you already have before allocating new ones.
   truly need a `string`.
 - Compare header names/values against the slice directly.
 - Defer `.clone()` / `.to_string()` until the byte data must outlive the buffer.
+- Build a map lookup key as a non-owning view — `unsafe { tos(ptr, len) }` —
+  when the map never retains it (it only hashes the key bytes). The
+  [static_assets module](../http_server/static_assets/static_assets.v#L273-L281)
+  is the canonical example: `key := tos(&buf[rs], rel_len)`, a view straight into
+  the request buffer, so routing costs no allocation.
 
 **Don't**
 
 - Copy the whole body to inspect a few bytes.
 - Build intermediate `string`s in a loop — concatenation reallocates.
+- Build a lookup key with a slice expression like `route[8..]` — V `string.substr`
+  does `malloc_noscan(len+1)` + `memcpy`, a fresh heap string **every request**
+  (a permanent leak under `-gc none`). Isolated proof (2026-06): 20M lookups into
+  the same `map[string]int`, `-prod -gc none` — `route[8..]` grows RSS +625 MiB,
+  monotonic (~31 B/request); `tos(route.str + 8, route.len - 8)` stays flat at
+  +28 KiB. The vanilla library already uses the `tos` view; an HttpArena benchmark
+  handler is what regressed here.
 
 ---
 

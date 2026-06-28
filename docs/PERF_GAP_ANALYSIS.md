@@ -196,6 +196,75 @@ round-robin ignores load. The 256-byte starting buffer guarantees ≥2 recv
 calls + reallocs for any normal request. Dropping pipelined bytes makes
 pipelined benchmarks (and clients) outright fail/slow.
 
+### Static serving: memory (2026-06)
+
+HttpArena `static` profile (`wrk`, `GET /static/<file>`, keep-alive, 200
+req/conn, at 1024 / 4096 / 6800 connections). rps / peak RSS:
+
+| server | 1024 | 4096 | 6800 | memory |
+|---|---|---|---|---|
+| zix (Zig, io_uring) | 2.03M / 140 MiB | 2.04M / 195 MiB | 1.99M / 241 MiB | flat |
+| iris (C++, epoll) | 1.77M / 111 MiB | 2.11M / 193 MiB | 1.88M / 281 MiB | flat |
+| vanilla-epoll (V, `-gc none`) | 1.10M / 262 MiB | 1.14M / 426 MiB | 1.18M / 912 MiB | balloons ~3.5× |
+| vanilla-io_uring (V, default Boehm) | — | — | — | collapses 231K→8K rps, 1.4–1.7 GiB |
+
+1. **The body is not the gap.** All three (iris, zix, vanilla) serve the file
+   with `sendfile(2)` — zero-copy straight from the page cache, body never
+   enters the heap. vanilla already does the right thing on the body: a cached
+   open fd + precomputed header + `queue_file`/sendfile. The differentiator is
+   the *non-body* allocation: per-request heap traffic on the routing/key path
+   and per-conn buffer footprint.
+
+2. **Root cause of the epoll balloon is in the HttpArena benchmark handler, NOT
+   the vanilla library.** The benchmark handler rolls its own asset map and
+   builds the lookup key with `route[8..]` — V's `string.substr` →
+   `malloc_noscan(len+1)` + `memcpy`, a fresh heap string **every request**.
+   The arena build ships `-gc none`, so that string is never freed → unbounded
+   leak. Sites (HttpArena repo, not this one):
+   `frameworks/vanilla-epoll/main.v:357` and
+   `frameworks/vanilla-io_uring/main.v:160`.
+
+   Empirical proof (isolated: identical `map[string]int` + 20,000,000 lookups,
+   `v -prod -gc none`, RSS from `/proc/self/status`; only the key construction
+   differs):
+   - `key = route[8..]` → **+625 MiB**, monotonic, never plateaus (~31 B/request).
+   - `key = tos(route.str + 8, route.len - 8)` → **+28 KiB**, flat (0 B/request).
+
+   A ~22,000× difference for the same work. A map lookup only hashes the key
+   bytes and never retains the key, so a non-owning view (`tos`) is safe as a
+   lookup key. The vanilla **library is already the reference for this**:
+   [`http_server/static_assets/static_assets.v:273-281`](../http_server/static_assets/static_assets.v)
+   builds the key as `key := tos(&buf[rs], rel_len)` — a zero-copy view into the
+   request buffer, documented as "never retained, so routing costs no
+   allocation." Never imply the lib leaks; the fix belongs in the arena handler.
+
+3. **io_uring is a separate problem, not this leak.** The default-Boehm
+   io_uring build *does* collect the substr (no hard leak), but it pays
+   per-request GC churn, and its static collapse (231K→8K rps, 1.4–1.7 GiB) is
+   the per-conn buffer-pool allocation problem, distinct from the `route[8..]`
+   substr above.
+
+4. **Secondary: the 24K/conn baseline floor (a deliberate tradeoff, not the
+   balloon).** vanilla's per-conn buffers are read_buf 8K + write_buf 16K = 24K
+   ([`http_server/backend_epoll/conn_state_linux.c.v:54-55`](../http_server/backend_epoll/conn_state_linux.c.v)),
+   pooled in `free_conns` (bounded to peak concurrent conns). On the sendfile
+   static path the 16K write_buf carries only a ~200 B header (the body goes
+   through the kernel), so it is ~163 MiB of mostly-idle buffer at 6800 conns vs
+   zix's ~27 MiB (zix uses a 4K fixed recv buffer and no write buffer for
+   static). Shrinking or lazily allocating write_buf would reintroduce
+   GC-scanned growth (the "static cliff") on the default-GC io_uring build, so
+   it is intentionally left as-is — **future work only, not a bug or planned
+   change**.
+
+5. **How the leaders stay flat (zero per-request heap):**
+   - **zix:** 4K fixed recv buffer, no write buffer for static, lock-free
+     append-only fd cache (one fd per variant), 192-byte precomputed header sent
+     with `MSG_MORE` then `sendfileAll`. Zero per-request heap allocation.
+   - **iris:** thread-per-core epoll + `SO_REUSEPORT`; a sealed `memfd` holding
+     pre-baked **complete frozen responses** (header+body together); per request
+     it just sendfiles an `(offset, len)` slice, so bodies never enter the heap;
+     fixed buffers pooled and reused across connections.
+
 ## Why they beat vanilla on io_uring
 
 Vanilla io_uring backend today (`http_server_io_uring_linux.c.v`,

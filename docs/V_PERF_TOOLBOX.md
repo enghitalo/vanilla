@@ -83,6 +83,19 @@ Already used here for the per-worker epoll fd arrays
   loses the atomic property.
 - A fixed-size stack array `[N]u8{}` **does** zero N bytes per call — don't make
   big ones on the hot path.
+- **`s[a..b]` / `string.substr` allocates a fresh heap string** every call
+  (`malloc_noscan(len+1)` + `memcpy`). Under `-gc none` a result used-and-discarded
+  on the hot path **leaks** (nothing frees it); under the default GC it is
+  per-request churn. For a **non-retained lookup key** (e.g. a map key) use a
+  zero-copy view: `unsafe { tos(ptr, len) }` — map lookup only hashes the key bytes
+  and never retains the key, so a view is safe. Empirical (isolated, same
+  `map[string]int` + 20M lookups, `-gc none`, only the key construction differs):
+  `route[8..]` → **+625 MiB** (monotonic, never plateaus) vs `tos(route.str+8,
+  route.len-8)` → **+28 KiB** flat — a ~22,000x gap for the same work. The vanilla
+  LIBRARY is already the reference (the substr leak lived in an HttpArena benchmark
+  handler, not here): [`http_server/static_assets/static_assets.v:273-281`](../http_server/static_assets/static_assets.v)
+  builds the key as `key := tos(&buf[rs], rel_len)`, a view straight into the
+  request buffer, "never retained, so routing costs no allocation."
 - `recv` into spare capacity to avoid a scratch buffer + second copy:
   `recv(fd, &u8(buf.data) + buf.len, buf.cap - buf.len)` then `unsafe { buf.len += n }`.
 - **Allocation cost is hidden at low core counts and explodes under GC at scale.**
