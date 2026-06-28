@@ -1,0 +1,90 @@
+name: (Linux) Benchmark hot-path
+
+# Same-runner A/B of the hot-path micro-benchmarks. Two ways in:
+#
+#   * push to main (hot-path or bench files changed): measures the landed commit
+#     vs its parent on ONE runner and comments the delta on the PR that landed it.
+#   * manual: `gh workflow run bench.yml` — runs on demand even with no open PR
+#     (results go to the run's Job Summary). Optional inputs let you pin the V
+#     toolchain, so you can check whether a new V version shifts the numbers:
+#       gh workflow run bench.yml -f v_version=0.4.8
+#       gh workflow run bench.yml -f base_ref=main~5
+#     NOTE: a workflow is only dispatchable once this file is on the DEFAULT
+#     branch (GitHub requirement), i.e. after this PR merges.
+#
+# Why A/B and not absolute numbers: hosted runners are noisy and change hardware
+# every run, so an absolute time is not comparable across runs. Building both
+# sides in one job cancels the machine; the leftover is the change itself. See
+# bench/ci_bench.sh and docs/BEST_PRACTICES.md section 10.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'http_server/**'
+      - 'bench/**'
+      - '.github/workflows/bench.yml'
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: 'Ref to A/B the current checkout against'
+        required: false
+        default: 'HEAD~1'
+      v_version:
+        description: 'V version for setup-v (blank = latest). Set to compare toolchains.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  pull-requests: write   # to comment the delta on the merged PR
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: false   # let each landed commit finish its measurement
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: the A/B checks out a baseline ref (HEAD~1 by default, or
+          # an arbitrary ref on manual dispatch) in a worktree.
+          fetch-depth: 0
+      - name: Set up V
+        uses: vlang/setup-v@v1.4
+        with:
+          version: ${{ github.event.inputs.v_version }}   # empty on push -> latest
+      - name: Remove Vlang folder to avoid conflicts
+        shell: bash
+        run: |
+          rm -rf -v ./vlang || true
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev liburing-dev linux-libc-dev
+      - name: Same-runner A/B benchmark
+        shell: bash
+        env:
+          BENCH_RUNS: '5'
+          BASE_REF: ${{ github.event.inputs.base_ref || 'HEAD~1' }}
+        run: |
+          # Writes the Markdown report to the Job Summary (via ci_bench.sh) and to
+          # this file for the PR comment below.
+          bench/ci_bench.sh | tee /tmp/bench_comment.md
+      - name: Comment the delta on the PR that landed this commit
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pr=$(gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" \
+                 --jq '.[0].number' 2>/dev/null || true)
+          if [ -z "$pr" ] || [ "$pr" = "null" ]; then
+            echo "No PR is associated with ${{ github.sha }} (direct push?) — see the Job Summary."
+            exit 0
+          fi
+          gh pr comment "$pr" --body-file /tmp/bench_comment.md
+          echo "Commented benchmark delta on PR #$pr"
