@@ -38,6 +38,7 @@ on:
 permissions:
   contents: read
   pull-requests: write   # to comment the delta on the merged PR
+  issues: write          # to open/update a regression issue
 
 concurrency:
   group: bench-${{ github.ref }}
@@ -66,13 +67,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsqlite3-dev liburing-dev linux-libc-dev
       - name: Same-runner A/B benchmark
+        id: bench
         shell: bash
         env:
           BENCH_RUNS: '5'
           BASE_REF: ${{ github.event.inputs.base_ref || 'HEAD~1' }}
         run: |
           # Writes the Markdown report to the Job Summary (via ci_bench.sh) and to
-          # this file for the PR comment below.
+          # this file for the PR comment / issue below. ci_bench.sh also sets the
+          # step outputs `regressed` / `issue_regressions` via $GITHUB_OUTPUT.
           bench/ci_bench.sh | tee /tmp/bench_comment.md
       - name: Comment the delta on the PR that landed this commit
         if: github.event_name == 'push'
@@ -88,3 +91,36 @@ jobs:
           fi
           gh pr comment "$pr" --body-file /tmp/bench_comment.md
           echo "Commented benchmark delta on PR #$pr"
+      - name: Open or update a regression issue
+        # Only on a real landed commit (not exploratory manual dispatch), and only
+        # when a bench cleared the higher issue threshold (see BENCH_ISSUE_THRESHOLD).
+        if: github.event_name == 'push' && steps.bench.outputs.regressed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          label="perf-regression"
+          # Idempotent: create the label if it does not exist yet (so the list/filter
+          # below never 422s on an unknown label).
+          gh label create "$label" --color B60205 \
+            --description "Benchmark regression caught by CI" >/dev/null 2>&1 || true
+
+          { echo "Detected on commit \`${SHA}\` — [CI run](${RUN_URL})."; echo;
+            cat /tmp/bench_comment.md; } > /tmp/issue_body.md
+
+          # Dedup: keep ONE rolling open issue. Append the new report if it exists,
+          # otherwise open it. Close the issue once the regression is resolved.
+          existing=$(gh issue list --repo "$REPO" --state open --label "$label" \
+                       --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body-file /tmp/issue_body.md
+            echo "Appended regression report to issue #$existing"
+          else
+            gh issue create --repo "$REPO" --label "$label" \
+              --title "⚠️ Performance regression on main" \
+              --body-file /tmp/issue_body.md
+            echo "Opened a new regression issue"
+          fi
