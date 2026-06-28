@@ -265,6 +265,27 @@ fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn
 	iou_arm_recv(worker, mut *conn, limits)
 }
 
+// buf_view returns a non-owning []u8 window into buf[start..start+length] with the
+// `.managed` flag cleared, so V skips the per-slice slice-aliasing bookkeeping
+// (mark_buffer_has_slices + header/flag churn) that the native `buf[a..b]` operator
+// runs unconditionally. read_buf is manually managed here (grown via grow_cap,
+// compacted via memmove, len reset — never `delete`d with a live slice), so that
+// bookkeeping is pure waste: callgrind showed the native slices as ~23% of the
+// io_uring worker's pipelined instructions (builtin__array_slice), absent from the
+// epoll backend, which already frames with this same helper. Mirrors
+// backend_epoll/conn_state_linux.c.v:buf_view.
+@[inline]
+fn buf_view(buf []u8, start int, length int) []u8 {
+	mut v := unsafe { buf }
+	unsafe {
+		v.data = &u8(buf.data) + start
+		v.len = length
+		v.cap = length
+		v.flags.clear(.managed)
+	}
+	return v
+}
+
 // drain_iou_requests parses and answers every complete request in read_buf,
 // appending responses to response_buffer, then compacts the leftover partial
 // bytes to the front. On a framing error, an oversized payload, or a handler
@@ -274,7 +295,7 @@ fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn
 fn drain_iou_requests(mut conn io_uring.Connection, handler fn (req []u8, fd int, mut out []u8) !, limits Limits) {
 	mut pos := 0
 	for pos < conn.read_buf.len {
-		total := request_parser.frame_request_length_lim(conn.read_buf[pos..],
+		total := request_parser.frame_request_length_lim(buf_view(conn.read_buf, pos, conn.read_buf.len - pos),
 			limits.max_header_bytes, limits.max_body_bytes) or {
 			match err.code() {
 				413 { conn.response_buffer << response.status_413_response }
@@ -288,7 +309,7 @@ fn drain_iou_requests(mut conn io_uring.Connection, handler fn (req []u8, fd int
 		if total < 0 {
 			break // incomplete — wait for more bytes
 		}
-		req := conn.read_buf[pos..pos + total] // zero-copy view into read_buf
+		req := buf_view(conn.read_buf, pos, total) // zero-copy, non-marking view (no array_slice)
 		handler(req, conn.fd, mut conn.response_buffer) or {
 			conn.response_buffer << response.tiny_bad_request_response
 			conn.close_after_send = true
@@ -333,7 +354,7 @@ fn start_iou_body_drain(mut conn io_uring.Connection, handler fn (req []u8, fd i
 	if head_len <= 0 || head_len > conn.read_buf.len {
 		return false // head not complete in the buffer yet — keep buffering
 	}
-	head := conn.read_buf[0..head_len] // zero-copy view; the handler consumes it now
+	head := buf_view(conn.read_buf, 0, head_len) // zero-copy, non-marking view; handler consumes it now
 	handler(head, conn.fd, mut conn.response_buffer) or {
 		conn.response_buffer << response.tiny_bad_request_response
 		conn.close_after_send = true
