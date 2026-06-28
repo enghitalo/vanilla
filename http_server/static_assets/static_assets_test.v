@@ -270,3 +270,67 @@ fn test_large_asset_range() {
 	assert body.len == 4
 	assert body[0] == 10 && body[3] == 13 // the i&0xff pattern at offset 10
 }
+
+// --- conditional GET + Range edge cases (zero-copy slice parsing) ------------
+//
+// These pin the byte-scan etag_matches_slice / parse_range_slice rewrites: same
+// behavior as the old string-split parsers, but reading straight off the request
+// buffer with no per-request allocation.
+
+fn test_etag_weak_validator_matches() {
+	s := server()
+	etag := s.etag_for('core.9f3a1c.wasm')!
+	resp := s.respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nIf-None-Match: W/' + etag))!.bytestr()
+	assert resp.starts_with('HTTP/1.1 304')
+}
+
+fn test_etag_list_matches_later_member() {
+	s := server()
+	etag := s.etag_for('core.9f3a1c.wasm')!
+	resp := s.respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nIf-None-Match: "nope", ' +
+		etag))!.bytestr()
+	assert resp.starts_with('HTTP/1.1 304')
+}
+
+fn test_etag_list_no_member_serves_200() {
+	resp := server().respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nIf-None-Match: "a", "b"'))!.bytestr()
+	assert resp.starts_with('HTTP/1.1 200')
+}
+
+fn test_range_suffix_returns_last_bytes() {
+	// 8-byte asset; `-3` is the last 3 bytes (offsets 5..7).
+	resp := server().respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=-3'))!.bytestr()
+	assert resp.starts_with('HTTP/1.1 206')
+	assert resp.contains('Content-Range: bytes 5-7/8')
+	assert resp.contains('Content-Length: 3')
+}
+
+fn test_range_open_ended_runs_to_eof() {
+	resp := server().respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=5-'))!.bytestr()
+	assert resp.starts_with('HTTP/1.1 206')
+	assert resp.contains('Content-Range: bytes 5-7/8')
+	assert resp.contains('Content-Length: 3')
+}
+
+fn test_range_multi_dash_falls_through_to_200() {
+	// More than one '-' is not a single range → serve the full 200, not a 206.
+	resp := server().respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=0-1-2'))!.bytestr()
+	assert resp.starts_with('HTTP/1.1 200')
+}
+
+fn test_range_wrong_unit_falls_through_to_200() {
+	resp := server().respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: items=0-3'))!.bytestr()
+	assert resp.starts_with('HTTP/1.1 200')
+}
+
+fn test_range_unsatisfiable_falls_through_to_200() {
+	// start beyond EOF (8-byte asset) → none → full 200.
+	resp := server().respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=900-1000'))!.bytestr()
+	assert resp.starts_with('HTTP/1.1 200')
+}
+
+fn test_range_absurd_number_falls_through_to_200() {
+	// A number past i64 saturates (does not wrap to a valid offset) → none → 200.
+	resp := server().respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=18446744073709551616-'))!.bytestr()
+	assert resp.starts_with('HTTP/1.1 200')
+}
