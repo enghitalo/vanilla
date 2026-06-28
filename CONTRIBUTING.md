@@ -44,6 +44,18 @@ curl -X GET -v http://localhost:3000/user/1
 wrk  -H 'Connection: "keep-alive"' --connection 512 --threads 16 --duration 10s http://localhost:3000
 ```
 
+## Telling a real change from noise
+
+For hot-path functions, a controlled micro-benchmark beats a noisy `wrk` run.
+Build the bench with `-prod`, then drive it through `bench/measure.sh`, which pins
+a core, reports the environment, and reports the **minimum** across runs (see
+[docs/BEST_PRACTICES.md](docs/BEST_PRACTICES.md) §10):
+
+```sh
+v -prod -gc none -o /tmp/bench bench/request_parser/request_parser_bench.v
+bench/measure.sh /tmp/bench
+```
+
 ### Valgrind
 
 ```sh
