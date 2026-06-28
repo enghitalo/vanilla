@@ -1,8 +1,7 @@
 import benchmark
 import hash as wyhash
 import crypto.md5
-
-const intentions = 1_000_000
+import os
 
 // Precomputed u16 LUT: Each entry contains two ASCII hex characters.
 // Example: hex_lut_u16[0x0A] = u16(0x6130) which is '0a' in little-endian.
@@ -138,6 +137,11 @@ fn generate_md5_etag(content_ptr &u8, content_len int) []u8 {
 }
 
 fn main() {
+	// Loop count: BENCH_ITERS env if set (CI uses a smaller value for speed),
+	// else 5M for stable local numbers. See bench/ci_bench.sh.
+	env_iters := os.getenv('BENCH_ITERS').int()
+	iterations := if env_iters > 0 { env_iters } else { 5_000_000 }
+
 	buffer := 'The quick brown fox jumps over the lazy dog'.bytes()
 
 	// Verification
@@ -159,29 +163,29 @@ fn main() {
 
 	mut b_md5 := benchmark.start()
 
-	for _ in 0 .. intentions {
+	for _ in 0 .. iterations {
 		_ = generate_md5_etag(buffer.data, buffer.len)
 	}
 	b_md5.measure('generate_md5_etag (u16 chunked)')
-	for _ in 0 .. intentions {
+	for _ in 0 .. iterations {
 		_ = md5.sum(buffer).hex().bytes()
 	}
 	b_md5.measure('md5.sum().hex()')
 
 	mut b_wyhash := benchmark.start()
 
-	for _ in 0 .. intentions {
+	for _ in 0 .. iterations {
 		_ = generate_wyhash_etag(buffer.data, buffer.len)
 	}
 	b_wyhash.measure('generate_wyhash_etag (u16 chunked)')
 
-	for _ in 0 .. intentions {
+	for _ in 0 .. iterations {
 		_ = wyhash.wyhash_c(buffer.data, u64(buffer.len), 0).hex().bytes()
 	}
 	b_wyhash.measure('wyhash.wyhash_c().hex()')
 
 	mut b_validate := benchmark.start()
-	for _ in 0 .. intentions {
+	for _ in 0 .. iterations {
 		_ = validate_u64_to_hex(etag_wyhash_u64, etag_wyhash.data, etag_wyhash.len)
 	}
 	b_validate.measure('validate_u64_to_hex')

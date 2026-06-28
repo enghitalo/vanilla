@@ -15,11 +15,10 @@ module main
 //
 // (Use -prod: the default debug build is not representative.)
 import benchmark
+import os
 import http_server.http1_1.request_parser
 
 fn C.memchr(buf voidptr, c int, n usize) voidptr
-
-const iterations = 5_000_000
 
 const raw_request = 'GET /users/42/posts?id=123&format=json HTTP/1.1\r\nHost: example.com\r\nUser-Agent: wrk/4.1\r\nAccept: application/json\r\nConnection: keep-alive\r\n\r\n'.bytes()
 
@@ -121,6 +120,11 @@ fn build_log_line(req_buffer []u8, resp []u8) int {
 }
 
 fn main() {
+	// Loop count: BENCH_ITERS env if set (CI uses a smaller value for speed),
+	// else 5M for stable local numbers. See bench/ci_bench.sh.
+	env_iters := os.getenv('BENCH_ITERS').int()
+	iterations := if env_iters > 0 { env_iters } else { 5_000_000 }
+
 	// Sanity-print once so we know both injectors produce the same result.
 	a := inject_headers(base_resp, headers).bytestr()
 	b := inject_headers_string(base_resp, headers_str).bytestr()
