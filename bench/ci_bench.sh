@@ -34,13 +34,20 @@ ISSUE_THRESHOLD="${BENCH_ISSUE_THRESHOLD:-10}" # a regression must clear THIS to
                                              # 5-10%) does not file issues on its own
 export BENCH_RUNS="${BENCH_RUNS:-5}"         # passed through to measure.sh
 
-# Hot-path micro-benches to A/B. name|path — each built with -prod -gc none.
+# Hot-path micro-benches to A/B. name | source — each built with -prod -gc none.
+# All run on every invocation; BENCH_ITERS (below) keeps the full set to a few
+# minutes in CI.
 BENCHES=(
 	"request_parser|bench/request_parser/request_parser_bench.v"
-	"static_assets|bench/static_assets/static_assets_bench.v"
 	"middleware|bench/middleware/middleware_bench.v"
 	"etag_hash|bench/etag_hash/etag_hash.v"
+	"static_assets|bench/static_assets/static_assets_bench.v"
 )
+# Standardize the loop count for the A/B: the benches read BENCH_ITERS. 2M keeps
+# even the cheapest bench (request_parser, ~0.3s) comfortably above the runner's
+# noise floor while a full run stays a few minutes; raise it if a bench's spread
+# is high on the runner. Unset (or run a bench directly) to use the 5M default.
+export BENCH_ITERS="${BENCH_ITERS:-2000000}"
 
 # Always measure with HEAD's measure.sh (one methodology for both sides), even
 # when the baseline ref predates it.
@@ -91,7 +98,7 @@ if [ "$worktree_ok" -ne 1 ]; then
 	emit "⚠️ Could not check out baseline \`${BASE_REF}\` (shallow clone? need \`fetch-depth: 2\`). No comparison."
 	exit 0
 fi
-emit "Same-runner A/B on \`${RUNNER_OS:-local}\`, toolchain \`$(v version 2>/dev/null || echo 'V unknown')\`. Hosted runners are noisy — treat **|Δ| < ${THRESHOLD}%** as noise. Each side is the **minimum of ${BENCH_RUNS} runs** (\`bench/measure.sh\`)."
+emit "Same-runner A/B on \`${RUNNER_OS:-local}\`, toolchain \`$(v version 2>/dev/null || echo 'V unknown')\`. Hosted runners are noisy — treat **|Δ| < ${THRESHOLD}%** as noise. Each side is the **minimum of ${BENCH_RUNS} runs** of ${BENCH_ITERS} iterations (\`bench/measure.sh\`)."
 emit ''
 emit '| bench | baseline | this commit | Δ | |'
 emit '|---|--:|--:|--:|:--|'

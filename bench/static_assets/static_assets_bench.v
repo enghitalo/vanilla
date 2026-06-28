@@ -15,8 +15,6 @@ import benchmark
 import os
 import http_server.static_assets
 
-const iterations = 5_000_000
-
 const bench_root = os.join_path(os.temp_dir(), 'vanilla_sa_bench')
 
 fn setup() static_assets.AssetServer {
@@ -50,6 +48,11 @@ fn r(line string) []u8 {
 
 fn main() {
 	s := setup()
+
+	// Loop count: BENCH_ITERS env if set (CI uses a smaller value for speed),
+	// else 5M for stable local numbers. See bench/ci_bench.sh.
+	env_iters := os.getenv('BENCH_ITERS').int()
+	iterations := if env_iters > 0 { env_iters } else { 5_000_000 }
 
 	// Realistic requests with the headers a browser actually sends.
 	req_wasm :=
@@ -98,13 +101,22 @@ fn main() {
 	// Full handler path: the server copies the response into the per-connection
 	// write buffer (`out << ...`). This is the body-copy cost a precomputed
 	// response can't avoid without sendfile(2). 256 KiB body.
+	//
+	// Generation (parse/route/encode) is already measured at the FULL count in the
+	// sections above; this section adds only the body copy on top. That copy is
+	// memcpy-bandwidth-bound (~40 GB/s) — a CPU/libc property, not vanilla's code,
+	// so it can't regress from a code change and needs few samples. Scale it to
+	// iters/50 (e.g. 1M -> 20k ~0.1s, 5M -> 100k) so it neither dominates the
+	// bench's wall time (it was ~90% at full count) nor reports a misleading
+	// memcpy figure. The label prints the actual count used.
+	copy_iters := if iterations > 100_000 { iterations / 50 } else { iterations }
 	mut out := []u8{cap: 300 * 1024}
-	for _ in 0 .. iterations {
+	for _ in 0 .. copy_iters {
 		out.clear()
 		out << (s.respond(req_wasm) or { panic(err) })
 		acc += out.len
 	}
-	b.measure('handler  200 wasm + copy into out (256 KiB)')
+	b.measure('handler  200 wasm + copy into out (256 KiB, ${copy_iters} iters)')
 
 	os.rmdir_all(bench_root) or {}
 	println('\nchecksum=${acc} (ignore; keeps the optimizer honest)')

@@ -11,9 +11,8 @@ module main
 //
 // (Use -prod: the default debug build is not representative.)
 import benchmark
+import os
 import http_server.http1_1.request_parser
-
-const iterations = 5_000_000
 
 // A realistic request: method + path with a query string + the headers a real
 // client sends. The Host header makes it valid HTTP/1.1.
@@ -22,6 +21,11 @@ const raw_request = ('GET /users/42/posts?id=123&format=json&page=2 HTTP/1.1\r\n
 	'Accept-Encoding: gzip, deflate\r\n' + 'Connection: keep-alive\r\n' + '\r\n').bytes()
 
 fn main() {
+	// Loop count: BENCH_ITERS env if set (CI uses a smaller value for speed),
+	// else 5M for stable local numbers. See bench/ci_bench.sh.
+	env_iters := os.getenv('BENCH_ITERS').int()
+	iterations := if env_iters > 0 { env_iters } else { 5_000_000 }
+
 	// Sanity-print once so we know we're measuring correct behavior.
 	req0 := request_parser.decode_http_request(raw_request) or { panic('decode: ${err}') }
 	println('path            = "${req0.path.to_string(req0.buffer)}"')
