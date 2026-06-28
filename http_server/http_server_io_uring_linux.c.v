@@ -295,9 +295,15 @@ fn buf_view(buf []u8, start int, length int) []u8 {
 fn drain_iou_requests(mut conn io_uring.Connection, handler fn (req []u8, fd int, mut out []u8) !, limits Limits) {
 	mut pos := 0
 	for pos < conn.read_buf.len {
-		total := request_parser.frame_request_length_lim(buf_view(conn.read_buf, pos, conn.read_buf.len - pos),
-			limits.max_header_bytes, limits.max_body_bytes) or {
-			match err.code() {
+		// _idx twin: plain int, no per-request !int boxing. The error sentinel is
+		// the negated HTTP status, so `-total` recovers the old err.code() value.
+		total := request_parser.frame_request_length_lim_idx(buf_view(conn.read_buf, pos,
+			conn.read_buf.len - pos), limits.max_header_bytes, limits.max_body_bytes)
+		if total == -1 {
+			break // incomplete — wait for more bytes
+		}
+		if total < -1 {
+			match -total {
 				413 { conn.response_buffer << response.status_413_response }
 				431 { conn.response_buffer << response.status_431_response }
 				else { conn.response_buffer << response.tiny_bad_request_response }
@@ -305,9 +311,6 @@ fn drain_iou_requests(mut conn io_uring.Connection, handler fn (req []u8, fd int
 
 			conn.close_after_send = true
 			return
-		}
-		if total < 0 {
-			break // incomplete — wait for more bytes
 		}
 		req := buf_view(conn.read_buf, pos, total) // zero-copy, non-marking view (no array_slice)
 		handler(req, conn.fd, mut conn.response_buffer) or {

@@ -454,12 +454,43 @@ pub fn frame_request_length(buf []u8) !int {
 	return frame_request_length_lim(buf, 0, 0)
 }
 
+// Framing sentinels returned by frame_request_length_lim_idx (the no-Result
+// twin). Distinct from -1 (incomplete) and any real length (>= 0); the Result
+// wrapper maps each to its HTTP status code.
+const frame_err_malformed = -400
+const frame_err_body = -413 // body exceeds the configured max_body
+const frame_err_header = -431 // header block exceeds the configured max_header
+
 // frame_request_length_lim is frame_request_length with optional size limits
 // (0 = unlimited, zero-cost). When a limit is exceeded it returns an error whose
 // `.code()` is the HTTP status to send: 431 (header fields too large) or 413
-// (payload too large). Other malformed framing carries code 400.
-@[direct_array_access]
+// (payload too large). Other malformed framing carries code 400. Thin Result
+// wrapper over the no-Result hot-path twin frame_request_length_lim_idx: cold
+// callers (request decode, tests) keep this API, while the per-request drain
+// loops call the twin directly to skip the !int boxing.
 pub fn frame_request_length_lim(buf []u8, max_header int, max_body int) !int {
+	r := frame_request_length_lim_idx(buf, max_header, max_body)
+	if r == frame_err_body {
+		return error_with_code('body exceeds ${max_body} bytes', 413)
+	}
+	if r == frame_err_header {
+		return error_with_code('header fields exceed ${max_header} bytes', 431)
+	}
+	if r == frame_err_malformed {
+		return error_with_code('malformed request framing', 400)
+	}
+	return r // >= 0 complete, or -1 incomplete
+}
+
+// frame_request_length_lim_idx is the no-Result hot-path twin of
+// frame_request_length_lim: it returns a plain int and never constructs a Result,
+// so the per-request success path skips the !int boxing (builtin___result_ok,
+// which callgrind put at ~5-9% of the pipelined worker's instructions). Mirrors
+// find_byte_idx vs find_byte. Returns a length >= 0 (complete — exactly that many
+// bytes), -1 (incomplete — wait for more bytes), or a frame_err_* sentinel that
+// the Result wrapper maps to 400 / 413 / 431.
+@[direct_array_access]
+pub fn frame_request_length_lim_idx(buf []u8, max_header int, max_body int) int {
 	if buf.len < 4 {
 		return -1
 	}
@@ -479,7 +510,7 @@ pub fn frame_request_length_lim(buf []u8, max_header int, max_body int) !int {
 	for {
 		// Cap the head size so a hostile peer can't grow it without bound.
 		if max_header > 0 && pos > max_header {
-			return error_with_code('header fields exceed ${max_header} bytes', 431)
+			return frame_err_header
 		}
 		if pos >= buf.len {
 			return -1
@@ -492,7 +523,11 @@ pub fn frame_request_length_lim(buf []u8, max_header int, max_body int) !int {
 			if buf[pos + 1] == lf_char {
 				body_start := pos + 2
 				if chunked {
-					return frame_chunked_total(buf, body_start, max_body)
+					// Cold path: the chunked framer still returns a Result; map it
+					// to a sentinel (the one boxing here is off the GET hot path).
+					return frame_chunked_total(buf, body_start, max_body) or {
+						if err.code() == 413 { frame_err_body } else { frame_err_malformed }
+					}
 				}
 				if content_length >= 0 {
 					total := body_start + content_length
@@ -511,12 +546,10 @@ pub fn frame_request_length_lim(buf []u8, max_header int, max_body int) !int {
 
 		// Cheap checks: both reject at byte 0 for the vast majority of headers.
 		if v := line_header_value(buf, line_start, line_len, 'Content-Length') {
-			content_length = parse_content_length(buf, v) or {
-				return error_with_code('invalid Content-Length', 400)
-			}
+			content_length = parse_content_length(buf, v) or { return frame_err_malformed }
 			// Reject an over-large body from the declared length, BEFORE buffering it.
 			if max_body > 0 && content_length > max_body {
-				return error_with_code('body exceeds ${max_body} bytes', 413)
+				return frame_err_body
 			}
 		} else if v := line_header_value(buf, line_start, line_len, 'Transfer-Encoding') {
 			if ci_contains(buf, v, 'chunked') {

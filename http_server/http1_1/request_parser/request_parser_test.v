@@ -478,3 +478,42 @@ fn test_frame_expected_total() {
 	nobody := 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 	assert frame_expected_total(nobody) == -1
 }
+
+// --- Phase 3: the no-Result hot-path twin frame_request_length_lim_idx --------
+// The drain loops call this directly to skip !int boxing. It must agree with the
+// Result wrapper: length >= 0 (complete), -1 (incomplete), or a frame_err_*
+// sentinel = the negated HTTP status (-413 / -431 / -400).
+fn test_frame_idx_complete_and_incomplete() {
+	req := 'GET /pipeline HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+	assert frame_request_length_lim_idx(req, 0, 0) == req.len
+	assert frame_request_length_lim_idx(req[..req.len - 1], 0, 0) == -1 // missing last LF
+	assert frame_request_length_lim_idx('GET'.bytes(), 0, 0) == -1
+	// body via Content-Length
+	withbody := 'POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc'.bytes()
+	assert frame_request_length_lim_idx(withbody, 0, 0) == withbody.len
+}
+
+fn test_frame_idx_error_sentinels() {
+	// 413: declared body over the limit (sentinel -413, so -total == 413).
+	over_body := 'POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\n\r\n'.bytes()
+	t413 := frame_request_length_lim_idx(over_body, 0, 1024)
+	assert t413 < -1 && -t413 == 413
+	// 431: header block over the limit.
+	big := ('GET / HTTP/1.1\r\nX-Pad: ' + 'a'.repeat(2000) + '\r\n').bytes()
+	t431 := frame_request_length_lim_idx(big, 64, 0)
+	assert t431 < -1 && -t431 == 431
+	// 400: malformed Content-Length.
+	bad := 'POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n'.bytes()
+	t400 := frame_request_length_lim_idx(bad, 0, 0)
+	assert t400 < -1 && -t400 == 400
+}
+
+// The wrapper must still surface the same .code()s after routing through _idx.
+fn test_frame_wrapper_codes_match_idx() {
+	over_body := 'POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\n\r\n'.bytes()
+	if _ := frame_request_length_lim(over_body, 0, 1024) {
+		assert false, 'over-limit body must error'
+	} else {
+		assert err.code() == 413
+	}
+}
