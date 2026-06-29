@@ -31,6 +31,7 @@ struct TlsConn {
 mut:
 	sess           tls.Session
 	established    bool
+	ktls           bool // kTLS engaged: reads/writes are PLAIN recv/send, kernel does AES-GCM
 	watching_out   bool // currently subscribed to EPOLLOUT (avoid redundant epoll_ctl)
 	read_buf       []u8 // per-conn request buffer: a partial across edges (len>0) or an empty pooled buffer reused next request (len==0, cap>0)
 	resp_buf       []u8 // per-conn response buffer, pooled across requests (reset to len 0, reused)
@@ -55,6 +56,44 @@ fn tls_set_out(mut conn TlsConn, epoll_fd int, fd int, want_out bool) {
 	}
 }
 
+// ktls_send writes plaintext over a kTLS socket (the kernel encrypts it into a TLS
+// record). Returns the byte count (>0), tls.want_write on EAGAIN (park on EPOLLOUT),
+// or tls.closed on a fatal error — the same sentinels Session.write_from returns, so
+// the call sites branch uniformly. MSG_NOSIGNAL avoids SIGPIPE; MSG_WAITALL must
+// NEVER be used on a kTLS socket (the TLS ULP rejects it).
+@[inline]
+fn ktls_send(fd int, ptr &u8, len int) int {
+	r := C.send(fd, ptr, usize(len), C.MSG_NOSIGNAL)
+	if r < 0 {
+		if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
+			return tls.want_write
+		}
+		return tls.closed
+	}
+	return int(r)
+}
+
+// ktls_recv reads PLAINTEXT from a kTLS socket (the kernel already decrypted the
+// record). Returns the byte count (>0), tls.want on EAGAIN (wait for EPOLLIN), or
+// tls.closed on EOF/error — the same sentinels Session.read_into returns, so the
+// call site branches uniformly. A non-application-data record (e.g. a peer alert)
+// surfaces as an error here and maps to tls.closed, which is the right action for
+// the request/response profile; tickets are disabled so no KeyUpdate arrives.
+@[inline]
+fn ktls_recv(fd int, ptr &u8, len int) int {
+	r := C.recv(fd, ptr, usize(len), 0)
+	if r < 0 {
+		if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
+			return tls.want
+		}
+		return tls.closed
+	}
+	if r == 0 {
+		return tls.closed
+	}
+	return int(r)
+}
+
 // tls_handshake_step drives the handshake one step. Returns true once the
 // session is established (caller may proceed to read); false while it is still
 // pending or has been closed (caller must return).
@@ -73,6 +112,17 @@ fn tls_handshake_step(mut conn TlsConn, epoll_fd int, fd int, active_conns &core
 		return false
 	}
 	conn.established = true
+	// Hand record crypto to the kernel (kTLS). On success, subsequent reads/writes
+	// are plain recv()/send() syscalls and the kernel does AES-128-GCM — no userspace
+	// crypto and no PSA key-store mutex on the hot path. This fires exactly once, at
+	// handshake completion, before any application data — the correct handoff point.
+	// false => stay on the userspace mbedtls path (clean fallback); but if a setsockopt
+	// failed AFTER the ULP attached, the socket is half-converted, so close.
+	conn.ktls = conn.sess.enable_ktls(fd)
+	if !conn.ktls && conn.sess.ktls_failed() {
+		close_tls(epoll_fd, fd, active_conns, mut sessions)
+		return false
+	}
 	tls_set_out(mut conn, epoll_fd, fd, false) // handshake done — back to reading
 	return true
 }
@@ -122,7 +172,13 @@ fn handle_readable_fd_tls(request_handler core.RequestHandler, epoll_fd int, fd 
 			unsafe { buf.grow_cap(buf.cap) }
 		}
 		spare := buf.cap - buf.len
-		n := conn.sess.read_into(unsafe { &u8(buf.data) + buf.len }, spare)
+		// kTLS: read PLAINTEXT straight from the socket (kernel already decrypted).
+		// Otherwise decrypt in userspace via mbedtls. Both yield the same sentinels.
+		n := if conn.ktls {
+			ktls_recv(fd, unsafe { &u8(buf.data) + buf.len }, spare)
+		} else {
+			conn.sess.read_into(unsafe { &u8(buf.data) + buf.len }, spare)
+		}
 		if n == tls.want {
 			if buf.len == 0 {
 				conn.read_buf = buf // nothing buffered yet — return to the pool, no deadline
@@ -218,8 +274,12 @@ fn handle_writable_fd_tls(epoll_fd int, fd int, active_conns &core.Counter, mut 
 	}
 
 	for conn.write_off < conn.write_buf.len {
-		n := conn.sess.write_from(unsafe { &u8(conn.write_buf.data) + conn.write_off },
-			conn.write_buf.len - conn.write_off)
+		n := if conn.ktls {
+			ktls_send(fd, unsafe { &u8(conn.write_buf.data) + conn.write_off }, conn.write_buf.len - conn.write_off)
+		} else {
+			conn.sess.write_from(unsafe { &u8(conn.write_buf.data) + conn.write_off },
+				conn.write_buf.len - conn.write_off)
+		}
 		if n > 0 {
 			conn.write_off += n
 			continue
@@ -244,7 +304,11 @@ fn handle_writable_fd_tls(epoll_fd int, fd int, active_conns &core.Counter, mut 
 fn tls_send_or_park(epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut sessions map[int]&TlsConn, mut conn TlsConn, resp []u8) {
 	mut sent := 0
 	for sent < resp.len {
-		n := conn.sess.write_from(unsafe { &u8(resp.data) + sent }, resp.len - sent)
+		n := if conn.ktls {
+			ktls_send(fd, unsafe { &u8(resp.data) + sent }, resp.len - sent)
+		} else {
+			conn.sess.write_from(unsafe { &u8(resp.data) + sent }, resp.len - sent)
+		}
 		if n > 0 {
 			sent += n
 			continue

@@ -27,6 +27,9 @@ fn C.vtls_session_free(sess voidptr)
 fn C.vtls_handshake(sess voidptr) int
 fn C.vtls_read(sess voidptr, buf &u8, len usize) int
 fn C.vtls_write(sess voidptr, buf &u8, len usize) int
+fn C.vtls_enable_ktls(sess voidptr, fd int) int
+fn C.vtls_ktls_active(sess voidptr) int
+fn C.vtls_ktls_failed(sess voidptr) int
 
 // init performs process-wide crypto init (psa_crypto_init). Call once at startup.
 pub fn init() ! {
@@ -142,6 +145,25 @@ pub fn (s &Session) read_into(ptr &u8, len int) int {
 // `want`, or `closed`.
 pub fn (s &Session) write_from(ptr &u8, len int) int {
 	return C.vtls_write(s.sess, ptr, usize(len))
+}
+
+// enable_ktls hands record crypto to the kernel after the handshake. true => reads
+// and writes become PLAIN recv()/send() and the kernel does AES-128-GCM; false =>
+// keep using read_into/write_from (userspace mbedtls). When it returns false, check
+// ktls_failed(): if true the socket is half-converted and the connection must close.
+pub fn (s &Session) enable_ktls(fd int) bool {
+	return C.vtls_enable_ktls(s.sess, fd) == 1
+}
+
+// ktls_active reports whether kTLS is engaged on this session.
+pub fn (s &Session) ktls_active() bool {
+	return C.vtls_ktls_active(s.sess) == 1
+}
+
+// ktls_failed reports a setsockopt failure AFTER the kTLS ULP attached — the socket
+// is then unusable for the userspace path, so the caller must close the connection.
+pub fn (s &Session) ktls_failed() bool {
+	return C.vtls_ktls_failed(s.sess) == 1
 }
 
 // alpn returns the protocol negotiated via ALPN (e.g. 'http/1.1'), or '' if the
