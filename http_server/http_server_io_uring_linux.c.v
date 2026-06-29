@@ -107,9 +107,16 @@ fn iou_arm_drain_recv(worker &io_uring.Worker, mut conn io_uring.Connection, lim
 @[inline]
 fn iou_flush_response(worker &io_uring.Worker, mut conn io_uring.Connection, limits Limits) bool {
 	conn.read_deadline = 0
-	posted := iou_arm_send(worker, mut conn, unsafe {
-		&u8(conn.response_buffer.data) + conn.bytes_sent
-	}, usize(conn.response_buffer.len - conn.bytes_sent), limits)
+	// Send from the borrowed buffer (a preloaded static asset handed off via
+	// queue_buf) when one is queued, else from the per-conn response_buffer.
+	borrowed := conn.send_buf != unsafe { nil }
+	total := if borrowed { conn.send_total } else { conn.response_buffer.len }
+	ptr := if borrowed {
+		unsafe { &u8(conn.send_buf) + conn.bytes_sent }
+	} else {
+		unsafe { &u8(conn.response_buffer.data) + conn.bytes_sent }
+	}
+	posted := iou_arm_send(worker, mut conn, ptr, usize(total - conn.bytes_sent), limits)
 	// Count the in-flight response ONLY once the send is actually queued. If the SQ
 	// is full (posted == false) no send CQE will ever arrive, so a pre-increment
 	// would leak into worker.inflight and make Server.shutdown() wait out its whole
@@ -231,9 +238,11 @@ fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn
 		conn.response_buffer << response.status_413_response
 		conn.close_after_send = true
 	}
-	if conn.response_buffer.len > conn.bytes_sent {
+	if conn.send_buf != unsafe { nil } || conn.response_buffer.len > conn.bytes_sent {
 		// One batched send for every response produced this burst (arms the write
-		// deadline, counts the in-flight response for graceful shutdown).
+		// deadline, counts the in-flight response for graceful shutdown). send_buf is
+		// set when drain handed off a borrowed static-asset buffer (response_buffer
+		// then stays empty — the asset is sent directly, not copied through it).
 		iou_flush_response(worker, mut *conn, limits)
 		return
 	}
@@ -294,7 +303,19 @@ fn buf_view(buf []u8, start int, length int) []u8 {
 @[direct_array_access; manualfree]
 fn drain_iou_requests(mut conn io_uring.Connection, handler fn (req []u8, fd int, mut out []u8) !, limits Limits) {
 	mut pos := 0
+	// A borrowed static-asset buffer a handler queued via queue_buf, deferred so it
+	// can either be sent DIRECTLY (sole response) or, if more pipelined responses
+	// follow, copied into response_buffer IN ORDER before them.
+	mut pend := voidptr(unsafe { nil })
+	mut pend_len := i64(0)
 	for pos < conn.read_buf.len {
+		// Emit a borrow from the previous request before this request's response, so
+		// a pipelined batch stays in order. (A sole static response has no next
+		// iteration, so its borrow survives to the post-loop direct send below.)
+		if pend != unsafe { nil } {
+			unsafe { conn.response_buffer.push_many(pend, int(pend_len)) }
+			pend = unsafe { nil }
+		}
 		// _idx twin: plain int, no per-request !int boxing. The error sentinel is
 		// the negated HTTP status, so `-total` recovers the old err.code() value.
 		total := request_parser.frame_request_length_lim_idx(buf_view(conn.read_buf, pos,
@@ -313,10 +334,17 @@ fn drain_iou_requests(mut conn io_uring.Connection, handler fn (req []u8, fd int
 			return
 		}
 		req := buf_view(conn.read_buf, pos, total) // zero-copy, non-marking view (no array_slice)
+		// Borrowing is allowed only when the write buffer is empty, so a borrowed send
+		// is the WHOLE response and is never reordered against other pending bytes.
+		core.set_queue_buf_allowed(conn.response_buffer.len == 0)
 		handler(req, conn.fd, mut conn.response_buffer) or {
 			conn.response_buffer << response.tiny_bad_request_response
 			conn.close_after_send = true
 			return
+		}
+		if qb := core.take_queued_buf() {
+			pend = qb.ptr
+			pend_len = qb.len
 		}
 		pos += total
 		// Peer pipelines requests but never reads responses: bail before the
@@ -324,6 +352,18 @@ fn drain_iou_requests(mut conn io_uring.Connection, handler fn (req []u8, fd int
 		if conn.response_buffer.len - conn.bytes_sent > iou_max_pending_write {
 			conn.close_after_send = true
 			return
+		}
+	}
+	core.set_queue_buf_allowed(false)
+	// A sole borrowed response (write buffer still empty) is sent DIRECTLY from the
+	// borrowed buffer — the asset never touches the per-conn write buffer. Otherwise
+	// it was already copied into response_buffer in order by the loop above.
+	if pend != unsafe { nil } {
+		if conn.response_buffer.len == 0 {
+			conn.send_buf = pend
+			conn.send_total = int(pend_len)
+		} else {
+			unsafe { conn.response_buffer.push_many(pend, int(pend_len)) }
 		}
 	}
 	// Compact the leftover partial request to the buffer start (keeps capacity).
@@ -358,6 +398,10 @@ fn start_iou_body_drain(mut conn io_uring.Connection, handler fn (req []u8, fd i
 		return false // head not complete in the buffer yet — keep buffering
 	}
 	head := buf_view(conn.read_buf, 0, head_len) // zero-copy, non-marking view; handler consumes it now
+	// A streamed-body request answers from its head and then drains the body; its
+	// response must flow through response_buffer (not a borrowed direct send, which
+	// would race the body drain), so borrowing is disallowed for this handler call.
+	core.set_queue_buf_allowed(false)
 	handler(head, conn.fd, mut conn.response_buffer) or {
 		conn.response_buffer << response.tiny_bad_request_response
 		conn.close_after_send = true
@@ -399,17 +443,24 @@ fn handle_io_uring_write(worker &io_uring.Worker, cqe &C.io_uring_cqe, limits Li
 		return
 	}
 	conn.bytes_sent += res
-	if conn.bytes_sent < conn.response_buffer.len {
+	// The response is sent either from a BORROWED buffer (a preloaded static asset
+	// handed off via queue_buf; send_buf != nil) or from the per-conn response_buffer.
+	borrowed := conn.send_buf != unsafe { nil }
+	pending_total := if borrowed { conn.send_total } else { conn.response_buffer.len }
+	if conn.bytes_sent < pending_total {
 		// Partial send — resume from the offset. iou_arm_send keeps the existing
 		// write deadline (armed on the first send), so the whole batch must drain
 		// within write_timeout_ms regardless of how many partial sends it takes.
 		// Still in flight — the inflight count stays held until the batch finishes.
-		iou_arm_send(worker, mut *conn, unsafe {
-			&u8(conn.response_buffer.data) + conn.bytes_sent
-		}, usize(conn.response_buffer.len - conn.bytes_sent), limits)
+		ptr := if borrowed {
+			unsafe { &u8(conn.send_buf) + conn.bytes_sent }
+		} else {
+			unsafe { &u8(conn.response_buffer.data) + conn.bytes_sent }
+		}
+		iou_arm_send(worker, mut *conn, ptr, usize(pending_total - conn.bytes_sent), limits)
 		return
 	}
-	// Whole batch sent — the write is no longer outstanding; release the drain hold.
+	// Whole response sent — the write is no longer outstanding; release the drain hold.
 	conn.write_deadline = 0
 	if unsafe { worker.inflight != nil } {
 		stdatomic.add_i64(&worker.inflight.n, -1)
@@ -418,7 +469,12 @@ fn handle_io_uring_write(worker &io_uring.Worker, cqe &C.io_uring_cqe, limits Li
 		iou_release(worker, mut *conn, active_conns, track)
 		return
 	}
-	conn.response_buffer.clear() // len = 0, capacity kept for the next batch
+	if borrowed {
+		conn.send_buf = unsafe { nil } // borrowed buffer is never freed here
+		conn.send_total = 0
+	} else {
+		conn.response_buffer.clear() // len = 0, capacity kept for the next batch
+	}
 	conn.bytes_sent = 0
 	// Keep-alive: read the next request. read_buf still holds any pipelined
 	// leftover; iou_arm_recv re-arms the read deadline iff that leftover is a
@@ -480,6 +536,11 @@ fn io_uring_worker_main(listener int, cpu_id int, handler fn (req []u8, fd int, 
 	// shared draining flag (see Server.shutdown / handle_io_uring_accept).
 	worker.inflight = inflight
 	worker.draining = draining
+	// This worker can consume a borrowed buffer queued by a handler (queue_buf): a
+	// preloaded static asset is sent DIRECTLY instead of being copied through the
+	// per-connection write buffer (which otherwise grows to the asset size and is
+	// freed on release — per-request memcpy + realloc churn at high conn counts).
+	core.enable_queue_buf()
 	io_uring.pool_init(mut worker)
 
 	ring_entries := iou_init_ring(&worker.ring) or {
