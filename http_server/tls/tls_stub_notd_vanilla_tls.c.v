@@ -46,6 +46,18 @@ pub fn (s &Session) write_from(ptr &u8, len int) int {
 	return closed
 }
 
+pub fn (s &Session) enable_ktls(fd int) bool {
+	return false
+}
+
+pub fn (s &Session) ktls_active() bool {
+	return false
+}
+
+pub fn (s &Session) ktls_failed() bool {
+	return false
+}
+
 pub fn (s &Session) alpn() string {
 	return ''
 }

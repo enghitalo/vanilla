@@ -71,4 +71,16 @@ int vtls_handshake(void *sess);
 int vtls_read(void *sess, unsigned char *buf, size_t len);
 int vtls_write(void *sess, const unsigned char *buf, size_t len);
 
+// ---- kTLS: kernel record-crypto offload ------------------------------------
+
+// After vtls_handshake() returns VTLS_OK, try to hand record encrypt/decrypt to the
+// kernel (TLS_TX + TLS_RX). Returns 1 if kTLS engaged — thereafter the caller does
+// PLAIN recv()/send() on the fd and the kernel does AES-128-GCM. Returns 0 to keep
+// using vtls_read/vtls_write (userspace mbedtls) — a safe fallback when the host
+// lacks the tls ULP. If it returns 0 AND vtls_ktls_failed() is 1, the socket is
+// half-converted and the caller MUST close the connection.
+int vtls_enable_ktls(void *sess, int fd);
+int vtls_ktls_active(void *sess);
+int vtls_ktls_failed(void *sess);
+
 #endif /* VANILLA_TLS_H */
