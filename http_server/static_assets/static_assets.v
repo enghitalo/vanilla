@@ -431,10 +431,18 @@ fn (s &AssetServer) emit_into(asset &Asset, req request_parser.HttpRequest, head
 		out << v.response[..v.header_len]
 		return
 	}
-	out << v.response // small: full response; large: headers only
 	if !v.is_large() {
+		// Small (preloaded): the precomputed response (headers + body) is immutable
+		// for the server's lifetime, so hand it to the worker to send DIRECTLY
+		// (borrowed) when the backend can (io_uring core.queue_buf) — no copy through
+		// the per-connection write buffer. queue_buf returns false on any backend that
+		// can't borrow-send (epoll, TLS, non-Linux), where the copy stays the path.
+		if !core.queue_buf(v.response.data, v.response.len) {
+			out << v.response
+		}
 		return
 	}
+	out << v.response // large: headers only; body streamed below
 	// Large body: stream it from the page cache with sendfile(2); if the backend
 	// can't (TLS / non-epoll / non-Linux), read it into `out` as a fallback.
 	if !(v.file_fd >= 0 && core.queue_file(v.file_fd, i64(0), v.body_len)) {
