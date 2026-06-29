@@ -234,6 +234,15 @@ pub mut:
 	// recv is length-clamped to this remainder so the drain never reads past the
 	// body into the next pipelined request. Once it hits 0 the held response is sent.
 	body_drain i64
+
+	// Borrowed-buffer send (queue_buf): when send_buf != nil the whole response is
+	// a single borrowed, immutable, process-lifetime buffer (a preloaded static
+	// asset) sent DIRECTLY rather than copied through response_buffer — keeping
+	// response_buffer at its base cap (no per-request grow/realloc churn, no
+	// per-conn balloon). [bytes_sent..send_total) is still pending. The buffer is
+	// borrowed: never freed or modified here, and guaranteed to outlive the send.
+	send_buf   voidptr
+	send_total int
 }
 
 // ==================== Worker Structure ====================
@@ -297,6 +306,8 @@ pub fn pool_acquire(mut w Worker, fd int) &Connection {
 	c.read_deadline = 0
 	c.write_deadline = 0
 	c.body_drain = 0
+	c.send_buf = unsafe { nil }
+	c.send_total = 0
 	// Lock-free buffer REUSE: the per-worker pool is single-issuer (only this
 	// worker thread ever touches w.conns/free_stack), so a slot's buffers persist
 	// across connections with zero atomics. Reuse the pooled buffer (reset len,
@@ -363,6 +374,8 @@ pub fn pool_release(mut w Worker, mut c Connection) {
 	c.read_deadline = 0
 	c.write_deadline = 0
 	c.body_drain = 0
+	c.send_buf = unsafe { nil }
+	c.send_total = 0
 	c.owner = unsafe { nil }
 	unsafe {
 		idx := int(u64(&c) - u64(&w.conns[0])) / int(sizeof(Connection))
