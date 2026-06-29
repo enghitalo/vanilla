@@ -60,6 +60,13 @@ pub:
 	// Only takes effect on Linux; other OSes always preload (no behavior change).
 	// Use respond_into() (not respond()) to get the sendfile fast path.
 	sendfile_min_bytes i64 = 256 * 1024
+	// url_prefix mounts the bundle under a request-path prefix (e.g. '/static/').
+	// When set, route() requires the request path to start with it and strips it
+	// before keying the asset map, so a server can expose the same loaded bundle
+	// at any mount point without rewriting the request. Empty (default) serves at
+	// the root. The SPA fallback (when enabled) only triggers for paths under the
+	// prefix; paths outside it are a 404 (the asset server does not own them).
+	url_prefix string
 }
 
 // Variant is one representation (identity / br / gzip) of an asset.
@@ -106,6 +113,7 @@ pub struct AssetServer {
 pub:
 	spa_fallback  string
 	precompressed []Encoding
+	url_prefix    string // mount prefix stripped before keying (e.g. '/static/'); '' = root
 	assets        map[string]&Asset
 }
 
@@ -204,6 +212,7 @@ pub fn new(config Config) !AssetServer {
 	return AssetServer{
 		spa_fallback:  config.spa_fallback
 		precompressed: formats
+		url_prefix:    config.url_prefix
 		assets:        assets
 	}
 }
@@ -240,10 +249,27 @@ fn (s &AssetServer) route(req &request_parser.HttpRequest) ([]u8, &Asset, bool) 
 		}
 	}
 
+	// Mount prefix: when configured, the path must start with url_prefix; strip it
+	// so the asset key is mount-relative. A path outside the mount is a 404 — the
+	// asset server does not own it. Done before the `..` scan so traversal checks
+	// run on the mount-relative remainder.
+	mut pstart := p.start
+	if s.url_prefix.len > 0 {
+		if pend - pstart < s.url_prefix.len {
+			return status_404, unsafe { nil }, head
+		}
+		for k in 0 .. s.url_prefix.len {
+			if buf[pstart + k] != s.url_prefix[k] {
+				return status_404, unsafe { nil }, head
+			}
+		}
+		pstart += s.url_prefix.len
+	}
+
 	// SECURITY: refuse any `..` path segment before it can reach the fallback.
 	// Keys are clean relative paths, so a `..` can never match a real asset —
 	// but it could otherwise be masked by the SPA fallback as a 200.
-	mut seg := p.start
+	mut seg := pstart
 	for seg < pend {
 		mut j := seg
 		for j < pend && buf[j] != `/` {
@@ -256,7 +282,7 @@ fn (s &AssetServer) route(req &request_parser.HttpRequest) ([]u8, &Asset, bool) 
 	}
 
 	// Strip leading '/' to form the relative key — still just an offset + len.
-	mut rs := p.start
+	mut rs := pstart
 	for rs < pend && buf[rs] == `/` {
 		rs++
 	}

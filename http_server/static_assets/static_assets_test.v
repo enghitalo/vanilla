@@ -334,3 +334,41 @@ fn test_range_absurd_number_falls_through_to_200() {
 	resp := server().respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=18446744073709551616-'))!.bytestr()
 	assert resp.starts_with('HTTP/1.1 200')
 }
+
+// --- url_prefix mount -------------------------------------------------------
+
+fn mounted_server() AssetServer {
+	return new(Config{ root: fixture_root, url_prefix: '/static/' }) or { panic(err) }
+}
+
+fn test_url_prefix_serves_under_mount() {
+	// The same bundle, mounted at /static/: the prefix is stripped before keying.
+	resp := mounted_server().respond(req('GET /static/app.abc123.js HTTP/1.1'))!.bytestr()
+	assert resp.starts_with('HTTP/1.1 200')
+	assert resp.contains('export const x = 1')
+}
+
+fn test_url_prefix_negotiates_under_mount() {
+	// Precompressed negotiation still works through the mount.
+	resp := mounted_server().respond(req('GET /static/app.abc123.js HTTP/1.1\r\nAccept-Encoding: br'))!.bytestr()
+	assert resp.contains('Content-Encoding: br')
+	assert resp.contains('BROTLI-APP-JS')
+}
+
+fn test_url_prefix_path_outside_mount_is_404() {
+	// A path that does not start with the mount prefix is not owned by this server.
+	resp := mounted_server().respond(req('GET /app.abc123.js HTTP/1.1'))!.bytestr()
+	assert resp.starts_with('HTTP/1.1 404')
+}
+
+fn test_url_prefix_traversal_still_blocked() {
+	// `..` under the mount is still refused (cannot escape via the prefix).
+	resp := mounted_server().respond(req('GET /static/../core.9f3a1c.wasm HTTP/1.1'))!.bytestr()
+	assert resp.starts_with('HTTP/1.1 404')
+}
+
+fn test_no_prefix_default_still_serves_at_root() {
+	// Regression: default (no url_prefix) serves at the root exactly as before.
+	resp := server().respond(req('GET /app.abc123.js HTTP/1.1'))!.bytestr()
+	assert resp.starts_with('HTTP/1.1 200')
+}
