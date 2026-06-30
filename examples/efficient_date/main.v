@@ -20,6 +20,12 @@ module main
 import http_server
 import time
 
+#include <time.h>
+
+// C.time returns the current Unix second (time_t) directly — far cheaper than
+// building a full calendar Time per request just to read its second.
+fn C.time(t voidptr) i64
+
 // DateCache is one worker's cached Date line + the unix second it is valid for.
 struct DateCache {
 mut:
@@ -38,14 +44,18 @@ fn make_state() voidptr {
 // refresh rebuilds the cached Date line only when the second has advanced.
 @[direct_array_access]
 fn (mut dc DateCache) refresh() {
-	now := time.utc()
-	if now.unix() == dc.sec {
+	// Hot path: ONE cheap C.time() (no calendar decomposition, no allocation) to
+	// detect a second boundary. Only when the second actually advances do we pay
+	// for time.utc()'s full RFC-1123 formatting — once per second, not per request.
+	// (Was: time.utc() on EVERY request just to read its .unix() second.)
+	now_sec := C.time(unsafe { nil })
+	if now_sec == dc.sec {
 		return
 	}
-	dc.sec = now.unix()
+	dc.sec = now_sec
 	dc.line.clear()
 	dc.line << 'Date: '.bytes()
-	now.push_to_http_header(mut dc.line) // appends "Sun, 06 Nov 1994 08:49:37 GMT"
+	time.utc().push_to_http_header(mut dc.line) // appends "Sun, 06 Nov 1994 08:49:37 GMT"
 	dc.line << '\r\n'.bytes()
 }
 

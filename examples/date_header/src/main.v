@@ -25,7 +25,6 @@ module main
 import http_server
 import time
 import sync.stdatomic
-import strings
 
 // "Date: " (6) + "Wed, 21 Oct 2015 07:28:00" (25) + " GMT" (4) + "\r\n" (2) = 37
 const date_line_len = 37
@@ -61,17 +60,13 @@ fn (c &DateCache) date_line() []u8 {
 	return c.bufs[i][..]
 }
 
-fn handle(req_buffer []u8, _ int, cache &DateCache) ![]u8 {
-	body := 'ok'
-	mut sb := strings.new_builder(96)
-	sb.write_string('HTTP/1.1 200 OK\r\n')
-	sb.write(cache.date_line()) or {} // cached Date header line
-	sb.write_string('Content-Type: text/plain\r\n')
-	sb.write_string('Content-Length: ${body.len}\r\n')
-	sb.write_string('Connection: keep-alive\r\n\r\n')
-	sb.write_string(body)
-	return sb
-}
+// The two STATIC halves of the response — everything except the Date line, which
+// is the only per-request-varying part (and is already pre-built in the cache).
+// Built once as consts so the hot path allocates nothing.
+const status_head = 'HTTP/1.1 200 OK\r\n'.bytes()
+
+// Content-Length: 2 is the 'ok' body.
+const resp_tail = 'Content-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
 
 fn main() {
 	mut cache := &DateCache{}
@@ -97,7 +92,13 @@ fn main() {
 		port:            3000
 		io_multiplexing: backend
 		request_handler: fn [cache] (req_buffer []u8, fd int, mut out []u8) ! {
-			out << handle(req_buffer, fd, cache)!
+			// Zero per-request allocation: append the two static halves and the
+			// pre-built cached Date line (one atomic load, zero-copy slice) straight
+			// into the server-owned `out` buffer — no per-request strings.Builder, no
+			// copy-through an intermediate.
+			out << status_head
+			out << cache.date_line()
+			out << resp_tail
 		}
 	})!
 	println('Date-header demo on http://localhost:3000/  (cached, refreshed 1x/s)')
