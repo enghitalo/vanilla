@@ -98,7 +98,7 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 				socket.set_tcp_nodelay(client_conn_fd)
 				// Distribute client connection to worker threads (round-robin)
 				epoll_fd := epoll_fds[next_worker]
-				next_worker = (next_worker + 1) % core.max_thread_pool_size
+				next_worker = (next_worker + 1) % epoll_fds.len
 				$if verbose ? {
 					eprintln('[epoll] Adding client fd ${client_conn_fd} to worker epoll fd ${epoll_fd}')
 				}
@@ -304,10 +304,12 @@ pub fn run_epoll_backend(socket_fd int, request_handler core.RequestHandler, sta
 
 	// the function of this epoll_fds array is to hold epoll fds for each worker thread
 	// they are used to distribute client connections among worker threads
-	mut epoll_fds := []int{len: core.max_thread_pool_size, cap: core.max_thread_pool_size}
+	// One worker epoll fd per worker thread. threads was sized by new_server from
+	// config.workers (default nr_cpus), so its length is this server's worker count.
+	mut epoll_fds := []int{len: threads.len, cap: threads.len}
 
 	unsafe { epoll_fds.flags.set(.noslices | .noshrink | .nogrow) }
-	for i in 0 .. core.max_thread_pool_size {
+	for i in 0 .. threads.len {
 		epoll_fds[i] = epoll.create_epoll_fd()
 		if epoll_fds[i] < 0 {
 			C.perror(c'epoll_create1')

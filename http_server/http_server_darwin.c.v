@@ -115,7 +115,8 @@ pub fn run_kqueue_backend(socket_fd int, handler fn (req []u8, fd int, mut out [
 		return
 	}
 
-	n_workers := max_thread_pool_size
+	// Worker count = the thread array new_server sized from config.workers.
+	n_workers := threads.len
 	mut worker_kqs := []int{len: n_workers}
 
 	for i in 0 .. n_workers {

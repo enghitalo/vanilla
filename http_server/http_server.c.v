@@ -251,6 +251,16 @@ pub:
 	certificates    Certificates
 	limits          Limits
 	tls_config      &tls.Config = unsafe { nil } // set for HTTPS (e.g. tls.new_self_signed())
+	// workers sets how many worker threads THIS server runs. 0 (default) =
+	// `VANILLA_WORKERS` env → `runtime.nr_cpus()` (the process-wide default). Set it
+	// PER server instance when co-hosting two servers in one process so their worker
+	// threads don't oversubscribe the cores: e.g. give the high-traffic plaintext
+	// server most cores and a co-hosted TLS/secondary server a small pool, keeping
+	// the total ≈ nr_cpus. The meaning is uniform across backends (count of worker
+	// threads); the topology differs — epoll runs a central acceptor + `workers`
+	// epoll loops, io_uring runs `workers` shared-nothing rings (one SO_REUSEPORT
+	// listener each).
+	workers int
 }
 
 pub fn new_server(config ServerConfig) !Server {
@@ -336,6 +346,13 @@ pub fn new_server(config ServerConfig) !Server {
 		}
 	}
 
+	// Per-server worker count: config.workers when set (>0), else the process-wide
+	// default (VANILLA_WORKERS → nr_cpus). This is the single source of truth for
+	// this server's worker fan-out — it sizes the thread / in-flight-counter /
+	// io_uring-listener arrays below, and every backend derives its worker count
+	// from threads.len, so two co-hosted servers can split the cores independently.
+	n_workers := if config.workers > 0 { config.workers } else { max_thread_pool_size }
+
 	// Listeners the server will accept on. The first is always socket_fd. The
 	// io_uring backend is shared-nothing with one SO_REUSEPORT listener PER worker,
 	// so create the rest up front (worker 0 reuses socket_fd): then shutdown() can
@@ -344,7 +361,7 @@ pub fn new_server(config ServerConfig) !Server {
 	mut listener_fds := [socket_fd]
 	$if linux {
 		if io_multiplexing == .io_uring {
-			for _ in 1 .. max_thread_pool_size {
+			for _ in 1 .. n_workers {
 				listener_fds << socket.create_server_socket(config.port)
 			}
 		}
@@ -361,7 +378,8 @@ pub fn new_server(config ServerConfig) !Server {
 		on_worker_start:  config.on_worker_start
 		limits:           config.limits
 		tls_config:       config.tls_config
-		threads:          []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
+		threads:          []thread{len: n_workers, cap: n_workers}
+		inflight:         []&core.Counter{len: n_workers, init: &core.Counter{}}
 		listener_fds:     listener_fds
 	}
 }
