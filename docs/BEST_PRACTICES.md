@@ -166,6 +166,18 @@ sb.write_string('Content-Length: ${body.len}\r\n')
 > diagnostics, where readability beats the one-time allocation. That's how the
 > core uses it.
 
+**Worked example — the `Date` header.** `examples/date_header`, `examples/efficient_date`
+and `examples/async_date_timerfd` cache the 1-second-resolution `Date` line and just
+append it. `date_header` now builds the response from two `const ... .bytes()` halves +
+the cached line appended straight into `out` — no per-request `strings.Builder` (which
+also leaked under `-gc none`, §4). `efficient_date` checks the current second with a
+cheap `C.time()` instead of constructing a full calendar `time.utc()` on every request.
+Honest measurement (wrk `-t8 -c512`, 8 workers pinned, load generator on separate cores):
+at the I/O-bound throughput ceiling the three are indistinguishable from each other AND
+within run-to-run noise (~3-4%) of a response carrying **no `Date` header at all**. So the
+payoff is a zero-allocation, minimal-CPU hot path — mandatory under `-gc none` and
+valuable for latency/headroom — **not** raw req/s. Correct, cheap, paid once per second.
+
 ---
 
 ## 4. Allocate on the hot path with intent

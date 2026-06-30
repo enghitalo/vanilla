@@ -171,7 +171,8 @@ fn main() {
 | `examples/cors/` | CORS preflight and origin allowlist |
 | `examples/csrf/` | CSRF token protection |
 | `examples/database/` | PostgreSQL connection pool |
-| `examples/date_header/` | RFC 7231 `Date` header |
+| `examples/date_header/` | RFC 7231 `Date` header (shared cache, zero-alloc hot path) |
+| `examples/efficient_date/` | Cached `Date` header (per-worker, lazy 1×/s refresh) |
 | `examples/etag/` | ETag and conditional requests |
 | `examples/graceful_shutdown/` | SIGTERM/SIGINT drain |
 | `examples/hexagonal/` | Hexagonal architecture |
