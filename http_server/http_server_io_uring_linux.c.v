@@ -701,7 +701,9 @@ pub fn run_io_uring_backend(server Server, mut threads []thread) {
 	if server.on_worker_start != unsafe { nil } {
 		panic('on_worker_start is not supported on the io_uring backend')
 	}
-	num_workers := max_thread_pool_size
+	// Worker count = the thread array new_server sized from config.workers (one
+	// SO_REUSEPORT listener was created per worker, so server.listener_fds.len matches).
+	num_workers := threads.len
 
 	for i in 0 .. num_workers {
 		// One SO_REUSEPORT listener per worker, all created in new_server so
