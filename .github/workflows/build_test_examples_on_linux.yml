@@ -19,6 +19,7 @@ jobs:
           - examples/etag/src
           - examples/hexagonal/src
           - examples/io_uring_demo/src
+          - examples/per_server_workers/src
           - examples/simple/src
           - examples/simple2/src
           - examples/sse/src
