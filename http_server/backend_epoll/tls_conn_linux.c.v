@@ -250,7 +250,9 @@ fn handle_readable_fd_tls(request_handler core.RequestHandler, epoll_fd int, fd 
 		close_tls(epoll_fd, fd, active_conns, mut sessions)
 		return
 	}
-	unsafe { buf.len = 0 }
+	unsafe {
+		buf.len = 0
+	}
 	conn.read_buf = buf // pool the read buffer's capacity for the next request
 	tls_send_or_park(epoll_fd, fd, limits, active_conns, mut sessions, mut conn, resp)
 }
@@ -275,7 +277,8 @@ fn handle_writable_fd_tls(epoll_fd int, fd int, active_conns &core.Counter, mut 
 
 	for conn.write_off < conn.write_buf.len {
 		n := if conn.ktls {
-			ktls_send(fd, unsafe { &u8(conn.write_buf.data) + conn.write_off }, conn.write_buf.len - conn.write_off)
+			ktls_send(fd, unsafe { &u8(conn.write_buf.data) + conn.write_off },
+				conn.write_buf.len - conn.write_off)
 		} else {
 			conn.sess.write_from(unsafe { &u8(conn.write_buf.data) + conn.write_off },
 				conn.write_buf.len - conn.write_off)
@@ -323,7 +326,9 @@ fn tls_send_or_park(epoll_fd int, fd int, limits core.Limits, active_conns &core
 		return
 	}
 	mut done := unsafe { resp }
-	unsafe { done.len = 0 }
+	unsafe {
+		done.len = 0
+	}
 	conn.resp_buf = done // return to the per-conn pool instead of freeing
 	tls_set_out(mut conn, epoll_fd, fd, false) // keep-alive; not waiting on writability
 }

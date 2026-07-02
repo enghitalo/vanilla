@@ -320,12 +320,16 @@ pub fn pool_acquire(mut w Worker, fd int) &Connection {
 	if unsafe { c.read_buf.data == nil } {
 		c.read_buf = []u8{len: 0, cap: read_buf_cap}
 	} else {
-		unsafe { c.read_buf.len = 0 }
+		unsafe {
+			c.read_buf.len = 0
+		}
 	}
 	if unsafe { c.response_buffer.data == nil } {
 		c.response_buffer = []u8{len: 0, cap: write_buf_cap}
 	} else {
-		unsafe { c.response_buffer.len = 0 }
+		unsafe {
+			c.response_buffer.len = 0
+		}
 	}
 	// No manual `.noscan_data` here, on purpose. read_buf/response_buffer are `[]u8`
 	// (pointer-free), so under the default GC the compiler picks the no-scan array
@@ -361,13 +365,17 @@ pub fn pool_release(mut w Worker, mut c Connection) {
 		unsafe { c.read_buf.free() }
 		c.read_buf = []u8{}
 	} else {
-		unsafe { c.read_buf.len = 0 }
+		unsafe {
+			c.read_buf.len = 0
+		}
 	}
 	if c.response_buffer.cap > write_buf_cap {
 		unsafe { c.response_buffer.free() }
 		c.response_buffer = []u8{}
 	} else {
-		unsafe { c.response_buffer.len = 0 }
+		unsafe {
+			c.response_buffer.len = 0
+		}
 	}
 	c.bytes_sent = 0
 	c.close_after_send = false

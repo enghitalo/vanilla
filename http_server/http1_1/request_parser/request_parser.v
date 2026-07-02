@@ -526,7 +526,11 @@ pub fn frame_request_length_lim_idx(buf []u8, max_header int, max_body int) int 
 					// Cold path: the chunked framer still returns a Result; map it
 					// to a sentinel (the one boxing here is off the GET hot path).
 					return frame_chunked_total(buf, body_start, max_body) or {
-						if err.code() == 413 { frame_err_body } else { frame_err_malformed }
+						if err.code() == 413 {
+							frame_err_body
+						} else {
+							frame_err_malformed
+						}
 					}
 				}
 				if content_length >= 0 {

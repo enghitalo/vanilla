@@ -397,7 +397,8 @@ fn start_iou_body_drain(mut conn io_uring.Connection, handler fn (req []u8, fd i
 	if head_len <= 0 || head_len > conn.read_buf.len {
 		return false // head not complete in the buffer yet — keep buffering
 	}
-	head := buf_view(conn.read_buf, 0, head_len) // zero-copy, non-marking view; handler consumes it now
+	head :=
+		buf_view(conn.read_buf, 0, head_len) // zero-copy, non-marking view; handler consumes it now
 	// A streamed-body request answers from its head and then drains the body; its
 	// response must flow through response_buffer (not a borrowed direct send, which
 	// would race the body drain), so borrowing is disallowed for this handler call.

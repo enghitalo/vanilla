@@ -287,13 +287,14 @@ fn test_etag_weak_validator_matches() {
 fn test_etag_list_matches_later_member() {
 	s := server()
 	etag := s.etag_for('core.9f3a1c.wasm')!
-	resp := s.respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nIf-None-Match: "nope", ' +
-		etag))!.bytestr()
+	resp :=
+		s.respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nIf-None-Match: "nope", ' + etag))!.bytestr()
 	assert resp.starts_with('HTTP/1.1 304')
 }
 
 fn test_etag_list_no_member_serves_200() {
-	resp := server().respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nIf-None-Match: "a", "b"'))!.bytestr()
+	resp :=
+		server().respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nIf-None-Match: "a", "b"'))!.bytestr()
 	assert resp.starts_with('HTTP/1.1 200')
 }
 
@@ -325,13 +326,15 @@ fn test_range_wrong_unit_falls_through_to_200() {
 
 fn test_range_unsatisfiable_falls_through_to_200() {
 	// start beyond EOF (8-byte asset) → none → full 200.
-	resp := server().respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=900-1000'))!.bytestr()
+	resp :=
+		server().respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=900-1000'))!.bytestr()
 	assert resp.starts_with('HTTP/1.1 200')
 }
 
 fn test_range_absurd_number_falls_through_to_200() {
 	// A number past i64 saturates (does not wrap to a valid offset) → none → 200.
-	resp := server().respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=18446744073709551616-'))!.bytestr()
+	resp :=
+		server().respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=18446744073709551616-'))!.bytestr()
 	assert resp.starts_with('HTTP/1.1 200')
 }
 
@@ -350,7 +353,8 @@ fn test_url_prefix_serves_under_mount() {
 
 fn test_url_prefix_negotiates_under_mount() {
 	// Precompressed negotiation still works through the mount.
-	resp := mounted_server().respond(req('GET /static/app.abc123.js HTTP/1.1\r\nAccept-Encoding: br'))!.bytestr()
+	resp :=
+		mounted_server().respond(req('GET /static/app.abc123.js HTTP/1.1\r\nAccept-Encoding: br'))!.bytestr()
 	assert resp.contains('Content-Encoding: br')
 	assert resp.contains('BROTLI-APP-JS')
 }
