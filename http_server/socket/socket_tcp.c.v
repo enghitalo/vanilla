@@ -75,29 +75,32 @@ struct C.sockaddr_in {
 // Helper for client connections (for testing)
 pub fn connect_to_server(port int) !int {
 	println('[client] Creating client socket...')
+	// The unix body lives in `$else`: comptime early-return alone doesn't stop
+	// the checker, and on Windows C.socket/C.accept return u64 (SOCKET), so
+	// the unix int-typed code must not be typechecked there.
 	$if windows {
 		return connect_to_server_on_windows(port)
+	} $else {
+		client_fd := C.socket(C.AF_INET, C.SOCK_STREAM, 0)
+		if client_fd < 0 {
+			println('[client] Failed to create client socket')
+			return error('Failed to create client socket')
+		}
+		mut addr := C.sockaddr_in{
+			sin_family: u16(C.AF_INET)
+			sin_port:   C.htons(u16(port))
+			sin_addr:   C.in_addr{u32(C.INADDR_ANY)} // 0.0.0.0
+		}
+		println('[client] Connecting to server on port ${port} (0.0.0.0)...')
+		// Cast to voidptr for OS compatibility
+		if C.connect(client_fd, voidptr(&addr), sizeof(addr)) < 0 {
+			println('[client] Failed to connect to server')
+			C.close(client_fd)
+			return error('Failed to connect to server')
+		}
+		println('[client] Connected to server, fd=${client_fd}')
+		return client_fd
 	}
-
-	client_fd := C.socket(C.AF_INET, C.SOCK_STREAM, 0)
-	if client_fd < 0 {
-		println('[client] Failed to create client socket')
-		return error('Failed to create client socket')
-	}
-	mut addr := C.sockaddr_in{
-		sin_family: u16(C.AF_INET)
-		sin_port:   C.htons(u16(port))
-		sin_addr:   C.in_addr{u32(C.INADDR_ANY)} // 0.0.0.0
-	}
-	println('[client] Connecting to server on port ${port} (0.0.0.0)...')
-	// Cast to voidptr for OS compatibility
-	if C.connect(client_fd, voidptr(&addr), sizeof(addr)) < 0 {
-		println('[client] Failed to connect to server')
-		C.close(client_fd)
-		return error('Failed to connect to server')
-	}
-	println('[client] Connected to server, fd=${client_fd}')
-	return client_fd
 }
 
 // Setup and teardown for server sockets.
@@ -146,6 +149,14 @@ pub fn set_nosigpipe(fd int) {
 pub fn accept_client(server_fd int) int {
 	$if linux {
 		return C.accept4(server_fd, C.NULL, C.NULL, C.SOCK_NONBLOCK)
+	} $else $if windows {
+		// Winsock SOCKET is u64; kernel handles are 32-bit-significant, so the
+		// int fd convention holds (INVALID_SOCKET truncates to -1).
+		fd := int(C.accept(u64(server_fd), C.NULL, C.NULL))
+		if fd >= 0 {
+			set_blocking(fd, false)
+		}
+		return fd
 	} $else {
 		fd := C.accept(server_fd, C.NULL, C.NULL)
 		if fd >= 0 {
@@ -198,62 +209,64 @@ pub fn shutdown_socket(fd int) {
 }
 
 pub fn create_server_socket(port int) int {
+	// Unix body in `$else` — see connect_to_server for why.
 	$if windows {
 		return create_server_socket_on_windows(port)
-	}
-	server_fd := C.socket(C.AF_INET, C.SOCK_STREAM, 0)
-	if server_fd < 0 {
-		eprintln(@LOCATION)
-		C.perror(c'Socket creation failed')
-		exit(1)
-	}
-
-	set_blocking(server_fd, false)
-
-	opt := 1
-	// On Linux, also set SO_REUSEPORT for load balancing between threads
-	$if linux {
-		// On Linux/other Unix, use SO_REUSEPORT for socket sharding/load balancing
-		// SO_REUSEPORT allows multiple workers to bind() and accept() independently
-		if C.setsockopt(server_fd, C.SOL_SOCKET, C.SO_REUSEPORT, &opt, sizeof(opt)) < 0 {
-			eprintln(@LOCATION)
-			C.perror(c'setsockopt SO_REUSEPORT failed')
-			close_socket(server_fd)
-			exit(1)
-		}
-
-		eprintln('[socket] SO_REUSEPORT enabled for load balancing')
 	} $else {
-		if C.setsockopt(server_fd, C.SOL_SOCKET, C.SO_REUSEADDR, &opt, sizeof(opt)) < 0 {
+		server_fd := C.socket(C.AF_INET, C.SOCK_STREAM, 0)
+		if server_fd < 0 {
 			eprintln(@LOCATION)
-			C.perror(c'setsockopt SO_REUSEADDR failed')
+			C.perror(c'Socket creation failed')
+			exit(1)
+		}
+
+		set_blocking(server_fd, false)
+
+		opt := 1
+		// On Linux, also set SO_REUSEPORT for load balancing between threads
+		$if linux {
+			// On Linux/other Unix, use SO_REUSEPORT for socket sharding/load balancing
+			// SO_REUSEPORT allows multiple workers to bind() and accept() independently
+			if C.setsockopt(server_fd, C.SOL_SOCKET, C.SO_REUSEPORT, &opt, sizeof(opt)) < 0 {
+				eprintln(@LOCATION)
+				C.perror(c'setsockopt SO_REUSEPORT failed')
+				close_socket(server_fd)
+				exit(1)
+			}
+
+			eprintln('[socket] SO_REUSEPORT enabled for load balancing')
+		} $else {
+			if C.setsockopt(server_fd, C.SOL_SOCKET, C.SO_REUSEADDR, &opt, sizeof(opt)) < 0 {
+				eprintln(@LOCATION)
+				C.perror(c'setsockopt SO_REUSEADDR failed')
+				close_socket(server_fd)
+				exit(1)
+			}
+		}
+
+		// Bind to INADDR_ANY (0.0.0.0)
+		println('[socket] Binding to 0.0.0.0:${port}')
+		server_addr := C.sockaddr_in{
+			sin_family: u16(C.AF_INET)
+			sin_port:   C.htons(u16(port))
+			sin_addr:   C.in_addr{u32(C.INADDR_ANY)} // 0.0.0.0
+		}
+
+		// Cast to voidptr to fix the type mismatch
+		if C.bind(server_fd, voidptr(&server_addr), sizeof(server_addr)) < 0 {
+			eprintln(@LOCATION)
+			C.perror(c'Bind failed')
 			close_socket(server_fd)
 			exit(1)
 		}
-	}
 
-	// Bind to INADDR_ANY (0.0.0.0)
-	println('[socket] Binding to 0.0.0.0:${port}')
-	server_addr := C.sockaddr_in{
-		sin_family: u16(C.AF_INET)
-		sin_port:   C.htons(u16(port))
-		sin_addr:   C.in_addr{u32(C.INADDR_ANY)} // 0.0.0.0
-	}
+		if C.listen(server_fd, listen_backlog) < 0 {
+			eprintln(@LOCATION)
+			C.perror(c'Listen failed')
+			close_socket(server_fd)
+			exit(1)
+		}
 
-	// Cast to voidptr to fix the type mismatch
-	if C.bind(server_fd, voidptr(&server_addr), sizeof(server_addr)) < 0 {
-		eprintln(@LOCATION)
-		C.perror(c'Bind failed')
-		close_socket(server_fd)
-		exit(1)
+		return server_fd
 	}
-
-	if C.listen(server_fd, listen_backlog) < 0 {
-		eprintln(@LOCATION)
-		C.perror(c'Listen failed')
-		close_socket(server_fd)
-		exit(1)
-	}
-
-	return server_fd
 }

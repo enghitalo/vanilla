@@ -78,7 +78,7 @@ fn C.SetEvent(h_event voidptr) bool
 
 fn C.WaitForSingleObject(h_handle voidptr, dw_milliseconds u32) u32
 
-const infinity = 0xFFFFFFFF
+pub const infinity = u32(0xFFFFFFFF)
 
 pub struct IOCP {
 pub mut:

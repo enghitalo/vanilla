@@ -21,6 +21,9 @@ const acceptex_guid = C.WSAID_ACCEPTEX
 const max_iocp_workers = runtime.nr_cpus()
 const buffer_size = 8192
 
+fn C.GetOverlappedResult(h_file voidptr, lp_overlapped voidptr, lp_number_of_bytes_transferred &u32,
+	b_wait bool) bool
+
 struct WorkerContext {
 pub mut:
 	iocp_handle voidptr
@@ -79,7 +82,7 @@ fn worker_thread(mut ctx WorkerContext) {
 		}
 
 		// Cast overlapped back to IOData
-		io_data := unsafe { &iocp.IOData(overlapped) }
+		mut io_data := unsafe { &iocp.IOData(overlapped) }
 
 		match io_data.operation {
 			.accept {
@@ -89,7 +92,7 @@ fn worker_thread(mut ctx WorkerContext) {
 				handle_read_completion(io_data, ctx.handler, mut ctx)
 			}
 			.write {
-				handle_write_completion(io_data, mut ctx)
+				handle_write_completion(mut io_data, mut ctx)
 			}
 			.close {
 				socket.close_socket(io_data.socket_fd)
@@ -149,7 +152,7 @@ fn handle_read_completion(io_data &iocp.IOData, handler fn (req []u8, fd int, mu
 	}
 
 	// Prepare write operation
-	write_io_data := iocp.create_io_data(socket_fd, .write, response_data.len)
+	mut write_io_data := iocp.create_io_data(socket_fd, .write, response_data.len)
 	unsafe {
 		C.memcpy(&write_io_data.buffer[0], response_data.data, response_data.len)
 	}
@@ -178,7 +181,7 @@ fn handle_read_completion(io_data &iocp.IOData, handler fn (req []u8, fd int, mu
 	post_read_operation(socket_fd, ctx.iocp_handle)
 }
 
-fn handle_write_completion(io_data &iocp.IOData, mut ctx WorkerContext) {
+fn handle_write_completion(mut io_data iocp.IOData, mut ctx WorkerContext) {
 	socket_fd := io_data.socket_fd
 
 	// Check if all data was sent
@@ -285,7 +288,7 @@ pub fn run_iocp_backend(socket_fd int, handler fn (req []u8, fd int, mut out []u
 	println('[iocp] Starting IOCP backend on port ${port}')
 
 	// Create IOCP handle
-	iocp_handle := iocp.create_iocp(max_iocp_workers) or {
+	iocp_handle := iocp.create_iocp(u32(max_iocp_workers)) or {
 		eprintln('[iocp] Failed to create IOCP: ${err}')
 		return
 	}
@@ -316,7 +319,7 @@ pub fn run_iocp_backend(socket_fd int, handler fn (req []u8, fd int, mut out []u
 
 	// Wait for shutdown signal (in real implementation, this would be controlled)
 	mut dummy := 0
-	C.scanf('%d', &dummy)
+	C.scanf(c'%d', &dummy)
 
 	// Shutdown all workers
 	for mut ctx in worker_contexts {

@@ -6,8 +6,13 @@ module socket
 
 // Windows-specific socket helpers
 
+// struct WSAData is fully defined by the included winsock2.h; the empty V
+// decl just names the C struct tag (same form as vlib/net) so WSAStartup has
+// real storage to write into.
+struct C.WSAData {}
+
 pub fn init_winsock() ! {
-	mut wsa_data := WSAData{}
+	mut wsa_data := C.WSAData{}
 	if C.WSAStartup(0x202, &wsa_data) != 0 {
 		return error('WSAStartup failed')
 	}
@@ -19,8 +24,8 @@ pub fn cleanup_winsock() {
 
 type SOCKET = u64
 
-const invalid_socket = u64(~u64(0))
-const socket_error = -1
+pub const invalid_socket = u64(~u64(0))
+pub const socket_error = -1
 
 fn C.WSAStartup(wVersionRequired u16, lpWSAData voidptr) int
 fn C.WSACleanup() int
@@ -72,11 +77,12 @@ pub fn connect_to_server_on_windows(port int) !int {
 		return error('Failed to create client socket')
 	}
 
+	// sin_zero padding is left out of the literal: the shared C.sockaddr_in
+	// decl doesn't name it, and C zero-inits unspecified fields anyway.
 	mut addr := C.sockaddr_in{
 		sin_family: u16(C.AF_INET)
 		sin_port:   C.htons(u16(port))
 		sin_addr:   C.in_addr{u32(0)} // 0.0.0.0
-		sin_zero:   [8]u8{}
 	}
 
 	println('[client] Connecting to server on port ${port} (0.0.0.0)...')
@@ -115,9 +121,8 @@ pub fn create_server_socket_on_windows(port int) int {
 	println('[server] Binding to 0.0.0.0:${port}')
 	server_addr := C.sockaddr_in{
 		sin_family: u16(C.AF_INET)
-		sin_port:   C.htons(port)
+		sin_port:   C.htons(u16(port))
 		sin_addr:   C.in_addr{u32(C.INADDR_ANY)}
-		sin_zero:   [8]u8{}
 	}
 
 	if C.bind(u64(server_fd), voidptr(&server_addr), sizeof(server_addr)) == socket_error {
