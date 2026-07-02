@@ -15,6 +15,7 @@ jobs:
       matrix:
         folder:
           - examples/async_pipe/src
+          - examples/compression/src
           - examples/database/src
           - examples/etag/src
           - examples/hexagonal/src
@@ -41,7 +42,10 @@ jobs:
           # building examples: liburing-dev is userspace and linux-libc-dev already
           # ships the io_uring headers, neither needs a running-kernel upgrade.
           sudo apt-get update
-          sudo apt-get install -y libsqlite3-dev liburing-dev linux-libc-dev
+          # libbrotli1 ships the enc/dec runtime .so.1 that compress.brotli
+          # dlopens, so the compression example tests the `br` path for real
+          # (without it they skip gracefully).
+          sudo apt-get install -y libsqlite3-dev liburing-dev linux-libc-dev libbrotli1
       - name: Build ${{ matrix.folder }}
         shell: bash
         run: |
