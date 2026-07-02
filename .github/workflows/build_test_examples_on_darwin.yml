@@ -15,6 +15,7 @@ jobs:
       matrix:
         folder:
           - examples/async_pipe/src
+          - examples/compression/src
           - examples/database/src
           - examples/etag/src
           - examples/hexagonal/src
@@ -35,7 +36,9 @@ jobs:
         shell: bash
         run: |
             brew update
-            brew install sqlite3
+            # brotli: compress.brotli dlopens /opt/homebrew/lib/libbrotli{enc,dec}.dylib,
+            # so the compression example exercises the `br` path for real.
+            brew install sqlite3 brotli
       - name: Build ${{ matrix.folder }}
         shell: bash
         run: |
