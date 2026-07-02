@@ -33,12 +33,18 @@ registry.
 
 - Handlers are **pure functions** `(request) -> []u8`. No socket I/O, no hidden
   globals, no shared mutable state on the hot path.
-- Stay **zero-copy**: work with `Slice` views into the request buffer; defer
-  `.to_string()` / `.clone()` until the bytes must outlive the buffer.
-- **No `${}` string interpolation on the hot path** — it allocates (and calls
-  `.str()` for ints). Use `const ... .bytes()` for static responses and
-  `strings.Builder` with `write_string` / `write_decimal` / `write_u8` for
-  dynamic ones. `${}` is fine in `eprintln`/`error()` off the hot path.
+- Stay **zero-copy** — whenever a view suffices, use a view: `Slice` offsets
+  into the request buffer, `unsafe { (&buf[start]).vbytes(len) }` for `[]u8`
+  windows, `unsafe { tos(ptr, len) }` for read-only string params. Defer
+  `.to_string()` / `.clone()` until the bytes must outlive the buffer; avoid
+  `buf[a..b]` (it marks the source buffer every call).
+- **Never concatenate (`+`) or interpolate (`${}`) in request-serving code** —
+  not even on deliberately slow routes. Each one allocates (ints also pay
+  `.str()`). Use `const ... .bytes()` for static responses, append parts
+  straight into `out` (`push_many` + `strconv.write_dec`), and a single
+  `strings.Builder` (`write_string` / `write_decimal` / `write_u8`) when a
+  dynamic string is unavoidable. `${}` is fine in `eprintln`/`error()`
+  diagnostics off the request path.
 - Allocate with intent: `[]u8{cap: n}` is uninitialized/noscan; large `cap`
   costs GC pressure. Size to the realistic case.
 - **Benchmark before/after** any perf change with `-prod`; verify thread safety

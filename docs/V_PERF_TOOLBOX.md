@@ -96,6 +96,19 @@ Already used here for the per-worker epoll fd arrays
   handler, not here): [`http_server/static_assets/static_assets.v:273-281`](../http_server/static_assets/static_assets.v)
   builds the key as `key := tos(&buf[rs], rel_len)`, a view straight into the
   request buffer, "never retained, so routing costs no allocation."
+- **Zero-copy views, the pair to reach for:** `unsafe { (&buf[start]).vbytes(len) }`
+  builds a `[]u8` over existing memory — header-only, "the data is reused, NOT
+  copied" (builtin), and none of `a[start..end]`'s per-call slice-marking.
+  `unsafe { tos(ptr, len) }` is the `string` twin. Both are safe wherever the
+  callee only *reads* the input (hash/hmac/KDF inputs, base64 decode, map
+  lookups, comparisons) and the view does not outlive the buffer. Guard
+  `len > 0` before `&buf[start]`. Used across
+  [examples/auth](../examples/auth/src/main.v) for password/API-key/bearer
+  windows into the request buffer.
+- `strings.Builder` **is** `[]u8` (`pub type Builder = []u8`): pass a builder
+  mid-assembly to any `[]u8`-taking API (hash it, sign it) and keep appending;
+  `return sb` satisfies a `[]u8` return. Saves the `.str()` copy when the
+  result is consumed as bytes.
 - `recv` into spare capacity to avoid a scratch buffer + second copy:
   `recv(fd, &u8(buf.data) + buf.len, buf.cap - buf.len)` then `unsafe { buf.len += n }`.
 - **Allocation cost is hidden at low core counts and explodes under GC at scale.**

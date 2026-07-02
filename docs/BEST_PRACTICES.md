@@ -73,6 +73,16 @@ Reach for the bytes you already have before allocating new ones.
   [static_assets module](../http_server/static_assets/static_assets.v#L273-L281)
   is the canonical example: `key := tos(&buf[rs], rel_len)`, a view straight into
   the request buffer, so routing costs no allocation.
+- **Whenever a view suffices, use a view.** `unsafe { (&buf[start]).vbytes(len) }`
+  is the `[]u8` twin of `tos`: a header-only window over existing memory
+  ("the data is reused, NOT copied" — builtin), with none of the per-call
+  slice-marking of `buf[a..b]` (see
+  [V_PERF_TOOLBOX.md](V_PERF_TOOLBOX.md)). Feed views to any API that only
+  *reads* its input — hash/hmac/argon2, base64 decode, comparisons.
+  [examples/auth](../examples/auth/src/main.v) passes password, API key and
+  bearer token as views straight from the request buffer. Two rules: guard
+  `len > 0` before taking `&buf[start]` (indexing bounds-checks), and never
+  let a view outlive the buffer it borrows.
 
 **Don't**
 
@@ -137,6 +147,19 @@ result — but on the response hot path, appending into `out` avoids the builder
 allocation *and* the builder→`out` copy. **Fully static** responses should be a
 precomputed `const ... .bytes()` appended with `out << the_const`.
 
+Two things that make the builder go further when a dynamic string is
+unavoidable:
+
+- `strings.Builder` **is** `[]u8` (`pub type Builder = []u8`), so you can hand
+  the builder's bytes to any `[]u8` API *mid-assembly* and keep appending —
+  [examples/auth](../examples/auth/src/main.v) builds `header.payload`, hmac-signs
+  the builder directly, then appends the signature: one buffer, zero
+  intermediate strings — and `return sb` satisfies a `[]u8` return type.
+- **"Slow route" is not an excuse to concatenate.** A login route that pays
+  ~200 ms of argon2id still frames its response with `ws`/`wi` and builds its
+  JWT in one builder. Rules stay simple by having no carve-outs; the only
+  place `${}` belongs is off-path diagnostics (below).
+
 Compare to the slow form — every `${}` here allocates:
 
 ```v
@@ -158,6 +181,9 @@ sb.write_string('Content-Length: ${body.len}\r\n')
 **Don't**
 
 - Use `${}` to assemble response lines on the hot path.
+- Concatenate strings (`+`) or interpolate **anywhere in request-serving
+  code** — even on a deliberately slow route. Every `'${a}.${b}'` is an
+  allocation the builder/append patterns above do for free.
 - Call `.str()` / `int.str()` just to concatenate — `strconv.write_dec` avoids it.
 - Forget the blank line (`\r\n\r\n`) between headers and body.
 - Compute the body twice (once for the length, once for the payload).
@@ -177,6 +203,19 @@ at the I/O-bound throughput ceiling the three are indistinguishable from each ot
 within run-to-run noise (~3-4%) of a response carrying **no `Date` header at all**. So the
 payoff is a zero-allocation, minimal-CPU hot path — mandatory under `-gc none` and
 valuable for latency/headroom — **not** raw req/s. Correct, cheap, paid once per second.
+
+> **Worked example — content negotiation.**
+> [examples/compression](../examples/compression/src/main.v) takes the const
+> pattern to its conclusion: a static body is compressed ONCE at
+> init (stdlib brotli/zstd/gzip) into four **complete** const responses, and the
+> per-request work is parse → whole-token scan of the `Accept-Encoding` bytes by
+> offsets → one `out <<` append. Emitted-C-verified: zero slice/alloc calls in
+> the handler.
+>
+> **Worked example — auth.** [examples/auth](../examples/auth/src/main.v) applies the
+> same byte discipline where responses *can't* all be consts: argon2id login
+> (slow by design), JWT signed in a single builder, verification over
+> `vbytes`/`tos` views of the token, `ws`/`wi` framing the one dynamic response.
 
 ---
 

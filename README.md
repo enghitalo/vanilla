@@ -164,9 +164,9 @@ fn main() {
 | `examples/simple/` | Basic CRUD routing |
 | `examples/simple2/` | CRUD with helper utilities |
 | `examples/simple3/` | CRUD with a response builder |
-| `examples/auth/` | Password hashing, JWT (HMAC-SHA256), API key auth |
+| `examples/auth/` | Argon2id password hashing (RFC 9106), JWT with `exp` (HMAC-SHA256), API key auth |
 | `examples/chunked_streaming/` | Chunked transfer encoding |
-| `examples/compression/` | gzip response compression |
+| `examples/compression/` | `Accept-Encoding` negotiation over precompressed brotli/zstd/gzip const responses |
 | `examples/cookies_sessions/` | Cookie-based sessions |
 | `examples/cors/` | CORS preflight and origin allowlist |
 | `examples/csrf/` | CSRF token protection |
