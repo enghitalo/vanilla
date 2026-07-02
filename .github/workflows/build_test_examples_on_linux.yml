@@ -15,6 +15,7 @@ jobs:
       matrix:
         folder:
           - examples/async_pipe/src
+          - examples/chunked_streaming/src
           - examples/compression/src
           - examples/database/src
           - examples/etag/src

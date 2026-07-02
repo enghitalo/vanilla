@@ -1,88 +1,207 @@
 module main
 
-// Transfer-Encoding: chunked — reference design (request decode + response stream).
+// Transfer-Encoding: chunked — reference design (request decode + response frame).
 //
 // Chunked encoding is how HTTP/1.1 sends a body of UNKNOWN length: a series of
-// `<hex-size>\r\n<bytes>\r\n` chunks terminated by a `0\r\n\r\n`. It is the
-// streaming primitive of HTTP/1.1 — large downloads, live logs, generated
-// output you don't want to buffer entirely before sending.
+// `<hex-size>\r\n<bytes>\r\n` chunks terminated by `0\r\n\r\n` (RFC 9112 §7.1).
+// It is the streaming primitive of HTTP/1.1 — large uploads, live logs,
+// generated output you don't want to buffer entirely before sending.
 //
-// TWO DIRECTIONS, TWO STATES:
+// WHAT THE CORE DOES TODAY (this section used to say "ASPIRATIONAL" — it isn't):
+//   - FRAMES chunked requests: the handler is dispatched only after the
+//     terminating zero-chunk arrived (request_parser.frame_chunked_total);
+//     malformed chunk sizes are a 400 and an over-limit body a 413 BEFORE the
+//     handler ever runs, so `req.body` always holds complete, well-formed
+//     chunk frames.
+//   - Ships the smuggling guard: `req.validate_http1()` rejects Content-Length
+//     together with Transfer-Encoding (RFC 9112 §6.1) and enforces exactly-one
+//     Host. It is OPT-IN by design (a parse-free fast responder pays nothing),
+//     so a body-processing handler like this one calls it — one line.
 //
-// 1. DECODING a chunked REQUEST body  — ASPIRATIONAL (core work).
-//    `request.read_request` neither honors Content-Length nor decodes chunked
-//    bodies. The core must, before calling the handler, detect
-//    `Transfer-Encoding: chunked` and reassemble the body by consuming chunks
-//    until the terminating zero-chunk. The pure decoder is shown below.
-//    SECURITY: a request with BOTH Content-Length and Transfer-Encoding must be
-//    rejected (or TE wins, CL stripped) — the ambiguity is the classic request
-//    smuggling vector.
+// WHAT THE HANDLER STILL OWNS: `req.body` is the raw WIRE format. Decoding is
+// handler-side and ZERO-COPY: `next_chunk` walks the frames by offsets and
+// yields each chunk as a window into the request buffer. The echo below
+// re-frames those views straight into `out` — the payload bytes are appended
+// once and never pass through an intermediate buffer or string.
 //
-// 2. PRODUCING a chunked RESPONSE  — PARTLY POSSIBLE today, fully pure with a
-//    streaming write API. Today a handler returns one []u8, so you'd build the
-//    whole chunked body in memory (defeating the point). The pure design gives
-//    the handler a writer it can push chunks into, backed by the fd and
-//    EPOLLOUT for backpressure (see examples/request_limits for the write path).
+// RESPONSE side: a handler produces one buffer per request, so a chunked
+// response built here is framing, not true streaming — for incremental
+// delivery backed by the fd (backpressure via the event loop) see the async
+// examples (examples/async_sse). The frames below are still byte-exact wire
+// format; curl decodes them like any chunked response.
 import http_server
 import http_server.http1_1.request_parser
-import strings
 
-// ---- request side: decode a chunked body (pure function over bytes) --------
-//
-// ASPIRATIONAL: the core would call this to produce the real body before
-// dispatch. Shown as a standalone, testable function.
-fn decode_chunked(buf []u8) ![]u8 {
-	mut out := []u8{}
-	mut pos := 0
-	for pos < buf.len {
-		// chunk size line: hex digits up to CRLF
-		mut line_end := pos
-		for line_end < buf.len && buf[line_end] != 13 { // 13 = CR (escaped runes are broken in this toolchain)
-			line_end++
-		}
-		size_str := buf[pos..line_end].bytestr()
-		size := ('0x' + size_str.trim_space()).int() // hex chunk size
-		pos = line_end + 2 // skip CRLF
-		if size == 0 {
-			break // terminating chunk (trailers, if any, would follow)
-		}
-		if pos + size > buf.len {
-			return error('truncated chunk')
-		}
-		out << buf[pos..pos + size]
-		pos += size + 2 // skip chunk data + trailing CRLF
+// Escaped rune literals are broken in this toolchain (docs/V_PERF_TOOLBOX.md
+// gotcha) — CR/LF as explicit byte values, same as the core parser.
+const cr = u8(13)
+const lf = u8(10)
+
+// ---- request side: zero-copy chunk iterator ---------------------------------
+
+@[inline]
+fn hex_digit(c u8) !int {
+	if c >= `0` && c <= `9` {
+		return int(c - `0`)
 	}
-	return out
+	lc := c | 0x20 // lowercase ASCII letters
+	if lc >= `a` && lc <= `f` {
+		return int(lc - `a`) + 10
+	}
+	return error('invalid chunk size')
 }
 
-// ---- response side: frame bytes as one or more chunks ----------------------
-//
-// In the pure streaming design these would be written to the fd as they are
-// produced. Here we frame them into a buffer to illustrate the wire format.
-fn chunk(data string) string {
-	return '${data.len:x}\r\n${data}\r\n'
+// next_chunk parses ONE chunk frame at `pos` in buf[..limit] and returns
+// (data_start, data_len, next_pos):
+//   data_len > 0  -> chunk data is the window buf[data_start .. data_start+data_len]
+//   data_len == 0 -> terminating zero-chunk (next_pos is just past its CRLF)
+// Chunk extensions (`;name=val`) are skipped, trailers are not modeled.
+// Zero allocations, zero copies — callers consume the data as a view.
+// In production malformed framing never reaches the handler (the core 400s it
+// first); the error paths exist for direct-call tests and defense in depth.
+@[direct_array_access]
+fn next_chunk(buf []u8, pos int, limit int) !(int, int, int) {
+	mut size := 0
+	mut i := pos
+	mut digits := 0
+	for i < limit {
+		c := buf[i]
+		if c == cr || c == `;` {
+			break
+		}
+		size = size * 16 + hex_digit(c)!
+		digits++
+		i++
+	}
+	if digits == 0 {
+		return error('missing chunk size')
+	}
+	for i < limit && buf[i] != cr { // skip chunk extensions
+		i++
+	}
+	if i + 1 >= limit || buf[i + 1] != lf {
+		return error('truncated chunk-size line')
+	}
+	data_start := i + 2
+	if size == 0 {
+		// Terminating chunk: require the closing CRLF.
+		if data_start + 1 >= limit || buf[data_start] != cr || buf[data_start + 1] != lf {
+			return error('truncated terminating chunk')
+		}
+		return data_start, 0, data_start + 2
+	}
+	end := data_start + size
+	if end + 2 > limit {
+		return error('truncated chunk')
+	}
+	if buf[end] != cr || buf[end + 1] != lf {
+		return error('chunk data not CRLF-terminated')
+	}
+	return data_start, size, end + 2
+}
+
+// decode_chunked_into appends the decoded payload into dst — ONE copy total,
+// straight from the request-buffer windows; no intermediate buffers, no
+// strings, no hex-string parsing. For handlers that need the body contiguous.
+fn decode_chunked_into(buf []u8, start int, len int, mut dst []u8) ! {
+	limit := start + len
+	mut pos := start
+	for {
+		data_start, data_len, next_pos := next_chunk(buf, pos, limit)!
+		if data_len == 0 {
+			return
+		}
+		unsafe { dst.push_many(&buf[data_start], data_len) }
+		pos = next_pos
+	}
+}
+
+// ---- response side: frame views as chunks, no allocation --------------------
+
+// ws appends a string's bytes straight into `out` (BEST_PRACTICES §3b).
+@[inline]
+fn ws(mut out []u8, s string) {
+	unsafe { out.push_many(s.str, s.len) }
+}
+
+// wx appends n's lowercase hex digits into `out` — the chunk-size line —
+// via a stack scratch. No allocation, no `${n:x}`.
+fn wx(mut out []u8, n int) {
+	if n == 0 {
+		out << u8(`0`)
+		return
+	}
+	mut scratch := [8]u8{}
+	mut i := 8
+	mut v := u32(n)
+	for v > 0 {
+		i--
+		d := u8(v & 0xF)
+		scratch[i] = if d < 10 { `0` + d } else { `a` + (d - 10) }
+		v >>= 4
+	}
+	unsafe { out.push_many(&scratch[i], 8 - i) }
+}
+
+// write_chunk frames one chunk into `out`: <hex-size>\r\n<data>\r\n. The data
+// view is appended directly — never copied through an intermediate.
+fn write_chunk(mut out []u8, data []u8) {
+	wx(mut out, data.len)
+	ws(mut out, '\r\n')
+	out << data
+	ws(mut out, '\r\n')
+}
+
+const resp_head_chunked = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const last_chunk = '0\r\n\r\n'.bytes()
+
+// The no-body demo pieces — three separate frames on the wire.
+const demo_pieces = ['first piece\n'.bytes(), 'second piece\n'.bytes(),
+	'third piece\n'.bytes()]
+
+// is_chunked reports whether Transfer-Encoding is `chunked` — compared in
+// place over the header bytes (case-insensitive), no to_string/to_lower.
+@[direct_array_access]
+fn is_chunked(req request_parser.HttpRequest) bool {
+	s := req.get_header_value_slice('Transfer-Encoding') or { return false }
+	lit := 'chunked'
+	if s.len != lit.len {
+		return false
+	}
+	for i in 0 .. lit.len {
+		if (req.buffer[s.start + i] | 0x20) != lit[i] {
+			return false
+		}
+	}
+	return true
 }
 
 fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 	req := request_parser.decode_http_request(req_buffer)!
-
-	// If the request arrived chunked (once the core reassembles it), the body
-	// is already decoded plaintext by dispatch time — handler stays simple.
-	_ := req
-
-	// Stream a response of unknown length. No Content-Length; chunked framing.
-	mut sb := strings.new_builder(256)
-	sb.write_string('HTTP/1.1 200 OK\r\n')
-	sb.write_string('Content-Type: text/plain\r\n')
-	sb.write_string('Transfer-Encoding: chunked\r\n')
-	sb.write_string('Connection: keep-alive\r\n\r\n')
-	// In the pure design each of these is a separate write to the socket,
-	// flushed as it's generated — here concatenated to show the framing.
-	sb.write_string(chunk('first piece\n'))
-	sb.write_string(chunk('second piece\n'))
-	sb.write_string(chunk('third piece\n'))
-	sb.write_string('0\r\n\r\n') // terminating chunk
-	out << sb
+	// The RFC 9112 MUSTs, incl. the CL+TE request-smuggling rejection (§6.1).
+	// Anything that processes bodies should pay this one call.
+	req.validate_http1()!
+	out << resp_head_chunked
+	if req.body.len > 0 && is_chunked(req) {
+		// ECHO: walk the request's chunk frames and re-frame each data window
+		// into the response — request payload bytes are appended exactly once.
+		limit := req.body.start + req.body.len
+		mut pos := req.body.start
+		for {
+			data_start, data_len, next_pos := next_chunk(req.buffer, pos, limit)!
+			if data_len == 0 {
+				break
+			}
+			write_chunk(mut out, unsafe { (&req.buffer[data_start]).vbytes(data_len) })
+			pos = next_pos
+		}
+	} else {
+		// No chunked body: stream three known pieces to show the framing.
+		for piece in demo_pieces {
+			write_chunk(mut out, piece)
+		}
+	}
+	out << last_chunk
 }
 
 fn main() {
@@ -100,5 +219,7 @@ fn main() {
 		request_handler: handle
 	})!
 	println('Chunked streaming demo on http://localhost:3000/')
+	println('  GET  /  -> three chunked pieces')
+	println("  POST /  with Transfer-Encoding: chunked -> echoes your chunks back (try: curl -sS -H 'Transfer-Encoding: chunked' --data-binary 'hello' localhost:3000)")
 	server.run()
 }
