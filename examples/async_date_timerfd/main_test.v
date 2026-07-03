@@ -2,60 +2,40 @@ module main
 
 import time
 
-// SOLUTION: rebuild_at is pure over (dc.last, now) — drive it through every
-// bucket rollover and compare byte-for-byte against the vlib formatter as the
-// ORACLE. The incremental path only ever touches the digits that changed, so
-// the oracle equality is exactly the property that matters.
-
-// expected builds the reference line via vlib (test scaffolding).
-fn expected(u i64) string {
-	return 'Date: ' + time.unix(u).http_header_string() + '\r\n'
-}
-
-fn cache() &DateCache {
-	return unsafe { &DateCache(make_state()) }
-}
+// SOLUTION: the incremental-update logic itself lives in vlib now
+// (time.update_http_header, oracle-tested there across every rollover) —
+// these tests cover THIS example's wiring: the template seeding, the
+// refresh-current-second contract, and the handler's framing.
 
 fn line_of(dc &DateCache) string {
 	return unsafe { tos(&dc.line[0], date_line_len) }.clone()
 }
 
-fn test_first_format_and_idempotence() {
-	mut dc := cache()
-	dc.rebuild_at(1735689600) // 2025-01-01 00:00:00 UTC (full format path)
-	assert line_of(dc) == expected(1735689600)
-	dc.rebuild_at(1735689600) // same second: no-op, line unchanged
-	assert line_of(dc) == expected(1735689600)
+fn expected(u i64) string {
+	return 'Date: ' + time.unix(u).http_header_string() + '\r\n'
 }
 
-fn test_all_rollovers_match_oracle() {
-	mut dc := cache()
-	seq := [
-		i64(1735689600), // seed (full format)
-		1735689601, // +1 s: seconds digits only
-		1735689659, // :59
-		1735689660, // minute rollover
-		1735693199, // 00:59:59
-		1735693200, // hour rollover
-		1735775999, // 23:59:59
-		1735776000, // day rollover (full reformat)
-		1740787199, // jump forward weeks (leap-February territory)
-		999999999, // jump BACKWARD across years — must fully reformat
-		1000000000, // and advance again
-	]
-	for u in seq {
-		dc.rebuild_at(u)
-		assert line_of(dc) == expected(u), 'mismatch at unix=${u}'
-	}
+fn test_line_len_matches_vlib() {
+	assert date_line_len == date_prefix_len + time.http_header_len + 2
 }
 
-fn test_every_second_across_midnight() {
-	// Brute-force a window over a day boundary: every second must match the
-	// oracle (catches any missed bucket update in the incremental path).
-	mut dc := cache()
-	start := i64(1735775990) // 2025-01-01 23:59:50 UTC
-	for u in start .. start + 30 {
-		dc.rebuild_at(u)
-		assert line_of(dc) == expected(u), 'mismatch at unix=${u}'
-	}
+fn test_rebuild_encodes_the_current_second() {
+	mut dc := unsafe { &DateCache(make_state()) }
+	rebuild(mut dc)
+	assert dc.last > 0
+	assert line_of(dc) == expected(dc.last)
+	rebuild(mut dc) // same second: no-op; a second later: seconds digits only
+	assert line_of(dc) == expected(dc.last)
+}
+
+fn test_handle_serves_the_cached_date() ! {
+	state := make_state()
+	mut dc := unsafe { &DateCache(state) }
+	rebuild(mut dc)
+	mut out := []u8{}
+	handle('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), -1, mut out, state)!
+	s := out.bytestr()
+	assert s.starts_with('HTTP/1.1 200 OK\r\nDate: ')
+	assert s.contains(time.unix(dc.last).http_header_string())
+	assert s.ends_with('Connection: keep-alive\r\n\r\nok')
 }
