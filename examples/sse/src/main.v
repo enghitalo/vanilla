@@ -75,16 +75,36 @@ fn (mut c Clients) broadcast(event []u8) {
 
 // SSE response: note the deliberate ABSENCE of Content-Length and the
 // text/event-stream content type. The core sends these bytes and keeps the
-// connection open.
-const sse_headers = ('HTTP/1.1 200 OK\r\n' + 'Content-Type: text/event-stream\r\n' +
-	'Cache-Control: no-cache\r\n' + 'Connection: keep-alive\r\n' +
-	'Access-Control-Allow-Origin: *\r\n' + '\r\n').bytes()
+// connection open. Single literals — no `+` concatenation, even at init.
+const sse_headers = 'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n'.bytes()
 
-const ok_response = ('HTTP/1.1 200 OK\r\n' + 'Content-Length: 0\r\n' +
-	'Connection: keep-alive\r\n' + '\r\n').bytes()
+const ok_response = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 
-const bad_request = ('HTTP/1.1 400 Bad Request\r\n' + 'Content-Length: 0\r\n' +
-	'Connection: close\r\n' + '\r\n').bytes()
+const bad_request = 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
+
+// Static SSE frame pieces: allocated once, reused for every event.
+const keepalive_event = ': keepalive\n\n'.bytes()
+
+const data_prefix = 'data: '.bytes()
+
+const event_end = '\n\n'.bytes()
+
+// slice_eq compares a request Slice against a literal IN PLACE by offsets —
+// no `.to_string()`, no `buf[a..b]` (V array slicing marks the source buffer
+// on every call; see docs/V_PERF_TOOLBOX.md). In-bounds by construction: the
+// parser guarantees the Slice sits inside buf.
+@[direct_array_access]
+fn slice_eq(buf []u8, s request_parser.Slice, lit string) bool {
+	if s.len != lit.len {
+		return false
+	}
+	for i in 0 .. lit.len {
+		if buf[s.start + i] != lit[i] {
+			return false
+		}
+	}
+	return true
+}
 
 fn handle(req_buffer []u8, fd int, mut out []u8, mut clients Clients) ! {
 	// The kernel recycles fd numbers: a NEW request arriving on an fd that is
@@ -95,21 +115,32 @@ fn handle(req_buffer []u8, fd int, mut out []u8, mut clients Clients) ! {
 	clients.drop(fd)
 
 	req := request_parser.decode_http_request(req_buffer)!
-	method := req.method.to_string(req.buffer)
-	path := req.path.to_string(req.buffer)
 
 	// GET /events  — subscribe. Register the fd; the core sends the headers
 	//                and leaves the connection open. The broadcaster owns it now.
-	if method == 'GET' && path == '/events' {
+	if slice_eq(req.buffer, req.method, 'GET') && slice_eq(req.buffer, req.path, '/events') {
 		clients.add(fd)
 		out << sse_headers
 		return
 	}
 
 	// POST /broadcast — fan a message out to every subscriber, right now.
-	if method == 'POST' && path == '/broadcast' {
-		body := req.body.to_string(req.buffer)
-		clients.broadcast('data: ${body}\n\n'.bytes())
+	if slice_eq(req.buffer, req.method, 'POST') && slice_eq(req.buffer, req.path, '/broadcast') {
+		// Frame `data: <body>\n\n` once, into ONE contiguous buffer. This single
+		// allocation is required: C.send() takes one buffer per call, so the
+		// frame must be contiguous. The body itself is never copied to a string —
+		// push_many reads it straight out of the request buffer, which is safe
+		// because broadcast() completes synchronously inside handle(), before
+		// the buffer is recycled. (This is the admin fan-out path, not the
+		// subscriber hot path; a shared scratch buffer would need locking across
+		// workers — rule 3 says don't.)
+		mut event := []u8{cap: data_prefix.len + req.body.len + event_end.len}
+		event << data_prefix
+		if req.body.len > 0 { // guard: &buf[start] is out of bounds on an empty slice
+			unsafe { event.push_many(&req.buffer[req.body.start], req.body.len) }
+		}
+		event << event_end // an empty body still yields the valid event `data: \n\n`
+		clients.broadcast(event)
 		out << ok_response
 		return
 	}
@@ -125,7 +156,7 @@ fn main() {
 	spawn fn [mut clients] () {
 		for {
 			time.sleep(15 * time.second)
-			clients.broadcast(': keepalive\n\n'.bytes())
+			clients.broadcast(keepalive_event)
 		}
 	}()
 

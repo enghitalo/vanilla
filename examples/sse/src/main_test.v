@@ -1,14 +1,22 @@
 module main
 
-// SOLUTION: handler-state test (works today) + Solution-2/7 streaming note.
+// Handler-state tests (run today) + an aspirational raw-streaming note below.
 // We can assert the KEY property of the rewrite without a socket: subscribing
 // registers an fd in epoll-resident state and spawns NO per-client thread.
 
+// serve adapts the raw-handler contract (writes into a caller-owned buffer) to
+// the return-a-string shape the assertions expect. Callers pass their own
+// Clients so they can inspect subscriber state afterwards. fd -1 keeps any
+// accidental send() harmless (EBADF), never a write to a real descriptor.
+fn serve(req string, mut clients Clients) !string {
+	mut out := []u8{}
+	handle(req.bytes(), -1, mut out, mut clients)!
+	return out.bytestr()
+}
+
 fn test_subscribe_returns_event_stream_and_registers_fd() ! {
 	mut clients := Clients{}
-	mut resp := []u8{}
-	handle('GET /events HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), 7, mut resp, mut clients)!
-	out := resp.bytestr()
+	out := serve('GET /events HTTP/1.1\r\nHost: x\r\n\r\n', mut clients)!
 	assert out.contains('Content-Type: text/event-stream')
 	assert !out.contains('Content-Length:') // a stream stays open, no fixed length
 	assert clients.snapshot().len == 1 // fd registered; cost is one map entry
@@ -16,17 +24,34 @@ fn test_subscribe_returns_event_stream_and_registers_fd() ! {
 
 fn test_broadcast_endpoint_accepts() ! {
 	mut clients := Clients{} // empty set: no real fds to write to
-	mut resp := []u8{}
-	handle('POST /broadcast HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello'.bytes(), 7, mut resp, mut
-		clients)!
-	assert resp.bytestr().contains('200 OK')
+	out := serve('POST /broadcast HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello', mut clients)!
+	assert out.contains('200 OK')
+}
+
+fn test_broadcast_empty_body_is_ok() ! {
+	// exercises the body.len == 0 guard: `data: \n\n` is still a valid SSE event
+	mut clients := Clients{}
+	out := serve('POST /broadcast HTTP/1.1\r\nContent-Length: 0\r\n\r\n', mut clients)!
+	assert out.contains('200 OK')
 }
 
 fn test_unknown_route_is_bad_request() ! {
 	mut clients := Clients{}
-	mut resp := []u8{}
-	handle('GET /nope HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), 7, mut resp, mut clients)!
-	assert resp.bytestr().contains('400')
+	out := serve('GET /nope HTTP/1.1\r\nHost: x\r\n\r\n', mut clients)!
+	assert out.contains('400')
+}
+
+fn test_malformed_request_errors() {
+	mut clients := Clients{}
+	// not even a request line — decode_http_request must reject it
+	if _ := serve('garbage', mut clients) {
+		assert false, 'garbage input must error, not be routed'
+	}
+	// truncated head: request line parses, but the header block never terminates
+	if _ := serve('GET /events HTTP/1.1\r\nHost: x', mut clients) {
+		assert false, 'truncated request must error, not be routed'
+	}
+	assert clients.snapshot().len == 0 // nothing was registered along the way
 }
 
 /*

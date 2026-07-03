@@ -32,6 +32,33 @@ fn test_simple_request_echoes_allowed_origin() ! {
 	assert !out.contains('Access-Control-Allow-Origin: *')
 }
 
+fn test_simple_request_disallowed_origin_gets_no_cors() ! {
+	// The server still serves the resource — the missing CORS grant is what
+	// makes the BROWSER block the cross-origin read.
+	req := 'GET /api HTTP/1.1\r\nOrigin: https://evil.com\r\n\r\n'.bytes()
+	out := serve(req)!.bytestr()
+	assert out.contains('200 OK')
+	assert !out.contains('Access-Control-Allow-Origin')
+	assert !out.contains('Access-Control-Allow-Credentials')
+}
+
+fn test_simple_request_without_origin() ! {
+	// Same-origin (or non-browser) request: plain response, zero CORS headers.
+	req := 'GET /api HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+	out := serve(req)!.bytestr()
+	assert out.contains('200 OK')
+	assert out.contains('{"ok":true}')
+	assert !out.contains('Access-Control-Allow-Origin')
+	assert !out.contains('Vary: Origin')
+}
+
+fn test_malformed_request_errors() {
+	// Malformed input must surface as a handler error, never a response.
+	if _ := serve('garbage'.bytes()) {
+		assert false, 'garbage request must not produce a response'
+	}
+}
+
 // serve adapts the raw-handler contract (writes into a caller-owned buffer) to
 // the return-a-buffer shape the assertions expect.
 fn serve(req []u8) ![]u8 {
