@@ -1,8 +1,21 @@
 module http
 
 import strings
-import crypto.md5
+import hash as wyhash
 import time
+
+const hex_digits = '0123456789abcdef'
+
+// hex16 encodes the 64-bit wyhash as 16 lowercase hex chars on the stack —
+// no `.hex()` string, no allocation.
+@[direct_array_access]
+fn hex16(h u64) [16]u8 {
+	mut buf := [16]u8{}
+	for i in 0 .. 16 {
+		buf[i] = hex_digits[(h >> ((15 - i) * 4)) & 0xF]
+	}
+	return buf
+}
 
 const http_ok = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n'.bytes()
 const http_created = 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n'.bytes()
@@ -28,13 +41,15 @@ pub fn build_basic_response(status int, body_buffer []u8, content_type_buffer []
 		else { 'OK'.bytes() }
 	}
 
-	// slow
-	etag := md5.sum(body_buffer).hex().bytes()
+	// ETag = 64-bit wyhash hex-encoded on the stack — a cheap, strong opaque
+	// validator (same as http_server.static_assets); a crypto digest here is
+	// pure cost, and md5 is broken anyway.
+	etag := hex16(wyhash.wyhash_c(body_buffer.data, u64(body_buffer.len), 0))
 
 	mut sb := strings.new_builder(256)
 	// request line
 	sb.write(http1_version) or { println(err) }
-	sb.write_string(status.str())
+	sb.write_decimal(status)
 	sb.write(' '.bytes()) or { println(err) }
 	sb.write(status_text) or { println(err) }
 	sb.write('\r\n'.bytes()) or { println(err) }
@@ -48,13 +63,16 @@ pub fn build_basic_response(status int, body_buffer []u8, content_type_buffer []
 	sb.write(content_type_header_field) or { println(err) }
 	sb.write(content_type_buffer) or { println(err) }
 	sb.write('\r\n'.bytes()) or { println(err) }
-	// etag
+	// etag — DQUOTEd on the wire (RFC 9110 §8.8.3), pushed from the stack
+	// scratch (Builder IS []u8)
 	sb.write(etag_header_field) or { println(err) }
-	sb.write(etag) or { println(err) }
+	sb.write_u8(`"`)
+	unsafe { sb.push_many(&etag[0], 16) }
+	sb.write_u8(`"`)
 	sb.write('\r\n'.bytes()) or { println(err) }
 	// content length
 	sb.write(content_length_header_field) or { println(err) }
-	sb.write(body_buffer.len.str().bytes()) or { println(err) }
+	sb.write_decimal(body_buffer.len)
 	sb.write('\r\n'.bytes()) or { println(err) }
 	// connection
 	sb.write(connection_header_field) or { println(err) }

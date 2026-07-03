@@ -21,7 +21,7 @@ module main
 //   - Responses append straight into `out`: consts for 404/405; `ws`/`wi`
 //     framing for 200/206/304; the file bytes and the range window are
 //     appended as direct pointer copies, never via `content[a..b]`.
-//   - The ETag is the md5 digest hex-encoded into a STACK scratch (`hex32`) —
+//   - The ETag is a 64-bit wyhash hex-encoded into a STACK scratch (`hex16`) —
 //     no `.hex()` string per request. Hashing the whole file per request is
 //     O(filesize) BY DESIGN — it is the conditional-GET pedagogy; for
 //     precomputed validators use `http_server.static_assets`.
@@ -41,7 +41,7 @@ import http_server
 import http_server.http1_1.request_parser
 import os
 import strconv
-import crypto.md5
+import hash as wyhash
 
 const web_root = './public'
 
@@ -183,30 +183,26 @@ fn safe_path(url_path string) ?string {
 // ---- ETag --------------------------------------------------------------------
 const hex_digits = '0123456789abcdef'
 
-// hex32 encodes the 16-byte md5 digest as 32 lowercase hex chars in a fixed
+// hex16 encodes the 64-bit wyhash as 16 lowercase hex chars in a fixed
 // (stack) array — replaces `.hex()`, which allocates a string per request.
 @[direct_array_access]
-fn hex32(digest []u8) [32]u8 {
-	mut buf := [32]u8{}
-	if digest.len != 16 {
-		return buf
-	}
+fn hex16(h u64) [16]u8 {
+	mut buf := [16]u8{}
 	for i in 0 .. 16 {
-		buf[i * 2] = hex_digits[digest[i] >> 4]
-		buf[i * 2 + 1] = hex_digits[digest[i] & 0xF]
+		buf[i] = hex_digits[(h >> ((15 - i) * 4)) & 0xF]
 	}
 	return buf
 }
 
-// etag_matches compares the If-None-Match value IN PLACE against `"<32 hex>"`
-// (34 bytes). Exact match only — same semantics as the old string compare:
+// etag_matches compares the If-None-Match value IN PLACE against `"<16 hex>"`
+// (18 bytes). Exact match only — same semantics as the old string compare:
 // no weak validators, no comma-separated lists.
 @[direct_array_access]
-fn etag_matches(buf []u8, s request_parser.Slice, etag [32]u8) bool {
-	if s.len != 34 || buf[s.start] != `"` || buf[s.start + 33] != `"` {
+fn etag_matches(buf []u8, s request_parser.Slice, etag [16]u8) bool {
+	if s.len != 18 || buf[s.start] != `"` || buf[s.start + 17] != `"` {
 		return false
 	}
-	for i in 0 .. 32 {
+	for i in 0 .. 16 {
 		if buf[s.start + 1 + i] != etag[i] {
 			return false
 		}
@@ -312,14 +308,16 @@ fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 		return
 	}
 	ctype := mime_type(fs_path)
-	// ETag = md5 of the content, hex-encoded into a stack scratch (see header).
-	etag := hex32(md5.sum(content))
+	// ETag = 64-bit wyhash of the content, hex-encoded into a stack scratch —
+	// a cheap, strong opaque validator (same as http_server.static_assets);
+	// a crypto digest here is pure cost, and md5 is broken anyway.
+	etag := hex16(wyhash.wyhash_c(content.data, u64(content.len), 0))
 
 	// Conditional GET: if the client's cached ETag matches, save the bytes.
 	if inm := req.get_header_value_slice('If-None-Match') {
 		if etag_matches(req.buffer, inm, etag) {
 			ws(mut out, 'HTTP/1.1 304 Not Modified\r\nETag: "')
-			unsafe { out.push_many(&etag[0], 32) }
+			unsafe { out.push_many(&etag[0], 16) }
 			ws(mut out, '"\r\n\r\n')
 			return
 		}
@@ -341,7 +339,7 @@ fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 				ws(mut out, '\r\nAccept-Ranges: bytes\r\nContent-Length: ')
 				wi(mut out, end + 1 - start)
 				ws(mut out, '\r\nETag: "')
-				unsafe { out.push_many(&etag[0], 32) }
+				unsafe { out.push_many(&etag[0], 16) }
 				ws(mut out, '"\r\n\r\n')
 				if is_get {
 					// The range window is appended as a direct pointer copy —
@@ -359,7 +357,7 @@ fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 	ws(mut out, '\r\nContent-Length: ')
 	wi(mut out, content.len)
 	ws(mut out, '\r\nAccept-Ranges: bytes\r\nETag: "') // advertise range support
-	unsafe { out.push_many(&etag[0], 32) }
+	unsafe { out.push_many(&etag[0], 16) }
 	ws(mut out, '"\r\nCache-Control: public, max-age=3600\r\nConnection: keep-alive\r\n\r\n')
 	if is_get {
 		out << content // HEAD gets the headers only

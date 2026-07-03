@@ -157,8 +157,8 @@ fn test_if_none_match_roundtrip_304() ! {
 		assert false, 'response must carry an ETag'
 		return
 	}
-	assert first.len >= tag_at + 6 + 34
-	etag := first[tag_at + 6..tag_at + 6 + 34] // `"<32 hex>"`
+	assert first.len >= tag_at + 6 + 18
+	etag := first[tag_at + 6..tag_at + 6 + 18] // `"<16 hex>"` (64-bit wyhash)
 	out :=
 		serve('GET /index.html HTTP/1.1\r\nHost: x\r\nIf-None-Match: ${etag}\r\n\r\n'.bytes())!.bytestr()
 	assert out.contains('304 Not Modified')
