@@ -6,19 +6,25 @@ import http_server.http1_1.request_parser { HttpRequest, Slice }
 const bad_request_response = 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 const not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 
+// Static routes carry no params, but the handler signature is uniform — hand
+// them this shared empty map, created once at init, so a static hit allocates
+// nothing (a `map[string]Slice{}` literal costs three allocations even empty).
+const empty_params = map[string]Slice{}
+
 // router dispatches a request to the matching App method.
 //
 // Hot path: a single comptime-unrolled pass that matches "METHOD /path" exactly
-// (static) or against a parameterized pattern (dynamic). A quick `/`-count check
-// rejects non-candidates cheaply. The path length is taken WITHOUT the `?query`,
-// so query strings never break matching.
+// (static — allocation-free) or against a parameterized pattern (dynamic — the
+// params map is the only routing allocation, created inside match_*_route only
+// AFTER the match is validated, so a non-match allocates nothing). A quick
+// `/`-count check rejects non-candidates cheaply. The path length is taken
+// WITHOUT the `?query`, so query strings never break matching.
 //
 // Cold path (no handler matched): a malformed request yields 400 (never panics —
 // a panic would take down the worker thread); a known path under a different
 // method yields 405 + Allow; anything else yields 404.
 fn router(req_buffer []u8, _ int, app App) ![]u8 {
 	req := request_parser.decode_http_request(req_buffer) or { return bad_request_response }
-	mut params := map[string]Slice{}
 
 	// Path length excluding any "?query" — both the slash-count rejection and the
 	// matchers must stop at the query, or a query containing '/' (e.g.
@@ -34,13 +40,15 @@ fn router(req_buffer []u8, _ int, app App) ![]u8 {
 			if star >= 0 {
 				// Catch-all route ("/prefix/*name") — spans any number of
 				// segments, so it skips the slash-count gate.
-				if try_wildcard_route(req, attr, attr.len, star, path_len, mut params) {
+				if params := match_wildcard_route(req, attr, attr.len, star, path_len) {
 					return app.$method(req, params)
 				}
 			} else if slashes == path_slashes {
 				// A route's '/'-count (method has none) must equal the path's.
-				if try_static_route(req, attr, attr.len, path_len)
-					|| try_dynamic_route(req, attr, attr.len, path_len, mut params) {
+				if try_static_route(req, attr, attr.len, path_len) {
+					return app.$method(req, empty_params)
+				}
+				if params := match_dynamic_route(req, attr, attr.len, path_len) {
 					return app.$method(req, params)
 				}
 			}
@@ -67,6 +75,8 @@ fn path_len_without_query(req HttpRequest) int {
 // OTHER method, it's 405 Method Not Allowed (with an Allow header listing them);
 // otherwise 404. Runs only when nothing matched, so it never costs the hot path.
 fn resolve_no_match(req HttpRequest, path_len int) []u8 {
+	// `allow` collects zero-copy views of each attr's method part — attrs are
+	// comptime literals with static lifetime, so the views never dangle.
 	mut allow := []string{}
 	$for method in App.methods {
 		for attr in method.attrs {
@@ -82,17 +92,33 @@ fn resolve_no_match(req HttpRequest, path_len int) []u8 {
 	return not_found_response
 }
 
-// method_not_allowed_response builds a 405 with an Allow header (RFC 9110 §15.5.6
-// requires Allow on a 405).
+const method_not_allowed_head = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: '.bytes()
+const method_not_allowed_tail = '\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+
+// method_not_allowed_response builds a 405 with an Allow header (RFC 9110
+// §15.5.6 requires Allow on a 405). Cold path, but the byte discipline is the
+// same everywhere: const head/tail around the ', '-separated verbs — no `${}`,
+// no join().
 fn method_not_allowed_response(allow []string) []u8 {
-	allowed := allow.join(', ')
-	return 'HTTP/1.1 405 Method Not Allowed\r\nAllow: ${allowed}\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+	mut out := []u8{cap: 128}
+	out << method_not_allowed_head
+	for i, m in allow {
+		if i > 0 {
+			ws(mut out, ', ')
+		}
+		ws(mut out, m)
+	}
+	out << method_not_allowed_tail
+	return out
 }
 
 // split_attr splits a route attribute "METHOD /path" into ("METHOD", "/path").
+// Both halves are zero-copy `tos` views into the attribute literal (static
+// lifetime, never dangles) — the old `attr[..sp]` substrings allocated two
+// strings per route on every unmatched request.
 fn split_attr(attr string) (string, string) {
 	sp := attr.index(' ') or { return '', attr }
-	return attr[..sp], attr[sp + 1..]
+	return unsafe { tos(attr.str, sp) }, unsafe { tos(attr.str + sp + 1, attr.len - sp - 1) }
 }
 
 // route_path_matches reports whether a route's path pattern (with `:param`

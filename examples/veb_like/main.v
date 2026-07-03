@@ -2,11 +2,13 @@ module main
 
 // veb-like router — a production-minded reference.
 //
-// Routes are declared as method attributes (`@['GET /users/:id/get']`) and
+// Routes are declared as method attributes (`@['GET /users/:id']`) and
 // dispatched by a comptime-unrolled router (see router.v). It keeps the project
-// values: the handler contract is still bytes-in/bytes-out, matching is
-// allocation-free on the hot path, and there is "no magic" — you can read every
-// step.
+// values: the handler contract is still bytes-in/bytes-out; a static route
+// dispatches with zero allocations; a dynamic match allocates only the params
+// map it hands the handler (created only after the match is validated); and
+// every response is framed from consts with `out <<` — no `${}` interpolation
+// anywhere. There is "no magic" — you can read every step.
 //
 // Production properties wired here:
 //   • never crashes on bad input — a malformed request is answered 400, not
@@ -22,80 +24,132 @@ import os
 
 struct App {}
 
-// p is a tiny helper: read param `key` from the request buffer (zero-copy slice
-// -> string). Route params use the ':' prefix, catch-alls the '*' prefix.
-fn p(req HttpRequest, params map[string]Slice, key string) string {
-	return unsafe { params[key] }.to_string(req.buffer)
+// p reads param `key` as a zero-copy VIEW of its bytes in the request buffer —
+// no `.to_string()` copy. The view only feeds json_escape_into, which reads it
+// before the buffer is recycled, so nothing needs to outlive the request.
+// Route params use the ':' prefix, catch-alls the '*' prefix. A missing or
+// empty param yields an empty view (`[]u8{}` at len 0 / cap 0 allocates
+// nothing).
+fn p(req HttpRequest, params map[string]Slice, key string) []u8 {
+	sl := unsafe { params[key] }
+	if sl.len <= 0 {
+		return []u8{}
+	}
+	return unsafe { (&req.buffer[sl.start]).vbytes(sl.len) }
 }
 
 // ── static routes ──────────────────────────────────────────────────────────
+// Static bodies never change, so the full responses are framed ONCE at init
+// (Content-Length still computed, never hand-typed); the handlers return the
+// const — nothing is built per request.
+
+const users_list_response = json_ok('[]'.bytes())
+const user_created_response = json_created('{"id":1}'.bytes())
 
 @['GET /users']
 fn (app App) list_users(_ HttpRequest, _ map[string]Slice) []u8 {
-	return json_response('200 OK', '[]')
+	return users_list_response
 }
 
 @['POST /users']
 fn (app App) create_user(_ HttpRequest, _ map[string]Slice) []u8 {
-	return json_response('201 Created', '{"id":1}')
+	return user_created_response
 }
 
 // ── one parameter at the end (a REST resource), across several verbs ─────────
 // The same path on GET/PUT/PATCH/DELETE shows the router keying on METHOD+path,
 // and a wrong verb on it yields 405 with every allowed method in Allow.
+// Handler shape for dynamic bodies: JSON skeleton via `ws` consts, params
+// escaped straight into the builder, then json_ok() frames it.
 
 @['GET /users/:id']
 fn (app App) show_user(req HttpRequest, params map[string]Slice) []u8 {
-	return json_response('200 OK', '{"id":${json_str(p(req, params, ':id'))}}')
+	mut body := []u8{cap: 64}
+	ws(mut body, '{"id":')
+	json_escape_into(mut body, p(req, params, ':id'))
+	ws(mut body, '}')
+	return json_ok(body)
 }
 
 @['PUT /users/:id']
 fn (app App) replace_user(req HttpRequest, params map[string]Slice) []u8 {
-	return json_response('200 OK', '{"replaced":${json_str(p(req, params, ':id'))}}')
+	mut body := []u8{cap: 64}
+	ws(mut body, '{"replaced":')
+	json_escape_into(mut body, p(req, params, ':id'))
+	ws(mut body, '}')
+	return json_ok(body)
 }
 
 @['PATCH /users/:id']
 fn (app App) update_user(req HttpRequest, params map[string]Slice) []u8 {
-	return json_response('200 OK', '{"updated":${json_str(p(req, params, ':id'))}}')
+	mut body := []u8{cap: 64}
+	ws(mut body, '{"updated":')
+	json_escape_into(mut body, p(req, params, ':id'))
+	ws(mut body, '}')
+	return json_ok(body)
 }
 
 @['DELETE /users/:id']
 fn (app App) delete_user(req HttpRequest, params map[string]Slice) []u8 {
-	return json_response('200 OK', '{"deleted":${json_str(p(req, params, ':id'))}}')
+	mut body := []u8{cap: 64}
+	ws(mut body, '{"deleted":')
+	json_escape_into(mut body, p(req, params, ':id'))
+	ws(mut body, '}')
+	return json_ok(body)
 }
 
 // ── parameter followed by a literal tail ─────────────────────────────────────
 
 @['GET /users/:id/profile']
 fn (app App) user_profile(req HttpRequest, params map[string]Slice) []u8 {
-	return json_response('200 OK', '{"id":${json_str(p(req, params, ':id'))},"section":"profile"}')
+	mut body := []u8{cap: 64}
+	ws(mut body, '{"id":')
+	json_escape_into(mut body, p(req, params, ':id'))
+	ws(mut body, ',"section":"profile"}')
+	return json_ok(body)
 }
 
 // ── two parameters interleaved with literals ─────────────────────────────────
 
 @['GET /users/:user_id/posts/:post_id']
 fn (app App) user_post(req HttpRequest, params map[string]Slice) []u8 {
-	body := '{"user":${json_str(p(req, params, ':user_id'))},"post":${json_str(p(req, params,
-		':post_id'))}}'
-	return json_response('200 OK', body)
+	mut body := []u8{cap: 64}
+	ws(mut body, '{"user":')
+	json_escape_into(mut body, p(req, params, ':user_id'))
+	ws(mut body, ',"post":')
+	json_escape_into(mut body, p(req, params, ':post_id'))
+	ws(mut body, '}')
+	return json_ok(body)
 }
 
 // ── three parameters, deeply nested ──────────────────────────────────────────
 
 @['GET /users/:user_id/posts/:post_id/comments/:comment_id']
 fn (app App) post_comment(req HttpRequest, params map[string]Slice) []u8 {
-	body := '{"user":${json_str(p(req, params, ':user_id'))},"post":${json_str(p(req, params,
-		':post_id'))},"comment":${json_str(p(req, params, ':comment_id'))}}'
-	return json_response('200 OK', body)
+	mut body := []u8{cap: 96}
+	ws(mut body, '{"user":')
+	json_escape_into(mut body, p(req, params, ':user_id'))
+	ws(mut body, ',"post":')
+	json_escape_into(mut body, p(req, params, ':post_id'))
+	ws(mut body, ',"comment":')
+	json_escape_into(mut body, p(req, params, ':comment_id'))
+	ws(mut body, '}')
+	return json_ok(body)
 }
 
 // ── three CONSECUTIVE parameters (no literals between) ───────────────────────
 
 @['GET /tags/:a/:b/:c']
 fn (app App) tags(req HttpRequest, params map[string]Slice) []u8 {
-	body := '{"a":${json_str(p(req, params, ':a'))},"b":${json_str(p(req, params, ':b'))},"c":${json_str(p(req,
-		params, ':c'))}}'
-	return json_response('200 OK', body)
+	mut body := []u8{cap: 64}
+	ws(mut body, '{"a":')
+	json_escape_into(mut body, p(req, params, ':a'))
+	ws(mut body, ',"b":')
+	json_escape_into(mut body, p(req, params, ':b'))
+	ws(mut body, ',"c":')
+	json_escape_into(mut body, p(req, params, ':c'))
+	ws(mut body, '}')
+	return json_ok(body)
 }
 
 // ── a single parameter that often carries odd characters (search query) ──────
@@ -103,7 +157,11 @@ fn (app App) tags(req HttpRequest, params map[string]Slice) []u8 {
 @['GET /search/:term']
 fn (app App) search(req HttpRequest, params map[string]Slice) []u8 {
 	// :term is one segment; richer queries belong in ?q=… (req.get_query).
-	return json_response('200 OK', '{"term":${json_str(p(req, params, ':term'))}}')
+	mut body := []u8{cap: 64}
+	ws(mut body, '{"term":')
+	json_escape_into(mut body, p(req, params, ':term'))
+	ws(mut body, '}')
+	return json_ok(body)
 }
 
 // ── catch-all / wildcard: '*path' captures the REST of the path, slashes and
@@ -111,12 +169,20 @@ fn (app App) search(req HttpRequest, params map[string]Slice) []u8 {
 
 @['GET /files/*path']
 fn (app App) serve_file(req HttpRequest, params map[string]Slice) []u8 {
-	return json_response('200 OK', '{"file":${json_str(p(req, params, '*path'))}}')
+	mut body := []u8{cap: 96}
+	ws(mut body, '{"file":')
+	json_escape_into(mut body, p(req, params, '*path'))
+	ws(mut body, '}')
+	return json_ok(body)
 }
 
 @['GET /proxy/*upstream']
 fn (app App) proxy(req HttpRequest, params map[string]Slice) []u8 {
-	return json_response('200 OK', '{"upstream":${json_str(p(req, params, '*upstream'))}}')
+	mut body := []u8{cap: 96}
+	ws(mut body, '{"upstream":')
+	json_escape_into(mut body, p(req, params, '*upstream'))
+	ws(mut body, '}')
+	return json_ok(body)
 }
 
 fn main() {

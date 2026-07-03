@@ -16,14 +16,22 @@ fn C.vcam_done(c voidptr)
 fn C.vcam_close(c voidptr)
 
 // run_v4l2 streams frames straight from the camera until it errors/stops.
-// Returns the number of frames broadcast (0 ⇒ unavailable, caller falls back).
+// Returns the number of frames broadcast (0 ⇒ unavailable, the caller logs
+// that /webcam won't stream and gives up — there is deliberately no ffmpeg
+// fallback, see the README).
 fn run_v4l2(path string, mut v Viewers) int {
 	cam := C.vcam_open(&char(path.str), 640, 480)
 	if isnil(cam) {
-		return 0 // no device, or no MJPEG mode — let the caller try ffmpeg
+		return 0 // no device, or no MJPEG mode
 	}
 	eprintln('[webcam] capturing via V4L2 in-process (no ffmpeg, zero-copy mmap)')
 	mut frames := 0
+	// ONE frame buffer + ONE header scratch, reused for every frame (grown to
+	// the high-water JPEG size instead of a fresh zeroed alloc per frame,
+	// BEST_PRACTICES §4). Reuse is safe: broadcast_frame completes synchronously
+	// below, before the buffer is refilled — this thread is the only writer.
+	mut frame := []u8{cap: 256 * 1024}
+	mut scratch := []u8{cap: part_prefix.len + 32}
 	for {
 		n := C.vcam_next(cam)
 		if n <= 0 {
@@ -32,10 +40,13 @@ fn run_v4l2(path string, mut v Viewers) int {
 		// Copy the JPEG out of the mmap'd buffer, then immediately return the
 		// buffer to the driver so it can be refilled while we broadcast.
 		src := C.vcam_ptr(cam)
-		mut frame := []u8{len: n}
-		unsafe { vmemcpy(frame.data, src, n) }
+		frame.ensure_cap(n)
+		unsafe {
+			frame.len = n // spare capacity is about to be overwritten
+			vmemcpy(frame.data, src, n)
+		}
 		C.vcam_done(cam)
-		v.broadcast_frame(frame)
+		v.broadcast_frame(frame, mut scratch)
 		frames++
 	}
 	C.vcam_close(cam)

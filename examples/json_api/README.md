@@ -11,6 +11,8 @@ POST /users    Content-Type: application/json        -> 201 Created (JSON)
 POST /upload   Content-Type: multipart/form-data      -> 200 OK (JSON summary)
 ```
 
+Anything else answers `404 Not Found` with a JSON error body.
+
 ## Try it
 
 ```bash
@@ -22,23 +24,35 @@ curl -d '{"name":"Ada","email":"ada@example.com"}' \
 curl -F file=@./logo.png localhost:3000/upload
 ```
 
-## Aspirational prerequisite
+## Body framing lives in the core
 
-This example assumes `req.body` is the **complete** body. Today
-[`request.read_request`](../../http_server/http1_1/request/request.c.v) stops at
-the first short read and ignores `Content-Length`, so a body split across TCP
-segments arrives truncated.
+This example assumes `req.body` is the **complete** body — and the core
+delivers that today.
+[`request.read_request`](../../http_server/http1_1/request/request.c.v) loops
+`recv()` and asks the pure framer (`request_parser.frame_request_length`)
+whether a whole message is present yet, honoring `Content-Length` and
+`Transfer-Encoding: chunked`. A handler never reads the socket to reassemble a
+body — that is the point.
 
-The fix belongs in the **core**, not the handler: frame the body by
-`Content-Length` (or `Transfer-Encoding: chunked`) before invoking the handler.
-Once that lands, this handler works unchanged — that is the point. A handler
-should never read the socket to reassemble a body.
+Residual core limitation: a request fragmented across epoll readiness bursts
+(`EAGAIN` mid-message) is rejected with an error — it is never delivered
+truncated. Framing correctness is regression-tested in the core by a
+split-fuzz test over every prefix of a framed request
+([`request_parser_test.v`](../../http_server/http1_1/request_parser/request_parser_test.v)).
 
-## Notes on purity
+## Notes on purity & byte discipline
 
-- `parse_multipart` materializes the body as a string for readability. The
-  zero-copy form scans the raw `Slice` and returns each part's content as a
-  sub-slice — same logic, no per-file allocation. Worth doing for large uploads.
-- Header lookup is case-sensitive in the current parser, so `Content-Type` must
-  match exactly. A case-insensitive name compare in the core (RFC 9110 §5.1)
-  would remove that footgun.
+- `parse_multipart` scans the raw body bytes by offsets; every `Part` field is
+  a zero-copy view into the request buffer (`tos` / `vbytes`). The views must
+  not outlive the request — here the response is built synchronously, so
+  nothing retains them.
+- Header lookup is case-insensitive (RFC 9110 §5.1): `Content-Type`,
+  `content-type` and `CONTENT-TYPE` all match — the core folds ASCII case in
+  place. The `boundary=` parameter name is matched case-insensitively too
+  (RFC 2045).
+- Static responses (the 404 and the 400 family) are consts built once at init;
+  dynamic responses are framed straight into `out` with zero-alloc append
+  helpers — no `${}`, no `+` anywhere.
+- One deliberate copy remains: `json.decode` is cJSON-backed and measures its
+  input with `strlen`, so it needs a real NUL-terminated string — a view into
+  the request buffer would over-read past the body.

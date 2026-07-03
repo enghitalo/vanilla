@@ -2,7 +2,7 @@
 
 Two streaming models that look similar in a browser but are opposite on the
 wire — one server demonstrates both, on top of the frozen
-`fn ([]u8, int) ![]u8` handler contract.
+`fn ([]u8, int, mut []u8) !` handler contract.
 
 | Route | Model | Wire format | Who drives it |
 |-------|-------|-------------|---------------|
@@ -52,7 +52,7 @@ Shelling out to ffmpeg is the *portable* way, not the *efficient* way: even a
 passthrough subprocess costs a process, a pipe, and extra copies, and a transcode
 re-encodes frames the camera already produced.
 
-This example captures **in-process via V4L2** (`vcam.c` / `capture_v4l2.c.v`):
+This example captures **in-process via V4L2** (`vcam.c` / `capture_v4l2_linux.c.v`):
 open `/dev/video0`, request `V4L2_PIX_FMT_MJPEG`, `mmap` the kernel's capture
 buffers, and loop `VIDIOC_DQBUF`/`VIDIOC_QBUF`. Each dequeued buffer is a ready
 JPEG in a DMA buffer; we copy it once into a `[]u8` and hand the buffer straight

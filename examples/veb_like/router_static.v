@@ -1,3 +1,5 @@
+// Pre-rewrite record (measured before the const-framing / lazy-params-map
+// rewrite; re-measure with -prod before quoting):
 // wrk --connection 512 --threads 16 --duration 60s http://localhost:3000/users
 // Running 1m test @ http://localhost:3000/users
 //   16 threads and 512 connections
