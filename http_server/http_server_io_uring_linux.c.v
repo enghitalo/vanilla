@@ -528,7 +528,7 @@ fn iou_sweep_timeouts(worker &io_uring.Worker) {
 // up on the main thread and driving it here would make every submit_and_wait
 // fail; doing it all here keeps the ring single-owner (and matches how every
 // thread-per-core io_uring server sets up).
-fn io_uring_worker_main(listener int, cpu_id int, handler fn (req []u8, fd int, mut out []u8) !, limits Limits, active_conns &core.Counter, inflight &core.Counter, draining &core.Counter) {
+fn io_uring_worker_main(listener int, cpu_id int, handler fn (req []u8, fd int, mut out []u8) !, stateful_handler core.StatefulHandler, make_state fn () voidptr, limits Limits, active_conns &core.Counter, inflight &core.Counter, draining &core.Counter) {
 	maybe_pin_worker(cpu_id)
 	mut worker := &io_uring.Worker{}
 	worker.cpu_id = cpu_id
@@ -562,7 +562,32 @@ fn io_uring_worker_main(listener int, cpu_id int, handler fn (req []u8, fd int, 
 	// Skip the per-enter fget/fput on the ring fd.
 	C.io_uring_register_ring_fd(&worker.ring)
 
-	io_uring_worker_loop(worker, handler, limits, active_conns)
+	// Per-worker state (issue #93): build THIS worker's thread-local state once (e.g.
+	// its own DB pool / reused render scratch), then fold it into a plain
+	// RequestHandler-shaped closure so the ring hot path stays a plain handler and the
+	// state needs no sharing and no lock. make_state runs HERE — on the worker thread,
+	// after CPU pinning — so its allocations are thread- and NUMA-local. Mirrors the
+	// epoll backend's process_events_plain + build_handler.
+	mut state := voidptr(unsafe { nil })
+	if make_state != unsafe { nil } {
+		state = make_state()
+	}
+	eff_handler := build_iou_handler(handler, stateful_handler, state)
+
+	io_uring_worker_loop(worker, eff_handler, limits, active_conns)
+}
+
+// build_iou_handler resolves the effective synchronous per-worker handler: with no
+// stateful_handler it is just the stateless request_handler; otherwise it binds this
+// worker's `state` into a plain RequestHandler-shaped closure so the ring hot path
+// stays a plain handler and the state is thread-local. Mirrors backend_epoll.build_handler.
+fn build_iou_handler(request_handler fn (req []u8, fd int, mut out []u8) !, stateful_handler core.StatefulHandler, state voidptr) fn (req []u8, fd int, mut out []u8) ! {
+	if stateful_handler == unsafe { nil } {
+		return request_handler
+	}
+	return fn [state, stateful_handler] (req []u8, fd int, mut out []u8) ! {
+		stateful_handler(req, fd, mut out, state)!
+	}
 }
 
 @[direct_array_access]
@@ -717,8 +742,8 @@ pub fn run_io_uring_backend(server Server, mut threads []thread) {
 			eprintln('Failed to create listener for worker ${i}')
 			exit(1)
 		}
-		threads[i] = spawn io_uring_worker_main(listener, i, server.request_handler, server.limits,
-			server.active_conns, server.inflight[i], server.draining)
+		threads[i] = spawn io_uring_worker_main(listener, i, server.request_handler, server.stateful_handler,
+			server.make_state, server.limits, server.active_conns, server.inflight[i], server.draining)
 	}
 
 	println('listening on http://localhost:${server.port}/ (io_uring)')

@@ -15,7 +15,7 @@ per-request allocation.
 | Platform | Backend | Accept model | Handlers supported |
 |---|---|---|---|
 | Linux | `.epoll` *(default)* | one central acceptor → round-robins fds to per-worker epolls | `request_handler`, `stateful_handler`, `async_handler`, TLS |
-| Linux | `.io_uring` | per-worker `SO_REUSEPORT` listener + multishot accept (kernel 5.19+) | `request_handler` (stateless) |
+| Linux | `.io_uring` | per-worker `SO_REUSEPORT` listener + multishot accept (kernel 5.19+) | `request_handler`, `stateful_handler` |
 | macOS | kqueue | per-worker | `request_handler`, `async_handler` |
 | Windows | IOCP | per-worker | `request_handler` |
 
@@ -26,7 +26,7 @@ Provide **exactly one** of:
 - **`request_handler`** — `fn (req []u8, fd int, mut out []u8) !`, stateless. All backends.
 - **`stateful_handler` + `make_state`** — lock-free per-worker state (e.g. a DB
   connection): `make_state` runs once per worker, then every request on that worker
-  is dispatched with it. Linux/epoll only.
+  is dispatched with it. Linux epoll + io_uring (each ring worker builds its own state).
 - **`async_handler` (+ optional `make_state`)** — may PARK a request on any fd via
   `ac.watch(...)` and resume by a continuation in the worker loop (DB sockets,
   upstreams, timers, `EPOLLOUT` backpressure). Linux/epoll + macOS/kqueue.
