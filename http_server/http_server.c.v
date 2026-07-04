@@ -23,7 +23,7 @@ pub:
 pub mut:
 	threads         []thread            = []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
 	request_handler core.RequestHandler = unsafe { nil }
-	// Per-thread state path (epoll only); see ServerConfig. make_state runs once
+	// Per-worker state path (epoll + io_uring); see ServerConfig. make_state runs once
 	// per worker thread, stateful_handler receives its result on every request.
 	stateful_handler core.StatefulHandler = unsafe { nil }
 	async_handler    core.AsyncHandler    = unsafe { nil }
@@ -230,11 +230,12 @@ pub:
 	// Provide EITHER request_handler (stateless) OR stateful_handler+make_state
 	// (per-thread state). new_server enforces exactly one is set.
 	request_handler core.RequestHandler = unsafe { nil }
-	// stateful_handler + make_state opt into lock-free per-thread state: each
-	// epoll worker calls make_state ONCE (so the value is thread-local), then every
-	// request on that worker is dispatched through stateful_handler with it. Used to
-	// give each worker its own DB connection — no shared pool, no mutex. Linux/epoll
-	// only; ignored by other backends. See core.StatefulHandler.
+	// stateful_handler + make_state opt into lock-free per-worker state: each worker
+	// calls make_state ONCE (so the value is thread-local), then every request on that
+	// worker is dispatched through stateful_handler with it. Used to give each worker
+	// its own DB connection / reused render scratch — no shared pool, no mutex. Linux
+	// epoll AND io_uring (each ring worker builds its own state); ignored by other
+	// backends. See core.StatefulHandler.
 	stateful_handler core.StatefulHandler = unsafe { nil }
 	make_state       fn () voidptr        = unsafe { nil }
 	// async_handler opts into the async runtime: the handler may PARK a request on
@@ -304,13 +305,15 @@ pub fn new_server(config ServerConfig) !Server {
 	// inside the matching `$if` — otherwise this all-platform file fails to
 	// compile on the other targets.
 	if has_stateful {
-		// stateful_handler (sync per-thread state) is Linux/epoll only for now.
+		// stateful_handler (sync per-worker state) runs on the Linux epoll AND io_uring
+		// backends: each worker calls make_state once, then dispatches every request
+		// through stateful_handler with that thread-local state (no sharing, no lock).
 		$if linux {
-			if config.io_multiplexing != .epoll {
-				return error('stateful_handler requires the epoll backend')
+			if config.io_multiplexing != .epoll && config.io_multiplexing != .io_uring {
+				return error('stateful_handler requires the epoll or io_uring backend')
 			}
 		} $else {
-			return error('stateful_handler is only supported on the Linux epoll backend')
+			return error('stateful_handler is only supported on the Linux epoll and io_uring backends')
 		}
 	}
 	if has_async {
