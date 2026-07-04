@@ -244,7 +244,17 @@ fn process_events_plain(worker_id int, epoll_fd int, request_handler core.Reques
 @[direct_array_access; manualfree]
 fn process_events_tls(worker_id int, epoll_fd int, request_handler core.RequestHandler, stateful_handler core.StatefulHandler, make_state fn () voidptr, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config) {
 	maybe_pin_worker(worker_id)
-	handler := build_handler(request_handler, stateful_handler, make_state)
+	// Build THIS worker's per-thread state ONCE, then bind it into the handler — same
+	// as the plaintext worker. NOTE: pass make_state()'s RESULT, not the make_state fn
+	// pointer itself: build_handler's 3rd arg is the `state voidptr`, so passing the
+	// uncalled fn made a stateful+TLS handler cast the make_state address as its state
+	// (garbage). make_state is nil for the common stateless-TLS case (build_handler then
+	// ignores state), so only stateful+TLS was affected.
+	mut state := voidptr(unsafe { nil })
+	if make_state != unsafe { nil } {
+		state = make_state()
+	}
+	handler := build_handler(request_handler, stateful_handler, state)
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut sessions := map[int]&TlsConn{}
 	sweep_on := limits.read_timeout_ms > 0 || limits.write_timeout_ms > 0
