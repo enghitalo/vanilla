@@ -4,8 +4,9 @@ import time
 
 // SOLUTION: rebuild_at is pure over (dc.last, now) — drive it through every
 // bucket rollover and compare byte-for-byte against the vlib formatter as the
-// ORACLE. The incremental path only ever touches the digits that changed, so
-// the oracle equality is exactly the property that matters.
+// ORACLE. rebuild_at delegates to stdlib time.update_http_header (which only
+// touches the digits that changed); this test guards THIS example's integration
+// of it — the &line[6] offset and the make_state seeding of the static frame.
 
 // expected builds the reference line via vlib (test scaffolding).
 fn expected(u i64) string {

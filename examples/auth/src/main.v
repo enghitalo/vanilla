@@ -154,7 +154,7 @@ fn jwt_verify(token []u8) bool {
 	}
 	payload_b64 := unsafe { tos(&token[first + 1], last - first - 1) } // view string
 	exp := exp_of(base64.url_decode(payload_b64))
-	return exp > 0 && exp > time.utc().unix()
+	return exp > 0 && exp > time.unix_now()
 }
 
 // ---- API key ---------------------------------------------------------------
@@ -250,7 +250,7 @@ fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 		payload.write_string('{"sub":"')
 		payload.write_string(demo_user)
 		payload.write_string('","exp":')
-		payload.write_decimal(time.utc().unix() + 3600)
+		payload.write_decimal(time.unix_now() + 3600)
 		payload.write_u8(`}`)
 		token := jwt_sign(payload)
 		ws(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ')
