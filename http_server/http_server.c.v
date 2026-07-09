@@ -240,9 +240,10 @@ pub:
 	make_state       fn () voidptr        = unsafe { nil }
 	// async_handler opts into the async runtime: the handler may PARK a request on
 	// any fd via ac.watch(...) and return .suspend, resumed by a continuation when
-	// that fd is ready — all in the worker's epoll loop (DB sockets, upstreams,
-	// timers, EPOLLOUT backpressure). Optional make_state gives each worker its own
-	// state. Linux/epoll only; ignored by other backends. See core.AsyncHandler.
+	// that fd is ready — all in the worker's own event loop (DB sockets, upstreams,
+	// timers). Optional make_state gives each worker its own state. Linux epoll +
+	// io_uring (readiness via a oneshot IORING_OP_POLL_ADD on the worker's ring)
+	// and macOS/kqueue. See core.AsyncHandler.
 	async_handler core.AsyncHandler = unsafe { nil }
 	// on_worker_start runs once per worker (after make_state, before the loop) to
 	// arm CLIENTLESS background watches — e.g. a periodic timerfd that refreshes
@@ -317,10 +318,11 @@ pub fn new_server(config ServerConfig) !Server {
 		}
 	}
 	if has_async {
-		// async_handler runs on the Linux epoll worker and the macOS kqueue worker.
+		// async_handler runs on the Linux epoll and io_uring workers and the macOS
+		// kqueue worker (io_uring parks on a oneshot IORING_OP_POLL_ADD — issue #83).
 		$if linux {
-			if config.io_multiplexing != .epoll {
-				return error('async_handler requires the epoll backend')
+			if config.io_multiplexing != .epoll && config.io_multiplexing != .io_uring {
+				return error('async_handler requires the epoll or io_uring backend')
 			}
 		} $else $if darwin {
 			if config.io_multiplexing != .kqueue {

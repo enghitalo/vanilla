@@ -193,7 +193,7 @@ fn handle_io_uring_accept(worker &io_uring.Worker, cqe &C.io_uring_cqe, limits L
 	}
 }
 
-fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn (req []u8, fd int, mut out []u8) !, limits Limits, active_conns &core.Counter) {
+fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn (req []u8, fd int, mut out []u8) !, env &IouAsyncEnv, limits Limits, active_conns &core.Counter) {
 	track := limits.max_connections > 0
 	res := cqe.res
 	c_ptr := io_uring.decode_connection_ptr(C.io_uring_cqe_get_data64(cqe))
@@ -201,6 +201,7 @@ fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn
 		return
 	}
 	mut conn := unsafe { &io_uring.Connection(c_ptr) }
+	has_async := unsafe { env != nil }
 	if res <= 0 {
 		// res == 0: peer closed (EOF, incl. the half-close from a timeout sweep).
 		// res < 0: recv error (e.g. -ECONNRESET, -ECANCELED).
@@ -225,8 +226,21 @@ fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn
 		conn.read_buf.len += res
 	}
 	// Answer every complete request now buffered (pipelining), appending each
-	// raw response to response_buffer and compacting the partial leftover.
-	drain_iou_requests(mut conn, handler, limits)
+	// raw response to response_buffer and compacting the partial leftover. The
+	// async drain additionally PARKS the connection at the first .suspend.
+	if has_async {
+		mut e := unsafe { &IouAsyncEnv(env) }
+		e.cur_conn = conn
+		async_iou_drain(mut *e, mut *conn, limits)
+	} else {
+		drain_iou_requests(mut conn, handler, limits)
+	}
+	if has_async && conn.awaiting_fd >= 0 {
+		// Parked: hold every buffered response and arm NO client op — the op_poll
+		// completion on awaiting_fd resumes this connection (iou_finish_resume
+		// then flushes / re-arms). See the async module comment for the invariant.
+		return
+	}
 	req_cap := if limits.max_request_bytes > 0 {
 		limits.max_request_bytes
 	} else {
@@ -246,13 +260,26 @@ fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn
 		iou_flush_response(worker, mut *conn, limits)
 		return
 	}
+	if conn.close_after_send {
+		// An async .close (or error) can leave nothing pending to send — drop now
+		// rather than fall through to arming a recv on a condemned connection.
+		iou_release(worker, mut *conn, active_conns, track)
+		return
+	}
 	// Nothing complete yet. A body too large to be worth buffering is STREAMED:
 	// answer it from the head alone, then drain+discard the body. This keeps memory
 	// at O(read_buf_cap) instead of growing read_buf into a multi-MB block and
 	// ping-ponging recv→CQE→re-arm thousands of times for a 20 MiB upload.
 	total := request_parser.frame_expected_total(conn.read_buf)
 	if total > iou_stream_body_above && total <= req_cap {
-		if start_iou_body_drain(mut conn, handler, total) {
+		started := if has_async {
+			mut e := unsafe { &IouAsyncEnv(env) }
+			e.cur_conn = conn
+			async_start_iou_body_drain(mut *e, mut *conn, total, limits)
+		} else {
+			start_iou_body_drain(mut conn, handler, total)
+		}
+		if started {
 			if conn.close_after_send || conn.body_drain == 0 {
 				// Handler errored on the head (send the error, then close), or the
 				// whole body happened to be buffered already — either way send now.
@@ -426,7 +453,7 @@ fn start_iou_body_drain(mut conn io_uring.Connection, handler fn (req []u8, fd i
 	return true
 }
 
-fn handle_io_uring_write(worker &io_uring.Worker, cqe &C.io_uring_cqe, limits Limits, active_conns &core.Counter) {
+fn handle_io_uring_write(worker &io_uring.Worker, cqe &C.io_uring_cqe, env &IouAsyncEnv, limits Limits, active_conns &core.Counter) {
 	track := limits.max_connections > 0
 	res := cqe.res
 	c_ptr := io_uring.decode_connection_ptr(C.io_uring_cqe_get_data64(cqe))
@@ -477,18 +504,57 @@ fn handle_io_uring_write(worker &io_uring.Worker, cqe &C.io_uring_cqe, limits Li
 		conn.response_buffer.clear() // len = 0, capacity kept for the next batch
 	}
 	conn.bytes_sent = 0
+	if unsafe { env != nil } {
+		// Async path: requests pipelined BEHIND a parked/answered one may still sit
+		// in read_buf (the resume drained before flushing, but a burst that parked
+		// during THIS send's completion re-drain can leave more). Drain them now
+		// instead of arming a recv that would wait for bytes that never come.
+		if conn.awaiting_fd >= 0 {
+			return // parked (defensive: a parked conn should have no in-flight send)
+		}
+		if conn.read_buf.len > 0 {
+			mut e := unsafe { &IouAsyncEnv(env) }
+			e.cur_conn = conn
+			async_iou_drain(mut *e, mut *conn, limits)
+			if conn.awaiting_fd >= 0 {
+				return // parked on a new watch: hold responses until it resumes
+			}
+			if conn.send_buf != unsafe { nil } || conn.response_buffer.len > conn.bytes_sent {
+				iou_flush_response(worker, mut *conn, limits)
+				return
+			}
+			if conn.close_after_send {
+				iou_release(worker, mut *conn, active_conns, track)
+				return
+			}
+		}
+	}
 	// Keep-alive: read the next request. read_buf still holds any pipelined
 	// leftover; iou_arm_recv re-arms the read deadline iff that leftover is a
 	// partial request, and leaves an idle keep-alive wait deadline-free.
 	iou_arm_recv(worker, mut *conn, limits)
 }
 
-fn dispatch_io_uring_cqe(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn (req []u8, fd int, mut out []u8) !, limits Limits, active_conns &core.Counter) {
+fn dispatch_io_uring_cqe(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn (req []u8, fd int, mut out []u8) !, env &IouAsyncEnv, limits Limits, active_conns &core.Counter) {
 	op := io_uring.decode_op_type(C.io_uring_cqe_get_data64(cqe))
 	match op {
-		io_uring.op_accept { handle_io_uring_accept(worker, cqe, limits, active_conns) }
-		io_uring.op_read { handle_io_uring_read(worker, cqe, handler, limits, active_conns) }
-		io_uring.op_write { handle_io_uring_write(worker, cqe, limits, active_conns) }
+		io_uring.op_accept {
+			handle_io_uring_accept(worker, cqe, limits, active_conns)
+		}
+		io_uring.op_read {
+			handle_io_uring_read(worker, cqe, handler, env, limits, active_conns)
+		}
+		io_uring.op_write {
+			handle_io_uring_write(worker, cqe, env, limits, active_conns)
+		}
+		io_uring.op_poll {
+			// A watched external fd (async runtime) became ready: resume the parked
+			// continuation(s). Only armed when an async_handler is configured.
+			if unsafe { env != nil } {
+				mut e := unsafe { &IouAsyncEnv(env) }
+				handle_io_uring_poll(cqe, mut *e, limits, active_conns)
+			}
+		}
 		else {}
 	}
 }
@@ -528,7 +594,7 @@ fn iou_sweep_timeouts(worker &io_uring.Worker) {
 // up on the main thread and driving it here would make every submit_and_wait
 // fail; doing it all here keeps the ring single-owner (and matches how every
 // thread-per-core io_uring server sets up).
-fn io_uring_worker_main(listener int, cpu_id int, handler fn (req []u8, fd int, mut out []u8) !, stateful_handler core.StatefulHandler, make_state fn () voidptr, limits Limits, active_conns &core.Counter, inflight &core.Counter, draining &core.Counter) {
+fn io_uring_worker_main(listener int, cpu_id int, handler fn (req []u8, fd int, mut out []u8) !, stateful_handler core.StatefulHandler, async_handler core.AsyncHandler, make_state fn () voidptr, limits Limits, active_conns &core.Counter, inflight &core.Counter, draining &core.Counter) {
 	maybe_pin_worker(cpu_id)
 	mut worker := &io_uring.Worker{}
 	worker.cpu_id = cpu_id
@@ -574,7 +640,21 @@ fn io_uring_worker_main(listener int, cpu_id int, handler fn (req []u8, fd int, 
 	}
 	eff_handler := build_iou_handler(handler, stateful_handler, state)
 
-	io_uring_worker_loop(worker, eff_handler, limits, active_conns)
+	// Async runtime (issue #83): with an async_handler set, this worker owns an
+	// IouAsyncEnv (watch registry + state + ring access) and the drain/dispatch
+	// route through the async twins in http_server_io_uring_async_linux.c.v. nil
+	// when unset — the sync hot path then pays one nil-check per CQE and nothing else.
+	mut env := &IouAsyncEnv(unsafe { nil })
+	if async_handler != unsafe { nil } {
+		env = &IouAsyncEnv{
+			h:       async_handler
+			state:   state
+			worker:  worker
+			watches: []IouWatchEntry{len: iou_watch_table_min}
+		}
+	}
+
+	io_uring_worker_loop(worker, eff_handler, env, limits, active_conns)
 }
 
 // build_iou_handler resolves the effective synchronous per-worker handler: with no
@@ -591,7 +671,7 @@ fn build_iou_handler(request_handler fn (req []u8, fd int, mut out []u8) !, stat
 }
 
 @[direct_array_access]
-fn io_uring_worker_loop(worker &io_uring.Worker, handler fn (req []u8, fd int, mut out []u8) !, limits Limits, active_conns &core.Counter) {
+fn io_uring_worker_loop(worker &io_uring.Worker, handler fn (req []u8, fd int, mut out []u8) !, env &IouAsyncEnv, limits Limits, active_conns &core.Counter) {
 	io_uring.prepare_accept(&worker.ring, worker.socket_fd, worker.use_multishot)
 
 	// Only arm the periodic timeout wake when a read or write timeout is
@@ -632,7 +712,7 @@ fn io_uring_worker_loop(worker &io_uring.Worker, handler fn (req []u8, fd int, m
 				break
 			}
 			for i in 0 .. int(n) {
-				dispatch_io_uring_cqe(worker, cqes[i], handler, limits, active_conns)
+				dispatch_io_uring_cqe(worker, cqes[i], handler, env, limits, active_conns)
 			}
 			C.io_uring_cq_advance(&worker.ring, n)
 			if int(n) < io_uring.drain_batch {
@@ -642,6 +722,13 @@ fn io_uring_worker_loop(worker &io_uring.Worker, handler fn (req []u8, fd int, m
 			// to free SQ slots before draining the rest (keeps the SQ from ever
 			// overflowing, regardless of how many completions piled up).
 			C.io_uring_submit(&worker.ring)
+		}
+		// Re-queue watch polls that hit a momentarily-full SQ during the drain —
+		// the submit at the top of the next iteration flushes them. A park is
+		// never silently dropped (see iou_async_register).
+		if unsafe { env != nil } && env.pending_polls.len > 0 {
+			mut e := unsafe { &IouAsyncEnv(env) }
+			iou_retry_pending_polls(mut *e)
 		}
 		if sweep_on {
 			iou_sweep_timeouts(worker)
@@ -743,7 +830,8 @@ pub fn run_io_uring_backend(server Server, mut threads []thread) {
 			exit(1)
 		}
 		threads[i] = spawn io_uring_worker_main(listener, i, server.request_handler, server.stateful_handler,
-			server.make_state, server.limits, server.active_conns, server.inflight[i], server.draining)
+			server.async_handler, server.make_state, server.limits, server.active_conns,
+			server.inflight[i], server.draining)
 	}
 
 	println('listening on http://localhost:${server.port}/ (io_uring)')
