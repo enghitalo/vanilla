@@ -89,6 +89,25 @@ mut:
 struct AsyncReactor {
 mut:
 	watches []WatchEntry
+	// Set around a tombstoned slot's continuation (drain_pipelined dead branch):
+	// its re-arm must ONLY re-arm the fd in epoll — the tombstone queue slot stays
+	// exactly as it is (same continuation, same udata), and the watch table must
+	// not be touched (a dedup match would refresh the tombstone; a dedup that
+	// skips dead slots would append a duplicate).
+	rearming_dead bool
+}
+
+// reactor_clear_if_drained deactivates ext_fd's watch when its pipelined queue
+// has just been fully consumed. MUST run at the pop that drains the queue,
+// BEFORE any continuation/serve that could re-park on ext_fd: a trailing
+// "queue empty ⇒ active=false" epilogue would run AFTER such a re-park updated
+// the (stale) head fields in place, deactivating the re-park's live watch and
+// stranding its request forever (vanilla#100 hazard 1).
+@[direct_array_access; inline]
+fn (mut r AsyncReactor) reactor_clear_if_drained(ext_fd int) {
+	if ext_fd >= 0 && ext_fd < r.watches.len && r.watches[ext_fd].queue.len == 0 {
+		r.watches[ext_fd].active = false
+	}
 }
 
 // reactor_watch records (or rearms) the watch for ext_fd, growing the flat table
@@ -149,7 +168,12 @@ fn (mut r AsyncReactor) reactor_watch(ext_fd int, client_fd int, cont core.WakeF
 		}
 	}
 	for i in 0 .. r.watches[ext_fd].queue.len {
-		if r.watches[ext_fd].queue[i].client_fd == client_fd {
+		// Match LIVE slots only: a tombstone must never be revived by a new park
+		// whose client_fd happens to match (a reused fd) — the tombstone still
+		// drains its own orphaned reply first; the new park queues behind it,
+		// which is also FIFO-correct (its query was submitted later). Tombstone
+		// re-arms never reach this function (see rearming_dead in async_register).
+		if !r.watches[ext_fd].queue[i].dead && r.watches[ext_fd].queue[i].client_fd == client_fd {
 			r.watches[ext_fd].queue[i].cont = cont
 			r.watches[ext_fd].queue[i].udata = udata
 			return
@@ -184,10 +208,33 @@ fn (mut r AsyncReactor) reactor_mark_dead(ext_fd int, client_fd int) {
 		return
 	}
 	for i in 0 .. r.watches[ext_fd].queue.len {
-		if r.watches[ext_fd].queue[i].client_fd == client_fd {
+		// Skip already-dead slots: with fd reuse a dead slot can share client_fd
+		// with a LIVE later park — the live one is the tombstoning target.
+		if !r.watches[ext_fd].queue[i].dead && r.watches[ext_fd].queue[i].client_fd == client_fd {
 			r.watches[ext_fd].queue[i].dead = true
 			return
 		}
+	}
+}
+
+// detach_rejected_watch tears down a watch that a handler/continuation registered
+// during a call whose OUTCOME rejected the park — a streamed large-body head that
+// suspended (unsupported: answered 400 and dropped), or .done/.close returned
+// after ac.watch. Without this the entry stays active, keyed by a client_fd that
+// is about to be closed and REUSED: a later readiness edge would run the stale
+// continuation against whatever connection now owns that fd (vanilla#100 hazard
+// 2). Same teardown async_close applies on a mid-park disconnect: tombstone a
+// pipelined slot / a persistent single watch (the in-flight reply must still be
+// consumed IN ORDER, then discarded), and clear+close a request-owned fd.
+fn detach_rejected_watch(mut reactor AsyncReactor, epoll_fd int, ext_fd int, client_fd int) {
+	if ext_fd < 0 || ext_fd >= reactor.watches.len || !reactor.watches[ext_fd].active {
+		return
+	}
+	if reactor.watches[ext_fd].queue.len > 0 {
+		reactor.reactor_mark_dead(ext_fd, client_fd)
+	} else if !reactor.reactor_orphan_single(ext_fd, client_fd) {
+		reactor.reactor_clear(ext_fd)
+		epoll.remove_fd_from_epoll(epoll_fd, ext_fd) // DEL + close the request-owned fd
 	}
 }
 
@@ -234,6 +281,18 @@ fn async_register(mut ac core.AsyncCtx, ext_fd int, interest core.WatchInterest,
 		return
 	}
 	mut r := unsafe { &AsyncReactor(ac.reactor) }
+	if r.rearming_dead {
+		// Tombstone re-arm (drain_pipelined dead branch): the queue slot stays
+		// exactly as it is — only the (already-armed, level-triggered) fd needs to
+		// remain in epoll. Do NOT touch the watch table: a dedup match would
+		// refresh the tombstone, and a dedup that skips dead slots would append a
+		// duplicate live entry for a dead client.
+		if epoll.mod_fd_in_epoll(ac.loop_fd, ext_fd, u32(C.EPOLLIN)) != 0 {
+			epoll.add_fd_to_epoll(ac.loop_fd, ext_fd, u32(C.EPOLLIN))
+		}
+		ac.last_watched = ext_fd
+		return
+	}
 	r.reactor_watch(ext_fd, ac.client_fd, cont, udata)
 	if ac.persistent {
 		// Pool-owned fd (watch_persistent): mark the slot so a client disconnect won't
@@ -296,6 +355,26 @@ fn async_serve(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd i
 		limits.max_request_bytes
 	} else {
 		sm_max_request_bytes
+	}
+	// Drain requests ALREADY buffered before reading more. A `.done` resume hands
+	// this function a read_buf holding the requests that were pipelined BEHIND the
+	// parked one — they arrived long ago, so no further readable edge is coming on
+	// the (edge-triggered) client fd, and the recv-first loop below would EAGAIN
+	// out and strand them forever (vanilla#100: the pipelined-behind-a-park drain).
+	// On the plain readable-edge path this is a no-op: a leftover partial frames
+	// to -1 and nothing is consumed.
+	if cs.body_drain == 0 && cs.read_buf.len > 0 {
+		if !async_drain(h, mut reactor, epoll_fd, fd, limits, active_conns, mut st, mut cs, state) {
+			return
+		}
+		if cs.awaiting_fd >= 0 {
+			// A buffered request parked: stop reading (mirrors the in-loop park
+			// break) and flush what was produced before the park.
+			if cs.write_buf.len > cs.write_off || cs.file_remaining > 0 {
+				flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs)
+			}
+			return
+		}
 	}
 	for {
 		// Streaming-drain: a large body detected below is consumed off the socket
@@ -399,7 +478,14 @@ fn async_start_body_drain(h core.AsyncHandler, mut reactor AsyncReactor, epoll_f
 	}
 	if h(head, mut cs.write_buf, mut ac) != .done {
 		// suspend/close on a streamed-body request is unsupported in v1 — answer
-		// 400 and drop, rather than leave a half-drained connection parked.
+		// 400 and drop, rather than leave a half-drained connection parked. The
+		// handler may ALREADY have registered a watch (and submitted a query)
+		// before suspending: tear it down, or the entry would stay active keyed by
+		// this soon-reused client_fd, and a pooled fd's orphaned reply would be
+		// consumed against the wrong request (vanilla#100 hazard 2).
+		if ac.last_watched >= 0 {
+			detach_rejected_watch(mut reactor, epoll_fd, ac.last_watched, fd)
+		}
 		cs.write_buf << response.tiny_bad_request_response
 		if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
 			close_conn(epoll_fd, fd, active_conns, mut st)
@@ -471,6 +557,12 @@ fn async_drain(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, fd i
 		}
 		step := h(req, mut cs.write_buf, mut ac)
 		pos += total
+		if step != .suspend && ac.last_watched >= 0 {
+			// The handler registered a watch but did NOT park (.done/.close after
+			// ac.watch — a contract violation): tear it down so no stale entry can
+			// later fire against this (soon-reused) client_fd.
+			detach_rejected_watch(mut reactor, epoll_fd, ac.last_watched, fd)
+		}
 		match step {
 			.done {
 				// Handler may have appended headers + handed its body off for
@@ -593,7 +685,13 @@ fn async_on_ready(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, e
 		reactor:   unsafe { voidptr(&reactor) }
 		register:  async_register
 	}
-	match entry.cont(mut cs.write_buf, mut ac) {
+	cont_step := entry.cont(mut cs.write_buf, mut ac)
+	if cont_step != .suspend && ac.last_watched >= 0 {
+		// Continuation re-watched but did not park (.done/.close after ac.watch):
+		// tear the stray watch down before the connection moves on / is closed.
+		detach_rejected_watch(mut reactor, epoll_fd, ac.last_watched, client_fd)
+	}
+	match cont_step {
 		.done {
 			// Send this response and drain any requests that were pipelined behind it
 			// (and read anything that arrived while parked) — one batched flush.
@@ -650,10 +748,19 @@ fn drain_pipelined(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, 
 				reactor:   unsafe { voidptr(&reactor) }
 				register:  async_register
 			}
-			if slot.cont(mut scratch, mut dac) == .suspend {
+			// rearming_dead: a re-arm from this tombstone's continuation must leave
+			// the watch table alone (the tombstone slot stays exactly as it is) —
+			// see async_register. Without the bypass, dedup matching the dead slot
+			// would refresh it, and a dedup that SKIPS dead slots would append a
+			// duplicate instead.
+			reactor.rearming_dead = true
+			dead_step := slot.cont(mut scratch, mut dac)
+			reactor.rearming_dead = false
+			if dead_step == .suspend {
 				break // result not ready yet — the tombstone stays at the head
 			}
 			reactor.watches[ext_fd].queue.delete(0)
+			reactor.reactor_clear_if_drained(ext_fd)
 			continue
 		}
 		mut cs := st.conns[client_fd]
@@ -668,11 +775,24 @@ fn drain_pipelined(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, 
 			reactor:   unsafe { voidptr(&reactor) }
 			register:  async_register
 		}
-		match slot.cont(mut cs.write_buf, mut ac) {
+		pipelined_step := slot.cont(mut cs.write_buf, mut ac)
+		if pipelined_step != .suspend && ac.last_watched >= 0 && ac.last_watched != ext_fd {
+			// Continuation watched a DIFFERENT fd but did not park: stray watch —
+			// tear it down. (A non-suspend re-watch of ext_fd itself just updated
+			// this same queue slot, which the .done/.close arms below then pop.)
+			detach_rejected_watch(mut reactor, epoll_fd, ac.last_watched, client_fd)
+		}
+		match pipelined_step {
 			.done {
 				// Pop BEFORE serving: async_serve may read a request pipelined behind
 				// this one and re-park the client on ext_fd (appended at the tail).
+				// And if this pop DRAINED the queue, clear the slot BEFORE serving: a
+				// re-park inside async_serve must become a FRESH, live single watch —
+				// the former trailing "queue empty ⇒ active=false" epilogue ran AFTER
+				// that re-park had updated the stale head fields in place, deactivating
+				// its watch and stranding the request forever (vanilla#100 hazard 1).
 				reactor.watches[ext_fd].queue.delete(0)
+				reactor.reactor_clear_if_drained(ext_fd)
 				async_serve(h, mut reactor, epoll_fd, client_fd, limits, active_conns, mut st, mut
 					cs, state)
 			}
@@ -683,6 +803,7 @@ fn drain_pipelined(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, 
 				if cs.write_buf.len > cs.write_off {
 					if !flush_batch(epoll_fd, client_fd, limits, active_conns, mut st, mut cs) {
 						reactor.watches[ext_fd].queue.delete(0) // conn closed on write
+						reactor.reactor_clear_if_drained(ext_fd)
 						continue
 					}
 				}
@@ -691,19 +812,18 @@ fn drain_pipelined(h core.AsyncHandler, mut reactor AsyncReactor, epoll_fd int, 
 			}
 			.close {
 				reactor.watches[ext_fd].queue.delete(0)
+				reactor.reactor_clear_if_drained(ext_fd)
 				close_conn(epoll_fd, client_fd, active_conns, mut st)
 			}
 		}
 	}
-	// Queue emptied: revert the fd to the inactive single-watch state. The fd itself
-	// stays in this worker's epoll (pool-owned); the next park re-activates it.
-	// KEEP the drained queue's buffer (len is already 0 from the delete(0)s) — do
-	// NOT reassign []ParkSlot{}: the next pipeline cycle on this pool-owned fd
-	// refills it without reallocating. A fresh empty array per drain leaks under
-	// -gc none (this is the dominant pipelined-load residual).
-	if reactor.watches[ext_fd].queue.len == 0 {
-		reactor.watches[ext_fd].active = false
-	}
+	// No trailing "queue empty ⇒ active=false" epilogue on purpose: deactivation
+	// happens INLINE at each pop that drains the queue (reactor_clear_if_drained
+	// above), always BEFORE a continuation/serve that could re-park on this same
+	// fd. The fd itself stays in this worker's epoll (pool-owned); the next park
+	// re-activates the slot. The drained queue's buffer is retained either way
+	// (len 0 from the delete(0)s) — never reassigned, so the next pipeline cycle
+	// refills it without reallocating (a fresh array per drain leaks under -gc none).
 }
 
 // async_close tears down a connection, first removing any watch it is parked on
