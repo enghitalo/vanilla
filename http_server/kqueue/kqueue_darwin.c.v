@@ -35,13 +35,6 @@ pub mut:
 	udata  voidptr
 }
 
-// Callbacks for kqueue-driven IO events
-pub struct KqueueEventCallbacks {
-pub:
-	on_read  fn (fd int) @[required]
-	on_write fn (fd int) @[required]
-}
-
 // Create a new kqueue instance. Returns fd or <0 on error.
 pub fn create_kqueue_fd() int {
 	kq := C.kqueue()
@@ -93,31 +86,4 @@ pub fn wait_kqueue(kq int, events &C.kevent, nevents int, timeout int) int {
 		tsp.tv_nsec = i64((timeout % 1000) * 1000000)
 	}
 	return C.kevent(kq, C.NULL, 0, events, nevents, tsp)
-}
-
-// Worker event loop for kqueue io_multiplexing. Processes events for a given kqueue fd using provided callbacks.
-pub fn process_kqueue_events(callbacks KqueueEventCallbacks, kq int) {
-	mut events := [1024]C.kevent{}
-	for {
-		nev := wait_kqueue(kq, &events[0], 1024, -1)
-		if nev < 0 {
-			if C.errno == C.EINTR {
-				continue
-			}
-			C.perror(c'kevent wait')
-			break
-		}
-		for i in 0 .. nev {
-			fd := int(events[i].ident)
-			if (events[i].flags & (ev_eof | ev_error)) != 0 {
-				remove_fd_from_kqueue(kq, fd)
-				continue
-			}
-			if events[i].filter == evfilt_read {
-				callbacks.on_read(fd)
-			} else if events[i].filter == evfilt_write {
-				callbacks.on_write(fd)
-			}
-		}
-	}
 }

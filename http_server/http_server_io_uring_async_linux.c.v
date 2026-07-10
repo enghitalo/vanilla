@@ -398,11 +398,9 @@ fn iou_drain_requests(mut env IouEnv, mut conn io_uring.Connection, limits Limit
 		// send can be the WHOLE response (see post-loop; a park downgrades it to a
 		// copy so ordering survives the deferred flush).
 		core.set_queue_buf_allowed(conn.response_buffer.len == 0)
-		// Reset the per-request fields (initial-call contract: ready_fd -1, no
-		// error, no udata, nothing watched yet); the rest is loop-invariant.
-		ac.ready_fd = -1
-		ac.ready_err = false
-		ac.udata = unsafe { nil }
+		// Only last_watched can be dirtied between iterations (iou_register_watch
+		// is the sole runtime writer during an initial call); ready_fd/ready_err/
+		// udata keep their once-per-burst construction values.
 		ac.last_watched = -1
 		step := env.h(req, mut conn.response_buffer, mut ac)
 		if qb := core.take_queued_buf() {

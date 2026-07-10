@@ -250,7 +250,7 @@ fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd 
 		client_fd: fd
 		state:     state
 		loop_fd:   epoll_fd
-		register:  tls_reject_register
+		register:  core.reject_register
 	}
 	step := handler(buf, mut resp, mut ac)
 	unsafe {
@@ -271,20 +271,24 @@ fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd 
 			close_tls(epoll_fd, fd, active_conns, mut sessions)
 		}
 		.suspend {
-			// Parking is not supported over TLS (no reactor on this worker): the
-			// stub register armed nothing, so nothing leaks — drop the connection
-			// rather than strand a request that can never be resumed.
+			// Parking is not supported over TLS (no reactor on this worker; see
+			// core.reject_register): nothing was armed, so nothing leaks — drop the
+			// connection rather than strand a request that can never be resumed.
+			// Loud on purpose: a handler that works on plaintext and silently
+			// RSTs over HTTPS is otherwise undiagnosable from the server side.
+			eprintln('[tls] handler returned .suspend but the TLS worker has no watch reactor; dropping the connection')
 			unsafe { resp.free() }
 			close_tls(epoll_fd, fd, active_conns, mut sessions)
 		}
 	}
 }
 
-// tls_reject_register is the Ctx.register stub for the TLS worker: it has no
-// watch reactor, so a watch is never armed (last_watched stays -1) and a
-// handler that suspends is closed by the caller. Async-over-TLS is a follow-up.
-fn tls_reject_register(mut ac core.Ctx, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
-	ac.last_watched = -1
+// tls_write_chunk writes one chunk over the session — kTLS plaintext send or
+// userspace mbedtls — returning the byte count or the tls.want/want_write/
+// closed sentinels, so every write loop branches uniformly.
+@[inline]
+fn tls_write_chunk(mut conn TlsConn, fd int, ptr &u8, len int) int {
+	return if conn.ktls { ktls_send(fd, ptr, len) } else { conn.sess.write_from(ptr, len) }
 }
 
 // tls_write_all_best_effort synchronously writes as much of `resp` as the TLS
@@ -293,11 +297,7 @@ fn tls_reject_register(mut ac core.Ctx, ext_fd int, interest core.WatchInterest,
 fn tls_write_all_best_effort(mut conn TlsConn, fd int, resp []u8) {
 	mut off := 0
 	for off < resp.len {
-		n := if conn.ktls {
-			ktls_send(fd, unsafe { &u8(resp.data) + off }, resp.len - off)
-		} else {
-			conn.sess.write_from(unsafe { &u8(resp.data) + off }, resp.len - off)
-		}
+		n := tls_write_chunk(mut conn, fd, unsafe { &u8(resp.data) + off }, resp.len - off)
 		if n <= 0 {
 			return
 		}
@@ -324,13 +324,8 @@ fn handle_writable_fd_tls(epoll_fd int, fd int, active_conns &core.Counter, mut 
 	}
 
 	for conn.write_off < conn.write_buf.len {
-		n := if conn.ktls {
-			ktls_send(fd, unsafe { &u8(conn.write_buf.data) + conn.write_off },
-				conn.write_buf.len - conn.write_off)
-		} else {
-			conn.sess.write_from(unsafe { &u8(conn.write_buf.data) + conn.write_off },
-				conn.write_buf.len - conn.write_off)
-		}
+		n := tls_write_chunk(mut conn, fd, unsafe { &u8(conn.write_buf.data) + conn.write_off },
+			conn.write_buf.len - conn.write_off)
 		if n > 0 {
 			conn.write_off += n
 			continue
@@ -355,11 +350,7 @@ fn handle_writable_fd_tls(epoll_fd int, fd int, active_conns &core.Counter, mut 
 fn tls_send_or_park(epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut sessions map[int]&TlsConn, mut conn TlsConn, resp []u8) {
 	mut sent := 0
 	for sent < resp.len {
-		n := if conn.ktls {
-			ktls_send(fd, unsafe { &u8(resp.data) + sent }, resp.len - sent)
-		} else {
-			conn.sess.write_from(unsafe { &u8(resp.data) + sent }, resp.len - sent)
-		}
+		n := tls_write_chunk(mut conn, fd, unsafe { &u8(resp.data) + sent }, resp.len - sent)
 		if n > 0 {
 			sent += n
 			continue

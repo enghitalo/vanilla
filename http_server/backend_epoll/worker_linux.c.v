@@ -182,10 +182,12 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 			fd := epoll.event_fd(events[i])
 			ev := events[i].events
 			// A watched external fd became ready → run its continuation (a parked
-			// request resume, or a clientless background watch like a refresh timerfd).
-			if fd < reactor.watches.len && reactor.watches[fd].active {
-				on_watch_ready(handler, mut reactor, epoll_fd, fd, reactor.watches[fd], ev, limits,
-					counter, active_conns, mut st, state)
+			// request resume, or a clientless background watch like a refresh
+			// timerfd). `reactor.armed` is the pure-sync fast path: until the
+			// first watch is ever armed, this is one predictable bool test.
+			if reactor.armed && fd < reactor.watches.len && reactor.watches[fd].active {
+				on_watch_ready(handler, mut reactor, epoll_fd, fd, ev, limits, counter,
+					active_conns, mut st, state)
 				continue
 			}
 			if ev & (u32(C.EPOLLHUP) | u32(C.EPOLLERR)) != 0 {

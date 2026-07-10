@@ -135,13 +135,6 @@ fn handle_accept_completion(io_data &iocp.IOData, mut ctx WorkerContext) {
 	// (We need to get the listening socket from somewhere - stored in context)
 }
 
-// iocp_reject_register is the Ctx.register stub for the IOCP worker: it has no
-// watch reactor, so a watch is never armed (last_watched stays -1) and a
-// handler that suspends is closed by the caller. Async-on-IOCP is a follow-up.
-fn iocp_reject_register(mut ac core.Ctx, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
-	ac.last_watched = -1
-}
-
 @[manualfree]
 fn handle_read_completion(io_data &iocp.IOData, mut ctx WorkerContext) {
 	socket_fd := io_data.socket_fd
@@ -160,14 +153,17 @@ fn handle_read_completion(io_data &iocp.IOData, mut ctx WorkerContext) {
 	mut hctx := core.Ctx{
 		client_fd: socket_fd
 		state:     ctx.state
-		register:  iocp_reject_register
+		register:  core.reject_register
 	}
 	step := ctx.handler(request_data, mut response_data, mut hctx)
 	if step != .done {
 		// .close: flush whatever the handler appended (its error response), then
 		// drop. .suspend: parking is not supported on this backend (no watch
-		// reactor) — the stub register armed nothing, so drop the connection
-		// rather than strand a request that can never be resumed.
+		// reactor; see core.reject_register) — nothing was armed, so drop the
+		// connection rather than strand a request that can never be resumed.
+		if step == .suspend {
+			eprintln('[iocp] handler returned .suspend but the IOCP worker has no watch reactor; dropping the connection')
+		}
 		if step == .close && response_data.len > 0 {
 			response.send_response(socket_fd, response_data.data, response_data.len) or {}
 		}

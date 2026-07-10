@@ -86,6 +86,11 @@ mut:
 struct Reactor {
 mut:
 	watches []WatchEntry
+	// Sticky "any watch was ever armed on this worker" flag. The event loop
+	// checks it before probing the watch table, so a server whose handlers never
+	// suspend (and with no on_worker_start watch) pays ONE predictable bool test
+	// per event instead of an fd-indexed table load — the pure-sync fast path.
+	armed bool
 	// Set around a tombstoned slot's continuation (drain_pipelined dead branch):
 	// its re-arm must ONLY re-arm the fd in epoll — the tombstone queue slot stays
 	// exactly as it is (same continuation, same udata), and the watch table must
@@ -278,6 +283,7 @@ fn register_watch(mut ac core.Ctx, ext_fd int, interest core.WatchInterest, cont
 		return
 	}
 	mut r := unsafe { &Reactor(ac.reactor) }
+	r.armed = true // sticky: the event loop starts probing the watch table
 	if r.rearming_dead {
 		// Tombstone re-arm (drain_pipelined dead branch): the queue slot stays
 		// exactly as it is — only the (already-armed, level-triggered) fd needs to
@@ -587,11 +593,9 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 			cs.file_remaining = 0
 		}
 		req := buf_view(cs.read_buf, pos, total)
-		// Reset the per-request fields (initial-call contract: ready_fd -1, no
-		// error, no udata, nothing watched yet); everything else is loop-invariant.
-		ac.ready_fd = -1
-		ac.ready_err = false
-		ac.udata = unsafe { nil }
+		// Only last_watched can be dirtied between iterations (register_watch is
+		// the sole runtime writer during an initial call); ready_fd/ready_err/
+		// udata keep their once-per-burst construction values.
 		ac.last_watched = -1
 		step := h(req, mut cs.write_buf, mut ac)
 		pos += total
@@ -657,7 +661,7 @@ fn compact_read_buf(mut cs ConnState, pos int) {
 // EPOLLHUP) is surfaced to the continuation as the portable Ctx.ready_err so
 // it can release a dead fd instead of re-arming it into a busy-spin.
 @[direct_array_access; manualfree]
-fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int, entry WatchEntry, ev u32, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, state voidptr) {
+fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int, ev u32, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, state voidptr) {
 	// Resumes count toward the in-flight window too, so a graceful shutdown
 	// drain also covers continuations running right now.
 	stdatomic.add_i64(&counter.n, 1)
@@ -667,11 +671,17 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 	// A pipelined fd (multiple parked clients on one multiplexed pg connection):
 	// fan this readiness edge out to the queued continuations in submission order.
 	// The single-watch path below is left byte-identical for every other consumer.
-	if entry.queue.len > 0 {
+	if reactor.watches[ext_fd].queue.len > 0 {
 		drain_pipelined(h, mut reactor, epoll_fd, ext_fd, ev, limits, active_conns, mut st, state)
 		return
 	}
-	reactor.reactor_clear(ext_fd) // consumed; the continuation re-arms if it needs more
+	// Copy the three live fields into locals (NOT the whole entry — that copies
+	// the queue array header per resume for nothing), then clear the slot; the
+	// continuation re-arms if it needs more.
+	parked_client := reactor.watches[ext_fd].client_fd
+	cont := reactor.watches[ext_fd].cont
+	entry_udata := reactor.watches[ext_fd].udata
+	reactor.reactor_clear(ext_fd)
 	ready_err := ev & (u32(C.EPOLLHUP) | u32(C.EPOLLERR)) != 0
 	// Clientless background watch (armed by on_worker_start, e.g. a per-worker
 	// refresh timerfd): there is no parked connection. Run the continuation with a
@@ -684,19 +694,19 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 	// the client read path and is mistaken for a connection (fabricating a phantom
 	// conn and skewing active_conns). The fd OBJECT is the app's: it created it and
 	// closes it — except on a clean .done/.close, where the runtime owns teardown.
-	if entry.client_fd < 0 {
+	if parked_client < 0 {
 		mut scratch := []u8{}
 		mut bac := core.Ctx{
 			client_fd: -1
 			ready_fd:  ext_fd
 			ready_err: ready_err
-			udata:     entry.udata
+			udata:     entry_udata
 			state:     state
 			loop_fd:   epoll_fd
 			reactor:   unsafe { voidptr(&reactor) }
 			register:  register_watch
 		}
-		step := entry.cont(mut scratch, mut bac)
+		step := cont(mut scratch, mut bac)
 		if step == .suspend && bac.last_watched == ext_fd {
 			return
 		}
@@ -710,7 +720,7 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 		}
 		return
 	}
-	client_fd := entry.client_fd
+	client_fd := parked_client
 	if client_fd >= st.conns.len {
 		return
 	}
@@ -723,13 +733,13 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 		client_fd: client_fd
 		ready_fd:  ext_fd
 		ready_err: ready_err
-		udata:     entry.udata
+		udata:     entry_udata
 		state:     state
 		loop_fd:   epoll_fd
 		reactor:   unsafe { voidptr(&reactor) }
 		register:  register_watch
 	}
-	cont_step := entry.cont(mut cs.write_buf, mut ac)
+	cont_step := cont(mut cs.write_buf, mut ac)
 	if cont_step != .suspend && ac.last_watched >= 0 {
 		// Continuation re-watched but did not park (.done/.close after ac.watch):
 		// tear the stray watch down before the connection moves on / is closed.

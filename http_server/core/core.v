@@ -38,7 +38,10 @@ fn worker_count() int {
 //              a resumed continuation, unparks the connection)
 //   .suspend — the handler/continuation registered a watch (ctx.watch); the
 //              connection stays parked until that fd is ready (multi-step
-//              chains re-suspend)
+//              chains re-suspend). Supported on Linux epoll + io_uring and
+//              macOS kqueue; the TLS and Windows/IOCP workers have no watch
+//              reactor yet, so there a .suspend DROPS the connection (see
+//              reject_register).
 //   .close   — finish this connection: whatever is in `res` is flushed, then
 //              the connection is closed. Append an error response (e.g.
 //              response.tiny_bad_request_response) before returning .close if
@@ -103,11 +106,17 @@ pub type RegisterFn = fn (mut ctx Ctx, ext_fd int, interest WatchInterest, cont 
 // backend-free.
 pub struct Ctx {
 pub mut:
-	client_fd    int
-	ready_fd     int = -1 // the fd that woke this continuation (-1 on the initial call)
-	ready_err    bool    // backend-filled: ready_fd woke with an error/hangup (epoll EPOLLERR|EPOLLHUP, kqueue EV_ERROR|EV_EOF), not normal readiness — the watched fd is dead, release it
-	udata        voidptr // consumer context carried from watch() to the continuation
-	state        voidptr // this worker's per-thread state (see make_state on ServerConfig)
+	client_fd int
+	ready_fd  int = -1 // the fd that woke this continuation (-1 on the initial call)
+	ready_err bool    // backend-filled: ready_fd woke with an error/hangup (epoll EPOLLERR|EPOLLHUP, kqueue EV_ERROR|EV_EOF), not normal readiness — the watched fd is dead, release it
+	udata     voidptr // consumer context carried from watch() to the continuation
+	// state is this worker's per-thread value — EXACTLY the pointer make_state
+	// returned on this worker thread (nil when no make_state is configured). The
+	// server never inspects it, so the handler's `unsafe { &MyState(ctx.state) }`
+	// cast is sound, and it is thread-local by construction (each worker calls
+	// make_state once), so no lock is needed — the same opaque-context contract
+	// as picoev's cb_arg or libuv's data void*.
+	state        voidptr
 	loop_fd      int     // backend-filled: the worker's event-loop fd (epoll on Linux, kqueue on macOS)
 	reactor      voidptr // backend-filled: the worker's watch registry
 	last_watched int = -1 // backend-filled: the fd passed to the most recent watch()
@@ -140,6 +149,15 @@ pub fn (mut ctx Ctx) watch_persistent(ext_fd int, interest WatchInterest, cont W
 	ctx.persistent = true
 	ctx.register(mut ctx, ext_fd, interest, cont, udata)
 	ctx.persistent = false
+}
+
+// reject_register is the Ctx.register stub for workers that have NO watch
+// reactor (the TLS worker and the Windows/IOCP worker): it arms nothing and
+// leaves last_watched at -1, so a handler that suspends anyway is simply
+// dropped by the caller — parking cannot be resumed where nothing watches.
+// Shared here so the reactorless backends cannot drift apart.
+pub fn reject_register(mut ctx Ctx, ext_fd int, interest WatchInterest, cont WakeFn, udata voidptr) {
+	ctx.last_watched = -1
 }
 
 // ready_fd is the fd that woke the running continuation (-1 on the initial call).

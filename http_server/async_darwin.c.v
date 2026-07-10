@@ -154,6 +154,11 @@ fn kq_handle_request(h core.Handler, mut reactor KqReactor, kq int, fd int, limi
 			conn.awaiting_fd = ac.last_watched // parked; resumed by kq_run_cont
 		}
 		.close {
+			// Flush-then-close (the core.Step contract): the handler's error
+			// response, if any, must reach the client before the drop.
+			if conn.out.len > 0 {
+				response.send_response(fd, conn.out.data, conn.out.len) or {}
+			}
 			kq_close(mut reactor, kq, fd)
 		}
 	}
@@ -183,6 +188,10 @@ fn kq_run_cont(mut reactor KqReactor, kq int, w KqWatch, ext_fd int, ready_err b
 			conn.awaiting_fd = ac.last_watched // re-armed (multi-step); stay parked
 		}
 		.close {
+			// Flush-then-close: send whatever the continuation appended first.
+			if conn.out.len > 0 {
+				response.send_response(w.client_fd, conn.out.data, conn.out.len) or {}
+			}
 			kq_close(mut reactor, kq, w.client_fd)
 		}
 	}
