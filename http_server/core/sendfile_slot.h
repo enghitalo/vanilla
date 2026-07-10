@@ -20,16 +20,35 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#if defined(__TINYC__)
+// tcc cannot codegen thread-local storage: "_Thread_local is not implemented"
+// (and `__thread` is rejected too) — verified with V's bundled tccbin
+// (thirdparty-linux-amd64) on both Linux and macOS. tcc is a dev-only fast
+// compiler, so under it the whole slot is compiled INERT: enable is a no-op,
+// queue/take report "not taken", and every caller falls back to writing the
+// body bytes itself (correct, just without the sendfile(2) optimization).
+// The static is not even declared — a plain non-TLS static would be SHARED
+// across worker threads, a data race. -prod (clang/gcc) keeps the real
+// _Thread_local fast path everywhere.
+static inline void vanilla_sf_enable(void) {}
+
+static inline bool vanilla_sf_queue(int file_fd, int64_t off, int64_t len) {
+	(void)file_fd;
+	(void)off;
+	(void)len;
+	return false;
+}
+
+static inline bool vanilla_sf_take(int* out_fd, int64_t* out_off, int64_t* out_len) {
+	(void)out_fd;
+	(void)out_off;
+	(void)out_len;
+	return false;
+}
+#else
+
 #if defined(_MSC_VER)
 #define VANILLA_THREAD_LOCAL __declspec(thread)
-#elif defined(__TINYC__) && defined(__APPLE__)
-// tcc on macOS (arm64) cannot codegen thread-local storage and aborts with
-// "_Thread_local is not implemented". The slot is inert on macOS anyway:
-// vanilla_sf_enable() is only ever called by the Linux epoll worker
-// (backend_epoll/worker_linux.c.v), so on macOS nothing ever writes this static
-// and a plain (non-TLS) definition is safe. tcc is a dev-only fast compiler;
-// -prod (clang/gcc) keeps real _Thread_local everywhere.
-#define VANILLA_THREAD_LOCAL
 #else
 #define VANILLA_THREAD_LOCAL _Thread_local
 #endif
@@ -72,5 +91,7 @@ static inline bool vanilla_sf_take(int* out_fd, int64_t* out_off, int64_t* out_l
 	vanilla_sf.queued = false;
 	return true;
 }
+
+#endif // __TINYC__
 
 #endif // VANILLA_SENDFILE_SLOT_H

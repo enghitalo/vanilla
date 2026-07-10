@@ -27,7 +27,35 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#ifdef __linux__
+#if defined(__linux__) && defined(__TINYC__)
+
+// tcc cannot codegen thread-local storage ("_Thread_local is not implemented";
+// `__thread` is rejected too — verified with V's bundled tccbin). tcc is a
+// dev-only fast compiler, so under it the slot is compiled INERT: enable/
+// set_allowed are no-ops, queue/take report "not taken", and the caller copies
+// the bytes through the write buffer instead (correct, just without the
+// borrowed-send optimization). The static is not even declared — a plain
+// non-TLS static would be SHARED across worker threads, a data race. -prod
+// (clang/gcc) keeps the real _Thread_local fast path.
+static inline void vanilla_qb_enable(void) {}
+
+static inline void vanilla_qb_set_allowed(bool allowed) {
+	(void)allowed;
+}
+
+static inline bool vanilla_qb_queue(const void* ptr, int64_t len) {
+	(void)ptr;
+	(void)len;
+	return false;
+}
+
+static inline bool vanilla_qb_take(const void** out_ptr, int64_t* out_len) {
+	(void)out_ptr;
+	(void)out_len;
+	return false;
+}
+
+#elif defined(__linux__)
 
 #define VANILLA_QB_THREAD_LOCAL _Thread_local
 
