@@ -45,7 +45,7 @@ fn close_all(mut conns []PgConn) {
 
 // new_pool brings up a pool and returns it on the heap — convenient for a
 // make_state callback that hands the pool back to the worker as an opaque
-// voidptr (the StatefulHandler / async state contract).
+// voidptr (the make_state / ctx.state contract).
 pub fn new_pool(cfg ConnConfig, size int) !&PgPool {
 	pool := PgPool.connect(cfg, size)!
 	return &pool

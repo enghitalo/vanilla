@@ -128,7 +128,7 @@ fn tls_handshake_step(mut conn TlsConn, epoll_fd int, fd int, active_conns &core
 }
 
 @[direct_array_access; manualfree]
-fn handle_readable_fd_tls(request_handler core.RequestHandler, epoll_fd int, fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config, mut sessions map[int]&TlsConn) {
+fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config, mut sessions map[int]&TlsConn) {
 	stdatomic.add_i64(&counter.n, 1)
 	defer {
 		stdatomic.add_i64(&counter.n, -1)
@@ -244,17 +244,65 @@ fn handle_readable_fd_tls(request_handler core.RequestHandler, epoll_fd int, fd 
 	} else {
 		resp = []u8{len: 0, cap: 4096}
 	}
-	request_handler(buf, fd, mut resp) or {
-		unsafe { buf.free() }
-		unsafe { resp.free() }
-		close_tls(epoll_fd, fd, active_conns, mut sessions)
-		return
+	// The TLS worker has no watch reactor: register is a stub that arms nothing,
+	// so a handler that calls ctx.watch and suspends is simply dropped below.
+	mut ac := core.Ctx{
+		client_fd: fd
+		state:     state
+		loop_fd:   epoll_fd
+		register:  tls_reject_register
 	}
+	step := handler(buf, mut resp, mut ac)
 	unsafe {
 		buf.len = 0
 	}
 	conn.read_buf = buf // pool the read buffer's capacity for the next request
-	tls_send_or_park(epoll_fd, fd, limits, active_conns, mut sessions, mut conn, resp)
+	match step {
+		.done {
+			tls_send_or_park(epoll_fd, fd, limits, active_conns, mut sessions, mut conn, resp)
+		}
+		.close {
+			// Flush-then-close: best-effort synchronous write of whatever the
+			// handler appended (e.g. its error response), then drop the session.
+			// A send that cannot complete now (want/want_write) is abandoned —
+			// the connection is closing anyway.
+			tls_write_all_best_effort(mut conn, fd, resp)
+			unsafe { resp.free() }
+			close_tls(epoll_fd, fd, active_conns, mut sessions)
+		}
+		.suspend {
+			// Parking is not supported over TLS (no reactor on this worker): the
+			// stub register armed nothing, so nothing leaks — drop the connection
+			// rather than strand a request that can never be resumed.
+			unsafe { resp.free() }
+			close_tls(epoll_fd, fd, active_conns, mut sessions)
+		}
+	}
+}
+
+// tls_reject_register is the Ctx.register stub for the TLS worker: it has no
+// watch reactor, so a watch is never armed (last_watched stays -1) and a
+// handler that suspends is closed by the caller. Async-over-TLS is a follow-up.
+fn tls_reject_register(mut ac core.Ctx, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
+	ac.last_watched = -1
+}
+
+// tls_write_all_best_effort synchronously writes as much of `resp` as the TLS
+// session will take right now — used only on the .close path, where a partial
+// send is acceptable (the connection is being dropped).
+fn tls_write_all_best_effort(mut conn TlsConn, fd int, resp []u8) {
+	mut off := 0
+	for off < resp.len {
+		n := if conn.ktls {
+			ktls_send(fd, unsafe { &u8(resp.data) + off }, resp.len - off)
+		} else {
+			conn.sess.write_from(unsafe { &u8(resp.data) + off }, resp.len - off)
+		}
+		if n <= 0 {
+			return
+		}
+		off += n
+	}
 }
 
 // handle_writable_fd_tls resumes work blocked on writability: a handshake that

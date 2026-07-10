@@ -8,6 +8,7 @@ module main
 // ./public/index.html fixture in a temp dir and chdirs into it (web_root is
 // a relative const), testsuite_end removes it. `${}` here is test scaffolding,
 // not program code.
+import http_server.core
 import os
 
 const fixture_body = '<h1>hello</h1>' // 14 bytes
@@ -26,9 +27,10 @@ fn testsuite_end() {
 
 // serve adapts the raw-handler contract (writes into a caller-owned buffer) to
 // the return-a-buffer shape the assertions expect.
-fn serve(req []u8) ![]u8 {
+fn serve(req []u8) []u8 {
 	mut out := []u8{}
-	handle(req, -1, mut out)!
+	mut tctx := core.Ctx{}
+	assert handle(req, mut out, mut tctx) == .done
 	return out
 }
 
@@ -95,8 +97,8 @@ fn test_path_traversal_refused() {
 
 // ---- raw-request E2E (serve adapter) -------------------------------------------
 
-fn test_get_index() ! {
-	out := serve('GET /index.html HTTP/1.1\r\nHost: x\r\n\r\n'.bytes())!.bytestr()
+fn test_get_index() {
+	out := serve('GET /index.html HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()).bytestr()
 	assert out.contains('200 OK')
 	assert out.contains('Content-Type: text/html; charset=utf-8')
 	assert out.contains('Accept-Ranges: bytes')
@@ -104,55 +106,55 @@ fn test_get_index() ! {
 	assert out.ends_with(fixture_body)
 }
 
-fn test_root_serves_index() ! {
-	out := serve('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes())!.bytestr()
+fn test_root_serves_index() {
+	out := serve('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()).bytestr()
 	assert out.contains('200 OK')
 	assert out.ends_with(fixture_body)
 }
 
-fn test_query_string_is_stripped() ! {
-	out := serve('GET /index.html?v=123 HTTP/1.1\r\nHost: x\r\n\r\n'.bytes())!.bytestr()
+fn test_query_string_is_stripped() {
+	out := serve('GET /index.html?v=123 HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()).bytestr()
 	assert out.contains('200 OK')
 	assert out.ends_with(fixture_body)
 }
 
-fn test_head_sends_headers_only() ! {
-	out := serve('HEAD /index.html HTTP/1.1\r\nHost: x\r\n\r\n'.bytes())!.bytestr()
+fn test_head_sends_headers_only() {
+	out := serve('HEAD /index.html HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()).bytestr()
 	assert out.contains('200 OK')
 	assert out.contains('Content-Length: ${fixture_body.len}')
 	assert out.ends_with('\r\n\r\n') // no body after the header block
 }
 
-fn test_unknown_file_404() ! {
-	out := serve('GET /nope.html HTTP/1.1\r\nHost: x\r\n\r\n'.bytes())!.bytestr()
+fn test_unknown_file_404() {
+	out := serve('GET /nope.html HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()).bytestr()
 	assert out.contains('404 Not Found')
 }
 
-fn test_post_405_with_allow() ! {
+fn test_post_405_with_allow() {
 	out :=
-		serve('POST /index.html HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n'.bytes())!.bytestr()
+		serve('POST /index.html HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n'.bytes()).bytestr()
 	assert out.contains('405 Method Not Allowed')
 	assert out.contains('Allow: GET, HEAD')
 }
 
-fn test_range_request_206() ! {
+fn test_range_request_206() {
 	out :=
-		serve('GET /index.html HTTP/1.1\r\nHost: x\r\nRange: bytes=0-4\r\n\r\n'.bytes())!.bytestr()
+		serve('GET /index.html HTTP/1.1\r\nHost: x\r\nRange: bytes=0-4\r\n\r\n'.bytes()).bytestr()
 	assert out.contains('206 Partial Content')
 	assert out.contains('Content-Range: bytes 0-4/${fixture_body.len}')
 	assert out.contains('Content-Length: 5')
 	assert out.ends_with(fixture_body[..5])
 }
 
-fn test_invalid_range_falls_back_to_200() ! {
+fn test_invalid_range_falls_back_to_200() {
 	out :=
-		serve('GET /index.html HTTP/1.1\r\nHost: x\r\nRange: bytes=900-100\r\n\r\n'.bytes())!.bytestr()
+		serve('GET /index.html HTTP/1.1\r\nHost: x\r\nRange: bytes=900-100\r\n\r\n'.bytes()).bytestr()
 	assert out.contains('200 OK') // unusable spec -> full response, as before
 	assert out.ends_with(fixture_body)
 }
 
-fn test_if_none_match_roundtrip_304() ! {
-	first := serve('GET /index.html HTTP/1.1\r\nHost: x\r\n\r\n'.bytes())!.bytestr()
+fn test_if_none_match_roundtrip_304() {
+	first := serve('GET /index.html HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()).bytestr()
 	tag_at := first.index('ETag: ') or {
 		assert false, 'response must carry an ETag'
 		return
@@ -160,20 +162,21 @@ fn test_if_none_match_roundtrip_304() ! {
 	assert first.len >= tag_at + 6 + 18
 	etag := first[tag_at + 6..tag_at + 6 + 18] // `"<16 hex>"` (64-bit wyhash)
 	out :=
-		serve('GET /index.html HTTP/1.1\r\nHost: x\r\nIf-None-Match: ${etag}\r\n\r\n'.bytes())!.bytestr()
+		serve('GET /index.html HTTP/1.1\r\nHost: x\r\nIf-None-Match: ${etag}\r\n\r\n'.bytes()).bytestr()
 	assert out.contains('304 Not Modified')
 	assert out.contains('ETag: ${etag}')
 	assert !out.contains('200 OK')
 }
 
-fn test_path_traversal_gets_404() ! {
-	out := serve('GET /../../etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n'.bytes())!.bytestr()
+fn test_path_traversal_gets_404() {
+	out := serve('GET /../../etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()).bytestr()
 	assert out.contains('404 Not Found')
 }
 
 fn test_malformed_request_errors() {
-	// Malformed input must surface as a handler error, never a response.
-	if _ := serve('garbage'.bytes()) {
-		assert false, 'garbage request must not produce a response'
-	}
+	// Malformed input must append the canned 400 and close the connection.
+	mut out := []u8{}
+	mut tctx := core.Ctx{}
+	assert handle('garbage'.bytes(), mut out, mut tctx) == .close
+	assert out.bytestr().contains('400 Bad Request')
 }

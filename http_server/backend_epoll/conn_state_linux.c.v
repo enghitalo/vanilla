@@ -1,6 +1,9 @@
 module backend_epoll
 
-// Plain (non-TLS) connection state machine for the epoll worker.
+// Plain (non-TLS) per-connection state for the epoll worker: the persistent
+// buffers, the batched flush/EPOLLOUT machinery, sendfile streaming and the
+// timeout sweep. The request-serving loop that drives it lives in
+// async_linux.c.v (handle_readable / drain_requests / serve_conn).
 //
 // Shared-nothing hot path modeled on the fastest HTTP/1.1 servers
 // (see docs/PERF_GAP_ANALYSIS.md):
@@ -18,9 +21,7 @@ module backend_epoll
 //     pending batch exceeds sm_max_pending_write.
 import http_server.core
 import http_server.epoll
-import http_server.http1_1.request_parser
 import http_server.http1_1.response
-import sync.stdatomic
 import time
 
 #include <errno.h>
@@ -110,9 +111,9 @@ mut:
 	// head was already answered, this many body bytes are still to be consumed
 	// off the socket before the connection is ready for its next request.
 	body_drain i64
-	// Async runtime only (unused by the synchronous path): the external fd this
-	// connection is parked on while awaiting a watch (-1 = not parked). Lets the
-	// async worker tear the watch down if the client closes mid-await.
+	// The external fd this connection is parked on while awaiting a watch
+	// (-1 = not parked). Lets the worker tear the watch down if the client
+	// closes mid-await.
 	awaiting_fd int = -1
 }
 
@@ -187,259 +188,6 @@ fn state_for(mut st PlainState, fd int) &ConnState {
 		st.conns[fd] = cs
 	}
 	return st.conns[fd]
-}
-
-// start_body_drain answers a large-body request from its HEAD alone, then puts
-// the connection into streaming-drain mode for the body (see the cs.body_drain
-// branch in handle_readable_plain). The handler is given only the head — no body
-// is buffered — so such handlers must answer by Content-Length (request_parser's
-// HttpRequest.content_length()); the upload profile is exactly this shape.
-// Returns: 1 = draining started (keep reading the body), 2 = connection closed,
-// 0 = head not fully buffered yet (caller keeps buffering normally).
-@[direct_array_access]
-fn start_body_drain(request_handler core.RequestHandler, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, total int) int {
-	head_len := request_parser.frame_head_len(cs.read_buf)
-	if head_len <= 0 || head_len > cs.read_buf.len {
-		return 0 // head not complete in the buffer yet — grow/recv more
-	}
-	content_length := total - head_len
-	head := unsafe { cs.read_buf[0..head_len] }
-	request_handler(head, fd, mut cs.write_buf) or {
-		cs.write_buf << response.tiny_bad_request_response
-		if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-			close_conn(epoll_fd, fd, active_conns, mut st)
-		}
-		return 2
-	}
-	// DRAIN-THEN-RESPOND: the handler's response is now buffered in write_buf but is
-	// deliberately NOT flushed here. We first drain the whole body off the socket
-	// (the cs.body_drain branch in handle_readable_plain), and only once it is fully
-	// consumed (body_drain == 0) does the end-of-burst flush there send the response.
-	// Responding before the body is fully read desyncs any client that writes the
-	// entire request before reading the response (wrk and most upload clients): it
-	// would see the response mid-body, consider the request done, and stream the
-	// remaining body bytes as the start of its next request. (This whole streaming
-	// path was previously dead code — an inverted `flush_batch` check closed the
-	// connection right after the head response — so the desync was never observed.)
-	//
-	// Body bytes already received after the head count toward the drain. For a
-	// body past sm_stream_body_above detected at a full (small) read buffer,
-	// body_in_buf is always < content_length, so no next-request bytes are lost.
-	body_in_buf := cs.read_buf.len - head_len
-	cs.body_drain = i64(content_length) - i64(body_in_buf)
-	if cs.body_drain < 0 {
-		cs.body_drain = 0
-	}
-	unsafe {
-		cs.read_buf.len = 0 // head (and any buffered body bytes) consumed
-	}
-	return 1
-}
-
-// handle_readable_plain drains the socket into the connection's persistent
-// read buffer, answers EVERY complete request as it goes (pipelining), and
-// flushes all accumulated responses in one batched send at the end of the
-// burst. Returns early (connection closed) on any fatal condition.
-@[direct_array_access; manualfree]
-fn handle_readable_plain(request_handler core.RequestHandler, epoll_fd int, fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState) {
-	stdatomic.add_i64(&counter.n, 1)
-	defer {
-		stdatomic.add_i64(&counter.n, -1)
-	}
-
-	mut cs := state_for(mut st, fd)
-	req_cap := if limits.max_request_bytes > 0 {
-		limits.max_request_bytes
-	} else {
-		sm_max_request_bytes
-	}
-
-	// Edge-triggered: read to EAGAIN. Parse after every recv so the request
-	// cap applies to a single (partial) request, not to the whole burst.
-	for {
-		// Streaming-drain: once a large body has been detected (below), consume it
-		// off the socket into the fixed buffer and DISCARD it — the head was
-		// already answered. Keeps a multi-MB upload at O(buffer) memory instead of
-		// growing read_buf into a big scanned GC block.
-		if cs.body_drain > 0 {
-			want := if cs.body_drain < i64(cs.read_buf.cap) {
-				int(cs.body_drain)
-			} else {
-				cs.read_buf.cap
-			}
-			dn := C.recv(fd, cs.read_buf.data, usize(want), 0)
-			if dn < 0 {
-				if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
-					break // body not fully arrived yet; resume on the next edge
-				}
-				close_conn(epoll_fd, fd, active_conns, mut st)
-				return
-			}
-			if dn == 0 {
-				close_conn(epoll_fd, fd, active_conns, mut st)
-				return
-			}
-			cs.body_drain -= dn
-			continue
-		}
-		if cs.read_buf.len == cs.read_buf.cap {
-			// Pre-size to the exact message length when Content-Length is already
-			// known (one allocation), instead of doubling toward it. A 20 MiB
-			// upload otherwise grows 8K→16K→…→32M: ~12 reallocs, tens of MB of
-			// memcpy, and a buffer that overshoots the body by up to 2×. A hostile
-			// or chunked/unknown length (target -1 or > req_cap) falls back to
-			// doubling, so the existing req_cap/413 guard still trips normally.
-			target := request_parser.frame_expected_total(cs.read_buf)
-			// A body too large to be worth buffering is STREAMED instead: answer it
-			// from its head, then drain the body (keeps memory O(buffer)).
-			if target > sm_stream_body_above && target <= req_cap {
-				match start_body_drain(request_handler, epoll_fd, fd, limits, active_conns, mut st, mut
-					cs, target) {
-					1 { continue } // draining started; keep reading the body
-					2 { return } // connection closed
-					else {} // head not complete yet → fall through to grow
-				}
-			}
-			if target > cs.read_buf.cap && target <= req_cap {
-				unsafe { cs.read_buf.grow_cap(target - cs.read_buf.cap) }
-			} else {
-				unsafe { cs.read_buf.grow_cap(cs.read_buf.cap) }
-			}
-		}
-		spare := cs.read_buf.cap - cs.read_buf.len
-		n := C.recv(fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, usize(spare), 0)
-		if n < 0 {
-			if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
-				break // burst fully drained
-			}
-			close_conn(epoll_fd, fd, active_conns, mut st)
-			return
-		}
-		if n == 0 {
-			close_conn(epoll_fd, fd, active_conns, mut st)
-			return
-		}
-		unsafe {
-			cs.read_buf.len += n
-		}
-		// Answer every complete request currently buffered; false ⇒ closed.
-		if !drain_requests(request_handler, epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-			return
-		}
-		// After draining, read_buf holds at most one partial request.
-		if cs.read_buf.len > req_cap {
-			cs.write_buf << response.status_413_response
-			if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-				close_conn(epoll_fd, fd, active_conns, mut st)
-			}
-			return
-		}
-	}
-
-	// Read-timeout bookkeeping: armed once when a request is mid-read OR a large
-	// body is mid-drain (body_drain > 0 — a peer that stalls mid-upload is still
-	// reaped), cleared when the buffer holds no partial request and no drain is in
-	// progress. NOTE: like every other read path here (normal mid-read, TLS, io_uring),
-	// the deadline is armed once and not refreshed on progress, so read_timeout_ms —
-	// when set (default 0 = off) — bounds the TOTAL time to receive a request,
-	// including a streamed body. Size it for the largest upload you accept; an
-	// idle-style refresh-on-progress would be a separate, uniform change across all
-	// read paths.
-	if cs.read_buf.len > 0 || cs.body_drain > 0 {
-		if limits.read_timeout_ms > 0 && cs.read_deadline == 0 {
-			cs.read_deadline = time.sys_mono_now() + u64(limits.read_timeout_ms) * 1_000_000
-			st.parked++
-		}
-	} else if cs.read_deadline != 0 {
-		cs.read_deadline = 0
-		st.parked--
-	}
-
-	// One send for the whole batch of responses (plus any deferred file body) —
-	// but NOT while a large body is still draining: a streamed upload's response is
-	// held in write_buf until its body is fully consumed (see start_body_drain), so
-	// the client never sees the response mid-body.
-	if cs.body_drain == 0 && (cs.write_buf.len > cs.write_off || cs.file_remaining > 0) {
-		flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs)
-	}
-}
-
-// drain_requests parses and answers every complete request in read_buf,
-// appending responses to write_buf, then compacts the leftover partial bytes
-// to the buffer front. Returns false if the connection was closed.
-@[direct_array_access; manualfree]
-fn drain_requests(request_handler core.RequestHandler, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState) bool {
-	mut pos := 0
-	for pos < cs.read_buf.len {
-		// _idx twin: plain int, no per-request !int boxing. The error sentinel is
-		// the negated HTTP status, so `-total` recovers the old err.code() value.
-		total := request_parser.frame_request_length_lim_idx(buf_view(cs.read_buf, pos,
-			cs.read_buf.len - pos), limits.max_header_bytes, limits.max_body_bytes)
-		if total == -1 {
-			break // incomplete — wait for more bytes
-		}
-		if total < -1 {
-			// Append the canned error so it lands AFTER the responses already
-			// batched for this burst, then flush and close.
-			match -total {
-				413 { cs.write_buf << response.status_413_response }
-				431 { cs.write_buf << response.status_431_response }
-				else { cs.write_buf << response.tiny_bad_request_response }
-			}
-
-			if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-				close_conn(epoll_fd, fd, active_conns, mut st)
-			}
-			return false
-		}
-		req := buf_view(cs.read_buf, pos, total) // zero-copy, non-marking view into read_buf
-		// A file deferred by an earlier request in this batch must be emitted (as
-		// bytes, in order) BEFORE this next response is appended. This converts
-		// the rare "pipelined response after a sendfile body" case to a buffered
-		// copy of whatever file bytes remain — order preserved, sendfile skipped.
-		if cs.file_remaining > 0 {
-			append_file_region(mut cs.write_buf, cs.file_fd, cs.file_off, cs.file_remaining)
-			cs.file_fd = -1
-			cs.file_remaining = 0
-		}
-		request_handler(req, fd, mut cs.write_buf) or {
-			cs.write_buf << response.tiny_bad_request_response
-			if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-				close_conn(epoll_fd, fd, active_conns, mut st)
-			}
-			return false
-		}
-		// The handler may have appended headers to write_buf and handed its body
-		// off for sendfile(2). Remember it; it streams after write_buf drains.
-		if qf := core.take_queued_file() {
-			cs.file_fd = qf.file_fd
-			cs.file_off = qf.off
-			cs.file_remaining = qf.len
-		}
-		pos += total
-		// Peer pipelines requests but never reads responses: bail out before
-		// the pending batch grows without bound.
-		if cs.write_buf.len - cs.write_off > sm_max_pending_write {
-			if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-				close_conn(epoll_fd, fd, active_conns, mut st)
-			}
-			return false
-		}
-	}
-
-	// Compact leftover partial bytes to the buffer start (keeps capacity).
-	if pos > 0 {
-		leftover := cs.read_buf.len - pos
-		if leftover > 0 {
-			unsafe {
-				C.memmove(cs.read_buf.data, &u8(cs.read_buf.data) + pos, usize(leftover))
-			}
-		}
-		unsafe {
-			cs.read_buf.len = leftover
-		}
-	}
-	return true
 }
 
 // park_write arms the write deadline (once) and subscribes the fd to EPOLLOUT so

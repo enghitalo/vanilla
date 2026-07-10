@@ -18,6 +18,7 @@ module main
 //
 // This is the shape SSE should always take on top of a non-blocking core.
 import http_server
+import http_server.core
 import http_server.http1_1.request_parser
 import sync
 import time
@@ -106,7 +107,7 @@ fn slice_eq(buf []u8, s request_parser.Slice, lit string) bool {
 	return true
 }
 
-fn handle(req_buffer []u8, fd int, mut out []u8, mut clients Clients) ! {
+fn handle(req_buffer []u8, fd int, mut out []u8, mut clients Clients) core.Step {
 	// The kernel recycles fd numbers: a NEW request arriving on an fd that is
 	// still in the subscriber set means that subscription is stale — the old
 	// stream's connection was closed by the core and its number reused. Drop
@@ -114,14 +115,17 @@ fn handle(req_buffer []u8, fd int, mut out []u8, mut clients Clients) ! {
 	// (A real subscriber never sends a second request on its SSE connection.)
 	clients.drop(fd)
 
-	req := request_parser.decode_http_request(req_buffer)!
+	req := request_parser.decode_http_request(req_buffer) or {
+		out << bad_request
+		return .close
+	}
 
 	// GET /events  — subscribe. Register the fd; the core sends the headers
 	//                and leaves the connection open. The broadcaster owns it now.
 	if slice_eq(req.buffer, req.method, 'GET') && slice_eq(req.buffer, req.path, '/events') {
 		clients.add(fd)
 		out << sse_headers
-		return
+		return .done
 	}
 
 	// POST /broadcast — fan a message out to every subscriber, right now.
@@ -142,10 +146,11 @@ fn handle(req_buffer []u8, fd int, mut out []u8, mut clients Clients) ! {
 		event << event_end // an empty body still yields the valid event `data: \n\n`
 		clients.broadcast(event)
 		out << ok_response
-		return
+		return .done
 	}
 
 	out << bad_request
+	return .done
 }
 
 fn main() {
@@ -171,8 +176,8 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: fn [mut clients] (req_buffer []u8, fd int, mut out []u8) ! {
-			handle(req_buffer, fd, mut out, mut clients)!
+		handler:         fn [mut clients] (req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+			return handle(req_buffer, ctx.client_fd, mut out, mut clients)
 		}
 	})!
 	println('SSE server on http://localhost:3000/  (GET /events, POST /broadcast)')

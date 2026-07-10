@@ -1,5 +1,6 @@
 module main
 
+import http_server.core
 import http_server.http1_1.response
 
 fn test_handle_request_get_home() {
@@ -50,10 +51,14 @@ fn test_handle_request_bad_request() {
 	assert res == response.tiny_bad_request_response
 }
 
-// serve adapts the raw-handler contract (writes into a caller-owned buffer) to
-// the return-a-buffer shape the assertions expect.
+// serve adapts the unified-handler contract (writes into a caller-owned buffer)
+// to the return-a-buffer shape the assertions expect; a .close step maps to an
+// error, mirroring the old error-raising contract.
 fn serve(req []u8) ![]u8 {
 	mut out := []u8{}
-	handle_request(req, -1, mut out)!
+	mut tctx := core.Ctx{}
+	if handle_request(req, mut out, mut tctx) == .close {
+		return error('handler closed the connection')
+	}
 	return out
 }

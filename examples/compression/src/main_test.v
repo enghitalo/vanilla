@@ -1,5 +1,7 @@
 module main
 
+import http_server.core
+import http_server.http1_1.response
 import compress.brotli
 import compress.gzip
 import compress.zstd
@@ -98,33 +100,36 @@ fn test_brotli_response_roundtrip() ! {
 	assert brotli.decompress(body)! == demo_body
 }
 
-// serve adapts the raw-handler contract (writes into a caller-owned buffer) to
-// the return-a-buffer shape the assertions expect.
-fn serve(req []u8) ![]u8 {
+// serve adapts the unified handler contract (writes into a caller-owned
+// buffer) to the return-a-buffer shape the assertions expect.
+fn serve(req []u8) []u8 {
 	mut out := []u8{}
-	handle(req, -1, mut out)!
+	mut tctx := core.Ctx{}
+	handle(req, mut out, mut tctx)
 	return out
 }
 
-fn test_handle_raw_requests() ! {
-	assert serve('GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\n\r\n'.bytes())! == resp_gzip
+fn test_handle_raw_requests() {
+	assert serve('GET / HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\n\r\n'.bytes()) == resp_gzip
 	// Header NAMES are case-insensitive too (RFC 9110 §5.1).
-	assert serve('GET / HTTP/1.1\r\naccept-encoding: zstd\r\n\r\n'.bytes())! == resp_zstd
-	assert serve('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes())! == resp_identity
-	assert serve('GET / HTTP/1.1\r\nAccept-Encoding: pack200-gzip\r\n\r\n'.bytes())! == resp_identity
+	assert serve('GET / HTTP/1.1\r\naccept-encoding: zstd\r\n\r\n'.bytes()) == resp_zstd
+	assert serve('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()) == resp_identity
+	assert serve('GET / HTTP/1.1\r\nAccept-Encoding: pack200-gzip\r\n\r\n'.bytes()) == resp_identity
 	if resp_br.len > 0 {
-		assert serve('GET / HTTP/1.1\r\nAccept-Encoding: br, gzip\r\n\r\n'.bytes())! == resp_br
+		assert serve('GET / HTTP/1.1\r\nAccept-Encoding: br, gzip\r\n\r\n'.bytes()) == resp_br
 	}
 }
 
 fn test_handle_malformed_requests() {
-	// Malformed input must surface as a handler error (the core turns it into
-	// a 400), never a response — BEST_PRACTICES §9.
-	if _ := serve('garbage'.bytes()) {
-		assert false, 'garbage request must not produce a response'
-	}
+	// Malformed input gets the canned 400 appended and the connection closed
+	// (return .close) — BEST_PRACTICES §9.
+	mut out := []u8{}
+	mut tctx := core.Ctx{}
+	assert handle('garbage'.bytes(), mut out, mut tctx) == .close
+	assert out == response.tiny_bad_request_response
 	// Truncated before the CRLFCRLF terminator.
-	if _ := serve('GET / HTTP/1.1\r\nHost: local'.bytes()) {
-		assert false, 'truncated request must not produce a response'
-	}
+	mut out2 := []u8{}
+	mut tctx2 := core.Ctx{}
+	assert handle('GET / HTTP/1.1\r\nHost: local'.bytes(), mut out2, mut tctx2) == .close
+	assert out2 == response.tiny_bad_request_response
 }

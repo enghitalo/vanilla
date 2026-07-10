@@ -14,20 +14,27 @@ module http_server
 import net
 import time
 import http1_1.request_parser
+import http1_1.response
+import http_server.core
 
-fn bb_ok_handler(req []u8, fd int, mut out []u8) ! {
-	out << 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
+fn bb_ok_handler(req []u8, mut res []u8, mut ctx core.Ctx) core.Step {
+	res << 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
+	return .done
 }
 
 // bb_upload_handler answers a /upload by the DECLARED Content-Length only — it
 // never touches the body. This is the shape the large-body streaming path
 // requires (the head alone is passed; the body is drained + discarded), mirroring
 // the HttpArena vanilla /upload handler.
-fn bb_upload_handler(req []u8, fd int, mut out []u8) ! {
-	hr := request_parser.decode_http_request(req)!
+fn bb_upload_handler(req []u8, mut res []u8, mut ctx core.Ctx) core.Step {
+	hr := request_parser.decode_http_request(req) or {
+		res << response.tiny_bad_request_response
+		return .close
+	}
 	cl := hr.content_length()
 	body := cl.str()
-	out << 'HTTP/1.1 200 OK\r\nContent-Length: ${body.len}\r\nConnection: keep-alive\r\n\r\n${body}'.bytes()
+	res << 'HTTP/1.1 200 OK\r\nContent-Length: ${body.len}\r\nConnection: keep-alive\r\n\r\n${body}'.bytes()
+	return .done
 }
 
 const bb_req = 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'
@@ -102,7 +109,7 @@ fn check_pipelining_and_framing(backend IOBackend, port int) ! {
 	mut server := new_server(ServerConfig{
 		port:            port
 		io_multiplexing: backend
-		request_handler: bb_ok_handler
+		handler:         bb_ok_handler
 	})!
 	bb_start(mut server, port)
 
@@ -129,7 +136,7 @@ fn check_max_connections(backend IOBackend, port int) ! {
 	mut server := new_server(ServerConfig{
 		port:            port
 		io_multiplexing: backend
-		request_handler: bb_ok_handler
+		handler:         bb_ok_handler
 		limits:          Limits{
 			max_connections: 4
 		}
@@ -166,7 +173,7 @@ fn check_read_timeout(backend IOBackend, port int) ! {
 	mut server := new_server(ServerConfig{
 		port:            port
 		io_multiplexing: backend
-		request_handler: bb_ok_handler
+		handler:         bb_ok_handler
 		limits:          Limits{
 			read_timeout_ms: 400
 		}
@@ -198,7 +205,7 @@ fn check_graceful_shutdown(backend IOBackend, port int) ! {
 	mut server := new_server(ServerConfig{
 		port:            port
 		io_multiplexing: backend
-		request_handler: bb_ok_handler
+		handler:         bb_ok_handler
 	})!
 	bb_start(mut server, port)
 
@@ -269,7 +276,7 @@ fn check_large_upload_drain(backend IOBackend, port int) ! {
 	mut server := new_server(ServerConfig{
 		port:            port
 		io_multiplexing: backend
-		request_handler: bb_upload_handler
+		handler:         bb_upload_handler
 		limits:          Limits{
 			max_request_bytes: 8 * 1024 * 1024 // headroom for the 2 MiB bodies
 		}

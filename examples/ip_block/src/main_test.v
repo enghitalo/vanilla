@@ -1,5 +1,7 @@
 module main
 
+import http_server.core
+
 // SOLUTION: in-memory state test (denylist) + handler gate.
 // The blocklist set is pure/in-memory, so block/unblock/is_blocked and the 403
 // gate are unit-testable. The peer IP itself comes from the socket
@@ -14,21 +16,27 @@ fn test_block_unblock_roundtrip() {
 	assert !b.is_blocked('1.2.3.4')
 }
 
-fn test_allowed_ip_gets_200() ! {
+fn test_allowed_ip_gets_200() {
 	mut b := Blocklist{}
 	// fd -1 => socket.peer_addr returns '' (not in the list) => allowed.
 	mut resp := []u8{}
-	handle('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), -1, mut resp, mut b)!
+	mut tctx := core.Ctx{
+		client_fd: -1
+	}
+	assert handle('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), mut resp, mut tctx, mut b) == .done
 	out := resp.bytestr()
 	assert out.contains('200 OK')
 	assert out.contains('allowed')
 }
 
-fn test_blocked_ip_gets_403() ! {
+fn test_blocked_ip_gets_403() {
 	mut b := Blocklist{}
 	// peer_addr('' for fd -1) — block that to drive the deny path through handle.
 	b.block('')
 	mut resp := []u8{}
-	handle('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), -1, mut resp, mut b)!
+	mut tctx := core.Ctx{
+		client_fd: -1
+	}
+	assert handle('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), mut resp, mut tctx, mut b) == .done
 	assert resp.bytestr().contains('403 Forbidden')
 }

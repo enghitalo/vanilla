@@ -12,7 +12,8 @@ module main
 //                multipart/x-mixed-replace. One capture thread fans frames out to
 //                every viewer fd — no thread per viewer (see capture.v).
 //
-// Both keep the project's contract: the handler is still fn ([]u8, int, mut []u8) !.
+// Both keep the project's contract: the handler is still
+// fn ([]u8, mut []u8, mut core.Ctx) core.Step.
 // /video appends the response bytes into `out` (the core streams large ones via
 // EPOLLOUT back-pressure); /webcam registers the fd and a single broadcaster
 // owns it.
@@ -23,6 +24,7 @@ module main
 //   - Routing and the Range header are read IN PLACE as offsets/views into
 //     the request buffer — no `.to_string()`, no substr, no split.
 import http_server
+import http_server.core
 import http_server.http1_1.request_parser
 import os
 import strconv
@@ -92,14 +94,14 @@ fn route_len(buf []u8, path request_parser.Slice) int {
 	return path.len
 }
 
-fn handle(req_buffer []u8, fd int, mut out []u8, mut viewers Viewers) ! {
+fn handle(req_buffer []u8, mut out []u8, mut ctx core.Ctx, mut viewers Viewers) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {
 		out << bad_request
-		return
+		return .done
 	}
 	if !slice_eq(req.buffer, req.method, 'GET') {
 		out << method_not_allowed
-		return
+		return .done
 	}
 	// Effective route = path with the query string stripped, as offsets.
 	route := request_parser.Slice{
@@ -114,13 +116,14 @@ fn handle(req_buffer []u8, fd int, mut out []u8, mut viewers Viewers) ! {
 		// these headers and keeps the connection open. The broadcaster (in
 		// capture.v) now owns the fd and pushes frames to it.
 		viewers.ensure_capture()
-		viewers.add(fd)
+		viewers.add(ctx.client_fd)
 		out << mjpeg_headers
 	} else if slice_eq(req.buffer, route, '/video') {
 		serve_video(req, mut out)
 	} else {
 		out << not_found
 	}
+	return .done
 }
 
 // serve_video answers a (possibly ranged) request for the video file, reading
@@ -268,8 +271,8 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: fn [mut viewers] (req_buffer []u8, fd int, mut out []u8) ! {
-			handle(req_buffer, fd, mut out, mut viewers)!
+		handler:         fn [mut viewers] (req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+			return handle(req_buffer, mut out, mut ctx, mut viewers)
 		}
 		limits:          http_server.Limits{
 			max_header_bytes: 16 * 1024

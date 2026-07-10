@@ -64,7 +64,7 @@ pub const op_accept = u8(1)
 pub const op_read = u8(2)
 pub const op_write = u8(3)
 // op_poll: a oneshot IORING_OP_POLL_ADD on an EXTERNAL fd (a watched DB socket,
-// timerfd, ...) armed by the async runtime (AsyncCtx.watch). Its user_data packs
+// timerfd, ...) armed by the watch runtime (Ctx.watch). Its user_data packs
 // the WATCHED fd in the pointer bits — NOT a &Connection — because the reactor's
 // watch table is fd-indexed and can be reallocated by growth (a packed pointer
 // into it would dangle); the fd is stable and re-looked-up on completion.
@@ -267,7 +267,7 @@ pub mut:
 	send_total int
 
 	// >= 0 while a request on this connection is PARKED on the async runtime
-	// (AsyncCtx.watch returned .suspend awaiting this external fd). A parked
+	// (Ctx.watch returned .suspend awaiting this external fd). A parked
 	// connection has NO client-side op in flight — no recv (so the slot cannot be
 	// freed under a stale CQE) and no send (responses buffered before/at the park
 	// are HELD in response_buffer until resume: an in-flight send's captured data

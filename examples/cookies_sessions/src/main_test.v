@@ -1,5 +1,8 @@
 module main
 
+import http_server.core
+import http_server.http1_1.response
+
 // Pure logic tests + raw-request E2E (BEST_PRACTICES §9). The cookie scanner
 // and the session store are pure/in-memory, so the parsing rules, the session
 // round-trip and the unguessability invariant are unit testable; the handler
@@ -57,18 +60,19 @@ fn test_session_ids_unguessable() {
 	assert a != b // never collide / never sequential
 }
 
-// serve adapts the raw-handler contract (writes into a caller-owned buffer) to
-// the return-a-string shape the assertions expect.
-fn serve(mut store Store, req string) !string {
+// serve adapts the unified handler contract (writes into a caller-owned
+// buffer) to the return-a-string shape the assertions expect.
+fn serve(mut store Store, req string) string {
 	mut out := []u8{}
-	handle(req.bytes(), -1, mut out, mut store)!
+	mut tctx := core.Ctx{}
+	handle(req.bytes(), mut out, mut tctx, mut store)
 	return out.bytestr()
 }
 
-fn test_login_me_logout_flow() ! {
+fn test_login_me_logout_flow() {
 	mut s := Store{}
 	// /login mints a session and sets the cookie with ALL security attributes.
-	login := serve(mut s, 'GET /login HTTP/1.1\r\nHost: x\r\n\r\n')!
+	login := serve(mut s, 'GET /login HTTP/1.1\r\nHost: x\r\n\r\n')
 	assert login.contains('200 OK')
 	assert login.contains('HttpOnly')
 	assert login.contains('Secure')
@@ -79,46 +83,44 @@ fn test_login_me_logout_flow() ! {
 	sid := login.all_after('Set-Cookie: sid=').all_before(';')
 	assert sid.len == 64 // CSPRNG id, 32 bytes hex
 	// /me with that cookie -> the session's user, correct framing.
-	me := serve(mut s, 'GET /me HTTP/1.1\r\nHost: x\r\nCookie: sid=${sid}\r\n\r\n')!
+	me := serve(mut s, 'GET /me HTTP/1.1\r\nHost: x\r\nCookie: sid=${sid}\r\n\r\n')
 	assert me.contains('200 OK')
 	body := me.all_after('\r\n\r\n')
 	assert body == '{"user":"user-42"}'
 	assert me.all_after('Content-Length: ').all_before('\r\n').int() == body.len
 	// sid found even when it is not the first cookie pair.
-	me2 := serve(mut s, 'GET /me HTTP/1.1\r\nHost: x\r\nCookie: theme=dark; sid=${sid}\r\n\r\n')!
+	me2 := serve(mut s, 'GET /me HTTP/1.1\r\nHost: x\r\nCookie: theme=dark; sid=${sid}\r\n\r\n')
 	assert me2.contains('200 OK')
 	// /logout expires the cookie.
-	logout := serve(mut s, 'GET /logout HTTP/1.1\r\nHost: x\r\n\r\n')!
+	logout := serve(mut s, 'GET /logout HTTP/1.1\r\nHost: x\r\n\r\n')
 	assert logout.contains('200 OK')
 	assert logout.contains('Set-Cookie: sid=;')
 	assert logout.contains('Max-Age=0')
 }
 
-fn test_me_rejects_missing_or_bogus_cookie() ! {
+fn test_me_rejects_missing_or_bogus_cookie() {
 	mut s := Store{}
 	sid := s.create('user-42')
 	// no Cookie header at all
-	assert serve(mut s, 'GET /me HTTP/1.1\r\nHost: x\r\n\r\n')!.contains('401')
+	assert serve(mut s, 'GET /me HTTP/1.1\r\nHost: x\r\n\r\n').contains('401')
 	// cookie present but not a live session id
-	assert serve(mut s, 'GET /me HTTP/1.1\r\nHost: x\r\nCookie: sid=bogus\r\n\r\n')!.contains('401')
+	assert serve(mut s, 'GET /me HTTP/1.1\r\nHost: x\r\nCookie: sid=bogus\r\n\r\n').contains('401')
 	// empty sid value
-	assert serve(mut s, 'GET /me HTTP/1.1\r\nHost: x\r\nCookie: sid=\r\n\r\n')!.contains('401')
+	assert serve(mut s, 'GET /me HTTP/1.1\r\nHost: x\r\nCookie: sid=\r\n\r\n').contains('401')
 	// prefix collision: a valid id under `xsid` must never be read as `sid`
-	assert serve(mut s, 'GET /me HTTP/1.1\r\nHost: x\r\nCookie: xsid=${sid}\r\n\r\n')!.contains('401')
+	assert serve(mut s, 'GET /me HTTP/1.1\r\nHost: x\r\nCookie: xsid=${sid}\r\n\r\n').contains('401')
 }
 
 fn test_unknown_route_and_malformed() {
 	mut s := Store{}
-	if resp := serve(mut s, 'GET /nope HTTP/1.1\r\nHost: x\r\n\r\n') {
-		assert resp.contains('404')
-	} else {
-		assert false, '404 route must still produce a response'
-	}
-	// Malformed input must surface as a handler error, never a response.
-	if _ := serve(mut s, 'garbage') {
-		assert false, 'garbage request must not produce a response'
-	}
-	if _ := serve(mut s, 'GET /me HTTP/1.1\r\nHost: x\r\n') { // no final CRLFCRLF
-		assert false, 'truncated request must not produce a response'
-	}
+	assert serve(mut s, 'GET /nope HTTP/1.1\r\nHost: x\r\n\r\n').contains('404')
+	// Malformed input gets the canned 400 and the connection is closed.
+	mut tctx := core.Ctx{}
+	mut out := []u8{}
+	assert handle('garbage'.bytes(), mut out, mut tctx, mut s) == .close
+	assert out == response.tiny_bad_request_response
+	mut out2 := []u8{}
+	// no final CRLFCRLF
+	assert handle('GET /me HTTP/1.1\r\nHost: x\r\n'.bytes(), mut out2, mut tctx, mut s) == .close
+	assert out2 == response.tiny_bad_request_response
 }

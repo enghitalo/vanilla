@@ -9,7 +9,9 @@ module main
 // built with a pre-sized strings.Builder, writing integers via write_decimal so
 // there is no `.str()` / concat allocation (§3b).
 import strings
+import http_server.core
 import http_server.http1_1.request_parser { HttpRequest }
+import http_server.http1_1.response
 
 const not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 
@@ -19,14 +21,19 @@ const home_response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCont
 
 // route decodes the request and dispatches by path. This is the handler passed to
 // chain(); the global decorators wrap it.
-fn route(req_buffer []u8, _ int, mut out []u8) ! {
-	req := request_parser.decode_http_request(req_buffer)!
+fn route(req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+	req := request_parser.decode_http_request(req_buffer) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
 	out << match req.path.to_string(req.buffer) {
 		'/' { handle_home(req) }
 		'/me' { handle_profile(req) }
 		'/admin' { handle_admin(req) }
 		else { not_found_response }
 	}
+
+	return .done
 }
 
 // PUBLIC — no guard, static response.

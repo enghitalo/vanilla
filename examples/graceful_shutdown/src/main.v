@@ -16,10 +16,12 @@ module main
 // full 2s grace; the grace is just the cap). The counters are per-worker and
 // cache-line-padded, so the per-request increment is free on the hot path.
 import http_server
+import http_server.core
 import os
 
-fn handle(req_buffer []u8, _ int, mut out []u8) ! {
+fn handle(req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
 	out << 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+	return .done
 }
 
 fn main() {
@@ -34,7 +36,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: handle
+		handler:         handle
 	})!
 
 	// Stop accepting, drain briefly, exit cleanly. (Captures `server` by value —

@@ -11,6 +11,7 @@ module main
 // deterministic; refill-over-time is covered by the injected-clock unit tests.
 // (`${}` here is TEST scaffolding — the example code itself never
 // concatenates; see main.v.)
+import http_server.core
 
 const sec = i64(1_000_000_000) // 1s in nanoseconds
 
@@ -60,7 +61,12 @@ fn test_per_client_isolation() {
 // socket.peer_addr fail => the no-XFF identity is 'unknown'.
 fn serve(req string, mut l Limiter) !string {
 	mut out := []u8{}
-	handle(req.bytes(), -1, mut out, mut l)!
+	mut tctx := core.Ctx{
+		client_fd: -1
+	}
+	if handle(req.bytes(), mut out, mut tctx, mut l) == .close {
+		return error('handler closed the connection')
+	}
 	return out.bytestr()
 }
 

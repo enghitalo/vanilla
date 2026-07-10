@@ -4,8 +4,6 @@ module http_server
 
 import kqueue
 import socket
-import http1_1.response
-import http1_1.request
 import http_server.core
 
 // Backend selection
@@ -15,60 +13,6 @@ pub enum IOBackend {
 
 fn C.perror(s &char)
 fn C.close(fd int) int
-
-// Handle readable client connection.
-//
-// Connections are KEPT ALIVE after a successful response: the fd stays
-// registered in the worker's kqueue (level-triggered), so the next request on
-// the same connection just fires another read event. The kernel's EV_EOF (or a
-// read of 0 bytes) cleans up when the client goes away. This matches the
-// `Connection: keep-alive` the example handlers advertise — the previous
-// close-per-request behaviour both lied to clients and crippled throughput.
-@[manualfree]
-fn handle_readable_fd(handler fn (req []u8, fd int, mut out []u8) !, kq_fd int, client_fd int, limits Limits) {
-	request_buffer := request.read_request(client_fd, limits.max_header_bytes,
-		limits.max_body_bytes) or {
-		match err.code() {
-			413 {
-				response.send_status_413_response(client_fd)
-			}
-			431 {
-				response.send_status_431_response(client_fd)
-			}
-			400 {
-				response.send_bad_request_response(client_fd)
-			}
-			else {
-				if err.msg() == 'no data available' {
-					// Spurious wakeup on an idle keep-alive connection — keep it.
-					return
-				}
-				if err.msg() != 'client closed connection' {
-					response.send_status_444_response(client_fd)
-				}
-			}
-		}
-
-		kqueue.remove_fd_from_kqueue(kq_fd, client_fd)
-		return
-	}
-	defer { unsafe { request_buffer.free() } }
-
-	// Server-owned response buffer: the handler appends raw response bytes.
-	mut response_buffer := []u8{len: 0, cap: 4096}
-	defer { unsafe { response_buffer.free() } }
-	handler(request_buffer, client_fd, mut response_buffer) or {
-		response.send_bad_request_response(client_fd)
-		kqueue.remove_fd_from_kqueue(kq_fd, client_fd)
-		return
-	}
-
-	response.send_response(client_fd, response_buffer.data, response_buffer.len) or {
-		kqueue.remove_fd_from_kqueue(kq_fd, client_fd)
-		return
-	}
-	// Keep-alive: leave the fd registered for the next request.
-}
 
 // Accept loop for main thread
 fn handle_accept_loop(socket_fd int, main_kq int, worker_kqs []int) {
@@ -105,7 +49,7 @@ fn handle_accept_loop(socket_fd int, main_kq int, worker_kqs []int) {
 	}
 }
 
-pub fn run_kqueue_backend(socket_fd int, handler fn (req []u8, fd int, mut out []u8) !, async_handler core.AsyncHandler, make_state fn () voidptr, port int, limits Limits, mut threads []thread) {
+pub fn run_kqueue_backend(socket_fd int, handler core.Handler, make_state fn () voidptr, port int, limits Limits, mut threads []thread) {
 	main_kq := kqueue.create_kqueue_fd()
 	if main_kq < 0 {
 		return
@@ -131,19 +75,10 @@ pub fn run_kqueue_backend(socket_fd int, handler fn (req []u8, fd int, mut out [
 		}
 		worker_kqs[i] = kq
 
-		if async_handler != unsafe { nil } {
-			// Opt-in async runtime: this worker owns a watch registry and resumes
-			// parked requests when a watched fd fires (see async_darwin.c.v).
-			threads[i] = spawn process_kqueue_async(kq, async_handler, make_state, limits)
-		} else {
-			callbacks := kqueue.KqueueEventCallbacks{
-				on_read:  fn [handler, kq, limits] (fd int) {
-					handle_readable_fd(handler, kq, fd, limits)
-				}
-				on_write: fn (_ int) {}
-			}
-			threads[i] = spawn kqueue.process_kqueue_events(callbacks, kq)
-		}
+		// One worker loop for every handler: it owns a watch registry and resumes
+		// parked requests when a watched fd fires (see async_darwin.c.v); a handler
+		// that never suspends just appends and returns .done.
+		threads[i] = spawn process_kqueue_worker(kq, handler, make_state, limits)
 	}
 
 	println('listening on http://localhost:${port}/ (kqueue)')
@@ -156,8 +91,8 @@ pub fn run_kqueue_backend(socket_fd int, handler fn (req []u8, fd int, mut out [
 fn run_selected_backend(server Server, mut threads []thread) {
 	match server.io_multiplexing {
 		.kqueue {
-			run_kqueue_backend(server.socket_fd, server.request_handler, server.async_handler,
-				server.make_state, server.port, server.limits, mut threads)
+			run_kqueue_backend(server.socket_fd, server.handler, server.make_state, server.port,
+				server.limits, mut threads)
 		}
 	}
 }

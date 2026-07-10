@@ -14,7 +14,7 @@ module main
 //        # -> data: tick 1 of 5   (one line per second, then "bye")
 //
 // The same append-flush-suspend loop is how a chat feed, a progress stream, or a
-// log tail would push to many clients from one thread. See core.AsyncHandler.
+// log tail would push to many clients from one thread. See core.Handler.
 import http_server
 import http_server.core
 
@@ -25,7 +25,7 @@ fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
 fn C.read(fd int, buf voidptr, count usize) int
 
-// Stream is the per-connection cursor, carried across ticks via ac.udata — ONE
+// Stream is the per-connection cursor, carried across ticks via ctx.udata — ONE
 // heap allocation for the whole stream, freed when it ends (not per event).
 struct Stream {
 mut:
@@ -49,7 +49,7 @@ fn arm_periodic(tfd int, ms int) {
 	C.timerfd_settime(tfd, 0, voidptr(&spec[0]), unsafe { nil })
 }
 
-fn handle(req []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
+fn handle(req []u8, mut out []u8, mut ctx core.Ctx) core.Step {
 	if !req.bytestr().contains('/events') {
 		out << not_found
 		return .done
@@ -64,17 +64,17 @@ fn handle(req []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 	// Headers go out NOW: async_serve flushes the write buffer after the initial
 	// .suspend, so the client sees `200 text/event-stream` before any tick.
 	out << sse_headers
-	ac.watch(tfd, .readable, sse_tick, voidptr(st))
+	ctx.watch(tfd, .readable, sse_tick, voidptr(st))
 	return .suspend
 }
 
 // sse_tick fires once per timer expiry: emit one event and re-arm. The appended
 // bytes are flushed on .suspend (the streaming primitive), so each event ships
 // immediately instead of waiting for the stream to finish.
-fn sse_tick(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
+fn sse_tick(mut out []u8, mut ctx core.Ctx) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ac.ready_fd(), &tmp[0], 8) // drain the timerfd expiry count
-	mut st := unsafe { &Stream(ac.udata) }
+	C.read(ctx.ready_fd(), &tmp[0], 8) // drain the timerfd expiry count
+	mut st := unsafe { &Stream(ctx.udata) }
 	st.sent++
 	out << 'data: tick ${st.sent} of ${st.max}\n\n'.bytes()
 	if st.sent >= st.max {
@@ -82,7 +82,7 @@ fn sse_tick(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 		C.close(st.tfd) // request owns the timerfd; closing it removes it from epoll
 		return .done
 	}
-	ac.watch(st.tfd, .readable, sse_tick, ac.udata) // keep streaming
+	ctx.watch(st.tfd, .readable, sse_tick, ctx.udata) // keep streaming
 	return .suspend
 }
 
@@ -90,7 +90,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            8092
 		io_multiplexing: .epoll
-		async_handler:   handle
+		handler:         handle
 	})!
 	server.run()
 }

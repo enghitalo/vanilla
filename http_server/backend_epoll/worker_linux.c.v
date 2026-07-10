@@ -39,8 +39,8 @@ fn release_conn(epoll_fd int, fd int, active_conns &core.Counter) {
 	stdatomic.add_i64(&active_conns.n, -1)
 }
 
-// (The plain request cycle now lives in the per-fd state machine — see
-// conn_state.c.v: handle_readable_plain / handle_writable_plain.)
+// (The request-serving cycle lives in async_linux.c.v — handle_readable /
+// drain_requests / serve_conn — over the per-fd state in conn_state_linux.c.v.)
 
 // Accept loop for the main epoll thread. Distributes new client connections to worker threads (round-robin).
 fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits core.Limits, active_conns &core.Counter) {
@@ -114,43 +114,24 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 	}
 }
 
-// build_handler resolves the effective synchronous per-worker handler. With no
-// stateful_handler it is just the stateless request_handler; otherwise it binds
-// this worker's `state` into a plain RequestHandler closure so the hot path stays
-// a plain RequestHandler and the state is thread-local (no sharing, no lock).
-fn build_handler(request_handler core.RequestHandler, stateful_handler core.StatefulHandler, state voidptr) core.RequestHandler {
-	if stateful_handler == unsafe { nil } {
-		return request_handler
-	}
-	return fn [state, stateful_handler] (req []u8, fd int, mut out []u8) ! {
-		stateful_handler(req, fd, mut out, state)!
-	}
-}
-
 // Plain (HTTP) worker: owns the per-fd connection state table (persistent
-// buffers, cross-edge reads, EPOLLOUT writes). ONE worker for both the
-// synchronous and the async-runtime paths: with an async_handler it also owns a
-// watch registry and resumes parked requests when a watched fd fires; otherwise
-// the async branches are skipped entirely (a single per-worker `has_async` bool)
-// so the synchronous hot path is byte-for-byte unchanged.
+// buffers, cross-edge reads, EPOLLOUT writes), plus the watch registry that
+// resumes parked requests when a watched fd fires. ONE worker, ONE handler
+// contract: a handler that never suspends just appends and returns .done, so
+// the only extra hot-path cost over the old synchronous-only worker is a
+// per-event `watches[fd].active` load.
 @[direct_array_access; manualfree]
-fn process_events_plain(worker_id int, epoll_fd int, request_handler core.RequestHandler, stateful_handler core.StatefulHandler, async_handler core.AsyncHandler, make_state fn () voidptr, on_worker_start core.WorkerStartFn, limits core.Limits, counter &core.Counter, active_conns &core.Counter) {
+fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_state fn () voidptr, on_worker_start core.WorkerStartFn, limits core.Limits, counter &core.Counter, active_conns &core.Counter) {
 	maybe_pin_worker(worker_id)
-	// Build THIS worker's per-thread state once (e.g. its own DB connection) — used
-	// by the stateful sync handler closure AND passed to async handlers via AsyncCtx.
+	// Build THIS worker's per-thread state once (e.g. its own DB connection);
+	// every handler call on this worker reaches it via ctx.state.
 	mut state := voidptr(unsafe { nil })
 	if make_state != unsafe { nil } {
 		state = make_state()
 	}
-	has_async := async_handler != unsafe { nil }
-	// The watch dispatch runs for async handlers AND for clientless background
-	// watches armed by on_worker_start (e.g. a per-worker refresh timerfd) — a sync
-	// server can own a background watch with no async_handler.
-	has_watches := has_async || on_worker_start != unsafe { nil }
-	handler := build_handler(request_handler, stateful_handler, state) // sync path
-	mut reactor := AsyncReactor{
+	mut reactor := Reactor{
 		watches: []WatchEntry{len: conn_table_min}
-	} // async path: flat fd-indexed table of parked requests (grows by doubling)
+	} // flat fd-indexed table of parked requests (grows by doubling)
 	// This worker can stream file bodies with sendfile(2): let handlers hand a
 	// file off via core.queue_file instead of copying it through write_buf.
 	core.enable_sendfile()
@@ -160,14 +141,14 @@ fn process_events_plain(worker_id int, epoll_fd int, request_handler core.Reques
 	// worker's loop, once, before serving. The ctx carries client_fd = -1 so the
 	// watch + its continuation take the clientless path (no conn, scratch buffer).
 	if on_worker_start != unsafe { nil } {
-		mut start_ac := core.AsyncCtx{
+		mut start_ctx := core.Ctx{
 			client_fd: -1
 			state:     state
 			loop_fd:   epoll_fd
 			reactor:   unsafe { voidptr(&reactor) }
-			register:  async_register
+			register:  register_watch
 		}
-		on_worker_start(mut start_ac)
+		on_worker_start(mut start_ctx)
 	}
 	// Only arm the timeout sweep if a deadline is actually configured.
 	sweep_on := limits.read_timeout_ms > 0 || limits.write_timeout_ms > 0
@@ -200,21 +181,15 @@ fn process_events_plain(worker_id int, epoll_fd int, request_handler core.Reques
 		for i in 0 .. num_events {
 			fd := epoll.event_fd(events[i])
 			ev := events[i].events
-			// A watched external fd became ready → run its continuation (async request
-			// resume, or a clientless background watch like a refresh timerfd).
-			if has_watches {
-				if fd < reactor.watches.len && reactor.watches[fd].active {
-					async_on_ready(async_handler, mut reactor, epoll_fd, fd, reactor.watches[fd],
-						ev, limits, counter, active_conns, mut st, state)
-					continue
-				}
+			// A watched external fd became ready → run its continuation (a parked
+			// request resume, or a clientless background watch like a refresh timerfd).
+			if fd < reactor.watches.len && reactor.watches[fd].active {
+				on_watch_ready(handler, mut reactor, epoll_fd, fd, reactor.watches[fd], ev, limits,
+					counter, active_conns, mut st, state)
+				continue
 			}
 			if ev & (u32(C.EPOLLHUP) | u32(C.EPOLLERR)) != 0 {
-				if has_async {
-					async_close(mut reactor, epoll_fd, fd, active_conns, mut st) // tear any watch down first
-				} else {
-					close_conn(epoll_fd, fd, active_conns, mut st)
-				}
+				close_client(mut reactor, epoll_fd, fd, active_conns, mut st) // tears any watch down first
 				continue
 			}
 			if ev & u32(C.EPOLLOUT) != 0 {
@@ -223,13 +198,8 @@ fn process_events_plain(worker_id int, epoll_fd int, request_handler core.Reques
 				}
 			}
 			if ev & u32(C.EPOLLIN) != 0 {
-				if has_async {
-					async_handle_readable(async_handler, mut reactor, epoll_fd, fd, limits,
-						counter, active_conns, mut st, state)
-				} else {
-					handle_readable_plain(handler, epoll_fd, fd, limits, counter, active_conns, mut
-						st)
-				}
+				handle_readable(handler, mut reactor, epoll_fd, fd, limits, counter, active_conns, mut
+					st, state)
 			}
 		}
 		// After handling this batch (or a timeout wake with num_events == 0),
@@ -241,20 +211,17 @@ fn process_events_plain(worker_id int, epoll_fd int, request_handler core.Reques
 }
 
 // TLS (HTTPS) worker: owns the per-fd TLS session map (handshake + ssl read/write).
+// The TLS worker has no watch reactor, so handlers here must complete
+// synchronously: .suspend closes the connection (async-over-TLS is a follow-up).
 @[direct_array_access; manualfree]
-fn process_events_tls(worker_id int, epoll_fd int, request_handler core.RequestHandler, stateful_handler core.StatefulHandler, make_state fn () voidptr, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config) {
+fn process_events_tls(worker_id int, epoll_fd int, handler core.Handler, make_state fn () voidptr, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config) {
 	maybe_pin_worker(worker_id)
-	// Build THIS worker's per-thread state ONCE, then bind it into the handler — same
-	// as the plaintext worker. NOTE: pass make_state()'s RESULT, not the make_state fn
-	// pointer itself: build_handler's 3rd arg is the `state voidptr`, so passing the
-	// uncalled fn made a stateful+TLS handler cast the make_state address as its state
-	// (garbage). make_state is nil for the common stateless-TLS case (build_handler then
-	// ignores state), so only stateful+TLS was affected.
+	// Build THIS worker's per-thread state ONCE — same as the plaintext worker;
+	// every handler call reaches it via ctx.state.
 	mut state := voidptr(unsafe { nil })
 	if make_state != unsafe { nil } {
 		state = make_state()
 	}
-	handler := build_handler(request_handler, stateful_handler, state)
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut sessions := map[int]&TlsConn{}
 	sweep_on := limits.read_timeout_ms > 0 || limits.write_timeout_ms > 0
@@ -282,8 +249,8 @@ fn process_events_tls(worker_id int, epoll_fd int, request_handler core.RequestH
 				}
 			}
 			if ev & u32(C.EPOLLIN) != 0 {
-				handle_readable_fd_tls(handler, epoll_fd, fd, limits, counter, active_conns, cfg, mut
-					sessions)
+				handle_readable_fd_tls(handler, state, epoll_fd, fd, limits, counter, active_conns,
+					cfg, mut sessions)
 			}
 		}
 		if sweep_on && sessions.len > 0 {
@@ -292,7 +259,7 @@ fn process_events_tls(worker_id int, epoll_fd int, request_handler core.RequestH
 	}
 }
 
-pub fn run_epoll_backend(socket_fd int, request_handler core.RequestHandler, stateful_handler core.StatefulHandler, async_handler core.AsyncHandler, make_state fn () voidptr, on_worker_start core.WorkerStartFn, port int, limits core.Limits, inflight []&core.Counter, active_conns &core.Counter, tls_config &tls.Config, mut threads []thread) {
+pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () voidptr, on_worker_start core.WorkerStartFn, port int, limits core.Limits, inflight []&core.Counter, active_conns &core.Counter, tls_config &tls.Config, mut threads []thread) {
 	if socket_fd < 0 {
 		return
 	}
@@ -331,19 +298,15 @@ pub fn run_epoll_backend(socket_fd int, request_handler core.RequestHandler, sta
 			exit(1)
 		}
 
-		// Build per-thread callbacks. The plaintext and TLS paths are SEPARATE
 		// Spawn the right concrete worker: HTTPS or plain HTTP. The plain worker
 		// has no TLS code at all, so the plain hot path carries zero TLS cost.
 		counter := inflight[i] // this worker's own in-flight counter
 		if tls_config != unsafe { nil } {
-			threads[i] = spawn process_events_tls(i, epoll_fds[i], request_handler,
-				stateful_handler, make_state, limits, counter, active_conns, tls_config)
+			threads[i] = spawn process_events_tls(i, epoll_fds[i], handler, make_state, limits,
+				counter, active_conns, tls_config)
 		} else {
-			// ONE plain worker for both sync and async (async_handler opts in); it skips
-			// all async code via a per-worker bool, so the sync hot path is unchanged.
-			threads[i] = spawn process_events_plain(i, epoll_fds[i], request_handler,
-				stateful_handler, async_handler, make_state, on_worker_start, limits, counter,
-				active_conns)
+			threads[i] = spawn process_events_plain(i, epoll_fds[i], handler, make_state,
+				on_worker_start, limits, counter, active_conns)
 		}
 	}
 

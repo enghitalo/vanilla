@@ -1,5 +1,6 @@
 module main
 
+import http_server.core
 import http_server.http1_1.request_parser
 
 // SOLUTION: the trust rule is pure over an INJECTED peer — real_client_ip
@@ -16,7 +17,12 @@ fn mkreq(s string) request_parser.HttpRequest {
 // the return-a-buffer shape the assertions expect (BEST_PRACTICES §9).
 fn serve(req []u8) ![]u8 {
 	mut out := []u8{}
-	handle(req, -1, mut out)!
+	mut tctx := core.Ctx{
+		client_fd: -1
+	}
+	if handle(req, mut out, mut tctx) == .close {
+		return error('handler closed the connection')
+	}
 	return out
 }
 

@@ -23,10 +23,11 @@ fn qb_build_resp() []u8 {
 	return b
 }
 
-fn iou_qb_handler(req []u8, _ int, mut out []u8) ! {
+fn iou_qb_handler(req []u8, mut res []u8, mut ctx core.Ctx) core.Step {
 	if !core.queue_buf(qb_resp.data, qb_resp.len) {
-		out << qb_resp // fallback when the backend can't borrow-send
+		res << qb_resp // fallback when the backend can't borrow-send
 	}
+	return .done
 }
 
 fn test_io_uring_queue_buf_borrowed_send() ! {
@@ -39,7 +40,7 @@ fn test_io_uring_queue_buf_borrowed_send() ! {
 		mut server := new_server(ServerConfig{
 			port:            8089
 			io_multiplexing: .io_uring
-			request_handler: iou_qb_handler
+			handler:         iou_qb_handler
 		})!
 		// Two requests on ONE keep-alive connection: both answered from the borrowed
 		// buffer (response_buffer never holds the body), each body > write_buf_cap so

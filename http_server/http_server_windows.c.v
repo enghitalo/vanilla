@@ -4,6 +4,7 @@ import socket
 import runtime
 import iocp
 import http1_1.response
+import http_server.core
 
 // Backend selection
 pub enum IOBackend {
@@ -27,7 +28,9 @@ fn C.GetOverlappedResult(h_file voidptr, lp_overlapped voidptr, lp_number_of_byt
 struct WorkerContext {
 pub mut:
 	iocp_handle voidptr
-	handler     fn (req []u8, fd int, mut out []u8) ! @[required]
+	handler     core.Handler @[required]
+	make_state  fn () voidptr = unsafe { nil }
+	state       voidptr
 	running     bool
 	thread_id   u32
 }
@@ -52,6 +55,12 @@ fn get_system_error() string {
 
 fn worker_thread(mut ctx WorkerContext) {
 	println('[iocp-worker] Worker thread started')
+
+	// Per-worker state, built ON this worker thread (thread-local, no lock);
+	// every handler call on this worker reaches it via ctx.state.
+	if ctx.make_state != unsafe { nil } {
+		ctx.state = ctx.make_state()
+	}
 
 	for ctx.running {
 		mut bytes_transferred := u32(0)
@@ -86,10 +95,10 @@ fn worker_thread(mut ctx WorkerContext) {
 
 		match io_data.operation {
 			.accept {
-				handle_accept_completion(io_data, ctx.handler, mut ctx)
+				handle_accept_completion(io_data, mut ctx)
 			}
 			.read {
-				handle_read_completion(io_data, ctx.handler, mut ctx)
+				handle_read_completion(io_data, mut ctx)
 			}
 			.write {
 				handle_write_completion(mut io_data, mut ctx)
@@ -104,8 +113,7 @@ fn worker_thread(mut ctx WorkerContext) {
 	println('[iocp-worker] Worker thread exiting')
 }
 
-fn handle_accept_completion(io_data &iocp.IOData, handler fn (req []u8, fd int, mut out []u8) !,
-	mut ctx WorkerContext) {
+fn handle_accept_completion(io_data &iocp.IOData, mut ctx WorkerContext) {
 	socket_fd := io_data.socket_fd
 
 	// Set socket options for accepted connection
@@ -127,9 +135,15 @@ fn handle_accept_completion(io_data &iocp.IOData, handler fn (req []u8, fd int, 
 	// (We need to get the listening socket from somewhere - stored in context)
 }
 
+// iocp_reject_register is the Ctx.register stub for the IOCP worker: it has no
+// watch reactor, so a watch is never armed (last_watched stays -1) and a
+// handler that suspends is closed by the caller. Async-on-IOCP is a follow-up.
+fn iocp_reject_register(mut ac core.Ctx, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
+	ac.last_watched = -1
+}
+
 @[manualfree]
-fn handle_read_completion(io_data &iocp.IOData, handler fn (req []u8, fd int, mut out []u8) !,
-	mut ctx WorkerContext) {
+fn handle_read_completion(io_data &iocp.IOData, mut ctx WorkerContext) {
 	socket_fd := io_data.socket_fd
 	bytes_read := io_data.bytes_transferred
 
@@ -143,9 +157,21 @@ fn handle_read_completion(io_data &iocp.IOData, handler fn (req []u8, fd int, mu
 	// Process the request — server-owned response buffer, handler appends raw bytes.
 	request_data := io_data.buffer[..bytes_read]
 	mut response_data := []u8{len: 0, cap: 4096}
-	handler(request_data, socket_fd, mut response_data) or {
+	mut hctx := core.Ctx{
+		client_fd: socket_fd
+		state:     ctx.state
+		register:  iocp_reject_register
+	}
+	step := ctx.handler(request_data, mut response_data, mut hctx)
+	if step != .done {
+		// .close: flush whatever the handler appended (its error response), then
+		// drop. .suspend: parking is not supported on this backend (no watch
+		// reactor) — the stub register armed nothing, so drop the connection
+		// rather than strand a request that can never be resumed.
+		if step == .close && response_data.len > 0 {
+			response.send_response(socket_fd, response_data.data, response_data.len) or {}
+		}
 		unsafe { response_data.free() }
-		response.send_bad_request_response(socket_fd)
 		socket.close_socket(socket_fd)
 		iocp.free_io_data(io_data)
 		return
@@ -284,7 +310,7 @@ fn accept_thread(listen_socket int, iocp_handle voidptr) {
 	println('[iocp-accept] Accept thread exiting')
 }
 
-pub fn run_iocp_backend(socket_fd int, handler fn (req []u8, fd int, mut out []u8) !, port int, mut threads []thread) {
+pub fn run_iocp_backend(socket_fd int, handler core.Handler, make_state fn () voidptr, port int, mut threads []thread) {
 	println('[iocp] Starting IOCP backend on port ${port}')
 
 	// Create IOCP handle
@@ -305,6 +331,7 @@ pub fn run_iocp_backend(socket_fd int, handler fn (req []u8, fd int, mut out []u
 		mut ctx := &WorkerContext{
 			iocp_handle: iocp_handle
 			handler:     handler
+			make_state:  make_state
 			running:     true
 		}
 		worker_contexts << ctx
@@ -344,7 +371,8 @@ pub fn run_iocp_backend(socket_fd int, handler fn (req []u8, fd int, mut out []u
 fn run_selected_backend(server Server, mut threads []thread) {
 	match server.io_multiplexing {
 		.iocp {
-			run_iocp_backend(server.socket_fd, server.request_handler, server.port, mut threads)
+			run_iocp_backend(server.socket_fd, server.handler, server.make_state, server.port, mut
+				threads)
 		}
 	}
 }

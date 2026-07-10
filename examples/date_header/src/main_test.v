@@ -28,7 +28,7 @@ fn test_response_includes_date_header() {
 	mut c := DateCache{}
 	c.seed()
 	c.refresh()
-	// Reproduce exactly what the request_handler closure writes into `out`:
+	// Reproduce exactly what the handler closure writes into `out`:
 	// the two static halves plus the cached, zero-copy Date line.
 	mut out := []u8{}
 	out << status_head

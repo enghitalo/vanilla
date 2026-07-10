@@ -1,5 +1,8 @@
 module main
 
+import http_server.core
+import http_server.http1_1.response
+
 // SOLUTION: pure codec tests + raw-request E2E (BEST_PRACTICES §9).
 // The chunk iterator is a pure function over bytes — exactly the thing to
 // unit-test hard, since it's the request-smuggling-adjacent piece. The E2E
@@ -64,16 +67,17 @@ fn test_next_chunk_yields_views() ! {
 	assert p3 == enc.len
 }
 
-// serve adapts the raw-handler contract (writes into a caller-owned buffer) to
-// the return-a-string shape the assertions expect.
-fn serve(req string) !string {
+// serve adapts the unified handler contract (writes into a caller-owned
+// buffer) to the return-a-string shape the assertions expect.
+fn serve(req string) string {
 	mut out := []u8{}
-	handle(req.bytes(), -1, mut out)!
+	mut tctx := core.Ctx{}
+	handle(req.bytes(), mut out, mut tctx)
 	return out.bytestr()
 }
 
 fn test_response_uses_chunked_framing() ! {
-	out := serve('GET / HTTP/1.1\r\nHost: x\r\n\r\n')!
+	out := serve('GET / HTTP/1.1\r\nHost: x\r\n\r\n')
 	assert out.contains('Transfer-Encoding: chunked')
 	assert !out.contains('Content-Length') // chunked => no Content-Length
 	assert out.ends_with('0\r\n\r\n') // terminating chunk present
@@ -86,7 +90,7 @@ fn test_chunked_request_is_echoed() ! {
 	// Chunk boundaries need not survive the round trip — the PAYLOAD must.
 	req := 'POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n' +
 		'5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n'
-	out := serve(req)!
+	out := serve(req)
 	assert out.contains('Transfer-Encoding: chunked')
 	body := out.all_after('\r\n\r\n').bytes()
 	assert decode_all(body)!.bytestr() == 'hello world'
@@ -95,16 +99,20 @@ fn test_chunked_request_is_echoed() ! {
 fn test_smuggling_guard_via_validate_http1() {
 	// Content-Length + Transfer-Encoding together must be rejected
 	// (RFC 9112 §6.1) via req.validate_http1() — opt-in, one line in the handler.
+	// The handler appends the canned 400 and closes the connection.
 	req :=
 		'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n' +
 		'5\r\nhello\r\n0\r\n\r\n'
-	if _ := serve(req) {
-		assert false, 'CL+TE request must be rejected by validate_http1'
-	}
+	mut out := []u8{}
+	mut tctx := core.Ctx{}
+	assert handle(req.bytes(), mut out, mut tctx) == .close
+	assert out == response.tiny_bad_request_response
 }
 
 fn test_malformed_request_errors() {
-	if _ := serve('garbage') {
-		assert false, 'garbage request must not produce a response'
-	}
+	// Malformed input gets the canned 400 and the connection is closed.
+	mut out := []u8{}
+	mut tctx := core.Ctx{}
+	assert handle('garbage'.bytes(), mut out, mut tctx) == .close
+	assert out == response.tiny_bad_request_response
 }

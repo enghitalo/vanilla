@@ -1,5 +1,6 @@
 module main
 
+import http_server.core
 import http_server.http1_1.request_parser
 
 // SOLUTION: pure body-parsing unit tests + raw-request E2E through serve().
@@ -14,11 +15,15 @@ import http_server.http1_1.request_parser
 // core limitation is fragmentation across epoll readiness bursts (EAGAIN
 // mid-message), which is rejected with an error — never delivered truncated.
 
-// serve adapts the raw-handler contract (writes into a caller-owned buffer) to
-// the return-a-buffer shape the assertions expect.
+// serve adapts the unified-handler contract (writes into a caller-owned buffer)
+// to the return-a-buffer shape the assertions expect; a .close step maps to an
+// error, mirroring the old error-raising contract.
 fn serve(req []u8) ![]u8 {
 	mut out := []u8{}
-	handle(req, -1, mut out)!
+	mut tctx := core.Ctx{}
+	if handle(req, mut out, mut tctx) == .close {
+		return error('handler closed the connection')
+	}
 	return out
 }
 
@@ -158,7 +163,8 @@ fn test_e2e_unknown_route_is_404() ! {
 }
 
 fn test_e2e_malformed_request_errors() {
-	// Malformed input must surface as a handler error, never a response.
+	// Malformed input must surface as .close (the canned 400 + drop), never a
+	// routed response.
 	if _ := serve('garbage'.bytes()) {
 		assert false, 'garbage request must not produce a response'
 	}

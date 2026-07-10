@@ -1,6 +1,7 @@
 module main
 
 import http_server
+import http_server.core
 import runtime
 
 // ServerConfig.workers sizes each server's worker pool independently. new_server
@@ -10,7 +11,9 @@ import runtime
 // public array lengths verifies the knob end-to-end, deterministically — no
 // sleeps, no real server to start or stop, nothing that can hang CI.
 
-fn noop_handler(req_buffer []u8, _ int, mut out []u8) ! {}
+fn noop_handler(req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+	return .done
+}
 
 // workers:N is honored, and two co-hosted servers size their pools independently.
 fn test_workers_override_sizes_pools_independently() {
@@ -19,7 +22,7 @@ fn test_workers_override_sizes_pools_independently() {
 			port:            18181
 			io_multiplexing: .epoll
 			workers:         5
-			request_handler: noop_handler
+			handler:         noop_handler
 		}) or { panic(err) }
 		assert a.threads.len == 5
 		assert a.inflight.len == 5
@@ -28,7 +31,7 @@ fn test_workers_override_sizes_pools_independently() {
 			port:            18182
 			io_multiplexing: .epoll
 			workers:         9
-			request_handler: noop_handler
+			handler:         noop_handler
 		}) or { panic(err) }
 		assert b.threads.len == 9
 		assert b.inflight.len == 9
@@ -42,7 +45,7 @@ fn test_workers_zero_falls_back_to_default() {
 		mut s := http_server.new_server(http_server.ServerConfig{
 			port:            18183
 			io_multiplexing: .epoll
-			request_handler: noop_handler
+			handler:         noop_handler
 		}) or { panic(err) }
 		assert s.threads.len == runtime.nr_cpus()
 		assert s.inflight.len == runtime.nr_cpus()
@@ -57,7 +60,7 @@ fn test_workers_io_uring_one_listener_per_worker() {
 			port:            18184
 			io_multiplexing: .io_uring
 			workers:         6
-			request_handler: noop_handler
+			handler:         noop_handler
 		}) or { panic(err) }
 		assert s.threads.len == 6
 		assert s.listener_fds.len == 6

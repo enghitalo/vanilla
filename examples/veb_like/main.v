@@ -19,6 +19,7 @@ module main
 //   • bounded — request size / connection limits and read/write timeouts;
 //   • graceful shutdown — SIGTERM/SIGINT drain in-flight work, then exit.
 import http_server
+import http_server.core
 import http_server.http1_1.request_parser { HttpRequest, Slice }
 import os
 
@@ -198,8 +199,12 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: fn [app] (req_buffer []u8, client_conn_fd int, mut out []u8) ! {
-			out << router(req_buffer, client_conn_fd, app)!
+		handler:         fn [app] (req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+			out << router(req_buffer, ctx.client_fd, app) or {
+				out << bad_request_response
+				return .close
+			}
+			return .done
 		}
 		// Production limits: bound resource use so a single client can't exhaust
 		// the server. All default to 0 (unlimited) — set explicitly here.

@@ -4,6 +4,7 @@ module main
 // Percent-decoding is the kind of byte transformation that benefits most from
 // table-driven tests, including the SECURITY case: decode exactly once.
 // (`${}` and `.bytes()` here are test scaffolding — fine outside the handler.)
+import http_server.core
 
 fn test_percent_decode() {
 	assert percent_decode('hello%20world'.bytes()) == 'hello world'
@@ -36,80 +37,82 @@ fn test_parse_form() {
 // The JSON pair order follows V map insertion order; contains() per pair keeps
 // the asserts robust to that.
 
-fn test_get_query_is_decoded() ! {
+fn test_get_query_is_decoded() {
 	req := 'GET /x?q=hello%20world&tag=c%2B%2B HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
-	out := serve(req)!.bytestr()
+	out := serve(req).bytestr()
 	assert out.contains('200 OK')
 	assert out.contains('"q":"hello world"')
 	assert out.contains('"tag":"c++"')
 }
 
-fn test_plus_as_space_through_full_request() ! {
+fn test_plus_as_space_through_full_request() {
 	req := 'GET /x?msg=a+b HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
-	assert serve(req)!.bytestr().contains('"msg":"a b"')
+	assert serve(req).bytestr().contains('"msg":"a b"')
 }
 
-fn test_empty_query_is_empty_object() ! {
+fn test_empty_query_is_empty_object() {
 	req := 'GET /x? HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
-	out := serve(req)!.bytestr()
+	out := serve(req).bytestr()
 	assert out.contains('200 OK')
 	assert out.contains('{}')
 }
 
-fn test_post_form_body_is_decoded() ! {
+fn test_post_form_body_is_decoded() {
 	body := 'q=hello%20world&tag=c%2B%2B'
 	req :=
 		'POST /submit HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: ${body.len}\r\n\r\n${body}'.bytes()
-	out := serve(req)!.bytestr()
+	out := serve(req).bytestr()
 	assert out.contains('200 OK')
 	assert out.contains('"q":"hello world"')
 	assert out.contains('"tag":"c++"')
 }
 
-fn test_post_content_type_is_case_insensitive() ! {
+fn test_post_content_type_is_case_insensitive() {
 	// RFC 9110 §8.3.1: media types are case-insensitive — odd casing must
 	// still parse (behavior improvement over the old case-sensitive check).
 	body := 'k=v'
 	req :=
 		'POST /submit HTTP/1.1\r\nHost: x\r\nContent-Type: Application/X-WWW-Form-URLencoded\r\nContent-Length: ${body.len}\r\n\r\n${body}'.bytes()
-	assert serve(req)!.bytestr().contains('"k":"v"')
+	assert serve(req).bytestr().contains('"k":"v"')
 }
 
-fn test_post_form_with_charset_suffix() ! {
+fn test_post_form_with_charset_suffix() {
 	body := 'k=v'
 	req :=
 		'POST /submit HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded; charset=UTF-8\r\nContent-Length: ${body.len}\r\n\r\n${body}'.bytes()
-	assert serve(req)!.bytestr().contains('"k":"v"')
+	assert serve(req).bytestr().contains('"k":"v"')
 }
 
-fn test_post_non_form_content_type_not_parsed() ! {
+fn test_post_non_form_content_type_not_parsed() {
 	body := 'k=v'
 	req :=
 		'POST /submit HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: ${body.len}\r\n\r\n${body}'.bytes()
-	out := serve(req)!.bytestr()
+	out := serve(req).bytestr()
 	assert out.contains('200 OK')
 	assert out.contains('{}') // body must NOT be parsed as a form
 	assert !out.contains('"k"')
 }
 
-fn test_json_echo_escapes_user_input() ! {
+fn test_json_echo_escapes_user_input() {
 	// %22 -> '"' — echoed unescaped this would be broken, injectable JSON.
 	req := 'GET /x?q=a%22b HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
-	out := serve(req)!.bytestr()
+	out := serve(req).bytestr()
 	assert out.contains('"q":"a\\"b"') // the quote arrives escaped
 }
 
 fn test_malformed_request_errors() {
-	// Malformed input must surface as a handler error, never a response.
-	if _ := serve('garbage'.bytes()) {
-		assert false, 'garbage request must not produce a response'
-	}
+	// Malformed input must append the canned 400 and close the connection.
+	mut out := []u8{}
+	mut tctx := core.Ctx{}
+	assert handle('garbage'.bytes(), mut out, mut tctx) == .close
+	assert out.bytestr().contains('400 Bad Request')
 }
 
 // serve adapts the raw-handler contract (writes into a caller-owned buffer) to
 // the return-a-buffer shape the assertions expect.
-fn serve(req []u8) ![]u8 {
+fn serve(req []u8) []u8 {
 	mut out := []u8{}
-	handle(req, -1, mut out)!
+	mut tctx := core.Ctx{}
+	assert handle(req, mut out, mut tctx) == .done
 	return out
 }

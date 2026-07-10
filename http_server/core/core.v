@@ -33,27 +33,17 @@ fn worker_count() int {
 	return runtime.nr_cpus()
 }
 
-// RequestHandler is the raw, zero-allocation handler contract: it receives the
-// complete request bytes (a view into the connection's read buffer — copy
-// anything that must outlive the call) and APPENDS the complete raw HTTP
-// response (status line + headers + body) to `out`, the connection's
-// persistent write buffer. The server owns `out`: it batches everything
-// appended during one readiness event into a single send and reuses the
-// buffer across requests — the handler must never free or keep it.
-//
-// Static routes append a precomputed `const ... .bytes()`; dynamic routes
-// append a const prefix, the Content-Length digits, '\r\n\r\n' and the body.
-// Returning an error sends 400 and closes the connection.
-pub type RequestHandler = fn (req []u8, fd int, mut out []u8) !
-
-// --- Async runtime (opt-in) -------------------------------------------------
-//
-// AsyncStep is what an async handler / continuation returns to the worker:
-//   .done    — the response is in `out`; the worker sends it and unparks the conn
-//   .suspend — the handler/continuation registered a watch (ac.watch); the conn
-//              stays parked until that fd is ready (multi-step chains re-suspend)
-//   .close   — error; the worker drops the connection
-pub enum AsyncStep {
+// Step is what a handler / continuation returns to the worker:
+//   .done    — the response is complete in `res`; the worker sends it (and, for
+//              a resumed continuation, unparks the connection)
+//   .suspend — the handler/continuation registered a watch (ctx.watch); the
+//              connection stays parked until that fd is ready (multi-step
+//              chains re-suspend)
+//   .close   — finish this connection: whatever is in `res` is flushed, then
+//              the connection is closed. Append an error response (e.g.
+//              response.tiny_bad_request_response) before returning .close if
+//              the client should see one.
+pub enum Step {
 	done
 	suspend
 	close
@@ -68,37 +58,56 @@ pub enum WatchInterest {
 	writable
 }
 
-// WakeFn is a continuation: it runs when a watched fd (ac.ready_fd) becomes
-// ready, may append the response to `out`, and returns the next AsyncStep.
-pub type WakeFn = fn (mut out []u8, mut ac AsyncCtx) AsyncStep
+// WakeFn is a continuation: it runs when a watched fd (ctx.ready_fd) becomes
+// ready, may append the response to `res`, and returns the next Step.
+pub type WakeFn = fn (mut res []u8, mut ctx Ctx) Step
 
-// AsyncHandler is the opt-in async request handler. Like RequestHandler it gets
-// the request bytes and the connection write buffer, but instead of always
-// producing a response it can PARK the request on any fd via `ac.watch(...)` and
-// return .suspend — the worker resumes the registered continuation when that fd
-// is ready, all in the same epoll loop. The DB driver, a reverse proxy, timers,
-// and SSE/WebSocket backpressure are all consumers of this one primitive.
-pub type AsyncHandler = fn (req []u8, mut out []u8, mut ac AsyncCtx) AsyncStep
+// Handler is THE request handler contract — one signature for every use case:
+// static routes, per-worker state, and async/parked requests. It receives the
+// complete request bytes (a view into the connection's read buffer — copy
+// anything that must outlive the call) and APPENDS the complete raw HTTP
+// response (status line + headers + body) to `res`, the connection's
+// persistent write buffer. The server owns `res`: it batches everything
+// appended during one readiness event into a single send and reuses the
+// buffer across requests — the handler must never free or keep it.
+//
+// Static routes append a precomputed `const ... .bytes()` and return .done;
+// dynamic routes append a const prefix, the Content-Length digits, '\r\n\r\n'
+// and the body. On a bad request, append the canned error response and return
+// .close. A handler that must wait on something (a DB socket, an upstream,
+// a timer, client writability) PARKS the request on that fd via
+// `ctx.watch(...)` and returns .suspend — the worker resumes the registered
+// continuation when the fd is ready, all in the same event loop. The DB
+// driver, a reverse proxy, timers, and SSE/WebSocket backpressure are all
+// consumers of that one primitive.
+//
+// Per-worker state (a thread-local DB connection, reused render scratch) is
+// reachable via ctx.state — the value ServerConfig.make_state returned on THIS
+// worker thread (nil when no make_state is configured). The client's fd is
+// ctx.client_fd.
+pub type Handler = fn (req []u8, mut res []u8, mut ctx Ctx) Step
 
-// RegisterFn is the backend-installed watch-registration hook (see AsyncCtx.register).
+// RegisterFn is the backend-installed watch-registration hook (see Ctx.register).
 // A NAMED fn type, not an inline one on the field: on recent V (c0624b274) calling an
 // inline-fn-typed struct field mis-resolves its parameter types and errors with
 // "cannot use WatchInterest as WatchInterest" — a named alias resolves the signature
 // canonically. (A vlang/v function-pointer-field checker quirk.)
-pub type RegisterFn = fn (mut ac AsyncCtx, ext_fd int, interest WatchInterest, cont WakeFn, udata voidptr)
+pub type RegisterFn = fn (mut ctx Ctx, ext_fd int, interest WatchInterest, cont WakeFn, udata voidptr)
 
-// AsyncCtx is the per-invocation handle a handler/continuation uses to await an
-// fd. The backend fills it in and installs `register`; handlers only call
-// watch()/ready_fd()/udata()/state(). It is the layering bridge: `core` owns the
-// type and the handler contract, the epoll backend owns the registration logic
-// (added via the `register` fn pointer), so `core` stays backend-free.
-pub struct AsyncCtx {
+// Ctx is the per-invocation handle a handler/continuation uses to reach the
+// runtime: the client fd (client_fd), this worker's per-thread state (state),
+// and the await-an-fd primitive (watch/watch_persistent/ready_fd/ready_err).
+// The backend fills it in and installs `register`. It is the layering bridge:
+// `core` owns the type and the handler contract, each backend owns the
+// registration logic (added via the `register` fn pointer), so `core` stays
+// backend-free.
+pub struct Ctx {
 pub mut:
 	client_fd    int
 	ready_fd     int = -1 // the fd that woke this continuation (-1 on the initial call)
 	ready_err    bool    // backend-filled: ready_fd woke with an error/hangup (epoll EPOLLERR|EPOLLHUP, kqueue EV_ERROR|EV_EOF), not normal readiness — the watched fd is dead, release it
 	udata        voidptr // consumer context carried from watch() to the continuation
-	state        voidptr // this worker's per-thread state (see StatefulHandler/make_state)
+	state        voidptr // this worker's per-thread state (see make_state on ServerConfig)
 	loop_fd      int     // backend-filled: the worker's event-loop fd (epoll on Linux, kqueue on macOS)
 	reactor      voidptr // backend-filled: the worker's watch registry
 	last_watched int = -1 // backend-filled: the fd passed to the most recent watch()
@@ -115,9 +124,9 @@ pub mut:
 
 // watch parks the current request and asks the worker to call `cont` when
 // `ext_fd` becomes ready for `interest` (readable/writable). `udata` is handed
-// back to the continuation via ac.udata. After calling watch, return .suspend.
-pub fn (mut ac AsyncCtx) watch(ext_fd int, interest WatchInterest, cont WakeFn, udata voidptr) {
-	ac.register(mut ac, ext_fd, interest, cont, udata)
+// back to the continuation via ctx.udata. After calling watch, return .suspend.
+pub fn (mut ctx Ctx) watch(ext_fd int, interest WatchInterest, cont WakeFn, udata voidptr) {
+	ctx.register(mut ctx, ext_fd, interest, cont, udata)
 }
 
 // watch_persistent is watch() for an fd the CALLER owns and reuses across
@@ -127,15 +136,15 @@ pub fn (mut ac AsyncCtx) watch(ext_fd int, interest WatchInterest, cont WakeFn, 
 // and a fresh auth handshake). Use it only for fds whose lifetime you manage;
 // per-request fds (timerfd, pipe) must use watch() so they are closed on
 // disconnect and do not leak.
-pub fn (mut ac AsyncCtx) watch_persistent(ext_fd int, interest WatchInterest, cont WakeFn, udata voidptr) {
-	ac.persistent = true
-	ac.register(mut ac, ext_fd, interest, cont, udata)
-	ac.persistent = false
+pub fn (mut ctx Ctx) watch_persistent(ext_fd int, interest WatchInterest, cont WakeFn, udata voidptr) {
+	ctx.persistent = true
+	ctx.register(mut ctx, ext_fd, interest, cont, udata)
+	ctx.persistent = false
 }
 
 // ready_fd is the fd that woke the running continuation (-1 on the initial call).
-pub fn (ac &AsyncCtx) ready_fd() int {
-	return ac.ready_fd
+pub fn (ctx &Ctx) ready_fd() int {
+	return ctx.ready_fd
 }
 
 // ready_err reports whether ready_fd became ready because of an error or hangup
@@ -145,50 +154,33 @@ pub fn (ac &AsyncCtx) ready_fd() int {
 // it) instead of re-arming, otherwise a level-triggered watch on a dead fd
 // re-fires every loop iteration (a busy-spin). It is a portable boolean on
 // purpose: handlers never name a platform event constant (cf. WatchInterest).
-pub fn (ac &AsyncCtx) ready_err() bool {
-	return ac.ready_err
+pub fn (ctx &Ctx) ready_err() bool {
+	return ctx.ready_err
 }
 
 // WorkerStartFn runs ONCE per worker thread, right after make_state and before
-// the event loop, ON the worker thread. It receives an AsyncCtx whose client_fd
+// the event loop, ON the worker thread. It receives a Ctx whose client_fd
 // is -1 (there is no request): use it to arm CLIENTLESS background watches via
-// ac.watch — e.g. a periodic timerfd that refreshes per-worker state, a signalfd,
+// ctx.watch — e.g. a periodic timerfd that refreshes per-worker state, a signalfd,
 // or an inotify fd. Such a watch's continuation later runs on this worker's loop
-// with the same -1 client_fd and is handed a scratch (ignored) `out` buffer.
-// ac.state is this worker's make_state value, or nil when no make_state is set
+// with the same -1 client_fd and is handed a scratch (ignored) `res` buffer.
+// ctx.state is this worker's make_state value, or nil when no make_state is set
 // (a stateless watch is fine; a stateful one must configure make_state).
 //
 // CONTRACT for a clientless continuation (a core.WakeFn):
-//   - To keep the watch alive, re-arm THE SAME fd (`ac.watch(ac.ready_fd(), ...)`)
+//   - To keep the watch alive, re-arm THE SAME fd (`ctx.watch(ctx.ready_fd(), ...)`)
 //     and return .suspend — the periodic-refresh pattern; the fd then lives for
 //     the worker's whole lifetime and is never timed out or torn down as a conn.
-//   - Do NOT close ac.ready_fd() yourself: on .done/.close the runtime detaches
+//   - Do NOT close ctx.ready_fd() yourself: on .done/.close the runtime detaches
 //     AND closes it (avoiding an fd-reuse race); if you re-arm a DIFFERENT fd the
 //     runtime only detaches the old one (you still own and must close it).
-//   - Check ac.ready_err(): if the fd woke with an error/hangup, return .done or
+//   - Check ctx.ready_err(): if the fd woke with an error/hangup, return .done or
 //     .close (do NOT re-arm) — a re-armed watch on a dead level-triggered fd
 //     busy-spins. (A timerfd never hangs up, so a refresh watch can ignore it.)
 //
-// It composes with ANY handler path (request_handler / stateful_handler /
-// async_handler): the background watch shares the worker's epoll loop with normal
-// request handling. epoll backend only.
-pub type WorkerStartFn = fn (mut ac AsyncCtx)
-
-// StatefulHandler is the per-thread-state variant of RequestHandler. It receives
-// the same arguments PLUS an opaque `state voidptr` — the value the server's
-// `make_state` callback returned for THIS worker thread (and only this one). It
-// lets a handler reach per-thread resources (e.g. its own DB connection) with no
-// lock: each worker owns its state, so nothing is shared across threads.
-//
-// The server never inspects `state`; it hands back exactly the pointer make_state
-// produced, so the handler's `unsafe { &MyCtx(state) }` cast is sound. This is the
-// same opaque-context contract as picoev's `cb_arg` or libuv's `data` void*.
-//
-// Wiring: set `make_state` + `stateful_handler` on ServerConfig instead of
-// `request_handler`. Each worker calls make_state ONCE, then every request on that
-// worker is dispatched through stateful_handler with that state. RequestHandler is
-// untouched, so stateless handlers and the other backends are unaffected.
-pub type StatefulHandler = fn (req []u8, fd int, mut out []u8, state voidptr) !
+// The background watch shares the worker's epoll loop with normal request
+// handling. epoll backend only.
+pub type WorkerStartFn = fn (mut ctx Ctx)
 
 // Counter is a single i64 padded to a full cache line, so independent counters
 // (per-worker in-flight, global active-connections) never false-share. Mutated

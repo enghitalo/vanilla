@@ -28,7 +28,9 @@ module main
 //   - The only per-request-path allocations left are Store.create's owned
 //     strings, and those run per LOGIN, not per request (see new_token).
 import http_server
+import http_server.core
 import http_server.http1_1.request_parser
+import http_server.http1_1.response
 import sync
 import crypto.rand
 import encoding.hex
@@ -179,8 +181,11 @@ fn slice_eq(buf []u8, s request_parser.Slice, lit string) bool {
 	return true
 }
 
-fn handle(req_buffer []u8, _ int, mut out []u8, mut store Store) ! {
-	req := request_parser.decode_http_request(req_buffer)!
+fn handle(req_buffer []u8, mut out []u8, mut ctx core.Ctx, mut store Store) core.Step {
+	req := request_parser.decode_http_request(req_buffer) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
 
 	if slice_eq(req.buffer, req.path, '/login') {
 		// (Authenticate first — see examples/auth.) Then mint a session.
@@ -193,19 +198,19 @@ fn handle(req_buffer []u8, _ int, mut out []u8, mut store Store) ! {
 	} else if slice_eq(req.buffer, req.path, '/me') {
 		c := req.get_header_value_slice('Cookie') or {
 			out << resp_401
-			return
+			return .done
 		}
 		vstart, vlen := cookie_value(req.buffer, c.start, c.len, 'sid')
 		if vlen <= 0 { // absent or empty sid — also guards &buf[vstart] below
 			out << resp_401
-			return
+			return .done
 		}
 		// Zero-copy lookup key: a string VIEW into the request buffer. Only
 		// valid because get() never retains it — see the Store.get comment.
 		sid := unsafe { tos(&req.buffer[vstart], vlen) }
 		sess := store.get(sid) or {
 			out << resp_401
-			return
+			return .done
 		}
 		// {"user":"<id>"} — const head, computed Content-Length via wi, then
 		// the three body parts via ws. No intermediate body string (§3b).
@@ -221,6 +226,7 @@ fn handle(req_buffer []u8, _ int, mut out []u8, mut store Store) ! {
 	} else {
 		out << resp_404
 	}
+	return .done
 }
 
 fn main() {
@@ -236,8 +242,8 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: fn [mut store] (req_buffer []u8, fd int, mut out []u8) ! {
-			handle(req_buffer, fd, mut out, mut store)!
+		handler:         fn [mut store] (req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+			return handle(req_buffer, mut out, mut ctx, mut store)
 		}
 	})!
 	println('Cookies/sessions demo on http://localhost:3000/  (/login, /me, /logout)')

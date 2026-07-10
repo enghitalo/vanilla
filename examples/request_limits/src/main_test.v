@@ -1,21 +1,24 @@
 module main
 
+import http_server.core
+
 // Size limits are now enforced by the CORE (the read loop), not the handler —
 // so the handler stays trivial and the limit behavior is tested where it lives:
 // `frame_request_length_lim` in request_parser_test.v (413 from Content-Length
 // before buffering; 431 for oversized header blocks). This file just confirms
 // the handler is a plain 200 and the timeout protections still to come.
 
-fn test_handler_is_trivial_200() ! {
+fn test_handler_is_trivial_200() {
 	req := 'POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n0123456789'.bytes()
-	assert serve(req)!.bytestr().contains('200 OK')
+	assert serve(req).bytestr().contains('200 OK')
 }
 
 // serve adapts the raw-handler contract (writes into a caller-owned buffer) to
 // the return-a-buffer shape the assertions expect.
-fn serve(req []u8) ![]u8 {
+fn serve(req []u8) []u8 {
 	mut out := []u8{}
-	handle(req, -1, mut out)!
+	mut tctx := core.Ctx{}
+	assert handle(req, mut out, mut tctx) == .done
 	return out
 }
 

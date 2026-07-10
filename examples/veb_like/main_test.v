@@ -1,7 +1,9 @@
 module main
 
+import http_server.core
+
 // Exhaustive coverage of every route TYPE the router supports. Each case drives
-// the real router() through the same closure shape as ServerConfig.request_handler
+// the real router() through the same closure shape as ServerConfig.handler
 // (BEST_PRACTICES §9: handlers are pure, so tests feed raw request bytes — no
 // listening socket needed) and checks status / headers / body.
 // `${}` interpolation is fine HERE: tests are scaffolding, not hot-path code.
@@ -18,16 +20,23 @@ module main
 //   GET  /files/*path                                         catch-all (wildcard)
 //   GET  /proxy/*upstream                                     catch-all (wildcard)
 
-// serve adapts the raw-handler contract (writes into a caller-owned buffer) to
-// the return-a-string shape the assertions expect — the closure below is the
-// exact request_handler wired in main().
+// serve adapts the unified handler contract (writes into a caller-owned
+// buffer) to the return-a-string shape the assertions expect — the closure
+// below is the exact handler wired in main().
 fn serve(raw string) string {
 	app := App{}
-	handler := fn [app] (req_buffer []u8, client_conn_fd int, mut out []u8) ! {
-		out << router(req_buffer, client_conn_fd, app)!
+	handler := fn [app] (req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+		out << router(req_buffer, ctx.client_fd, app) or {
+			out << bad_request_response
+			return .close
+		}
+		return .done
 	}
 	mut out := []u8{}
-	handler(raw.bytes(), -1, mut out) or { panic('handler error: ${err}') }
+	mut tctx := core.Ctx{
+		client_fd: -1
+	}
+	handler(raw.bytes(), mut out, mut tctx)
 	return out.bytestr()
 }
 

@@ -12,7 +12,7 @@ module main
 //        # -> "stage A done (80ms), then stage B done (140ms)" after ~220ms
 //
 // The worker is free between stages, so many /chain requests overlap their waits
-// instead of serializing. See core.AsyncHandler / core.WakeFn.
+// instead of serializing. See core.Handler / core.WakeFn.
 import http_server
 import http_server.core
 
@@ -43,26 +43,26 @@ fn drain_close(fd int) {
 	C.close(fd)
 }
 
-fn handle(req []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
+fn handle(req []u8, mut out []u8, mut ctx core.Ctx) core.Step {
 	if !req.bytestr().contains('/chain') {
 		out << not_found
 		return .done
 	}
-	ac.watch(one_shot_timer(80), .readable, after_a, unsafe { nil }) // stage A
+	ctx.watch(one_shot_timer(80), .readable, after_a, unsafe { nil }) // stage A
 	return .suspend
 }
 
 // after_a runs when timer A fires: close it, then arm a DIFFERENT fd (timer B)
 // and park again — demonstrating that a continuation can re-watch a new fd.
-fn after_a(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
-	drain_close(ac.ready_fd())
-	ac.watch(one_shot_timer(140), .readable, after_b, unsafe { nil }) // stage B
+fn after_a(mut out []u8, mut ctx core.Ctx) core.Step {
+	drain_close(ctx.ready_fd())
+	ctx.watch(one_shot_timer(140), .readable, after_b, unsafe { nil }) // stage B
 	return .suspend
 }
 
 // after_b runs when timer B fires: close it and produce the response.
-fn after_b(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
-	drain_close(ac.ready_fd())
+fn after_b(mut out []u8, mut ctx core.Ctx) core.Step {
+	drain_close(ctx.ready_fd())
 	body := 'stage A done (80ms), then stage B done (140ms)'
 	out << 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ${body.len}\r\nConnection: keep-alive\r\n\r\n${body}'.bytes()
 	return .done
@@ -72,7 +72,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            8094
 		io_multiplexing: .epoll
-		async_handler:   handle
+		handler:         handle
 	})!
 	server.run()
 }

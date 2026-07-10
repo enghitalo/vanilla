@@ -12,6 +12,7 @@ module main
 //   - Controllers append STRAIGHT INTO the caller-owned `out` buffer; static
 //     responses are consts appended with `out <<` (see controllers.v).
 import http_server
+import http_server.core
 import http_server.http1_1.request_parser
 import http_server.http1_1.response
 
@@ -33,17 +34,20 @@ fn slice_eq(buf []u8, s request_parser.Slice, lit string) bool {
 }
 
 @[direct_array_access]
-fn handle_request(req_buffer []u8, client_conn_fd int, mut out []u8) ! {
-	req := request_parser.decode_http_request(req_buffer)!
+fn handle_request(req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+	req := request_parser.decode_http_request(req_buffer) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
 
 	if slice_eq(req.buffer, req.method, 'GET') {
 		if slice_eq(req.buffer, req.path, '/') {
 			home_controller(mut out)
-			return
+			return .done
 		}
 		if slice_eq(req.buffer, req.path, '/users') {
 			get_users_controller(mut out)
-			return
+			return .done
 		}
 		// `/user/<id>`: prefix compare in place by offsets. The `>` (not `>=`)
 		// guard demands at least one id byte, so `GET /user/` (empty id) is a
@@ -59,26 +63,27 @@ fn handle_request(req_buffer []u8, client_conn_fd int, mut out []u8) ! {
 				// consumed by the controller before this call returns.
 				id := unsafe { (&req.buffer[req.path.start + prefix.len]).vbytes(req.path.len - prefix.len) }
 				get_user_controller(id, mut out)
-				return
+				return .done
 			}
 		}
 		out << response.tiny_bad_request_response
-		return
+		return .done
 	}
 	if slice_eq(req.buffer, req.method, 'POST') {
 		if slice_eq(req.buffer, req.path, '/user') {
 			create_user_controller(mut out)
-			return
+			return .done
 		}
 	}
 	out << response.tiny_bad_request_response
+	return .done
 }
 
 fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: unsafe { http_server.IOBackend(0) }
-		request_handler: handle_request
+		handler:         handle_request
 	})!
 	server.run()
 }

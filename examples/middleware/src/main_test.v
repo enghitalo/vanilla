@@ -1,6 +1,7 @@
 module main
 
 import os
+import http_server.core
 
 // Pure tests for the middleware reference design. Three layers:
 //   1. the composition mechanics (chain order, single-alloc header injection);
@@ -40,22 +41,28 @@ fn test_inject_headers_noop_without_status_line() {
 // body's suffix order reveals the nesting (pure data flow, no shared state).
 fn tag_mw(tag string) Middleware {
 	return fn [tag] (next Handler) Handler {
-		return fn [tag, next] (req []u8, fd int, mut out []u8) ! {
-			next(req, fd, mut out)!
+		return fn [tag, next] (req []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+			step := next(req, mut out, mut ctx)
+			if step != .done {
+				return step
+			}
 			out << tag.bytes()
+			return .done
 		}
 	}
 }
 
 fn test_chain_runs_outermost_first() {
-	base := fn (req []u8, fd int, mut out []u8) ! {
+	base := fn (req []u8, mut out []u8, mut ctx core.Ctx) core.Step {
 		out << 'app'.bytes()
+		return .done
 	}
 	// A is OUTERMOST: it wraps B, which wraps app. On the way out the response
 	// unwinds app -> B -> A, so A's tag lands LAST.
 	h := chain(base, tag_mw('A'), tag_mw('B'))
 	mut out := []u8{}
-	h('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), -1, mut out)!
+	mut tctx := core.Ctx{}
+	assert h('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), mut out, mut tctx) == .done
 	assert out.bytestr() == 'appBA'
 }
 
@@ -69,7 +76,10 @@ fn serve(target string, auth string) string {
 	}
 	raw += '\r\n'
 	mut out := []u8{}
-	handler(raw.bytes(), -1, mut out) or { return 'ERR' }
+	mut tctx := core.Ctx{}
+	if handler(raw.bytes(), mut out, mut tctx) == .close {
+		return 'ERR'
+	}
 	return out.bytestr()
 }
 

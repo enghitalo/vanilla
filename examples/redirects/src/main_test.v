@@ -5,6 +5,7 @@ module main
 // direct assertion. This is the cheapest, most deterministic layer.
 // (.bytestr()/string helpers are fine HERE — tests are scaffolding, not the
 // hot path.)
+import http_server.core
 
 fn test_safe_next_rejects_offsite() {
 	assert safe_next('/dashboard'.bytes()) == '/dashboard'.bytes() // same-origin relative: ok
@@ -94,6 +95,11 @@ fn test_malformed_requests_error() {
 // the return-a-buffer shape the assertions expect.
 fn serve(req []u8) ![]u8 {
 	mut out := []u8{}
-	handle(req, -1, mut out)!
+	mut tctx := core.Ctx{
+		client_fd: -1
+	}
+	if handle(req, mut out, mut tctx) == .close {
+		return error('handler closed the connection')
+	}
 	return out
 }

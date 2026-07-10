@@ -23,6 +23,7 @@ module main
 // never the one being written (the writer touches `1 - active`), so there are no
 // torn reads, no mutex, and no pointer-as-integer tricks for the GC to mishandle.
 import http_server
+import http_server.core
 import time
 import sync.stdatomic
 
@@ -101,7 +102,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: fn [cache] (req_buffer []u8, fd int, mut out []u8) ! {
+		handler:         fn [cache] (req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
 			// Zero per-request allocation: append the two static halves and the
 			// pre-built cached Date line (one atomic load, zero-copy slice) straight
 			// into the server-owned `out` buffer — no per-request strings.Builder, no
@@ -109,6 +110,7 @@ fn main() {
 			out << status_head
 			out << cache.date_line()
 			out << resp_tail
+			return .done
 		}
 	})!
 	println('Date-header demo on http://localhost:3000/  (cached, refreshed 1x/s)')

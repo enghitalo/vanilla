@@ -32,7 +32,9 @@ module main
 // with injected peers. On Windows peer_addr returns '' by design (as it does
 // on getpeername failure); '' is an UNTRUSTED peer with identity 'unknown'.
 import http_server
+import http_server.core
 import http_server.http1_1.request_parser
+import http_server.http1_1.response
 import http_server.socket
 import strconv
 
@@ -197,11 +199,14 @@ fn wi(mut out []u8, n i64) {
 	}
 }
 
-fn handle(req_buffer []u8, fd int, mut out []u8) ! {
-	req := request_parser.decode_http_request(req_buffer)!
+fn handle(req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+	req := request_parser.decode_http_request(req_buffer) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
 	// socket.peer_addr: the deliberate one-syscall/one-string exception — see
 	// the header comment. The trust logic itself stays pure.
-	client := real_client_ip(req, socket.peer_addr(fd))
+	client := real_client_ip(req, socket.peer_addr(ctx.client_fd))
 	// X-Forwarded-Proto as a zero-copy view (len > 0 guard), const fallback.
 	// It is client-settable like XFF — a production service should gate it on
 	// the same peer trust; the demo echoes it to show the read.
@@ -219,6 +224,7 @@ fn handle(req_buffer []u8, fd int, mut out []u8) ! {
 	ws(mut out, body_mid)
 	ws(mut out, proto)
 	ws(mut out, body_tail)
+	return .done
 }
 
 fn main() {
@@ -233,7 +239,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: handle
+		handler:         handle
 	})!
 	println('Proxy-aware demo on http://localhost:3000/  (trust rule: see header comment)')
 	server.run()

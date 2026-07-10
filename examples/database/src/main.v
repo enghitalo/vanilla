@@ -1,36 +1,53 @@
 module main
 
 import http_server
+import http_server.core
 import http_server.http1_1.response
 import http_server.http1_1.request_parser
 import db.pg
 
-fn handle_request(req_buffer []u8, client_conn_fd int, mut out []u8, mut pool ConnectionPool) ! {
-	req := request_parser.decode_http_request(req_buffer)!
+fn handle_request(req_buffer []u8, mut out []u8, mut pool ConnectionPool) core.Step {
+	req := request_parser.decode_http_request(req_buffer) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
 
 	method := unsafe { tos(&req.buffer[req.method.start], req.method.len) }
 	path := unsafe { tos(&req.buffer[req.path.start], req.path.len) }
 
 	if method == 'GET' {
 		if path == '/' {
-			out << home_controller([])!
-			return
+			out << home_controller([]) or {
+				out << response.tiny_bad_request_response
+				return .close
+			}
+			return .done
 		} else if path.starts_with('/user/') {
 			id := path[6..]
-			out << get_user_controller([id], mut pool)!
-			return
+			out << get_user_controller([id], mut pool) or {
+				out << response.tiny_bad_request_response
+				return .close
+			}
+			return .done
 		} else if path == '/user' {
-			out << get_users_controller([], mut pool)!
-			return
+			out << get_users_controller([], mut pool) or {
+				out << response.tiny_bad_request_response
+				return .close
+			}
+			return .done
 		}
 	} else if method == 'POST' {
 		if path == '/user' {
-			out << create_user_controller([], mut pool)!
-			return
+			out << create_user_controller([], mut pool) or {
+				out << response.tiny_bad_request_response
+				return .close
+			}
+			return .done
 		}
 	}
 
 	out << response.tiny_bad_request_response
+	return .done
 }
 
 fn main() {
@@ -53,8 +70,8 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: unsafe { http_server.IOBackend(0) }
-		request_handler: fn [mut pool] (req_buffer []u8, client_conn_fd int, mut out []u8) ! {
-			handle_request(req_buffer, client_conn_fd, mut out, mut pool)!
+		handler:         fn [mut pool] (req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+			return handle_request(req_buffer, mut out, mut pool)
 		}
 	})!
 

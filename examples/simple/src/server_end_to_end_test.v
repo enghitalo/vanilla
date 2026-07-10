@@ -13,7 +13,7 @@ fn test_server_end_to_end() ! {
 
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            8082
-		request_handler: handle_request
+		handler:         handle_request
 		io_multiplexing: unsafe { http_server.IOBackend(0) }
 	})!
 	responses := server.test(requests) or { panic('[test] server.test failed: ${err}') }

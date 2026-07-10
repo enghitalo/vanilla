@@ -34,7 +34,9 @@ module main
 //   - The response is framed with a const prefix + `wi`/`ws` appends; the JSON
 //     body is genuinely dynamic (map echo), so it gets ONE strings.Builder.
 import http_server
+import http_server.core
 import http_server.http1_1.request_parser
+import http_server.http1_1.response
 import strconv
 import strings
 
@@ -211,8 +213,11 @@ fn write_json_escaped(mut sb strings.Builder, s string) {
 const resp_prefix = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '.bytes()
 
 @[direct_array_access]
-fn handle(req_buffer []u8, _ int, mut out []u8) ! {
-	req := request_parser.decode_http_request(req_buffer)!
+fn handle(req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+	req := request_parser.decode_http_request(req_buffer) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
 
 	// Query string case: find '?' IN PLACE over the path bytes.
 	mut decoded := map[string]string{}
@@ -254,6 +259,7 @@ fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 	wi(mut out, body.len)
 	ws(mut out, '\r\n\r\n')
 	out << body
+	return .done
 }
 
 fn main() {
@@ -268,7 +274,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: handle
+		handler:         handle
 	})!
 	println('URL/form decoding demo on http://localhost:3000/  (try /x?q=hello%20world&tag=c%2B%2B)')
 	server.run()

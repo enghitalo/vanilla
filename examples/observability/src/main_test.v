@@ -5,6 +5,7 @@ module main
 // are pure given the registry, so they're directly assertable — and the raw
 // requests go through the FULL observed() wrapper (the example's core lesson)
 // via the serve() adapter, no listening socket required (BEST_PRACTICES §9).
+import http_server.core
 
 fn test_status_of() {
 	assert status_of('HTTP/1.1 200 OK\r\n\r\n'.bytes(), 0) == 200
@@ -88,8 +89,8 @@ fn test_unknown_path_gets_empty_200() ! {
 }
 
 fn test_malformed_request_errors_and_counts_5xx() {
-	// Malformed input must surface as a handler error, never a response —
-	// and the wrapper must record it as a 500.
+	// Malformed input must close the connection (canned 400), never a normal
+	// response — and the wrapper must record it as a 500.
 	mut m := &Metrics{}
 	if _ := serve('garbage'.bytes(), mut m) {
 		assert false, 'garbage request must not produce a response'
@@ -105,10 +106,13 @@ fn test_malformed_request_errors_and_counts_5xx() {
 // + metrics + app — and adapts the append-into-out contract to the
 // return-a-buffer shape the assertions expect (BEST_PRACTICES §9).
 fn serve(req []u8, mut m Metrics) ![]u8 {
-	handler := observed(fn [mut m] (req_buffer []u8, fd int, mut out []u8) ! {
-		app(req_buffer, fd, mut m, mut out)!
+	handler := observed(fn [mut m] (req_buffer []u8, mut out []u8) ! {
+		app(req_buffer, mut m, mut out)!
 	}, mut m)
 	mut out := []u8{}
-	handler(req, -1, mut out)!
+	mut tctx := core.Ctx{}
+	if handler(req, mut out, mut tctx) == .close {
+		return error('handler closed the connection')
+	}
 	return out
 }
