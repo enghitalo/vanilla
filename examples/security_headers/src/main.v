@@ -21,7 +21,9 @@ module main
 //
 // WORKS TODAY.
 import http_server
+import http_server.core
 import http_server.http1_1.request_parser
+import http_server.http1_1.response
 
 const security_headers = 'Strict-Transport-Security: max-age=63072000; includeSubDomains\r\n' +
 	"Content-Security-Policy: default-src 'self'\r\n" + 'X-Content-Type-Options: nosniff\r\n' +
@@ -30,24 +32,32 @@ const security_headers = 'Strict-Transport-Security: max-age=63072000; includeSu
 
 // with_security_headers wraps any handler and injects the headers into its
 // response, right after the status line. Composition, not inheritance.
-fn with_security_headers(next fn (req []u8, fd int, mut out []u8) !) fn (req []u8, fd int, mut out []u8) ! {
-	return fn [next] (req_buffer []u8, fd int, mut out []u8) ! {
+fn with_security_headers(next core.Handler) core.Handler {
+	return fn [next] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 		start := out.len
-		next(req_buffer, fd, mut out)!
+		step := next(req_buffer, mut out, -1, unsafe { nil }, mut event_loop)
+		if step != .done {
+			return step
+		}
 		s := out[start..].bytestr()
 		// Insert headers after the first CRLF (the status line).
-		idx := s.index('\r\n') or { return }
+		idx := s.index('\r\n') or { return .done }
 		injected := s[..idx + 2] + security_headers + s[idx + 2..]
 		out.trim(start)
 		out << injected.bytes()
+		return .done
 	}
 }
 
-fn app(req_buffer []u8, _ int, mut out []u8) ! {
-	req := request_parser.decode_http_request(req_buffer)!
+fn app(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	req := request_parser.decode_http_request(req_buffer) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
 	_ := req
 	body := '<h1>secure</h1>'
 	out << 'HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ${body.len}\r\n\r\n${body}'.bytes()
+	return .done
 }
 
 fn main() {
@@ -63,7 +73,7 @@ fn main() {
 		port:            3000
 		io_multiplexing: backend
 		// The whole point: one wrap, every response hardened.
-		request_handler: with_security_headers(app)
+		handler: with_security_headers(app)
 	})!
 	println('Security-headers demo on http://localhost:3000/  (every response hardened via wrapper)')
 	server.run()

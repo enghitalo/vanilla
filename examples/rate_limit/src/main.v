@@ -25,7 +25,9 @@ module main
 // direct peer IP, and examples/proxy_aware shows the CIDR-trust + right-most-
 // untrusted-hop logic for validating X-Forwarded-For behind proxies.
 import http_server
+import http_server.core
 import http_server.http1_1.request_parser
+import http_server.http1_1.response
 import http_server.socket
 import strconv
 import sync
@@ -139,9 +141,12 @@ fn client_key(req request_parser.HttpRequest, fd int) string {
 	return 'unknown'
 }
 
-fn handle(req_buffer []u8, fd int, mut out []u8, mut limiter Limiter) ! {
-	req := request_parser.decode_http_request(req_buffer)!
-	key := client_key(req, fd)
+fn handle(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop, mut limiter Limiter) core.Step {
+	req := request_parser.decode_http_request(req_buffer) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
+	key := client_key(req, client_fd)
 
 	// sys_mono_now: monotonic ns, no calendar conversion, immune to NTP jumps —
 	// exactly what elapsed-time refill needs (time.now() reads CLOCK_REALTIME
@@ -149,11 +154,12 @@ fn handle(req_buffer []u8, fd int, mut out []u8, mut limiter Limiter) ! {
 	allowed, remaining := limiter.allow(key, i64(time.sys_mono_now()))
 	if !allowed {
 		out << response_429
-		return
+		return .done
 	}
 	out << response_200_prefix
 	wi(mut out, remaining)
 	out << response_200_tail
+	return .done
 }
 
 fn main() {
@@ -172,8 +178,8 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: fn [mut limiter] (req_buffer []u8, fd int, mut out []u8) ! {
-			handle(req_buffer, fd, mut out, mut limiter)!
+		handler:         fn [mut limiter] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+			return handle(req_buffer, mut out, client_fd, worker_state, mut event_loop, mut limiter)
 		}
 	})!
 	println('Rate-limit demo on http://localhost:3000/  (token bucket per client IP)')

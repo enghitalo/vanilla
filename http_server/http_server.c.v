@@ -21,14 +21,12 @@ pub:
 	limits          Limits
 	tls_config      &tls.Config = unsafe { nil } // nil ⇒ plain HTTP; set ⇒ HTTPS
 pub mut:
-	threads         []thread            = []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
-	request_handler core.RequestHandler = unsafe { nil }
-	// Per-worker state path (epoll + io_uring); see ServerConfig. make_state runs once
-	// per worker thread, stateful_handler receives its result on every request.
-	stateful_handler core.StatefulHandler = unsafe { nil }
-	async_handler    core.AsyncHandler    = unsafe { nil }
-	make_state       fn () voidptr        = unsafe { nil }
-	on_worker_start  core.WorkerStartFn   = unsafe { nil }
+	threads []thread     = []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
+	handler core.Handler = unsafe { nil }
+	// Optional per-worker state; see ServerConfig. make_state runs once per worker
+	// thread, its result reaches every handler call as the worker_state parameter.
+	make_state      fn () voidptr      = unsafe { nil }
+	on_worker_start core.WorkerStartFn = unsafe { nil }
 	// Per-worker in-flight request counters (one per worker, each on its own
 	// cache line — written only by its worker, so no contention/false sharing).
 	// shutdown() sums them to drain precisely.
@@ -227,28 +225,23 @@ pub struct ServerConfig {
 pub:
 	port            int       = 3000
 	io_multiplexing IOBackend = unsafe { IOBackend(0) }
-	// Provide EITHER request_handler (stateless) OR stateful_handler+make_state
-	// (per-thread state). new_server enforces exactly one is set.
-	request_handler core.RequestHandler = unsafe { nil }
-	// stateful_handler + make_state opt into lock-free per-worker state: each worker
-	// calls make_state ONCE (so the value is thread-local), then every request on that
-	// worker is dispatched through stateful_handler with it. Used to give each worker
-	// its own DB connection / reused render scratch — no shared pool, no mutex. Linux
-	// epoll AND io_uring (each ring worker builds its own state); ignored by other
-	// backends. See core.StatefulHandler.
-	stateful_handler core.StatefulHandler = unsafe { nil }
-	make_state       fn () voidptr        = unsafe { nil }
-	// async_handler opts into the async runtime: the handler may PARK a request on
-	// any fd via ac.watch(...) and return .suspend, resumed by a continuation when
-	// that fd is ready — all in the worker's own event loop (DB sockets, upstreams,
-	// timers). Optional make_state gives each worker its own state. Linux epoll +
-	// io_uring (readiness via a oneshot IORING_OP_POLL_ADD on the worker's ring)
-	// and macOS/kqueue. See core.AsyncHandler.
-	async_handler core.AsyncHandler = unsafe { nil }
+	// handler is THE request handler — one contract for every use case, with
+	// every input as an explicit parameter (see core.Handler): it appends the
+	// raw response to `response` and returns .done, parks the request on an fd
+	// via event_loop.watch_fd(...) and returns .suspend (DB sockets, upstreams,
+	// timers — Linux epoll/io_uring and macOS/kqueue), or returns .close to
+	// flush-and-drop the connection.
+	handler core.Handler = unsafe { nil }
+	// make_state opts into lock-free per-worker state: each worker calls
+	// make_state ONCE (so the value is thread-local), then every handler call on
+	// that worker receives it as the worker_state parameter. Used to give each
+	// worker its own DB connection / reused render scratch — no shared pool, no
+	// mutex.
+	make_state fn () voidptr = unsafe { nil }
 	// on_worker_start runs once per worker (after make_state, before the loop) to
 	// arm CLIENTLESS background watches — e.g. a periodic timerfd that refreshes
-	// per-worker state with no shared state and no extra thread. Composes with any
-	// handler path. Linux/epoll only. See core.WorkerStartFn.
+	// per-worker state with no shared state and no extra thread. Linux/epoll
+	// only. See core.WorkerStartFn.
 	on_worker_start core.WorkerStartFn = unsafe { nil }
 	certificates    Certificates
 	limits          Limits
@@ -266,26 +259,8 @@ pub:
 }
 
 pub fn new_server(config ServerConfig) !Server {
-	// Exactly one handler path: stateless request_handler, per-thread
-	// stateful_handler (+make_state), or async_handler (+optional make_state).
-	has_sync := config.request_handler != unsafe { nil }
-	has_stateful := config.stateful_handler != unsafe { nil }
-	has_async := config.async_handler != unsafe { nil }
-	mut n_handlers := 0
-	if has_sync {
-		n_handlers++
-	}
-	if has_stateful {
-		n_handlers++
-	}
-	if has_async {
-		n_handlers++
-	}
-	if n_handlers != 1 {
-		return error('provide exactly one of request_handler / stateful_handler / async_handler')
-	}
-	if has_stateful && config.make_state == unsafe { nil } {
-		return error('stateful_handler requires make_state')
+	if config.handler == unsafe { nil } {
+		return error('provide a handler')
 	}
 	// on_worker_start arms clientless background watches on the epoll worker's
 	// reactor; the TLS worker has none, so it is epoll + plaintext only for now.
@@ -299,37 +274,6 @@ pub fn new_server(config ServerConfig) !Server {
 		}
 		if config.tls_config != unsafe { nil } {
 			return error('on_worker_start is not yet supported with TLS')
-		}
-	}
-	// Each backend's IOBackend enum has different values (.epoll on Linux,
-	// .kqueue on macOS, .iocp on Windows), so a value is only ever referenced
-	// inside the matching `$if` — otherwise this all-platform file fails to
-	// compile on the other targets.
-	if has_stateful {
-		// stateful_handler (sync per-worker state) runs on the Linux epoll AND io_uring
-		// backends: each worker calls make_state once, then dispatches every request
-		// through stateful_handler with that thread-local state (no sharing, no lock).
-		$if linux {
-			if config.io_multiplexing != .epoll && config.io_multiplexing != .io_uring {
-				return error('stateful_handler requires the epoll or io_uring backend')
-			}
-		} $else {
-			return error('stateful_handler is only supported on the Linux epoll and io_uring backends')
-		}
-	}
-	if has_async {
-		// async_handler runs on the Linux epoll and io_uring workers and the macOS
-		// kqueue worker (io_uring parks on a oneshot IORING_OP_POLL_ADD — issue #83).
-		$if linux {
-			if config.io_multiplexing != .epoll && config.io_multiplexing != .io_uring {
-				return error('async_handler requires the epoll or io_uring backend')
-			}
-		} $else $if darwin {
-			if config.io_multiplexing != .kqueue {
-				return error('async_handler requires the kqueue backend')
-			}
-		} $else {
-			return error('async_handler is supported on the Linux epoll and macOS kqueue backends')
 		}
 	}
 
@@ -373,18 +317,16 @@ pub fn new_server(config ServerConfig) !Server {
 	}
 
 	return Server{
-		port:             config.port
-		io_multiplexing:  config.io_multiplexing
-		socket_fd:        socket_fd
-		request_handler:  config.request_handler
-		stateful_handler: config.stateful_handler
-		async_handler:    config.async_handler
-		make_state:       config.make_state
-		on_worker_start:  config.on_worker_start
-		limits:           config.limits
-		tls_config:       config.tls_config
-		threads:          []thread{len: n_workers, cap: n_workers}
-		inflight:         []&core.Counter{len: n_workers, init: &core.Counter{}}
-		listener_fds:     listener_fds
+		port:            config.port
+		io_multiplexing: config.io_multiplexing
+		socket_fd:       socket_fd
+		handler:         config.handler
+		make_state:      config.make_state
+		on_worker_start: config.on_worker_start
+		limits:          config.limits
+		tls_config:      config.tls_config
+		threads:         []thread{len: n_workers, cap: n_workers}
+		inflight:        []&core.Counter{len: n_workers, init: &core.Counter{}}
+		listener_fds:    listener_fds
 	}
 }

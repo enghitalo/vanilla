@@ -1,10 +1,18 @@
 # HTTP Server Module
 
 `http_server` is vanilla's core: a multi-threaded, non-blocking HTTP/1.1 server
-with pluggable I/O backends. Handlers are pure — `fn (req []u8, fd int, mut out
-[]u8) !` — they receive the raw request bytes and **append** the raw response to a
-server-owned buffer; the server batches everything appended during one readiness
-event into a single send and reuses the buffer across requests.
+with pluggable I/O backends. There is ONE handler contract — `core.Handler` —
+and every input is an explicit, self-describing parameter (nothing hides in a
+context object):
+
+```v
+fn (request []u8, mut response []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step
+```
+
+The handler is pure on the hot path: it receives the raw request bytes,
+**appends** the raw response to the server-owned `response` buffer, and
+returns a `core.Step`. The server batches everything appended during one
+readiness event into a single send and reuses the buffer across requests.
 
 ## Backends
 
@@ -12,25 +20,35 @@ Selected via `ServerConfig.io_multiplexing` (`IOBackend`). One worker thread per
 core; per-connection read/response buffers are pooled, so the hot path does no
 per-request allocation.
 
-| Platform | Backend | Accept model | Handlers supported |
+| Platform | Backend | Accept model | Notes |
 |---|---|---|---|
-| Linux | `.epoll` *(default)* | one central acceptor → round-robins fds to per-worker epolls | `request_handler`, `stateful_handler`, `async_handler`, TLS |
-| Linux | `.io_uring` | per-worker `SO_REUSEPORT` listener + multishot accept (kernel 5.19+) | `request_handler`, `stateful_handler`, `async_handler` |
-| macOS | kqueue | per-worker | `request_handler`, `async_handler` |
-| Windows | IOCP | per-worker | `request_handler` |
+| Linux | `.epoll` *(default)* | one central acceptor → round-robins fds to per-worker epolls | `.suspend` watches, `make_state`, `on_worker_start`, TLS |
+| Linux | `.io_uring` | per-worker `SO_REUSEPORT` listener + multishot accept (kernel 5.19+) | `.suspend` watches (oneshot `IORING_OP_POLL_ADD`), `make_state` |
+| macOS | kqueue | per-worker | `.suspend` watches, `make_state` |
+| Windows | IOCP | per-worker | `.done`/`.close` only (`.suspend` closes), `make_state` |
 
-## Handler paths
+## The handler contract
 
-Provide **exactly one** of:
+`ServerConfig.handler` covers every use case with one signature:
 
-- **`request_handler`** — `fn (req []u8, fd int, mut out []u8) !`, stateless. All backends.
-- **`stateful_handler` + `make_state`** — lock-free per-worker state (e.g. a DB
-  connection): `make_state` runs once per worker, then every request on that worker
-  is dispatched with it. Linux epoll + io_uring (each ring worker builds its own state).
-- **`async_handler` (+ optional `make_state`)** — may PARK a request on any fd via
-  `ac.watch(...)` and resume by a continuation in the worker loop (DB sockets,
-  upstreams, timers, write backpressure). Linux epoll + io_uring (readiness via a
-  oneshot `IORING_OP_POLL_ADD` on the worker's own ring) and macOS/kqueue.
+- **Plain response** — append the raw response (status line + headers + body)
+  to `response` and return **`.done`**. Static routes append a precomputed
+  `const ... .bytes()`.
+- **Errors** — append the canned error response (e.g.
+  `response.tiny_bad_request_response`) and return **`.close`**: whatever is in
+  `response` is flushed, then the connection is dropped.
+- **Waiting on an fd** — PARK the request on any fd via
+  `event_loop.watch_fd(fd, interest, continuation, watch_payload)` and return
+  **`.suspend`**; the worker resumes the continuation (a `core.WakeFn`, which
+  receives `ready_fd`/`ready_fd_error`/`watch_payload` as explicit parameters)
+  when the fd is ready — DB sockets, upstreams, timers, write backpressure —
+  all in the worker's own event loop. Linux epoll + io_uring and macOS/kqueue;
+  on TLS and Windows/IOCP a `.suspend` closes the connection (no watch reactor
+  there yet).
+- **Per-worker state** — set `make_state`: it runs once per worker thread, and
+  every handler call on that worker receives the value as the
+  **`worker_state`** parameter (e.g. a per-thread DB connection — no shared
+  pool, no mutex).
 
 `on_worker_start` arms clientless background watches (e.g. a periodic timerfd that
 refreshes per-worker state with no extra thread). Linux/epoll, plaintext only.
@@ -39,23 +57,24 @@ refreshes per-worker state with no extra thread). Linux/epoll, plaintext only.
 
 ```v
 import vanilla.http_server
+import vanilla.http_server.core
 
-fn handle(req []u8, fd int, mut out []u8) ! {
-	out << 'HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!'.bytes()
+fn handle(request []u8, mut response []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	response << 'HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!'.bytes()
+	return .done
 }
 
 fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            8080
 		io_multiplexing: .epoll // or .io_uring on Linux
-		request_handler: handle
+		handler:         handle
 	})!
 	server.run() // blocks
 }
 ```
 
-`new_server(ServerConfig) !Server` validates the config (e.g. rejects more than one
-handler path, or a backend that doesn't support the chosen handler); `server.run()`
+`new_server(ServerConfig) !Server` validates the config; `server.run()`
 spawns the workers and blocks; `server.shutdown(grace_ms int)` shuts the listeners
 and drains in-flight requests up to the grace period.
 
@@ -79,10 +98,11 @@ HTTPS on the **epoll** backend; the other backends are plaintext.
 
 ## Internals (where to look)
 
+- `core/core.v` — the handler contract: `Handler`, `Step`, `WakeFn`, `EventLoop`.
 - `http_server.c.v` — `new_server`, `ServerConfig`, `Server`, `shutdown`.
 - `backend_epoll/` — epoll worker (`worker_linux.c.v`), connection state + buffer
-  pool (`conn_state_linux.c.v`), async reactor (`async_linux.c.v`), TLS
-  (`tls_conn_linux.c.v`).
+  pool (`conn_state_linux.c.v`), request serving + watch reactor
+  (`async_linux.c.v`), TLS (`tls_conn_linux.c.v`).
 - `http_server_io_uring_linux.c.v` + `io_uring/` — the io_uring backend.
 - `http1_1/request_parser/` — request framing (`frame_request_length_lim`/`_idx`
   with the non-marking `buf_view` window; chunked via `frame_chunked_total`).

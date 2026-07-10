@@ -36,7 +36,9 @@ module main
 //
 // WORKS TODAY: crypto.rand + crypto.hmac.equal + header/cookie plumbing.
 import http_server
+import http_server.core
 import http_server.http1_1.request_parser
+import http_server.http1_1.response
 import crypto.rand
 import crypto.hmac
 
@@ -125,17 +127,23 @@ fn cookie_value(buf []u8, hdr request_parser.Slice, name string) (int, int) {
 	return 0, -1
 }
 
-fn handle(req_buffer []u8, _ int, mut out []u8) ! {
-	req := request_parser.decode_http_request(req_buffer)!
+fn handle(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	req := request_parser.decode_http_request(req_buffer) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
 
 	// GET the form: issue a fresh CSRF token in a cookie. rand.bytes is the one
 	// unavoidable per-request allocation — CSPRNG output must exist (see header).
 	if slice_eq(req.buffer, req.path, '/form') && slice_eq(req.buffer, req.method, 'GET') {
-		token := rand.bytes(32)! // 32 bytes of CSPRNG entropy -> 64 hex chars
+		token := rand.bytes(32) or { // 32 bytes of CSPRNG entropy -> 64 hex chars
+			out << response.tiny_bad_request_response
+			return .close
+		}
 		out << form_head
 		write_hex(mut out, token)
 		out << form_tail
-		return
+		return .done
 	}
 
 	// State-changing request: require the header token to match the cookie.
@@ -145,16 +153,16 @@ fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 	if is_unsafe(req.buffer, req.method) {
 		chdr := req.get_header_value_slice('Cookie') or {
 			out << resp_403
-			return
+			return .done
 		}
 		cstart, clen := cookie_value(req.buffer, chdr, 'csrf')
 		hdr := req.get_header_value_slice('X-CSRF-Token') or {
 			out << resp_403
-			return
+			return .done
 		}
 		if clen <= 0 || hdr.len <= 0 {
 			out << resp_403
-			return
+			return .done
 		}
 		// Zero-copy views of both tokens; hmac.equal only reads them, in
 		// constant time, and both are consumed before the buffer is recycled.
@@ -162,15 +170,16 @@ fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 		header_token := unsafe { (&req.buffer[hdr.start]).vbytes(hdr.len) }
 		if !hmac.equal(cookie_token, header_token) {
 			out << resp_403
-			return
+			return .done
 		}
 		out << resp_ok
-		return
+		return .done
 	}
 
 	// Safe method (GET/HEAD/...): no token required — they must be side-effect
 	// free anyway.
 	out << resp_ok
+	return .done
 }
 
 fn main() {
@@ -185,7 +194,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: handle
+		handler:         handle
 	})!
 	println('CSRF demo on http://localhost:3000/  (GET /form sets token; unsafe methods require X-CSRF-Token)')
 	server.run()

@@ -1,22 +1,22 @@
 module main
 
+import http_server.core
 import os
 
-// serve adapts the raw-handler contract (writes into a caller-owned buffer) to
-// the return-a-string shape the assertions expect. Callers pass their own
-// Viewers so they can inspect state afterwards. fd -1 keeps any accidental
-// send() harmless (EBADF), never a write to a real descriptor.
-fn serve(req string, mut v Viewers) !string {
+// serve adapts the unified handler contract (writes into a caller-owned
+// buffer) to the return-a-string shape the assertions expect. Callers pass
+// their own Viewers so they can inspect state afterwards. client_fd -1 keeps
+// any accidental send() harmless (EBADF), never a write to a real descriptor.
+fn serve(req string, mut v Viewers) string {
 	mut out := []u8{}
-	handle(req.bytes(), -1, mut out, mut v)!
+	mut event_loop := core.EventLoop{}
+	handle(req.bytes(), mut out, -1, unsafe { nil }, mut event_loop, mut v)
 	return out.bytestr()
 }
 
 fn route(method string, target string) string {
 	mut v := Viewers{}
-	return serve('${method} ${target} HTTP/1.1\r\nHost: localhost\r\n\r\n', mut v) or {
-		panic('handle error: ${err}')
-	}
+	return serve('${method} ${target} HTTP/1.1\r\nHost: localhost\r\n\r\n', mut v)
 }
 
 // --- routing (these paths never touch the camera) -------------------------
@@ -49,10 +49,10 @@ fn test_non_get_405() {
 fn test_malformed_400() {
 	mut v := Viewers{}
 	// not even a request line
-	r := serve('GARBAGE\r\n\r\n', mut v) or { panic(err) }
+	r := serve('GARBAGE\r\n\r\n', mut v)
 	assert r.contains('400 Bad Request')
 	// truncated head: request line parses, but the header block never terminates
-	r2 := serve('GET / HTTP/1.1\r\nHost: localhost', mut v) or { panic(err) }
+	r2 := serve('GET / HTTP/1.1\r\nHost: localhost', mut v)
 	assert r2.contains('400 Bad Request')
 	assert v.snapshot().len == 0 // nothing was registered along the way
 }

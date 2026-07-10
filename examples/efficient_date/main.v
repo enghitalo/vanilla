@@ -18,6 +18,7 @@ module main
 // but that needs a worker-start hook for a watch not tied to any request — a
 // noted async-runtime follow-up. Lazy refresh is simpler and just as cheap.
 import http_server
+import http_server.core
 import time
 
 // DateCache is one worker's cached Date line + the unix second it is valid for.
@@ -62,20 +63,21 @@ const head = 'HTTP/1.1 200 OK\r\n'.bytes()
 
 const tail = 'Content-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
 
-fn handle(req []u8, fd int, mut out []u8, state voidptr) ! {
-	mut dc := unsafe { &DateCache(state) }
+fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	mut dc := unsafe { &DateCache(worker_state) }
 	dc.refresh()
 	out << head
 	out << dc.line // cached: no per-request formatting in the common case
 	out << tail
+	return .done
 }
 
 fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
-		port:             8096
-		io_multiplexing:  .epoll
-		stateful_handler: handle
-		make_state:       make_state
+		port:            8096
+		io_multiplexing: .epoll
+		handler:         handle
+		make_state:      make_state
 	})!
 	server.run()
 }

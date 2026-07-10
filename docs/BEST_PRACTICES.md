@@ -18,15 +18,21 @@ Everything below is a concrete way to honor those rules.
 
 A request handler is a **pure function of the request that APPENDS the complete
 raw response into `out`** — the connection's persistent, server-owned write
-buffer. It returns nothing, must not touch the socket, read globals, or perform
-hidden I/O.
+buffer — and returns a `core.Step`. It must not touch the socket, read globals,
+or perform hidden I/O.
 
 ```v
 // out is the connection's reused write buffer. Append the full response
 // (status line + headers + body) into it; the server batches everything
 // appended during one readiness event into a single send. Never free or keep it.
-fn handle(req []u8, fd int, mut out []u8) ! {
+// Return .done when the response is complete; append a canned error response
+// and return .close on a bad request; park on an fd via event_loop.watch_fd(...)
+// and return .suspend to wait without blocking the worker (§5). Every input is
+// an explicit parameter: client_fd (who), worker_state (this thread's
+// make_state value), event_loop (how to wait).
+fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
     // parse req, append bytes into out. Nothing else.
+    return .done
 }
 ```
 
@@ -50,7 +56,7 @@ fn handle(req []u8, fd int, mut out []u8) ! {
 
 **Don't**
 
-- Read from `client_conn_fd` inside a handler — the body is already framed for
+- Read from `client_fd` inside a handler — the body is already framed for
   you.
 - Mutate shared state without synchronization (see §6).
 - Block on disk, DNS, or a database call on the hot path without a pool (see §5).
@@ -261,8 +267,8 @@ The recurring zero-allocation patterns:
 ## 5. Side effects go through the async runtime + pools, off the hot path
 
 Databases, upstreams, and other blocking resources must not stall the event
-loop. The async runtime exists exactly for this: a handler that must wait calls
-`ac.watch(ext_fd, interest, continuation, udata)` and returns `.suspend`; the
+loop. The watch runtime exists exactly for this: a handler that must wait calls
+`event_loop.watch_fd(fd, interest, continuation, watch_payload)` and returns `.suspend`; the
 worker parks the connection, serves others, and runs the continuation when
 `ext_fd` is ready. The DB driver (`pg_async`), upstream calls, and timers are all
 consumers of this one primitive — see the

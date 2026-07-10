@@ -28,7 +28,9 @@ module main
 //   - ONE deliberate copy remains: `json.decode` is cJSON-backed and reads its
 //     input through strlen — see create_user_json.
 import http_server
+import http_server.core
 import http_server.http1_1.request_parser
+import http_server.http1_1.response
 import json
 import strconv
 import strings
@@ -410,20 +412,24 @@ fn slice_eq(buf []u8, s request_parser.Slice, lit string) bool {
 
 // Sub-handlers take `mut out` and append directly — nothing is returned just
 // to be copied again (no return-then-copy).
-fn handle(req_buffer []u8, _ int, mut out []u8) ! {
-	req := request_parser.decode_http_request(req_buffer)!
+fn handle(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	req := request_parser.decode_http_request(req_buffer) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
 
 	if slice_eq(req.buffer, req.method, 'POST') {
 		if slice_eq(req.buffer, req.path, '/users') {
 			create_user_json(req, mut out)
-			return
+			return .done
 		}
 		if slice_eq(req.buffer, req.path, '/upload') {
 			upload(req, mut out)
-			return
+			return .done
 		}
 	}
 	out << resp_404
+	return .done
 }
 
 fn main() {
@@ -438,7 +444,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: handle
+		handler:         handle
 	})!
 	println('JSON API on http://localhost:3000/  (POST /users, POST /upload)')
 	server.run()

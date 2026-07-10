@@ -31,7 +31,9 @@ module main
 //
 // WORKS TODAY: pure header logic.
 import http_server
+import http_server.core
 import http_server.http1_1.request_parser
+import http_server.http1_1.response
 
 const allowed_origins = ['https://app.example.com', 'http://localhost:5173']
 
@@ -67,8 +69,11 @@ fn slice_eq(buf []u8, s request_parser.Slice, lit string) bool {
 	return true
 }
 
-fn handle(req_buffer []u8, _ int, mut out []u8) ! {
-	req := request_parser.decode_http_request(req_buffer)!
+fn handle(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	req := request_parser.decode_http_request(req_buffer) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
 
 	// Origin as OFFSETS into the request buffer; the allowlist check runs over
 	// a read-only `tos` view of those bytes (guarded len > 0 — an empty value
@@ -91,12 +96,12 @@ fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 	if slice_eq(req.buffer, req.method, 'OPTIONS') {
 		if !allowed {
 			out << resp_403
-			return
+			return .done
 		}
 		out << preflight_head
 		unsafe { out.push_many(&req.buffer[o_start], o_len) } // echo the allowlisted origin
 		out << preflight_tail
-		return
+		return .done
 	}
 
 	// Actual (simple) request: attach CORS headers only for allowlisted
@@ -106,9 +111,10 @@ fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 		out << ok_cors_head
 		unsafe { out.push_many(&req.buffer[o_start], o_len) } // echo the allowlisted origin
 		out << ok_cors_tail
-		return
+		return .done
 	}
 	out << resp_ok_plain
+	return .done
 }
 
 fn main() {
@@ -123,7 +129,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: handle
+		handler:         handle
 	})!
 	println('CORS demo on http://localhost:3000/  (handles OPTIONS preflight + allowlist)')
 	server.run()

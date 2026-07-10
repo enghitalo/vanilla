@@ -14,8 +14,7 @@ pub enum IOBackend {
 fn run_selected_backend(server Server, mut threads []thread) {
 	match server.io_multiplexing {
 		.epoll {
-			backend_epoll.run_epoll_backend(server.socket_fd, server.request_handler,
-				server.stateful_handler, server.async_handler, server.make_state,
+			backend_epoll.run_epoll_backend(server.socket_fd, server.handler, server.make_state,
 				server.on_worker_start, server.port, server.limits, server.inflight,
 				server.active_conns, server.tls_config, mut threads)
 		}

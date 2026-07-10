@@ -25,13 +25,15 @@ module main
 //   - idle_timeout to reap idle keep-alive connections (max_connections already
 //     bounds total fds).
 import http_server
+import http_server.core
 
 // The handler is now trivial: the CORE enforces the size limits before the
 // handler ever runs — over-large bodies are rejected (413) from Content-Length
 // WITHOUT buffering them, and oversized header blocks get 431. That's the whole
 // point: limits belong in the read loop, not bolted onto each handler.
-fn handle(req_buffer []u8, _ int, mut out []u8) ! {
+fn handle(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	out << 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+	return .done
 }
 
 fn main() {
@@ -46,7 +48,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: handle
+		handler:         handle
 		limits:          http_server.Limits{
 			max_body_bytes:   10 * 1024 * 1024 // 10 MiB -> 413
 			max_header_bytes: 16 * 1024        // 16 KiB  -> 431

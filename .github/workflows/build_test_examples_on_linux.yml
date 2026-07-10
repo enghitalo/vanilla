@@ -47,11 +47,26 @@ jobs:
           # dlopens, so the compression example tests the `br` path for real
           # (without it they skip gracefully).
           sudo apt-get install -y libsqlite3-dev liburing-dev linux-libc-dev libbrotli1
+      # `-cc gcc -no-parallel` makes these debug example builds deterministic.
+      # Two independent V-toolchain flakes bite otherwise, both only in the
+      # default (non -prod) build — real deployments ship -prod, which is
+      # unaffected (verified 0 failures in 20 -prod builds):
+      #   1) Every http_server program compiles the Linux io_uring backend,
+      #      which pulls in <liburing.h> -> barrier.h -> <stdatomic.h>. V's
+      #      bundled tcc cannot parse that stdatomic.h, and its automatic
+      #      tcc->gcc fallback is a race (reproduced ~1 in 4 of the SAME source
+      #      flaking). Pinning gcc removes tcc entirely (and the wasted
+      #      tcc-then-retry double compile).
+      #   2) V's PARALLEL debug codegen non-deterministically emits one array
+      #      `.free()` unmangled (`array_free` instead of `builtin__array_free`,
+      #      an undefined-reference link error — surfaces in backend_epoll's
+      #      close_tls, compiled into every example). Reproduced 4 of 20 default
+      #      builds failing; 0 of 40 with -no-parallel. -prod codegen is immune.
       - name: Build ${{ matrix.folder }}
         shell: bash
         run: |
-          v $(pwd)/${{ matrix.folder }}
+          v -cc gcc -no-parallel $(pwd)/${{ matrix.folder }}
       - name: Test ${{ matrix.folder }}
         shell: bash
         run: |
-          v test $(pwd)/${{ matrix.folder }}
+          v -cc gcc -no-parallel test $(pwd)/${{ matrix.folder }}

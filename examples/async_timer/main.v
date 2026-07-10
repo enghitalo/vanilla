@@ -11,9 +11,9 @@ module main
 //        # 20 concurrent 500ms delays finish in ~0.5s, not 10s:
 //        seq 20 | xargs -P20 -I{} curl -s 'http://localhost:8091/delay?ms=500' >/dev/null
 //
-// The same `ac.watch(...)` primitive drives an async DB query (watch the DB
+// The same `event_loop.watch_fd(...)` primitive drives an async DB query (watch the DB
 // socket), a reverse proxy (watch the upstream socket), or SSE/WebSocket
-// backpressure (watch the client for EPOLLOUT). See core.AsyncHandler.
+// backpressure (watch the client for EPOLLOUT). See core.Handler.
 import http_server
 import http_server.core
 
@@ -27,10 +27,10 @@ fn C.read(fd int, buf voidptr, count usize) int
 
 const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
 
-// handle is the async request handler. For /delay it arms a one-shot timerfd and
+// handle is the request handler. For /delay it arms a one-shot timerfd and
 // parks the request on it (returns .suspend); the worker resumes `timer_done`
 // when the timer fires. Anything else is answered immediately (.done).
-fn handle(req []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
+fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if req.bytestr().contains('/delay') {
 		ms := 200
 		tfd := C.timerfd_create(C.CLOCK_MONOTONIC, 0)
@@ -39,7 +39,7 @@ fn handle(req []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 		spec[2] = i64(ms / 1000)
 		spec[3] = i64(ms % 1000) * 1_000_000
 		C.timerfd_settime(tfd, 0, voidptr(&spec[0]), unsafe { nil })
-		ac.watch(tfd, .readable, timer_done, unsafe { nil })
+		event_loop.watch_fd(tfd, .readable, timer_done, unsafe { nil })
 		return .suspend
 	}
 	out << resp_ok
@@ -48,10 +48,10 @@ fn handle(req []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 
 // timer_done runs when the timerfd is readable: drain it, close it (the request
 // owns it), append the response, and finish.
-fn timer_done(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
+fn timer_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ac.ready_fd(), &tmp[0], 8)
-	C.close(ac.ready_fd())
+	C.read(ready_fd, &tmp[0], 8)
+	C.close(ready_fd)
 	body := 'delayed'
 	out << 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ${body.len}\r\nConnection: keep-alive\r\n\r\n${body}'.bytes()
 	return .done
@@ -61,7 +61,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            8091
 		io_multiplexing: .epoll
-		async_handler:   handle
+		handler:         handle
 	})!
 	server.run()
 }

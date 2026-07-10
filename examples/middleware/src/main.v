@@ -43,7 +43,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: handler
+		handler:         handler
 	})!
 
 	// The access log is buffered for throughput, so flush on shutdown or the

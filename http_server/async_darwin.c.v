@@ -1,13 +1,14 @@
-// Async runtime for the macOS (kqueue) backend — the counterpart of
-// backend_epoll/async_linux.c.v. Same opt-in contract (core.AsyncHandler +
-// ac.watch(fd, interest, cont, udata) + AsyncStep), so a handler that parks on a
-// DB socket / upstream / timer / pipe runs unchanged on Linux and macOS; only the
-// fd registration differs (kqueue EVFILT_READ here, epoll EPOLLIN there).
+// Request serving + watch/park/resume runtime for the macOS (kqueue) backend —
+// the counterpart of backend_epoll/async_linux.c.v. Same handler contract
+// (core.Handler + worker.watch(fd, interest, cont, udata) + core.Step), so a
+// handler that parks on a DB socket / upstream / timer / pipe runs unchanged on
+// Linux and macOS; only the fd registration differs (kqueue EVFILT_READ here,
+// epoll EPOLLIN there).
 //
 // The macOS HTTP path is per-request (no persistent ConnState, no pipelining), so
 // this is a small, self-contained reactor: a per-worker watch registry plus a
-// per-connection response buffer (KqConn.out) held across a suspend. v1 scope
-// matches the Linux async runtime minus the Linux-only pipelining/streaming.
+// per-connection response buffer (KqConn.out) held across a suspend. Scope
+// matches the Linux runtime minus the Linux-only pipelining/streaming.
 
 module http_server
 
@@ -43,23 +44,23 @@ mut:
 	watches map[int]KqWatch
 }
 
-// kqueue_async_register is installed into AsyncCtx.register on macOS: record the
-// parked request and add the ext fd to this worker's kqueue.
-fn kqueue_async_register(mut ac core.AsyncCtx, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
-	mut r := unsafe { &KqReactor(ac.reactor) }
+// kqueue_async_register is installed into EventLoop.register on macOS: record
+// the parked request and add the ext fd to this worker's kqueue.
+fn kqueue_async_register(mut w core.EventLoop, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
+	mut r := unsafe { &KqReactor(w.reactor) }
 	r.watches[ext_fd] = KqWatch{
-		client_fd: ac.client_fd
+		client_fd: w.client_fd
 		cont:      cont
 		udata:     udata
 	}
 	filter := if interest == .writable { kqueue.evfilt_write } else { kqueue.evfilt_read }
-	kqueue.add_fd_to_kqueue(ac.loop_fd, ext_fd, filter)
-	ac.last_watched = ext_fd
+	kqueue.add_fd_to_kqueue(w.loop_fd, ext_fd, filter)
+	w.last_watched = ext_fd
 }
 
-// process_kqueue_async is the async worker loop (one per worker thread). Client
+// process_kqueue_worker is the worker loop (one per worker thread). Client
 // fds (registered by the accept loop) and watched ext fds share this kqueue.
-fn process_kqueue_async(kq int, async_handler core.AsyncHandler, make_state fn () voidptr, limits Limits) {
+fn process_kqueue_worker(kq int, handler core.Handler, make_state fn () voidptr, limits Limits) {
 	mut state := voidptr(unsafe { nil })
 	if make_state != unsafe { nil } {
 		state = make_state()
@@ -75,16 +76,16 @@ fn process_kqueue_async(kq int, async_handler core.AsyncHandler, make_state fn (
 			if C.errno == C.EINTR {
 				continue
 			}
-			C.perror(c'kevent async')
+			C.perror(c'kevent worker')
 			break
 		}
 		for i in 0 .. nev {
 			fd := int(events[i].ident)
 			// A watched ext fd became ready → run its continuation.
-			if w := reactor.watches[fd] {
+			if watch := reactor.watches[fd] {
 				reactor.watches.delete(fd)
 				rerr := (events[i].flags & (kqueue.ev_eof | kqueue.ev_error)) != 0
-				kq_run_cont(mut reactor, kq, w, fd, rerr, state)
+				kq_run_cont(mut reactor, kq, watch, fd, rerr, state)
 				continue
 			}
 			// Client connection.
@@ -92,14 +93,14 @@ fn process_kqueue_async(kq int, async_handler core.AsyncHandler, make_state fn (
 				kq_close(mut reactor, kq, fd)
 				continue
 			}
-			kq_handle_request(async_handler, mut reactor, kq, fd, limits, state)
+			kq_handle_request(handler, mut reactor, kq, fd, limits, state)
 		}
 	}
 }
 
-// kq_handle_request reads one request and dispatches the async handler.
+// kq_handle_request reads one request and dispatches the handler.
 @[manualfree]
-fn kq_handle_request(h core.AsyncHandler, mut reactor KqReactor, kq int, fd int, limits Limits, state voidptr) {
+fn kq_handle_request(h core.Handler, mut reactor KqReactor, kq int, fd int, limits Limits, state voidptr) {
 	request_buffer := request.read_request(fd, limits.max_header_bytes, limits.max_body_bytes) or {
 		match err.code() {
 			413 {
@@ -135,14 +136,13 @@ fn kq_handle_request(h core.AsyncHandler, mut reactor KqReactor, kq int, fd int,
 		c
 	}
 	conn.out.clear()
-	mut ac := core.AsyncCtx{
+	mut event_loop := core.EventLoop{
 		client_fd: fd
-		state:     state
 		loop_fd:   kq
 		reactor:   unsafe { voidptr(&reactor) }
 		register:  kqueue_async_register
 	}
-	match h(request_buffer, mut conn.out, mut ac) {
+	match h(request_buffer, mut conn.out, fd, state, mut event_loop) {
 		.done {
 			response.send_response(fd, conn.out.data, conn.out.len) or {
 				kq_close(mut reactor, kq, fd)
@@ -150,39 +150,44 @@ fn kq_handle_request(h core.AsyncHandler, mut reactor KqReactor, kq int, fd int,
 			// keep-alive: fd stays registered for the next request
 		}
 		.suspend {
-			conn.awaiting_fd = ac.last_watched // parked; resumed by kq_run_cont
+			conn.awaiting_fd = event_loop.last_watched // parked; resumed by kq_run_cont
 		}
 		.close {
+			// Flush-then-close (the core.Step contract): the handler's error
+			// response, if any, must reach the client before the drop.
+			if conn.out.len > 0 {
+				response.send_response(fd, conn.out.data, conn.out.len) or {}
+			}
 			kq_close(mut reactor, kq, fd)
 		}
 	}
 }
 
 // kq_run_cont resumes a parked request when its watched fd fires.
-fn kq_run_cont(mut reactor KqReactor, kq int, w KqWatch, ext_fd int, ready_err bool, state voidptr) {
-	mut conn := reactor.conns[w.client_fd] or { return } // client went away
+fn kq_run_cont(mut reactor KqReactor, kq int, watch KqWatch, ext_fd int, ready_err bool, state voidptr) {
+	mut conn := reactor.conns[watch.client_fd] or { return } // client went away
 	conn.awaiting_fd = -1
-	mut ac := core.AsyncCtx{
-		client_fd: w.client_fd
-		ready_fd:  ext_fd
-		ready_err: ready_err
-		udata:     w.udata
-		state:     state
+	mut event_loop := core.EventLoop{
+		client_fd: watch.client_fd
 		loop_fd:   kq
 		reactor:   unsafe { voidptr(&reactor) }
 		register:  kqueue_async_register
 	}
-	match w.cont(mut conn.out, mut ac) {
+	match watch.cont(mut conn.out, ext_fd, ready_err, watch.udata, state, mut event_loop) {
 		.done {
-			response.send_response(w.client_fd, conn.out.data, conn.out.len) or {
-				kq_close(mut reactor, kq, w.client_fd)
+			response.send_response(watch.client_fd, conn.out.data, conn.out.len) or {
+				kq_close(mut reactor, kq, watch.client_fd)
 			}
 		}
 		.suspend {
-			conn.awaiting_fd = ac.last_watched // re-armed (multi-step); stay parked
+			conn.awaiting_fd = event_loop.last_watched // re-armed (multi-step); stay parked
 		}
 		.close {
-			kq_close(mut reactor, kq, w.client_fd)
+			// Flush-then-close: send whatever the continuation appended first.
+			if conn.out.len > 0 {
+				response.send_response(watch.client_fd, conn.out.data, conn.out.len) or {}
+			}
+			kq_close(mut reactor, kq, watch.client_fd)
 		}
 	}
 }

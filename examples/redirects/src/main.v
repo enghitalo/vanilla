@@ -32,7 +32,9 @@ module main
 //
 // Everything here WORKS TODAY — redirects are just a status line + Location.
 import http_server
+import http_server.core
 import http_server.http1_1.request_parser
+import http_server.http1_1.response
 
 // ---- static responses (consts — the fast path appends, never builds) --------
 const resp_301_old = 'HTTP/1.1 301 Moved Permanently\r\nLocation: /new\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
@@ -95,8 +97,11 @@ fn safe_next(next []u8) []u8 {
 	return slash_bytes // reject absolute / protocol-relative / empty targets
 }
 
-fn handle(req_buffer []u8, _ int, mut out []u8) ! {
-	req := request_parser.decode_http_request(req_buffer)!
+fn handle(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	req := request_parser.decode_http_request(req_buffer) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
 	// Effective route = path with the query string stripped, as offsets.
 	route := request_parser.Slice{
 		start: req.path.start
@@ -122,7 +127,7 @@ fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 				out << dashboard_bytes // no `next`: default landing page
 			}
 			ws(mut out, '\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n')
-			return
+			return .done
 		}
 		out << resp_200_empty // GET /login: the form page (empty stand-in)
 	} else if slice_eq(req.buffer, route, '/api/v1/resource') {
@@ -131,6 +136,7 @@ fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 	} else {
 		out << resp_200_empty
 	}
+	return .done
 }
 
 fn main() {
@@ -145,7 +151,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: handle
+		handler:         handle
 	})!
 	println('Redirect demo on http://localhost:3000/  (/old -> 301, /login POST -> 303, /api/v1 -> 308)')
 	server.run()

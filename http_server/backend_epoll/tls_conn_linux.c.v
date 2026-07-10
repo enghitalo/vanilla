@@ -128,7 +128,7 @@ fn tls_handshake_step(mut conn TlsConn, epoll_fd int, fd int, active_conns &core
 }
 
 @[direct_array_access; manualfree]
-fn handle_readable_fd_tls(request_handler core.RequestHandler, epoll_fd int, fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config, mut sessions map[int]&TlsConn) {
+fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config, mut sessions map[int]&TlsConn) {
 	stdatomic.add_i64(&counter.n, 1)
 	defer {
 		stdatomic.add_i64(&counter.n, -1)
@@ -244,17 +244,64 @@ fn handle_readable_fd_tls(request_handler core.RequestHandler, epoll_fd int, fd 
 	} else {
 		resp = []u8{len: 0, cap: 4096}
 	}
-	request_handler(buf, fd, mut resp) or {
-		unsafe { buf.free() }
-		unsafe { resp.free() }
-		close_tls(epoll_fd, fd, active_conns, mut sessions)
-		return
+	// The TLS worker has no watch reactor: register is a stub that arms nothing,
+	// so a handler that calls event_loop.watch_fd and suspends is dropped below.
+	mut event_loop := core.EventLoop{
+		client_fd: fd
+		loop_fd:   epoll_fd
+		register:  core.reject_register
 	}
+	step := handler(buf, mut resp, fd, state, mut event_loop)
 	unsafe {
 		buf.len = 0
 	}
 	conn.read_buf = buf // pool the read buffer's capacity for the next request
-	tls_send_or_park(epoll_fd, fd, limits, active_conns, mut sessions, mut conn, resp)
+	match step {
+		.done {
+			tls_send_or_park(epoll_fd, fd, limits, active_conns, mut sessions, mut conn, resp)
+		}
+		.close {
+			// Flush-then-close: best-effort synchronous write of whatever the
+			// handler appended (e.g. its error response), then drop the session.
+			// A send that cannot complete now (want/want_write) is abandoned —
+			// the connection is closing anyway.
+			tls_write_all_best_effort(mut conn, fd, resp)
+			unsafe { resp.free() }
+			close_tls(epoll_fd, fd, active_conns, mut sessions)
+		}
+		.suspend {
+			// Parking is not supported over TLS (no reactor on this worker; see
+			// core.reject_register): nothing was armed, so nothing leaks — drop the
+			// connection rather than strand a request that can never be resumed.
+			// Loud on purpose: a handler that works on plaintext and silently
+			// RSTs over HTTPS is otherwise undiagnosable from the server side.
+			eprintln('[tls] handler returned .suspend but the TLS worker has no watch reactor; dropping the connection')
+			unsafe { resp.free() }
+			close_tls(epoll_fd, fd, active_conns, mut sessions)
+		}
+	}
+}
+
+// tls_write_chunk writes one chunk over the session — kTLS plaintext send or
+// userspace mbedtls — returning the byte count or the tls.want/want_write/
+// closed sentinels, so every write loop branches uniformly.
+@[inline]
+fn tls_write_chunk(mut conn TlsConn, fd int, ptr &u8, len int) int {
+	return if conn.ktls { ktls_send(fd, ptr, len) } else { conn.sess.write_from(ptr, len) }
+}
+
+// tls_write_all_best_effort synchronously writes as much of `resp` as the TLS
+// session will take right now — used only on the .close path, where a partial
+// send is acceptable (the connection is being dropped).
+fn tls_write_all_best_effort(mut conn TlsConn, fd int, resp []u8) {
+	mut off := 0
+	for off < resp.len {
+		n := tls_write_chunk(mut conn, fd, unsafe { &u8(resp.data) + off }, resp.len - off)
+		if n <= 0 {
+			return
+		}
+		off += n
+	}
 }
 
 // handle_writable_fd_tls resumes work blocked on writability: a handshake that
@@ -276,13 +323,8 @@ fn handle_writable_fd_tls(epoll_fd int, fd int, active_conns &core.Counter, mut 
 	}
 
 	for conn.write_off < conn.write_buf.len {
-		n := if conn.ktls {
-			ktls_send(fd, unsafe { &u8(conn.write_buf.data) + conn.write_off },
-				conn.write_buf.len - conn.write_off)
-		} else {
-			conn.sess.write_from(unsafe { &u8(conn.write_buf.data) + conn.write_off },
-				conn.write_buf.len - conn.write_off)
-		}
+		n := tls_write_chunk(mut conn, fd, unsafe { &u8(conn.write_buf.data) + conn.write_off },
+			conn.write_buf.len - conn.write_off)
 		if n > 0 {
 			conn.write_off += n
 			continue
@@ -307,11 +349,7 @@ fn handle_writable_fd_tls(epoll_fd int, fd int, active_conns &core.Counter, mut 
 fn tls_send_or_park(epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut sessions map[int]&TlsConn, mut conn TlsConn, resp []u8) {
 	mut sent := 0
 	for sent < resp.len {
-		n := if conn.ktls {
-			ktls_send(fd, unsafe { &u8(resp.data) + sent }, resp.len - sent)
-		} else {
-			conn.sess.write_from(unsafe { &u8(resp.data) + sent }, resp.len - sent)
-		}
+		n := tls_write_chunk(mut conn, fd, unsafe { &u8(resp.data) + sent }, resp.len - sent)
 		if n > 0 {
 			sent += n
 			continue
