@@ -25,7 +25,7 @@ fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
 fn C.read(fd int, buf voidptr, count usize) int
 
-// Stream is the per-connection cursor, carried across ticks via worker.udata — ONE
+// Stream is the per-connection cursor, carried across ticks via watch_payload — ONE
 // heap allocation for the whole stream, freed when it ends (not per event).
 struct Stream {
 mut:
@@ -49,7 +49,7 @@ fn arm_periodic(tfd int, ms int) {
 	C.timerfd_settime(tfd, 0, voidptr(&spec[0]), unsafe { nil })
 }
 
-fn handle(req []u8, mut out []u8, mut worker core.Worker) core.Step {
+fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if !req.bytestr().contains('/events') {
 		out << not_found
 		return .done
@@ -64,17 +64,17 @@ fn handle(req []u8, mut out []u8, mut worker core.Worker) core.Step {
 	// Headers go out NOW: async_serve flushes the write buffer after the initial
 	// .suspend, so the client sees `200 text/event-stream` before any tick.
 	out << sse_headers
-	worker.watch(tfd, .readable, sse_tick, voidptr(st))
+	event_loop.watch_fd(tfd, .readable, sse_tick, voidptr(st))
 	return .suspend
 }
 
 // sse_tick fires once per timer expiry: emit one event and re-arm. The appended
 // bytes are flushed on .suspend (the streaming primitive), so each event ships
 // immediately instead of waiting for the stream to finish.
-fn sse_tick(mut out []u8, mut worker core.Worker) core.Step {
+fn sse_tick(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(worker.ready_fd(), &tmp[0], 8) // drain the timerfd expiry count
-	mut st := unsafe { &Stream(worker.udata) }
+	C.read(ready_fd, &tmp[0], 8) // drain the timerfd expiry count
+	mut st := unsafe { &Stream(watch_payload) }
 	st.sent++
 	out << 'data: tick ${st.sent} of ${st.max}\n\n'.bytes()
 	if st.sent >= st.max {
@@ -82,7 +82,7 @@ fn sse_tick(mut out []u8, mut worker core.Worker) core.Step {
 		C.close(st.tfd) // request owns the timerfd; closing it removes it from epoll
 		return .done
 	}
-	worker.watch(st.tfd, .readable, sse_tick, worker.udata) // keep streaming
+	event_loop.watch_fd(st.tfd, .readable, sse_tick, watch_payload) // keep streaming
 	return .suspend
 }
 

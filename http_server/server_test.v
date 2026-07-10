@@ -2,7 +2,7 @@ module http_server
 
 import http_server.core
 
-fn dummy_handler(req []u8, mut res []u8, mut worker core.Worker) core.Step {
+fn dummy_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if req.bytestr().contains('/notfound') {
 		res << 'HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found'.bytes()
 		return .done

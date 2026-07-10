@@ -150,12 +150,11 @@ fn handle_read_completion(io_data &iocp.IOData, mut ctx WorkerContext) {
 	// Process the request — server-owned response buffer, handler appends raw bytes.
 	request_data := io_data.buffer[..bytes_read]
 	mut response_data := []u8{len: 0, cap: 4096}
-	mut w := core.Worker{
+	mut event_loop := core.EventLoop{
 		client_fd: socket_fd
-		state:     ctx.state
 		register:  core.reject_register
 	}
-	step := ctx.handler(request_data, mut response_data, mut w)
+	step := ctx.handler(request_data, mut response_data, socket_fd, ctx.state, mut event_loop)
 	if step != .done {
 		// .close: flush whatever the handler appended (its error response), then
 		// drop. .suspend: parking is not supported on this backend (no watch

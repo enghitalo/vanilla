@@ -5,7 +5,7 @@ import http_server.core
 import http_server.http1_1.response
 import http_server.http1_1.request_parser
 
-fn handle_request(req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
+fn handle_request(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {
 		out << response.tiny_bad_request_response
 		return .close

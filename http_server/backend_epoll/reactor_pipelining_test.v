@@ -13,11 +13,11 @@ import http_server.core
 // load), since the test harness is single-connection and the epoll backend runs
 // one worker per core (concurrent parks can't be co-located in a unit test).
 
-fn noop_cont(mut out []u8, mut w core.Worker) core.Step {
+fn noop_cont(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	return .done
 }
 
-fn other_cont(mut out []u8, mut w core.Worker) core.Step {
+fn other_cont(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	return .suspend
 }
 

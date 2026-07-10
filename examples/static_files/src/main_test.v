@@ -29,8 +29,8 @@ fn testsuite_end() {
 // the return-a-buffer shape the assertions expect.
 fn serve(req []u8) []u8 {
 	mut out := []u8{}
-	mut worker := core.Worker{}
-	assert handle(req, mut out, mut worker) == .done
+	mut event_loop := core.EventLoop{}
+	assert handle(req, mut out, -1, unsafe { nil }, mut event_loop) == .done
 	return out
 }
 
@@ -176,7 +176,7 @@ fn test_path_traversal_gets_404() {
 fn test_malformed_request_errors() {
 	// Malformed input must append the canned 400 and close the connection.
 	mut out := []u8{}
-	mut worker := core.Worker{}
-	assert handle('garbage'.bytes(), mut out, mut worker) == .close
+	mut event_loop := core.EventLoop{}
+	assert handle('garbage'.bytes(), mut out, -1, unsafe { nil }, mut event_loop) == .close
 	assert out.bytestr().contains('400 Bad Request')
 }

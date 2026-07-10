@@ -63,8 +63,8 @@ const head = 'HTTP/1.1 200 OK\r\n'.bytes()
 
 const tail = 'Content-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
 
-fn handle(req []u8, mut out []u8, mut worker core.Worker) core.Step {
-	mut dc := unsafe { &DateCache(worker.state) }
+fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	mut dc := unsafe { &DateCache(worker_state) }
 	dc.refresh()
 	out << head
 	out << dc.line // cached: no per-request formatting in the common case

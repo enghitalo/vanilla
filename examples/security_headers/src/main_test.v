@@ -32,7 +32,7 @@ fn test_status_line_and_body_preserved() {
 fn serve(req []u8) []u8 {
 	wrapped := with_security_headers(app)
 	mut out := []u8{}
-	mut worker := core.Worker{}
-	assert wrapped(req, mut out, mut worker) == .done
+	mut event_loop := core.EventLoop{}
+	assert wrapped(req, mut out, -1, unsafe { nil }, mut event_loop) == .done
 	return out
 }

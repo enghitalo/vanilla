@@ -7,7 +7,7 @@ import http_server.core
 
 // Handler is the frozen core contract: bytes in (+ worker), response bytes
 // APPENDED to `out`, next Step returned.
-type Handler = fn (req []u8, mut out []u8, mut worker core.Worker) core.Step
+type Handler = fn (req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step
 
 // Middleware takes the next handler and returns a wrapping handler.
 type Middleware = fn (Handler) Handler

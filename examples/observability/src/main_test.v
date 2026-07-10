@@ -110,8 +110,8 @@ fn serve(req []u8, mut m Metrics) ![]u8 {
 		app(req_buffer, mut m, mut out)!
 	}, mut m)
 	mut out := []u8{}
-	mut worker := core.Worker{}
-	if handler(req, mut out, mut worker) == .close {
+	mut event_loop := core.EventLoop{}
+	if handler(req, mut out, -1, unsafe { nil }, mut event_loop) == .close {
 		return error('handler closed the connection')
 	}
 	return out

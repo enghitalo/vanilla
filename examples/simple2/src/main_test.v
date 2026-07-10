@@ -53,8 +53,8 @@ fn test_handle_request_get_user_empty_id() {
 fn test_handle_request_malformed_head() {
 	req_buffer := 'GET / HTTP/1.1'.bytes()
 	mut out := []u8{}
-	mut worker := core.Worker{}
-	assert handle_request(req_buffer, mut out, mut worker) == .close
+	mut event_loop := core.EventLoop{}
+	assert handle_request(req_buffer, mut out, -1, unsafe { nil }, mut event_loop) == .close
 	assert out == response.tiny_bad_request_response
 }
 
@@ -62,7 +62,7 @@ fn test_handle_request_malformed_head() {
 // the return-a-buffer shape the assertions expect.
 fn serve(req []u8) []u8 {
 	mut out := []u8{}
-	mut worker := core.Worker{}
-	handle_request(req, mut out, mut worker)
+	mut event_loop := core.EventLoop{}
+	handle_request(req, mut out, -1, unsafe { nil }, mut event_loop)
 	return out
 }

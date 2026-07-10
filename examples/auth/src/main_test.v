@@ -61,8 +61,8 @@ fn test_api_key_constant_time_check() {
 // buffer) to the return-a-string shape the assertions expect.
 fn serve(req string) string {
 	mut out := []u8{}
-	mut worker := core.Worker{}
-	handle(req.bytes(), mut out, mut worker)
+	mut event_loop := core.EventLoop{}
+	handle(req.bytes(), mut out, -1, unsafe { nil }, mut event_loop)
 	return out.bytestr()
 }
 
@@ -112,7 +112,7 @@ fn test_unknown_route_and_malformed() {
 	assert serve('GET /nope HTTP/1.1\r\nHost: x\r\n\r\n').contains('404')
 	// Malformed input gets the canned 400 and the connection is closed.
 	mut out := []u8{}
-	mut worker := core.Worker{}
-	assert handle('garbage'.bytes(), mut out, mut worker) == .close
+	mut event_loop := core.EventLoop{}
+	assert handle('garbage'.bytes(), mut out, -1, unsafe { nil }, mut event_loop) == .close
 	assert out == response.tiny_bad_request_response
 }

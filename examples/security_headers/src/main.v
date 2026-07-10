@@ -33,9 +33,9 @@ const security_headers = 'Strict-Transport-Security: max-age=63072000; includeSu
 // with_security_headers wraps any handler and injects the headers into its
 // response, right after the status line. Composition, not inheritance.
 fn with_security_headers(next core.Handler) core.Handler {
-	return fn [next] (req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
+	return fn [next] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 		start := out.len
-		step := next(req_buffer, mut out, mut worker)
+		step := next(req_buffer, mut out, -1, unsafe { nil }, mut event_loop)
 		if step != .done {
 			return step
 		}
@@ -49,7 +49,7 @@ fn with_security_headers(next core.Handler) core.Handler {
 	}
 }
 
-fn app(req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
+fn app(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {
 		out << response.tiny_bad_request_response
 		return .close

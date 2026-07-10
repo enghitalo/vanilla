@@ -70,7 +70,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: unsafe { http_server.IOBackend(0) }
-		handler:         fn [mut pool] (req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
+		handler:         fn [mut pool] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 			return handle_request(req_buffer, mut out, mut pool)
 		}
 	})!

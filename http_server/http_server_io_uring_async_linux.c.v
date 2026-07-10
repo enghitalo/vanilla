@@ -264,7 +264,7 @@ fn (mut env IouEnv) iou_reactor_clear(ext_fd int) {
 // external fd — the SQE is flushed by the worker loop's next submit_and_wait.
 // Runs on the ring's own worker thread (continuations execute inside the CQE
 // dispatch), so SINGLE_ISSUER holds and no synchronization is needed.
-fn iou_register_watch(mut w core.Worker, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
+fn iou_register_watch(mut w core.EventLoop, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
 	if ext_fd < 0 {
 		// A consumer handed us a failed fd (e.g. timerfd_create returned -1); never
 		// index the flat table at a negative slot. Arm nothing.
@@ -333,17 +333,13 @@ fn iou_retry_pending_polls(mut env IouEnv) {
 	}
 }
 
-// iou_worker_handle builds the per-invocation Worker for a handler/continuation
-// call. loop_fd is -1 — io_uring has no event-loop fd; the ring is reached via
-// env.worker inside register.
+// iou_event_loop builds the per-invocation EventLoop handle for a handler /
+// continuation call. loop_fd is -1 — io_uring has no event-loop fd; the ring
+// is reached via env.worker inside register.
 @[inline]
-fn iou_worker_handle(mut env IouEnv, client_fd int, ready_fd int, ready_err bool, udata voidptr) core.Worker {
-	return core.Worker{
+fn iou_event_loop(mut env IouEnv, client_fd int) core.EventLoop {
+	return core.EventLoop{
 		client_fd: client_fd
-		ready_fd:  ready_fd
-		ready_err: ready_err
-		udata:     udata
-		state:     env.state
 		loop_fd:   -1
 		reactor:   unsafe { voidptr(env) }
 		register:  iou_register_watch
@@ -371,7 +367,7 @@ fn iou_drain_requests(mut env IouEnv, mut conn io_uring.Connection, limits Limit
 	mut pend_len := i64(0)
 	// ONE Worker per burst, not per request: the loop-invariant fields are set once;
 	// the per-request fields are reset before each handler call below.
-	mut w := iou_worker_handle(mut env, conn.fd, -1, false, unsafe { nil })
+	mut event_loop := iou_event_loop(mut env, conn.fd)
 	for pos < conn.read_buf.len && conn.awaiting_fd < 0 && !conn.close_after_send {
 		if pend != unsafe { nil } {
 			unsafe { conn.response_buffer.push_many(pend, int(pend_len)) }
@@ -399,10 +395,9 @@ fn iou_drain_requests(mut env IouEnv, mut conn io_uring.Connection, limits Limit
 		// copy so ordering survives the deferred flush).
 		core.set_queue_buf_allowed(conn.response_buffer.len == 0)
 		// Only last_watched can be dirtied between iterations (iou_register_watch
-		// is the sole runtime writer during an initial call); ready_fd/ready_err/
-		// udata keep their once-per-burst construction values.
-		w.last_watched = -1
-		step := env.h(req, mut conn.response_buffer, mut w)
+		// is the sole runtime writer during an initial call).
+		event_loop.last_watched = -1
+		step := env.h(req, mut conn.response_buffer, conn.fd, env.state, mut event_loop)
 		if qb := core.take_queued_buf() {
 			pend = qb.ptr
 			pend_len = qb.len
@@ -414,7 +409,7 @@ fn iou_drain_requests(mut env IouEnv, mut conn io_uring.Connection, limits Limit
 				// Park: no client op will be armed until the watch resumes. Clear the
 				// read deadline — nothing is mid-read, and the sweep must not shut a
 				// parked connection down as a slow reader.
-				conn.awaiting_fd = w.last_watched
+				conn.awaiting_fd = event_loop.last_watched
 				conn.read_deadline = 0
 			}
 			.close {
@@ -422,11 +417,11 @@ fn iou_drain_requests(mut env IouEnv, mut conn io_uring.Connection, limits Limit
 			}
 		}
 
-		if step != .suspend && w.last_watched >= 0 {
+		if step != .suspend && event_loop.last_watched >= 0 {
 			// The handler registered a watch but did NOT park (.done/.close after
 			// w.watch — a contract violation): tear it down so no armed poll can
 			// later resume against this (soon-recycled) connection.
-			env.iou_detach_rejected_watch(w.last_watched, env.cur_conn)
+			env.iou_detach_rejected_watch(event_loop.last_watched, env.cur_conn)
 		}
 		// Peer pipelines requests but never reads responses: bail before the pending
 		// batch grows without bound.
@@ -476,15 +471,15 @@ fn iou_start_body_drain(mut env IouEnv, mut conn io_uring.Connection, total int,
 	}
 	head := buf_view(conn.read_buf, 0, head_len)
 	core.set_queue_buf_allowed(false)
-	mut w := iou_worker_handle(mut env, conn.fd, -1, false, unsafe { nil })
-	if env.h(head, mut conn.response_buffer, mut w) != .done {
+	mut event_loop := iou_event_loop(mut env, conn.fd)
+	if env.h(head, mut conn.response_buffer, conn.fd, env.state, mut event_loop) != .done {
 		// suspend/close on a streamed-body head is unsupported (as on epoll):
 		// answer 400 and condemn. The handler may ALREADY have registered a watch
 		// (armed poll + submitted query) before suspending — tear it down, or the
 		// armed poll would later resume against this recycled connection (and a
 		// pooled fd's orphaned reply must still be drained in order: tombstoned).
-		if w.last_watched >= 0 {
-			env.iou_detach_rejected_watch(w.last_watched, env.cur_conn)
+		if event_loop.last_watched >= 0 {
+			env.iou_detach_rejected_watch(event_loop.last_watched, env.cur_conn)
 		}
 		conn.response_buffer << response.tiny_bad_request_response
 		conn.close_after_send = true
@@ -559,12 +554,12 @@ fn handle_io_uring_poll(cqe &C.io_uring_cqe, mut env IouEnv, limits Limits, acti
 	}
 	conn.awaiting_fd = -1
 	env.cur_conn = conn
-	mut w := iou_worker_handle(mut env, conn.fd, ext_fd, ready_err, udata)
-	step := cont(mut conn.response_buffer, mut w)
-	if step != .suspend && w.last_watched >= 0 {
+	mut event_loop := iou_event_loop(mut env, conn.fd)
+	step := cont(mut conn.response_buffer, ext_fd, ready_err, udata, env.state, mut event_loop)
+	if step != .suspend && event_loop.last_watched >= 0 {
 		// Continuation re-watched but did not park (.done/.close after w.watch):
 		// tear the stray watch down before the connection moves on / is released.
-		env.iou_detach_rejected_watch(w.last_watched, conn)
+		env.iou_detach_rejected_watch(event_loop.last_watched, conn)
 	}
 	match step {
 		.done {
@@ -574,7 +569,7 @@ fn handle_io_uring_poll(cqe &C.io_uring_cqe, mut env IouEnv, limits Limits, acti
 			// Multi-step chain: register already queued a fresh oneshot poll. Stay
 			// parked; bytes (if any) stay HELD — no send while parked (see module
 			// comment; epoll's stream-as-you-go on .suspend is a follow-up here).
-			conn.awaiting_fd = w.last_watched
+			conn.awaiting_fd = event_loop.last_watched
 		}
 		.close {
 			// A parked connection has no in-flight op, so releasing here is safe.
@@ -601,12 +596,13 @@ fn drain_pipelined_iou(mut env IouEnv, ext_fd int, ready_err bool, limits Limits
 		if slot.dead || unsafe { conn == nil } || unsafe { conn.owner == nil }
 			|| conn.fd != slot.client_fd {
 			mut scratch := []u8{}
-			mut dw := iou_worker_handle(mut env, slot.client_fd, ext_fd, ready_err, slot.udata)
+			mut dead_loop := iou_event_loop(mut env, slot.client_fd)
 			// rearming_dead: a re-arm from this tombstone's continuation must ONLY
 			// re-queue the oneshot poll — the queue slot stays as-is and the watch
 			// table is untouched (see iou_register_watch).
 			env.rearming_dead = true
-			dead_step := slot.cont(mut scratch, mut dw)
+			dead_step := slot.cont(mut scratch, ext_fd, ready_err, slot.udata, env.state, mut
+				dead_loop)
 			env.rearming_dead = false
 			if dead_step == .suspend {
 				break // result not ready yet — the tombstone stays at the head
@@ -617,14 +613,15 @@ fn drain_pipelined_iou(mut env IouEnv, ext_fd int, ready_err bool, limits Limits
 		}
 		conn.awaiting_fd = -1
 		env.cur_conn = conn
-		mut w := iou_worker_handle(mut env, conn.fd, ext_fd, ready_err, slot.udata)
-		step := slot.cont(mut conn.response_buffer, mut w)
-		if step != .suspend && w.last_watched >= 0 && w.last_watched != ext_fd {
+		mut event_loop := iou_event_loop(mut env, conn.fd)
+		step := slot.cont(mut conn.response_buffer, ext_fd, ready_err, slot.udata, env.state, mut
+			event_loop)
+		if step != .suspend && event_loop.last_watched >= 0 && event_loop.last_watched != ext_fd {
 			// Continuation watched a DIFFERENT fd but did not park: stray watch —
 			// tear it down. (last_watched == ext_fd can't happen on a non-suspend:
 			// a re-watch of ext_fd updates this same queue slot, which the .done/
 			// .close arms below then pop.)
-			env.iou_detach_rejected_watch(w.last_watched, conn)
+			env.iou_detach_rejected_watch(event_loop.last_watched, conn)
 		}
 		match step {
 			.done {

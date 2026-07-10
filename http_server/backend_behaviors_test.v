@@ -17,7 +17,7 @@ import http1_1.request_parser
 import http1_1.response
 import http_server.core
 
-fn bb_ok_handler(req []u8, mut res []u8, mut worker core.Worker) core.Step {
+fn bb_ok_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	res << 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
 	return .done
 }
@@ -26,7 +26,7 @@ fn bb_ok_handler(req []u8, mut res []u8, mut worker core.Worker) core.Step {
 // never touches the body. This is the shape the large-body streaming path
 // requires (the head alone is passed; the body is drained + discarded), mirroring
 // the HttpArena vanilla /upload handler.
-fn bb_upload_handler(req []u8, mut res []u8, mut worker core.Worker) core.Step {
+fn bb_upload_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	hr := request_parser.decode_http_request(req) or {
 		res << response.tiny_bad_request_response
 		return .close

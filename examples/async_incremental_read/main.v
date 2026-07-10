@@ -32,7 +32,7 @@ const chunk_headers = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-E
 
 const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 
-fn handle(req []u8, mut out []u8, mut worker core.Worker) core.Step {
+fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if !req.bytestr().contains('/stream') {
 		out << not_found
 		return .done
@@ -46,35 +46,35 @@ fn handle(req []u8, mut out []u8, mut worker core.Worker) core.Step {
 	fd := C.fileno(fp)
 	C.fcntl(fd, C.F_SETFL, C.O_NONBLOCK) // so read() returns EAGAIN instead of blocking
 	out << chunk_headers // flushed after the initial .suspend
-	worker.watch(fd, .readable, on_chunk, fp) // carry FILE* so we can pclose at EOF
+	event_loop.watch_fd(fd, .readable, on_chunk, fp) // carry FILE* so we can pclose at EOF
 	return .suspend
 }
 
 // on_chunk runs whenever the pipe has bytes (or hit EOF): forward what is there
 // as one chunk and re-arm. Each chunk flushes on .suspend, so the client sees
 // output as the producer emits it.
-fn on_chunk(mut out []u8, mut worker core.Worker) core.Step {
+fn on_chunk(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut buf := [4096]u8{}
-	n := C.read(worker.ready_fd(), &buf[0], 4096)
+	n := C.read(ready_fd, &buf[0], 4096)
 	if n > 0 {
 		// HTTP chunk = <hex length>\r\n<bytes>\r\n
 		out << '${n.hex()}\r\n'.bytes()
 		out << buf[..n]
 		out << '\r\n'.bytes()
-		worker.watch(worker.ready_fd(), .readable, on_chunk, worker.udata)
+		event_loop.watch_fd(ready_fd, .readable, on_chunk, watch_payload)
 		return .suspend
 	}
 	if n == 0 {
 		out << '0\r\n\r\n'.bytes() // terminating chunk
-		C.pclose(worker.udata)
+		C.pclose(watch_payload)
 		return .done
 	}
 	// n < 0: nothing ready yet (EAGAIN) → wait for the next readable edge.
 	if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
-		worker.watch(worker.ready_fd(), .readable, on_chunk, worker.udata)
+		event_loop.watch_fd(ready_fd, .readable, on_chunk, watch_payload)
 		return .suspend
 	}
-	C.pclose(worker.udata) // a real read error → drop the connection
+	C.pclose(watch_payload) // a real read error → drop the connection
 	return .close
 }
 

@@ -44,9 +44,9 @@ mut:
 	watches map[int]KqWatch
 }
 
-// kqueue_async_register is installed into Worker.register on macOS: record the
-// parked request and add the ext fd to this worker's kqueue.
-fn kqueue_async_register(mut w core.Worker, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
+// kqueue_async_register is installed into EventLoop.register on macOS: record
+// the parked request and add the ext fd to this worker's kqueue.
+fn kqueue_async_register(mut w core.EventLoop, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
 	mut r := unsafe { &KqReactor(w.reactor) }
 	r.watches[ext_fd] = KqWatch{
 		client_fd: w.client_fd
@@ -136,14 +136,13 @@ fn kq_handle_request(h core.Handler, mut reactor KqReactor, kq int, fd int, limi
 		c
 	}
 	conn.out.clear()
-	mut w := core.Worker{
+	mut event_loop := core.EventLoop{
 		client_fd: fd
-		state:     state
 		loop_fd:   kq
 		reactor:   unsafe { voidptr(&reactor) }
 		register:  kqueue_async_register
 	}
-	match h(request_buffer, mut conn.out, mut w) {
+	match h(request_buffer, mut conn.out, fd, state, mut event_loop) {
 		.done {
 			response.send_response(fd, conn.out.data, conn.out.len) or {
 				kq_close(mut reactor, kq, fd)
@@ -151,7 +150,7 @@ fn kq_handle_request(h core.Handler, mut reactor KqReactor, kq int, fd int, limi
 			// keep-alive: fd stays registered for the next request
 		}
 		.suspend {
-			conn.awaiting_fd = w.last_watched // parked; resumed by kq_run_cont
+			conn.awaiting_fd = event_loop.last_watched // parked; resumed by kq_run_cont
 		}
 		.close {
 			// Flush-then-close (the core.Step contract): the handler's error
@@ -168,24 +167,20 @@ fn kq_handle_request(h core.Handler, mut reactor KqReactor, kq int, fd int, limi
 fn kq_run_cont(mut reactor KqReactor, kq int, watch KqWatch, ext_fd int, ready_err bool, state voidptr) {
 	mut conn := reactor.conns[watch.client_fd] or { return } // client went away
 	conn.awaiting_fd = -1
-	mut w := core.Worker{
+	mut event_loop := core.EventLoop{
 		client_fd: watch.client_fd
-		ready_fd:  ext_fd
-		ready_err: ready_err
-		udata:     watch.udata
-		state:     state
 		loop_fd:   kq
 		reactor:   unsafe { voidptr(&reactor) }
 		register:  kqueue_async_register
 	}
-	match watch.cont(mut conn.out, mut w) {
+	match watch.cont(mut conn.out, ext_fd, ready_err, watch.udata, state, mut event_loop) {
 		.done {
 			response.send_response(watch.client_fd, conn.out.data, conn.out.len) or {
 				kq_close(mut reactor, kq, watch.client_fd)
 			}
 		}
 		.suspend {
-			conn.awaiting_fd = w.last_watched // re-armed (multi-step); stay parked
+			conn.awaiting_fd = event_loop.last_watched // re-armed (multi-step); stay parked
 		}
 		.close {
 			// Flush-then-close: send whatever the continuation appended first.

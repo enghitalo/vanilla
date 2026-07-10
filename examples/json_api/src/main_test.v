@@ -20,8 +20,8 @@ import http_server.http1_1.request_parser
 // error, mirroring the old error-raising contract.
 fn serve(req []u8) ![]u8 {
 	mut out := []u8{}
-	mut worker := core.Worker{}
-	if handle(req, mut out, mut worker) == .close {
+	mut event_loop := core.EventLoop{}
+	if handle(req, mut out, -1, unsafe { nil }, mut event_loop) == .close {
 		return error('handler closed the connection')
 	}
 	return out

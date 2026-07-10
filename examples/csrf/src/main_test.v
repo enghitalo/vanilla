@@ -13,8 +13,8 @@ import http_server.http1_1.response
 // buffer) to the return-a-buffer shape the assertions expect.
 fn serve(req []u8) []u8 {
 	mut out := []u8{}
-	mut worker := core.Worker{}
-	handle(req, mut out, mut worker)
+	mut event_loop := core.EventLoop{}
+	handle(req, mut out, -1, unsafe { nil }, mut event_loop)
 	return out
 }
 
@@ -121,10 +121,11 @@ fn test_safe_get_passes_through() {
 fn test_malformed_request_errors() {
 	// Malformed input gets the canned 400 and the connection is closed.
 	mut out := []u8{}
-	mut worker := core.Worker{}
-	assert handle('garbage'.bytes(), mut out, mut worker) == .close
+	mut event_loop := core.EventLoop{}
+	assert handle('garbage'.bytes(), mut out, -1, unsafe { nil }, mut event_loop) == .close
 	assert out == response.tiny_bad_request_response
 	mut out2 := []u8{}
-	assert handle('POST /save HTTP/1.1\r\nTrunc'.bytes(), mut out2, mut worker) == .close
+	assert handle('POST /save HTTP/1.1\r\nTrunc'.bytes(), mut out2, -1, unsafe { nil }, mut
+		event_loop) == .close
 	assert out2 == response.tiny_bad_request_response
 }

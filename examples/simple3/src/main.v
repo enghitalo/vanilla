@@ -13,7 +13,7 @@ pub mut:
 	db_pool ?pool.ConnectionPool
 }
 
-fn (app App) handle_request(req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
+fn (app App) handle_request(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {
 		out << response.tiny_bad_request_response
 		return .close
@@ -70,8 +70,8 @@ fn main() {
 
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
-		handler:         fn [app] (req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
-			return app.handle_request(req_buffer, mut out, mut worker)
+		handler:         fn [app] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+			return app.handle_request(req_buffer, mut out, -1, unsafe { nil }, mut event_loop)
 		}
 		io_multiplexing: unsafe { http_server.IOBackend(0) }
 	})!

@@ -64,8 +64,8 @@ fn test_session_ids_unguessable() {
 // buffer) to the return-a-string shape the assertions expect.
 fn serve(mut store Store, req string) string {
 	mut out := []u8{}
-	mut worker := core.Worker{}
-	handle(req.bytes(), mut out, mut worker, mut store)
+	mut event_loop := core.EventLoop{}
+	handle(req.bytes(), mut out, -1, unsafe { nil }, mut event_loop, mut store)
 	return out.bytestr()
 }
 
@@ -115,12 +115,13 @@ fn test_unknown_route_and_malformed() {
 	mut s := Store{}
 	assert serve(mut s, 'GET /nope HTTP/1.1\r\nHost: x\r\n\r\n').contains('404')
 	// Malformed input gets the canned 400 and the connection is closed.
-	mut worker := core.Worker{}
+	mut event_loop := core.EventLoop{}
 	mut out := []u8{}
-	assert handle('garbage'.bytes(), mut out, mut worker, mut s) == .close
+	assert handle('garbage'.bytes(), mut out, -1, unsafe { nil }, mut event_loop, mut s) == .close
 	assert out == response.tiny_bad_request_response
 	mut out2 := []u8{}
 	// no final CRLFCRLF
-	assert handle('GET /me HTTP/1.1\r\nHost: x\r\n'.bytes(), mut out2, mut worker, mut s) == .close
+	assert handle('GET /me HTTP/1.1\r\nHost: x\r\n'.bytes(), mut out2, -1, unsafe { nil }, mut
+		event_loop, mut s) == .close
 	assert out2 == response.tiny_bad_request_response
 }

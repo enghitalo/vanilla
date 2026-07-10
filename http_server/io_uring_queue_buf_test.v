@@ -23,7 +23,7 @@ fn qb_build_resp() []u8 {
 	return b
 }
 
-fn iou_qb_handler(req []u8, mut res []u8, mut worker core.Worker) core.Step {
+fn iou_qb_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if !core.queue_buf(qb_resp.data, qb_resp.len) {
 		res << qb_resp // fallback when the backend can't borrow-send
 	}

@@ -124,7 +124,7 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_state fn () voidptr, on_worker_start core.WorkerStartFn, limits core.Limits, counter &core.Counter, active_conns &core.Counter) {
 	maybe_pin_worker(worker_id)
 	// Build THIS worker's per-thread state once (e.g. its own DB connection);
-	// every handler call on this worker reaches it via worker.state.
+	// every handler call on this worker receives it as the worker_state parameter.
 	mut state := voidptr(unsafe { nil })
 	if make_state != unsafe { nil } {
 		state = make_state()
@@ -138,17 +138,16 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut st := new_plain_state()
 	// Arm clientless background watches (timerfd refresh, signalfd, ...) on THIS
-	// worker's loop, once, before serving. The handle carries client_fd = -1 so the
-	// watch + its continuation take the clientless path (no conn, scratch buffer).
+	// worker's loop, once, before serving. client_fd = -1 makes the watch + its
+	// continuation take the clientless path (no conn, scratch buffer).
 	if on_worker_start != unsafe { nil } {
-		mut startup := core.Worker{
+		mut startup_loop := core.EventLoop{
 			client_fd: -1
-			state:     state
 			loop_fd:   epoll_fd
 			reactor:   unsafe { voidptr(&reactor) }
 			register:  register_watch
 		}
-		on_worker_start(mut startup)
+		on_worker_start(state, mut startup_loop)
 	}
 	// Only arm the timeout sweep if a deadline is actually configured.
 	sweep_on := limits.read_timeout_ms > 0 || limits.write_timeout_ms > 0

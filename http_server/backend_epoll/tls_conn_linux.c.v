@@ -245,14 +245,13 @@ fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd 
 		resp = []u8{len: 0, cap: 4096}
 	}
 	// The TLS worker has no watch reactor: register is a stub that arms nothing,
-	// so a handler that calls worker.watch and suspends is simply dropped below.
-	mut w := core.Worker{
+	// so a handler that calls event_loop.watch_fd and suspends is dropped below.
+	mut event_loop := core.EventLoop{
 		client_fd: fd
-		state:     state
 		loop_fd:   epoll_fd
 		register:  core.reject_register
 	}
-	step := handler(buf, mut resp, mut w)
+	step := handler(buf, mut resp, fd, state, mut event_loop)
 	unsafe {
 		buf.len = 0
 	}

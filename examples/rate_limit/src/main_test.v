@@ -61,10 +61,8 @@ fn test_per_client_isolation() {
 // socket.peer_addr fail => the no-XFF identity is 'unknown'.
 fn serve(req string, mut l Limiter) !string {
 	mut out := []u8{}
-	mut worker := core.Worker{
-		client_fd: -1
-	}
-	if handle(req.bytes(), mut out, mut worker, mut l) == .close {
+	mut event_loop := core.EventLoop{}
+	if handle(req.bytes(), mut out, -1, unsafe { nil }, mut event_loop, mut l) == .close {
 		return error('handler closed the connection')
 	}
 	return out.bytestr()

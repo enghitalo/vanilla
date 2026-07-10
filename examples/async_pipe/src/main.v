@@ -1,5 +1,5 @@
 // Cross-platform async-runtime example (Linux epoll + macOS kqueue): the smallest
-// portable consumer of `worker.watch(fd, interest, cont, udata)`. `/async` parks the
+// portable consumer of `event_loop.watch_fd(fd, interest, cont, udata)`. `/async` parks the
 // request on a pipe's read end (which we make readable to stand in for async work
 // completing), then answers from the continuation. Everything else answers
 // immediately. Uses only a pipe + read/write/close, so it builds and runs on both
@@ -22,7 +22,7 @@ fn C.close(fd int) int
 const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
 
 // handle parks /async on a pipe read-end and answers everything else immediately.
-fn handle(req []u8, mut out []u8, mut worker core.Worker) core.Step {
+fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if req.bytestr().contains('/async') {
 		mut fds := [2]int{}
 		if C.pipe(unsafe { &fds[0] }) != 0 {
@@ -35,7 +35,7 @@ fn handle(req []u8, mut out []u8, mut worker core.Worker) core.Step {
 		b := u8(1)
 		C.write(fds[1], &b, 1)
 		C.close(fds[1])
-		worker.watch(fds[0], .readable, pipe_done, unsafe { nil })
+		event_loop.watch_fd(fds[0], .readable, pipe_done, unsafe { nil })
 		return .suspend
 	}
 	out << resp_ok
@@ -44,10 +44,10 @@ fn handle(req []u8, mut out []u8, mut worker core.Worker) core.Step {
 
 // pipe_done runs when the pipe read-end is readable: drain it, close it (the
 // request owns the watched fd), and answer.
-fn pipe_done(mut out []u8, mut worker core.Worker) core.Step {
+fn pipe_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(worker.ready_fd(), &tmp[0], 8)
-	C.close(worker.ready_fd())
+	C.read(ready_fd, &tmp[0], 8)
+	C.close(ready_fd)
 	body := 'async-ok'
 	out << 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ${body.len}\r\nConnection: keep-alive\r\n\r\n${body}'.bytes()
 	return .done

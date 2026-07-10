@@ -24,7 +24,7 @@ fn test_simple_without_init_the_server() {
 // buffer) to the return-a-buffer shape the assertions expect.
 fn serve(app App, req []u8) []u8 {
 	mut out := []u8{}
-	mut worker := core.Worker{}
-	app.handle_request(req, mut out, mut worker)
+	mut event_loop := core.EventLoop{}
+	app.handle_request(req, mut out, -1, unsafe { nil }, mut event_loop)
 	return out
 }

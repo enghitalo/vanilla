@@ -20,10 +20,9 @@ fn test_allowed_ip_gets_200() {
 	mut b := Blocklist{}
 	// fd -1 => socket.peer_addr returns '' (not in the list) => allowed.
 	mut resp := []u8{}
-	mut worker := core.Worker{
-		client_fd: -1
-	}
-	assert handle('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), mut resp, mut worker, mut b) == .done
+	mut event_loop := core.EventLoop{}
+	assert handle('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), mut resp, -1, unsafe { nil }, mut
+		event_loop, mut b) == .done
 	out := resp.bytestr()
 	assert out.contains('200 OK')
 	assert out.contains('allowed')
@@ -34,9 +33,8 @@ fn test_blocked_ip_gets_403() {
 	// peer_addr('' for fd -1) — block that to drive the deny path through handle.
 	b.block('')
 	mut resp := []u8{}
-	mut worker := core.Worker{
-		client_fd: -1
-	}
-	assert handle('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), mut resp, mut worker, mut b) == .done
+	mut event_loop := core.EventLoop{}
+	assert handle('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), mut resp, -1, unsafe { nil }, mut
+		event_loop, mut b) == .done
 	assert resp.bytestr().contains('403 Forbidden')
 }
