@@ -11,7 +11,7 @@ import runtime
 // public array lengths verifies the knob end-to-end, deterministically — no
 // sleeps, no real server to start or stop, nothing that can hang CI.
 
-fn noop_handler(req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+fn noop_handler(req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
 	return .done
 }
 

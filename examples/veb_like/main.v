@@ -199,8 +199,8 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		handler:         fn [app] (req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
-			out << router(req_buffer, ctx.client_fd, app) or {
+		handler:         fn [app] (req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
+			out << router(req_buffer, worker.client_fd, app) or {
 				out << bad_request_response
 				return .close
 			}

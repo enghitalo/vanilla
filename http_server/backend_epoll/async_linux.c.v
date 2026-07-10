@@ -9,7 +9,7 @@ module backend_epoll
 // just appends its response and returns `.done` — that is the whole hot path.
 // A handler that needs to wait on something (a DB socket, an upstream
 // connection, a timerfd, the client becoming writable, ...) calls
-// `ctx.watch(ext_fd, interest, continuation, udata)` and returns `.suspend`.
+// `worker.watch(ext_fd, interest, continuation, udata)` and returns `.suspend`.
 // The worker registers the external fd in its OWN epoll, PARKS the connection
 // (its response is not produced yet), and goes on serving other connections.
 // When `ext_fd` is ready the worker runs the continuation, which appends the
@@ -35,7 +35,7 @@ import time
 
 // WatchEntry records one parked request: which client connection is waiting, the
 // continuation to run when the watched fd is ready, and the consumer's opaque
-// context handed back via Ctx.udata. `active` is the slot's occupancy flag:
+// context handed back via Worker.udata. `active` is the slot's occupancy flag:
 // the table is indexed by fd (a flat array, not a hashmap), so a cleared slot is
 // just `active = false` rather than an erased key.
 //
@@ -222,7 +222,7 @@ fn (mut r Reactor) reactor_mark_dead(ext_fd int, client_fd int) {
 // detach_rejected_watch tears down a watch that a handler/continuation registered
 // during a call whose OUTCOME rejected the park — a streamed large-body head that
 // suspended (unsupported: answered 400 and dropped), or .done/.close returned
-// after ac.watch. Without this the entry stays active, keyed by a client_fd that
+// after w.watch. Without this the entry stays active, keyed by a client_fd that
 // is about to be closed and REUSED: a later readiness edge would run the stale
 // continuation against whatever connection now owns that fd (vanilla#100 hazard
 // 2). Same teardown close_client applies on a mid-park disconnect: tombstone a
@@ -271,18 +271,18 @@ fn (mut r Reactor) reactor_orphan_single(ext_fd int, client_fd int) bool {
 	return true
 }
 
-// register_watch is installed into Ctx.register; it is what `ctx.watch(...)`
+// register_watch is installed into Worker.register; it is what `worker.watch(...)`
 // ultimately calls. It records the watch and arms the external fd in this
 // worker's epoll (level-triggered: simplest correct default for arbitrary
 // consumer fds). Runs on the worker thread, so no synchronization is needed.
-fn register_watch(mut ac core.Ctx, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
+fn register_watch(mut w core.Worker, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
 	if ext_fd < 0 {
 		// A consumer handed us a failed fd (e.g. timerfd_create returned -1); never
 		// index the flat table at a negative slot. Arm nothing.
-		ac.last_watched = -1
+		w.last_watched = -1
 		return
 	}
-	mut r := unsafe { &Reactor(ac.reactor) }
+	mut r := unsafe { &Reactor(w.reactor) }
 	r.armed = true // sticky: the event loop starts probing the watch table
 	if r.rearming_dead {
 		// Tombstone re-arm (drain_pipelined dead branch): the queue slot stays
@@ -290,14 +290,14 @@ fn register_watch(mut ac core.Ctx, ext_fd int, interest core.WatchInterest, cont
 		// remain in epoll. Do NOT touch the watch table: a dedup match would
 		// refresh the tombstone, and a dedup that skips dead slots would append a
 		// duplicate live entry for a dead client.
-		if epoll.mod_fd_in_epoll(ac.loop_fd, ext_fd, u32(C.EPOLLIN)) != 0 {
-			epoll.add_fd_to_epoll(ac.loop_fd, ext_fd, u32(C.EPOLLIN))
+		if epoll.mod_fd_in_epoll(w.loop_fd, ext_fd, u32(C.EPOLLIN)) != 0 {
+			epoll.add_fd_to_epoll(w.loop_fd, ext_fd, u32(C.EPOLLIN))
 		}
-		ac.last_watched = ext_fd
+		w.last_watched = ext_fd
 		return
 	}
-	r.reactor_watch(ext_fd, ac.client_fd, cont, udata)
-	if ac.persistent {
+	r.reactor_watch(ext_fd, w.client_fd, cont, udata)
+	if w.persistent {
 		// Pool-owned fd (watch_persistent): mark the slot so a client disconnect won't
 		// close it. Sticky — reactor_watch zeroes the entry on a fresh single watch, so
 		// this re-stamps it every park; promotion to a queue preserves it.
@@ -308,17 +308,17 @@ fn register_watch(mut ac core.Ctx, ext_fd int, interest core.WatchInterest, cont
 	// re-watched across queries), otherwise add it (a fresh request-owned fd).
 	// Trying MOD first avoids an EEXIST perror on every pool-fd reuse and needs no
 	// extra bookkeeping: a fresh fd's MOD fails with ENOENT and falls through to ADD.
-	if epoll.mod_fd_in_epoll(ac.loop_fd, ext_fd, events) != 0 {
-		if epoll.add_fd_to_epoll(ac.loop_fd, ext_fd, events) < 0 {
+	if epoll.mod_fd_in_epoll(w.loop_fd, ext_fd, events) != 0 {
+		if epoll.add_fd_to_epoll(w.loop_fd, ext_fd, events) < 0 {
 			// The fd could not be armed (bad fd, epoll limits): don't leave a slot
 			// marked active that the loop would never actually fire — clear it so the
 			// watch is genuinely absent rather than silently dead.
 			r.reactor_clear(ext_fd)
-			ac.last_watched = -1
+			w.last_watched = -1
 			return
 		}
 	}
-	ac.last_watched = ext_fd
+	w.last_watched = ext_fd
 }
 
 // handle_readable is the EPOLLIN entry point for a client connection: it
@@ -504,22 +504,22 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 	}
 	content_length := total - head_len
 	head := buf_view(cs.read_buf, 0, head_len)
-	mut ac := core.Ctx{
+	mut w := core.Worker{
 		client_fd: fd
 		state:     state
 		loop_fd:   epoll_fd
 		reactor:   unsafe { voidptr(&reactor) }
 		register:  register_watch
 	}
-	if h(head, mut cs.write_buf, mut ac) != .done {
+	if h(head, mut cs.write_buf, mut w) != .done {
 		// suspend/close on a streamed-body request is unsupported in v1 — answer
 		// 400 and drop, rather than leave a half-drained connection parked. The
 		// handler may ALREADY have registered a watch (and submitted a query)
 		// before suspending: tear it down, or the entry would stay active keyed by
 		// this soon-reused client_fd, and a pooled fd's orphaned reply would be
 		// consumed against the wrong request (vanilla#100 hazard 2).
-		if ac.last_watched >= 0 {
-			detach_rejected_watch(mut reactor, epoll_fd, ac.last_watched, fd)
+		if w.last_watched >= 0 {
+			detach_rejected_watch(mut reactor, epoll_fd, w.last_watched, fd)
 		}
 		cs.write_buf << response.tiny_bad_request_response
 		if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
@@ -553,10 +553,10 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 @[direct_array_access; manualfree]
 fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) bool {
 	mut pos := 0
-	// ONE Ctx per burst, not per request: the loop-invariant fields (client_fd,
+	// ONE Worker per burst, not per request: the loop-invariant fields (client_fd,
 	// state, loop_fd, reactor, register) are set once; only the per-request
 	// fields are reset before each handler call below.
-	mut ac := core.Ctx{
+	mut w := core.Worker{
 		client_fd: fd
 		state:     state
 		loop_fd:   epoll_fd
@@ -596,14 +596,14 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 		// Only last_watched can be dirtied between iterations (register_watch is
 		// the sole runtime writer during an initial call); ready_fd/ready_err/
 		// udata keep their once-per-burst construction values.
-		ac.last_watched = -1
-		step := h(req, mut cs.write_buf, mut ac)
+		w.last_watched = -1
+		step := h(req, mut cs.write_buf, mut w)
 		pos += total
-		if step != .suspend && ac.last_watched >= 0 {
+		if step != .suspend && w.last_watched >= 0 {
 			// The handler registered a watch but did NOT park (.done/.close after
-			// ac.watch — a contract violation): tear it down so no stale entry can
+			// w.watch — a contract violation): tear it down so no stale entry can
 			// later fire against this (soon-reused) client_fd.
-			detach_rejected_watch(mut reactor, epoll_fd, ac.last_watched, fd)
+			detach_rejected_watch(mut reactor, epoll_fd, w.last_watched, fd)
 		}
 		match step {
 			.done {
@@ -616,7 +616,7 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 				}
 			}
 			.suspend {
-				cs.awaiting_fd = ac.last_watched // park; leftover stays buffered for resume
+				cs.awaiting_fd = w.last_watched // park; leftover stays buffered for resume
 			}
 			.close {
 				compact_read_buf(mut cs, pos)
@@ -658,7 +658,7 @@ fn compact_read_buf(mut cs ConnState, pos int) {
 
 // on_watch_ready runs a parked request's continuation when its watched fd fires.
 // `ev` is the raw epoll event mask for this edge; an error/hangup (EPOLLERR|
-// EPOLLHUP) is surfaced to the continuation as the portable Ctx.ready_err so
+// EPOLLHUP) is surfaced to the continuation as the portable Worker.ready_err so
 // it can release a dead fd instead of re-arming it into a busy-spin.
 @[direct_array_access; manualfree]
 fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int, ev u32, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, state voidptr) {
@@ -685,8 +685,8 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 	ready_err := ev & (u32(C.EPOLLHUP) | u32(C.EPOLLERR)) != 0
 	// Clientless background watch (armed by on_worker_start, e.g. a per-worker
 	// refresh timerfd): there is no parked connection. Run the continuation with a
-	// throwaway buffer and a -1 client_fd; ac.state is the worker state and it
-	// re-arms via ac.watch. The slot was already cleared above, so the ONLY way the
+	// throwaway buffer and a -1 client_fd; w.state is the worker state and it
+	// re-arms via w.watch. The slot was already cleared above, so the ONLY way the
 	// watch stays alive is the continuation re-arming THIS SAME fd and suspending
 	// (the periodic-refresh case). Any other outcome means the continuation stopped
 	// watching ext_fd; we must then ensure ext_fd is neither active nor left in
@@ -696,7 +696,7 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 	// closes it — except on a clean .done/.close, where the runtime owns teardown.
 	if parked_client < 0 {
 		mut scratch := []u8{}
-		mut bac := core.Ctx{
+		mut bw := core.Worker{
 			client_fd: -1
 			ready_fd:  ext_fd
 			ready_err: ready_err
@@ -706,8 +706,8 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 			reactor:   unsafe { voidptr(&reactor) }
 			register:  register_watch
 		}
-		step := cont(mut scratch, mut bac)
-		if step == .suspend && bac.last_watched == ext_fd {
+		step := cont(mut scratch, mut bw)
+		if step == .suspend && bw.last_watched == ext_fd {
 			return
 		}
 		reactor.reactor_clear(ext_fd) // re-arm-then-.done could have re-set active
@@ -729,7 +729,7 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 		return
 	}
 	cs.awaiting_fd = -1
-	mut ac := core.Ctx{
+	mut w := core.Worker{
 		client_fd: client_fd
 		ready_fd:  ext_fd
 		ready_err: ready_err
@@ -739,11 +739,11 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 		reactor:   unsafe { voidptr(&reactor) }
 		register:  register_watch
 	}
-	cont_step := cont(mut cs.write_buf, mut ac)
-	if cont_step != .suspend && ac.last_watched >= 0 {
-		// Continuation re-watched but did not park (.done/.close after ac.watch):
+	cont_step := cont(mut cs.write_buf, mut w)
+	if cont_step != .suspend && w.last_watched >= 0 {
+		// Continuation re-watched but did not park (.done/.close after w.watch):
 		// tear the stray watch down before the connection moves on / is closed.
-		detach_rejected_watch(mut reactor, epoll_fd, ac.last_watched, client_fd)
+		detach_rejected_watch(mut reactor, epoll_fd, w.last_watched, client_fd)
 	}
 	match cont_step {
 		.done {
@@ -764,7 +764,7 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 					return
 				}
 			}
-			cs.awaiting_fd = ac.last_watched // re-armed (multi-step); stay parked
+			cs.awaiting_fd = w.last_watched // re-armed (multi-step); stay parked
 		}
 		.close {
 			close_conn(epoll_fd, client_fd, active_conns, mut st)
@@ -792,7 +792,7 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 		if slot.dead || client_fd < 0 || client_fd >= st.conns.len
 			|| unsafe { st.conns[client_fd] == nil } {
 			mut scratch := []u8{}
-			mut dac := core.Ctx{
+			mut dw := core.Worker{
 				client_fd: client_fd
 				ready_fd:  ext_fd
 				ready_err: ready_err
@@ -808,7 +808,7 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 			// would refresh it, and a dedup that SKIPS dead slots would append a
 			// duplicate instead.
 			reactor.rearming_dead = true
-			dead_step := slot.cont(mut scratch, mut dac)
+			dead_step := slot.cont(mut scratch, mut dw)
 			reactor.rearming_dead = false
 			if dead_step == .suspend {
 				break // result not ready yet — the tombstone stays at the head
@@ -819,7 +819,7 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 		}
 		mut cs := st.conns[client_fd]
 		cs.awaiting_fd = -1
-		mut ac := core.Ctx{
+		mut w := core.Worker{
 			client_fd: client_fd
 			ready_fd:  ext_fd
 			ready_err: ready_err
@@ -829,12 +829,12 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 			reactor:   unsafe { voidptr(&reactor) }
 			register:  register_watch
 		}
-		pipelined_step := slot.cont(mut cs.write_buf, mut ac)
-		if pipelined_step != .suspend && ac.last_watched >= 0 && ac.last_watched != ext_fd {
+		pipelined_step := slot.cont(mut cs.write_buf, mut w)
+		if pipelined_step != .suspend && w.last_watched >= 0 && w.last_watched != ext_fd {
 			// Continuation watched a DIFFERENT fd but did not park: stray watch —
 			// tear it down. (A non-suspend re-watch of ext_fd itself just updated
 			// this same queue slot, which the .done/.close arms below then pop.)
-			detach_rejected_watch(mut reactor, epoll_fd, ac.last_watched, client_fd)
+			detach_rejected_watch(mut reactor, epoll_fd, w.last_watched, client_fd)
 		}
 		match pipelined_step {
 			.done {

@@ -229,7 +229,7 @@ fn bearer_token(req request_parser.HttpRequest) []u8 {
 	return unsafe { (&req.buffer[s.start + prefix.len]).vbytes(s.len - prefix.len) }
 }
 
-fn handle(req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+fn handle(req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {
 		out << response.tiny_bad_request_response
 		return .close

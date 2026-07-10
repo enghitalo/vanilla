@@ -1,6 +1,6 @@
 // Request serving + watch/park/resume runtime for the macOS (kqueue) backend —
 // the counterpart of backend_epoll/async_linux.c.v. Same handler contract
-// (core.Handler + ctx.watch(fd, interest, cont, udata) + core.Step), so a
+// (core.Handler + worker.watch(fd, interest, cont, udata) + core.Step), so a
 // handler that parks on a DB socket / upstream / timer / pipe runs unchanged on
 // Linux and macOS; only the fd registration differs (kqueue EVFILT_READ here,
 // epoll EPOLLIN there).
@@ -44,18 +44,18 @@ mut:
 	watches map[int]KqWatch
 }
 
-// kqueue_async_register is installed into Ctx.register on macOS: record the
+// kqueue_async_register is installed into Worker.register on macOS: record the
 // parked request and add the ext fd to this worker's kqueue.
-fn kqueue_async_register(mut ac core.Ctx, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
-	mut r := unsafe { &KqReactor(ac.reactor) }
+fn kqueue_async_register(mut w core.Worker, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
+	mut r := unsafe { &KqReactor(w.reactor) }
 	r.watches[ext_fd] = KqWatch{
-		client_fd: ac.client_fd
+		client_fd: w.client_fd
 		cont:      cont
 		udata:     udata
 	}
 	filter := if interest == .writable { kqueue.evfilt_write } else { kqueue.evfilt_read }
-	kqueue.add_fd_to_kqueue(ac.loop_fd, ext_fd, filter)
-	ac.last_watched = ext_fd
+	kqueue.add_fd_to_kqueue(w.loop_fd, ext_fd, filter)
+	w.last_watched = ext_fd
 }
 
 // process_kqueue_worker is the worker loop (one per worker thread). Client
@@ -82,10 +82,10 @@ fn process_kqueue_worker(kq int, handler core.Handler, make_state fn () voidptr,
 		for i in 0 .. nev {
 			fd := int(events[i].ident)
 			// A watched ext fd became ready → run its continuation.
-			if w := reactor.watches[fd] {
+			if watch := reactor.watches[fd] {
 				reactor.watches.delete(fd)
 				rerr := (events[i].flags & (kqueue.ev_eof | kqueue.ev_error)) != 0
-				kq_run_cont(mut reactor, kq, w, fd, rerr, state)
+				kq_run_cont(mut reactor, kq, watch, fd, rerr, state)
 				continue
 			}
 			// Client connection.
@@ -136,14 +136,14 @@ fn kq_handle_request(h core.Handler, mut reactor KqReactor, kq int, fd int, limi
 		c
 	}
 	conn.out.clear()
-	mut ac := core.Ctx{
+	mut w := core.Worker{
 		client_fd: fd
 		state:     state
 		loop_fd:   kq
 		reactor:   unsafe { voidptr(&reactor) }
 		register:  kqueue_async_register
 	}
-	match h(request_buffer, mut conn.out, mut ac) {
+	match h(request_buffer, mut conn.out, mut w) {
 		.done {
 			response.send_response(fd, conn.out.data, conn.out.len) or {
 				kq_close(mut reactor, kq, fd)
@@ -151,7 +151,7 @@ fn kq_handle_request(h core.Handler, mut reactor KqReactor, kq int, fd int, limi
 			// keep-alive: fd stays registered for the next request
 		}
 		.suspend {
-			conn.awaiting_fd = ac.last_watched // parked; resumed by kq_run_cont
+			conn.awaiting_fd = w.last_watched // parked; resumed by kq_run_cont
 		}
 		.close {
 			// Flush-then-close (the core.Step contract): the handler's error
@@ -165,34 +165,34 @@ fn kq_handle_request(h core.Handler, mut reactor KqReactor, kq int, fd int, limi
 }
 
 // kq_run_cont resumes a parked request when its watched fd fires.
-fn kq_run_cont(mut reactor KqReactor, kq int, w KqWatch, ext_fd int, ready_err bool, state voidptr) {
-	mut conn := reactor.conns[w.client_fd] or { return } // client went away
+fn kq_run_cont(mut reactor KqReactor, kq int, watch KqWatch, ext_fd int, ready_err bool, state voidptr) {
+	mut conn := reactor.conns[watch.client_fd] or { return } // client went away
 	conn.awaiting_fd = -1
-	mut ac := core.Ctx{
-		client_fd: w.client_fd
+	mut w := core.Worker{
+		client_fd: watch.client_fd
 		ready_fd:  ext_fd
 		ready_err: ready_err
-		udata:     w.udata
+		udata:     watch.udata
 		state:     state
 		loop_fd:   kq
 		reactor:   unsafe { voidptr(&reactor) }
 		register:  kqueue_async_register
 	}
-	match w.cont(mut conn.out, mut ac) {
+	match watch.cont(mut conn.out, mut w) {
 		.done {
-			response.send_response(w.client_fd, conn.out.data, conn.out.len) or {
-				kq_close(mut reactor, kq, w.client_fd)
+			response.send_response(watch.client_fd, conn.out.data, conn.out.len) or {
+				kq_close(mut reactor, kq, watch.client_fd)
 			}
 		}
 		.suspend {
-			conn.awaiting_fd = ac.last_watched // re-armed (multi-step); stay parked
+			conn.awaiting_fd = w.last_watched // re-armed (multi-step); stay parked
 		}
 		.close {
 			// Flush-then-close: send whatever the continuation appended first.
 			if conn.out.len > 0 {
-				response.send_response(w.client_fd, conn.out.data, conn.out.len) or {}
+				response.send_response(watch.client_fd, conn.out.data, conn.out.len) or {}
 			}
-			kq_close(mut reactor, kq, w.client_fd)
+			kq_close(mut reactor, kq, watch.client_fd)
 		}
 	}
 }

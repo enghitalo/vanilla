@@ -9,10 +9,10 @@ import os
 // any accidental send() harmless (EBADF), never a write to a real descriptor.
 fn serve(req string, mut v Viewers) string {
 	mut out := []u8{}
-	mut tctx := core.Ctx{
+	mut worker := core.Worker{
 		client_fd: -1
 	}
-	handle(req.bytes(), mut out, mut tctx, mut v)
+	handle(req.bytes(), mut out, mut worker, mut v)
 	return out.bytestr()
 }
 

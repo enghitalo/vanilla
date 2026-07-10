@@ -34,7 +34,7 @@ fn slice_eq(buf []u8, s request_parser.Slice, lit string) bool {
 }
 
 @[direct_array_access]
-fn handle_request(req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+fn handle_request(req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {
 		out << response.tiny_bad_request_response
 		return .close

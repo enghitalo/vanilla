@@ -1,10 +1,10 @@
 module main
 
-// Async-runtime example: detecting a watched-fd hangup via ctx.ready_err().
+// Async-runtime example: detecting a watched-fd hangup via worker.ready_err().
 //
 // A clientless background watch (armed by on_worker_start) sits on the read end
 // of a pipe whose writer has gone away. epoll delivers that edge as EPOLLHUP; the
-// runtime surfaces it to the continuation as the portable ctx.ready_err() == true,
+// runtime surfaces it to the continuation as the portable worker.ready_err() == true,
 // so the continuation RELEASES the fd (returns .close) instead of re-arming it.
 // Re-arming a level-triggered watch on a dead fd would busy-spin forever — this
 // is the signal a signalfd / inotify / pipe / upstream-socket background watch
@@ -28,30 +28,30 @@ const resp = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r
 // on_start arms a clientless watch on a pipe read-end, then closes the write-end
 // so the read-end immediately reports a hangup (the "producer" is gone). Composes
 // with a plain stateless handler — no make_state.
-fn on_start(mut ctx core.Ctx) {
+fn on_start(mut worker core.Worker) {
 	mut fds := [2]int{}
 	if C.pipe(&fds[0]) != 0 {
 		return
 	}
 	read_fd, write_fd := fds[0], fds[1]
 	C.close(write_fd) // producer gone -> read_fd reports EPOLLHUP on the next poll
-	ctx.watch(read_fd, .readable, on_source_event, unsafe { nil })
+	worker.watch(read_fd, .readable, on_source_event, unsafe { nil })
 }
 
 // on_source_event runs when the watched fd fires. On error/hangup it gives up
 // cleanly (return .close — the runtime DEL+closes read_fd); a naive re-arm here
 // would spin every loop iteration on the dead, level-triggered fd.
-fn on_source_event(mut out []u8, mut ctx core.Ctx) core.Step {
-	if ctx.ready_err() {
-		eprintln('[worker] background source fd ${ctx.ready_fd()} hung up — releasing (no spin)')
+fn on_source_event(mut out []u8, mut worker core.Worker) core.Step {
+	if worker.ready_err() {
+		eprintln('[worker] background source fd ${worker.ready_fd()} hung up — releasing (no spin)')
 		return .close // runtime tears the fd down; we do NOT re-arm
 	}
 	// A real consumer would read the ready data here, then re-arm:
-	ctx.watch(ctx.ready_fd(), .readable, on_source_event, unsafe { nil })
+	worker.watch(worker.ready_fd(), .readable, on_source_event, unsafe { nil })
 	return .suspend
 }
 
-fn handle(req []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+fn handle(req []u8, mut out []u8, mut worker core.Worker) core.Step {
 	out << resp
 	return .done
 }

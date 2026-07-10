@@ -270,7 +270,7 @@ fn log_line(req_buffer []u8, status int, dur_us i64) {
 // on failure the wrapper answers the canned 400 and closes (what the old
 // runtime did on a handler error).
 fn observed(next fn (req []u8, mut out []u8) !, mut m Metrics) core.Handler {
-	return fn [next, mut m] (req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+	return fn [next, mut m] (req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
 		start := time.now()
 		start_len := out.len
 		next(req_buffer, mut out) or {

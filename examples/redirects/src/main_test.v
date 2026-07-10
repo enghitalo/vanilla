@@ -95,10 +95,10 @@ fn test_malformed_requests_error() {
 // the return-a-buffer shape the assertions expect.
 fn serve(req []u8) ![]u8 {
 	mut out := []u8{}
-	mut tctx := core.Ctx{
+	mut worker := core.Worker{
 		client_fd: -1
 	}
-	if handle(req, mut out, mut tctx) == .close {
+	if handle(req, mut out, mut worker) == .close {
 		return error('handler closed the connection')
 	}
 	return out

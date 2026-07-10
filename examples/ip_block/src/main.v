@@ -5,7 +5,7 @@ module main
 // Rejects requests from denied client IPs with 403 Forbidden, using the socket
 // peer address exposed by Phase 2 (`socket.peer_addr(fd)`). The handler keeps
 // the unified `core.Handler` contract — it just reads the client fd's peer
-// (ctx.client_fd) when it needs to decide.
+// (worker.client_fd) when it needs to decide.
 //
 // SECURITY / DESIGN notes:
 //   - Blocks by the SOCKET peer. Behind a proxy/CDN the peer IS the proxy, so
@@ -54,8 +54,8 @@ fn (mut b Blocklist) is_blocked(ip string) bool {
 const forbidden_response = 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 const ok_response = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\nConnection: keep-alive\r\n\r\nallowed'.bytes()
 
-fn handle(req_buffer []u8, mut out []u8, mut ctx core.Ctx, mut blocklist Blocklist) core.Step {
-	ip := socket.peer_addr(ctx.client_fd)
+fn handle(req_buffer []u8, mut out []u8, mut worker core.Worker, mut blocklist Blocklist) core.Step {
+	ip := socket.peer_addr(worker.client_fd)
 	if blocklist.is_blocked(ip) {
 		eprintln('[ip-block] denied ${ip}')
 		out << forbidden_response
@@ -82,8 +82,8 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		handler:         fn [mut blocklist] (req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
-			return handle(req_buffer, mut out, mut ctx, mut blocklist)
+		handler:         fn [mut blocklist] (req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
+			return handle(req_buffer, mut out, mut worker, mut blocklist)
 		}
 	})!
 	println('IP-block demo on http://localhost:3000/  (denied IPs get 403)')

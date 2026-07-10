@@ -43,26 +43,26 @@ fn drain_close(fd int) {
 	C.close(fd)
 }
 
-fn handle(req []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+fn handle(req []u8, mut out []u8, mut worker core.Worker) core.Step {
 	if !req.bytestr().contains('/chain') {
 		out << not_found
 		return .done
 	}
-	ctx.watch(one_shot_timer(80), .readable, after_a, unsafe { nil }) // stage A
+	worker.watch(one_shot_timer(80), .readable, after_a, unsafe { nil }) // stage A
 	return .suspend
 }
 
 // after_a runs when timer A fires: close it, then arm a DIFFERENT fd (timer B)
 // and park again — demonstrating that a continuation can re-watch a new fd.
-fn after_a(mut out []u8, mut ctx core.Ctx) core.Step {
-	drain_close(ctx.ready_fd())
-	ctx.watch(one_shot_timer(140), .readable, after_b, unsafe { nil }) // stage B
+fn after_a(mut out []u8, mut worker core.Worker) core.Step {
+	drain_close(worker.ready_fd())
+	worker.watch(one_shot_timer(140), .readable, after_b, unsafe { nil }) // stage B
 	return .suspend
 }
 
 // after_b runs when timer B fires: close it and produce the response.
-fn after_b(mut out []u8, mut ctx core.Ctx) core.Step {
-	drain_close(ctx.ready_fd())
+fn after_b(mut out []u8, mut worker core.Worker) core.Step {
+	drain_close(worker.ready_fd())
 	body := 'stage A done (80ms), then stage B done (140ms)'
 	out << 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ${body.len}\r\nConnection: keep-alive\r\n\r\n${body}'.bytes()
 	return .done

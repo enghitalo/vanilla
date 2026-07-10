@@ -22,7 +22,7 @@ fn test_simple_without_init_the_server() {
 // the return-a-buffer shape the assertions expect.
 fn serve(req []u8) []u8 {
 	mut out := []u8{}
-	mut tctx := core.Ctx{}
-	handle_request(req, mut out, mut tctx)
+	mut worker := core.Worker{}
+	handle_request(req, mut out, mut worker)
 	return out
 }

@@ -213,7 +213,7 @@ fn write_json_escaped(mut sb strings.Builder, s string) {
 const resp_prefix = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '.bytes()
 
 @[direct_array_access]
-fn handle(req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+fn handle(req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {
 		out << response.tiny_bad_request_response
 		return .close

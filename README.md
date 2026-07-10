@@ -16,7 +16,7 @@ A minimalist, high-performance HTTP server written in [V](https://vlang.io).
 - **Database Friendly**: Example with PostgreSQL connection pool.
 - **Graceful Shutdown**: Drain in-flight requests on `SIGTERM`/`SIGINT` via `server.shutdown(grace_ms)`.
 - **Multiple Backends**: epoll, io_uring (Linux), kqueue (macOS), IOCP (Windows).
-- **One Handler Contract**: a single `handler` signature covers every use case — append the response and return `.done`, suspend/resume on any fd (DB sockets, timers, upstream proxies) with `ctx.watch(...)` + `.suspend`, and reach lock-free per-worker state (e.g. a per-thread DB connection — no shared pool, no mutex) via `ctx.state`.
+- **One Handler Contract**: a single `handler` signature covers every use case — append the response and return `.done`, suspend/resume on any fd (DB sockets, timers, upstream proxies) with `worker.watch(...)` + `.suspend`, and reach lock-free per-worker state (e.g. a per-thread DB connection — no shared pool, no mutex) via `worker.state`.
 - **Compliant with HTTP standards**: Follows [RFC 9112](https://datatracker.ietf.org/doc/rfc9112/) and the [IANA Field Name Registry](https://www.iana.org/assignments/http-fields/http-fields.xhtml).
 
 ---
@@ -29,13 +29,13 @@ A minimalist, high-performance HTTP server written in [V](https://vlang.io).
 import http_server
 import http_server.core
 
-fn handle_request(req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+fn handle_request(req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
 	// Parse the request and APPEND the complete raw HTTP response
 	// (status line + headers + body) to `out`. The server owns `out`,
 	// reuses it across requests and batches pipelined responses into a
 	// single send — never free or keep it. Return `.done` when the
 	// response is complete, `.close` to flush-and-drop the connection,
-	// or `.suspend` after parking the request on an fd via `ctx.watch(...)`.
+	// or `.suspend` after parking the request on an fd via `worker.watch(...)`.
 	out << 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'.bytes()
 	return .done
 }
@@ -65,8 +65,8 @@ Call the handler directly — no server needed:
 fn test_handle_request() {
 	request := 'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
 	mut out := []u8{}
-	mut ctx := core.Ctx{}
-	assert handle_request(request, mut out, mut ctx) == .done
+	mut worker := core.Worker{}
+	assert handle_request(request, mut out, mut worker) == .done
 	assert out.starts_with('HTTP/1.1 200 OK'.bytes())
 }
 ```
@@ -149,7 +149,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		handler:         fn [mut pool] (req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+		handler:         fn [mut pool] (req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
 			// Use pool.acquire() / pool.release() for DB access;
 			// append the raw HTTP response to `out`.
 			return .done

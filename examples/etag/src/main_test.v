@@ -56,8 +56,8 @@ fn test_handle_request_bad_request() {
 // error, mirroring the old error-raising contract.
 fn serve(req []u8) ![]u8 {
 	mut out := []u8{}
-	mut tctx := core.Ctx{}
-	if handle_request(req, mut out, mut tctx) == .close {
+	mut worker := core.Worker{}
+	if handle_request(req, mut out, mut worker) == .close {
 		return error('handler closed the connection')
 	}
 	return out

@@ -16,12 +16,12 @@ import http_server
 import http_server.core
 import runtime
 
-fn api_handler(req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+fn api_handler(req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
 	out << 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\nmain'.bytes()
 	return .done
 }
 
-fn admin_handler(req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+fn admin_handler(req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
 	out << 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nadmin'.bytes()
 	return .done
 }

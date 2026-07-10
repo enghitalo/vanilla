@@ -8,7 +8,7 @@ import pg_async
 // End-to-end demo of the native async Postgres driver (pg_async) on the epoll
 // async runtime. Each worker owns its own connection pool (via make_state); a
 // GET /db request acquires a connection, issues a query, parks on the PG socket
-// with ctx.watch, and the continuation renders the rows once they arrive — all on
+// with worker.watch, and the continuation renders the rows once they arrive — all on
 // the worker's single epoll loop, never blocking it. This is the template the
 // HttpArena framework's async-db/fortunes endpoints follow.
 //
@@ -53,12 +53,12 @@ fn targets_db(req []u8) bool {
 
 // handler: GET /db runs a query via the pool + a watch on the PG socket; any
 // other path replies synchronously.
-fn handler(req []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+fn handler(req []u8, mut out []u8, mut worker core.Worker) core.Step {
 	if !targets_db(req) {
 		out << resp_ok
 		return .done
 	}
-	mut pool := unsafe { &pg_async.PgPool(ctx.state) }
+	mut pool := unsafe { &pg_async.PgPool(worker.state) }
 	idx := pool.acquire() or {
 		out << resp_503
 		return .done
@@ -81,15 +81,15 @@ fn handler(req []u8, mut out []u8, mut ctx core.Ctx) core.Step {
 		out << resp_500
 		return .done
 	}
-	ctx.watch(pool.fd(idx), .readable, on_db_ready, unsafe { nil })
+	worker.watch(pool.fd(idx), .readable, on_db_ready, unsafe { nil })
 	return .suspend
 }
 
 // on_db_ready runs when the watched PG socket is readable: it pumps the result
 // and, once complete, renders the rows as JSON and releases the connection.
-fn on_db_ready(mut out []u8, mut ctx core.Ctx) core.Step {
-	mut pool := unsafe { &pg_async.PgPool(ctx.state) }
-	idx := pool.idx_of_fd(ctx.ready_fd) or { return .close }
+fn on_db_ready(mut out []u8, mut worker core.Worker) core.Step {
+	mut pool := unsafe { &pg_async.PgPool(worker.state) }
+	idx := pool.idx_of_fd(worker.ready_fd) or { return .close }
 	mut conn := pool.conn(idx)
 	poll := conn.async_on_readable() or {
 		pool.release(idx)
@@ -97,7 +97,7 @@ fn on_db_ready(mut out []u8, mut ctx core.Ctx) core.Step {
 		return .done
 	}
 	if !poll.ready {
-		ctx.watch(pool.fd(idx), .readable, on_db_ready, unsafe { nil }) // re-arm: more bytes to come
+		worker.watch(pool.fd(idx), .readable, on_db_ready, unsafe { nil }) // re-arm: more bytes to come
 		return .suspend
 	}
 	mut body := []u8{cap: 512}

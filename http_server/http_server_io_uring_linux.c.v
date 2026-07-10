@@ -481,7 +481,7 @@ fn io_uring_worker_main(listener int, cpu_id int, handler core.Handler, make_sta
 
 	// Per-worker state (issue #93): build THIS worker's thread-local state once
 	// (e.g. its own DB pool / reused render scratch); every handler call on this
-	// worker reaches it via ctx.state — no sharing, no lock. make_state runs HERE
+	// worker reaches it via worker.state — no sharing, no lock. make_state runs HERE
 	// — on the worker thread, after CPU pinning — so its allocations are thread-
 	// and NUMA-local. Mirrors the epoll backend's process_events_plain.
 	mut state := voidptr(unsafe { nil })

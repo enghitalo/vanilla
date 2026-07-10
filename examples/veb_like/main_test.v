@@ -25,18 +25,18 @@ import http_server.core
 // below is the exact handler wired in main().
 fn serve(raw string) string {
 	app := App{}
-	handler := fn [app] (req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
-		out << router(req_buffer, ctx.client_fd, app) or {
+	handler := fn [app] (req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
+		out << router(req_buffer, worker.client_fd, app) or {
 			out << bad_request_response
 			return .close
 		}
 		return .done
 	}
 	mut out := []u8{}
-	mut tctx := core.Ctx{
+	mut worker := core.Worker{
 		client_fd: -1
 	}
-	handler(raw.bytes(), mut out, mut tctx)
+	handler(raw.bytes(), mut out, mut worker)
 	return out.bytestr()
 }
 

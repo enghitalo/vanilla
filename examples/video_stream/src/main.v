@@ -13,7 +13,7 @@ module main
 //                every viewer fd — no thread per viewer (see capture.v).
 //
 // Both keep the project's contract: the handler is still
-// fn ([]u8, mut []u8, mut core.Ctx) core.Step.
+// fn ([]u8, mut []u8, mut core.Worker) core.Step.
 // /video appends the response bytes into `out` (the core streams large ones via
 // EPOLLOUT back-pressure); /webcam registers the fd and a single broadcaster
 // owns it.
@@ -94,7 +94,7 @@ fn route_len(buf []u8, path request_parser.Slice) int {
 	return path.len
 }
 
-fn handle(req_buffer []u8, mut out []u8, mut ctx core.Ctx, mut viewers Viewers) core.Step {
+fn handle(req_buffer []u8, mut out []u8, mut worker core.Worker, mut viewers Viewers) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {
 		out << bad_request
 		return .done
@@ -116,7 +116,7 @@ fn handle(req_buffer []u8, mut out []u8, mut ctx core.Ctx, mut viewers Viewers) 
 		// these headers and keeps the connection open. The broadcaster (in
 		// capture.v) now owns the fd and pushes frames to it.
 		viewers.ensure_capture()
-		viewers.add(ctx.client_fd)
+		viewers.add(worker.client_fd)
 		out << mjpeg_headers
 	} else if slice_eq(req.buffer, route, '/video') {
 		serve_video(req, mut out)
@@ -271,8 +271,8 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		handler:         fn [mut viewers] (req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
-			return handle(req_buffer, mut out, mut ctx, mut viewers)
+		handler:         fn [mut viewers] (req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
+			return handle(req_buffer, mut out, mut worker, mut viewers)
 		}
 		limits:          http_server.Limits{
 			max_header_bytes: 16 * 1024

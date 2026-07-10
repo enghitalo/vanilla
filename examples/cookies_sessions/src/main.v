@@ -181,7 +181,7 @@ fn slice_eq(buf []u8, s request_parser.Slice, lit string) bool {
 	return true
 }
 
-fn handle(req_buffer []u8, mut out []u8, mut ctx core.Ctx, mut store Store) core.Step {
+fn handle(req_buffer []u8, mut out []u8, mut worker core.Worker, mut store Store) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {
 		out << response.tiny_bad_request_response
 		return .close
@@ -242,8 +242,8 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		handler:         fn [mut store] (req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
-			return handle(req_buffer, mut out, mut ctx, mut store)
+		handler:         fn [mut store] (req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
+			return handle(req_buffer, mut out, mut worker, mut store)
 		}
 	})!
 	println('Cookies/sessions demo on http://localhost:3000/  (/login, /me, /logout)')

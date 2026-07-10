@@ -41,8 +41,8 @@ fn test_inject_headers_noop_without_status_line() {
 // body's suffix order reveals the nesting (pure data flow, no shared state).
 fn tag_mw(tag string) Middleware {
 	return fn [tag] (next Handler) Handler {
-		return fn [tag, next] (req []u8, mut out []u8, mut ctx core.Ctx) core.Step {
-			step := next(req, mut out, mut ctx)
+		return fn [tag, next] (req []u8, mut out []u8, mut worker core.Worker) core.Step {
+			step := next(req, mut out, mut worker)
 			if step != .done {
 				return step
 			}
@@ -53,7 +53,7 @@ fn tag_mw(tag string) Middleware {
 }
 
 fn test_chain_runs_outermost_first() {
-	base := fn (req []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+	base := fn (req []u8, mut out []u8, mut worker core.Worker) core.Step {
 		out << 'app'.bytes()
 		return .done
 	}
@@ -61,8 +61,8 @@ fn test_chain_runs_outermost_first() {
 	// unwinds app -> B -> A, so A's tag lands LAST.
 	h := chain(base, tag_mw('A'), tag_mw('B'))
 	mut out := []u8{}
-	mut tctx := core.Ctx{}
-	assert h('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), mut out, mut tctx) == .done
+	mut worker := core.Worker{}
+	assert h('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), mut out, mut worker) == .done
 	assert out.bytestr() == 'appBA'
 }
 
@@ -76,8 +76,8 @@ fn serve(target string, auth string) string {
 	}
 	raw += '\r\n'
 	mut out := []u8{}
-	mut tctx := core.Ctx{}
-	if handler(raw.bytes(), mut out, mut tctx) == .close {
+	mut worker := core.Worker{}
+	if handler(raw.bytes(), mut out, mut worker) == .close {
 		return 'ERR'
 	}
 	return out.bytestr()

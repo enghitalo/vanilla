@@ -57,7 +57,7 @@ fn worker_thread(mut ctx WorkerContext) {
 	println('[iocp-worker] Worker thread started')
 
 	// Per-worker state, built ON this worker thread (thread-local, no lock);
-	// every handler call on this worker reaches it via ctx.state.
+	// every handler call on this worker reaches it via worker.state.
 	if ctx.make_state != unsafe { nil } {
 		ctx.state = ctx.make_state()
 	}
@@ -150,12 +150,12 @@ fn handle_read_completion(io_data &iocp.IOData, mut ctx WorkerContext) {
 	// Process the request — server-owned response buffer, handler appends raw bytes.
 	request_data := io_data.buffer[..bytes_read]
 	mut response_data := []u8{len: 0, cap: 4096}
-	mut hctx := core.Ctx{
+	mut w := core.Worker{
 		client_fd: socket_fd
 		state:     ctx.state
 		register:  core.reject_register
 	}
-	step := ctx.handler(request_data, mut response_data, mut hctx)
+	step := ctx.handler(request_data, mut response_data, mut w)
 	if step != .done {
 		// .close: flush whatever the handler appended (its error response), then
 		// drop. .suspend: parking is not supported on this backend (no watch

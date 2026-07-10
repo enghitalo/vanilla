@@ -104,8 +104,8 @@ fn test_brotli_response_roundtrip() ! {
 // buffer) to the return-a-buffer shape the assertions expect.
 fn serve(req []u8) []u8 {
 	mut out := []u8{}
-	mut tctx := core.Ctx{}
-	handle(req, mut out, mut tctx)
+	mut worker := core.Worker{}
+	handle(req, mut out, mut worker)
 	return out
 }
 
@@ -124,12 +124,12 @@ fn test_handle_malformed_requests() {
 	// Malformed input gets the canned 400 appended and the connection closed
 	// (return .close) — BEST_PRACTICES §9.
 	mut out := []u8{}
-	mut tctx := core.Ctx{}
-	assert handle('garbage'.bytes(), mut out, mut tctx) == .close
+	mut worker := core.Worker{}
+	assert handle('garbage'.bytes(), mut out, mut worker) == .close
 	assert out == response.tiny_bad_request_response
 	// Truncated before the CRLFCRLF terminator.
 	mut out2 := []u8{}
-	mut tctx2 := core.Ctx{}
+	mut tctx2 := core.Worker{}
 	assert handle('GET / HTTP/1.1\r\nHost: local'.bytes(), mut out2, mut tctx2) == .close
 	assert out2 == response.tiny_bad_request_response
 }

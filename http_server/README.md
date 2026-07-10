@@ -2,7 +2,7 @@
 
 `http_server` is vanilla's core: a multi-threaded, non-blocking HTTP/1.1 server
 with pluggable I/O backends. There is ONE handler contract — `core.Handler`,
-`fn (req []u8, mut res []u8, mut ctx core.Ctx) core.Step` — pure on the hot
+`fn (req []u8, mut res []u8, mut worker core.Worker) core.Step` — pure on the hot
 path: it receives the raw request bytes, **appends** the raw response to a
 server-owned buffer, and returns a `core.Step`. The server batches everything
 appended during one readiness event into a single send and reuses the buffer
@@ -31,16 +31,16 @@ per-request allocation.
 - **Errors** — append the canned error response (e.g.
   `response.tiny_bad_request_response`) and return **`.close`**: whatever is in
   `res` is flushed, then the connection is dropped.
-- **Waiting on an fd** — PARK the request on any fd via `ctx.watch(ext_fd,
+- **Waiting on an fd** — PARK the request on any fd via `worker.watch(ext_fd,
   interest, continuation, udata)` and return **`.suspend`**; the worker resumes
   the continuation (a `core.WakeFn`) when the fd is ready — DB sockets,
   upstreams, timers, write backpressure — all in the worker's own event loop.
   Linux epoll + io_uring and macOS/kqueue; on TLS and Windows/IOCP a `.suspend`
   closes the connection (no watch reactor there yet).
 - **Per-worker state** — set `make_state`: it runs once per worker thread, and
-  every handler call on that worker gets the value via **`ctx.state`** (e.g. a
+  every handler call on that worker gets the value via **`worker.state`** (e.g. a
   per-thread DB connection — no shared pool, no mutex). The client's fd is
-  `ctx.client_fd`.
+  `worker.client_fd`.
 
 `on_worker_start` arms clientless background watches (e.g. a periodic timerfd that
 refreshes per-worker state with no extra thread). Linux/epoll, plaintext only.
@@ -51,7 +51,7 @@ refreshes per-worker state with no extra thread). Linux/epoll, plaintext only.
 import vanilla.http_server
 import vanilla.http_server.core
 
-fn handle(req []u8, mut res []u8, mut ctx core.Ctx) core.Step {
+fn handle(req []u8, mut res []u8, mut worker core.Worker) core.Step {
 	res << 'HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!'.bytes()
 	return .done
 }
@@ -90,7 +90,7 @@ HTTPS on the **epoll** backend; the other backends are plaintext.
 
 ## Internals (where to look)
 
-- `core/core.v` — the handler contract: `Handler`, `Step`, `Ctx`, `WakeFn`.
+- `core/core.v` — the handler contract: `Handler`, `Step`, `Worker`, `WakeFn`.
 - `http_server.c.v` — `new_server`, `ServerConfig`, `Server`, `shutdown`.
 - `backend_epoll/` — epoll worker (`worker_linux.c.v`), connection state + buffer
   pool (`conn_state_linux.c.v`), request serving + watch reactor

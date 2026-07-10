@@ -10,9 +10,9 @@ const security_headers = ('X-Content-Type-Options: nosniff\r\n' + 'X-Frame-Optio
 
 // with_security_headers injects the hardening headers into every response, once.
 fn with_security_headers(next Handler) Handler {
-	return fn [next] (req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+	return fn [next] (req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
 		start := out.len
-		step := next(req_buffer, mut out, mut ctx)
+		step := next(req_buffer, mut out, mut worker)
 		if step != .done {
 			return step
 		}

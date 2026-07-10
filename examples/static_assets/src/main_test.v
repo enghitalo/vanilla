@@ -7,8 +7,8 @@ import http_server.core
 
 fn serve(line string) string {
 	mut out := []u8{}
-	mut tctx := core.Ctx{}
-	if handle((line + '\r\n\r\n').bytes(), mut out, mut tctx) != .done {
+	mut worker := core.Worker{}
+	if handle((line + '\r\n\r\n').bytes(), mut out, mut worker) != .done {
 		return 'ERR'
 	}
 	return out.bytestr()

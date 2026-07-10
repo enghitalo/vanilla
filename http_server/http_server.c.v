@@ -24,7 +24,7 @@ pub mut:
 	threads []thread     = []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
 	handler core.Handler = unsafe { nil }
 	// Optional per-worker state; see ServerConfig. make_state runs once per worker
-	// thread, its result reaches every handler call on that worker via ctx.state.
+	// thread, its result reaches every handler call on that worker via worker.state.
 	make_state      fn () voidptr      = unsafe { nil }
 	on_worker_start core.WorkerStartFn = unsafe { nil }
 	// Per-worker in-flight request counters (one per worker, each on its own
@@ -227,13 +227,13 @@ pub:
 	io_multiplexing IOBackend = unsafe { IOBackend(0) }
 	// handler is THE request handler — one contract for every use case (see
 	// core.Handler): it appends the raw response to `res` and returns .done,
-	// parks the request on an fd via ctx.watch(...) and returns .suspend (DB
+	// parks the request on an fd via worker.watch(...) and returns .suspend (DB
 	// sockets, upstreams, timers — Linux epoll/io_uring and macOS/kqueue), or
 	// returns .close to flush-and-drop the connection.
 	handler core.Handler = unsafe { nil }
 	// make_state opts into lock-free per-worker state: each worker calls
 	// make_state ONCE (so the value is thread-local), then every handler call on
-	// that worker receives it via ctx.state. Used to give each worker its own DB
+	// that worker receives it via worker.state. Used to give each worker its own DB
 	// connection / reused render scratch — no shared pool, no mutex.
 	make_state fn () voidptr = unsafe { nil }
 	// on_worker_start runs once per worker (after make_state, before the loop) to

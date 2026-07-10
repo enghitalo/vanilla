@@ -176,8 +176,8 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		handler:         fn [mut clients] (req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
-			return handle(req_buffer, ctx.client_fd, mut out, mut clients)
+		handler:         fn [mut clients] (req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
+			return handle(req_buffer, worker.client_fd, mut out, mut clients)
 		}
 	})!
 	println('SSE server on http://localhost:3000/  (GET /events, POST /broadcast)')

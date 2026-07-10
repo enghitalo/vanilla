@@ -35,7 +35,7 @@ registry.
   raw response into the server-owned buffer and return a `core.Step`
   (`.done`/`.suspend`/`.close`). No socket I/O, no hidden globals, no shared
   mutable state on the hot path (per-worker state goes through
-  `make_state`/`ctx.state`).
+  `make_state`/`worker.state`).
 - Stay **zero-copy** — whenever a view suffices, use a view: `Slice` offsets
   into the request buffer, `unsafe { (&buf[start]).vbytes(len) }` for `[]u8`
   windows, `unsafe { tos(ptr, len) }` for read-only string params. Defer

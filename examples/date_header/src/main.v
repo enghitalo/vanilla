@@ -102,7 +102,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		handler:         fn [cache] (req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+		handler:         fn [cache] (req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
 			// Zero per-request allocation: append the two static halves and the
 			// pre-built cached Date line (one atomic load, zero-copy slice) straight
 			// into the server-owned `out` buffer — no per-request strings.Builder, no

@@ -17,8 +17,8 @@ fn test_handler_is_trivial_200() {
 // the return-a-buffer shape the assertions expect.
 fn serve(req []u8) []u8 {
 	mut out := []u8{}
-	mut tctx := core.Ctx{}
-	assert handle(req, mut out, mut tctx) == .done
+	mut worker := core.Worker{}
+	assert handle(req, mut out, mut worker) == .done
 	return out
 }
 

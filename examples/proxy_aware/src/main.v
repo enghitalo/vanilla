@@ -199,14 +199,14 @@ fn wi(mut out []u8, n i64) {
 	}
 }
 
-fn handle(req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+fn handle(req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {
 		out << response.tiny_bad_request_response
 		return .close
 	}
 	// socket.peer_addr: the deliberate one-syscall/one-string exception — see
 	// the header comment. The trust logic itself stays pure.
-	client := real_client_ip(req, socket.peer_addr(ctx.client_fd))
+	client := real_client_ip(req, socket.peer_addr(worker.client_fd))
 	// X-Forwarded-Proto as a zero-copy view (len > 0 guard), const fallback.
 	// It is client-settable like XFF — a production service should gate it on
 	// the same peer trust; the demo echoes it to show the read.

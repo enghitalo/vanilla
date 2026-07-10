@@ -5,9 +5,9 @@ module main
 // no per-request dispatch — Invariant 2 (zero abstraction).
 import http_server.core
 
-// Handler is the frozen core contract: bytes in (+ ctx), response bytes
+// Handler is the frozen core contract: bytes in (+ worker), response bytes
 // APPENDED to `out`, next Step returned.
-type Handler = fn (req []u8, mut out []u8, mut ctx core.Ctx) core.Step
+type Handler = fn (req []u8, mut out []u8, mut worker core.Worker) core.Step
 
 // Middleware takes the next handler and returns a wrapping handler.
 type Middleware = fn (Handler) Handler

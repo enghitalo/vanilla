@@ -11,7 +11,7 @@ module main
 //        # 20 concurrent 500ms delays finish in ~0.5s, not 10s:
 //        seq 20 | xargs -P20 -I{} curl -s 'http://localhost:8091/delay?ms=500' >/dev/null
 //
-// The same `ctx.watch(...)` primitive drives an async DB query (watch the DB
+// The same `worker.watch(...)` primitive drives an async DB query (watch the DB
 // socket), a reverse proxy (watch the upstream socket), or SSE/WebSocket
 // backpressure (watch the client for EPOLLOUT). See core.Handler.
 import http_server
@@ -30,7 +30,7 @@ const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 
 // handle is the request handler. For /delay it arms a one-shot timerfd and
 // parks the request on it (returns .suspend); the worker resumes `timer_done`
 // when the timer fires. Anything else is answered immediately (.done).
-fn handle(req []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+fn handle(req []u8, mut out []u8, mut worker core.Worker) core.Step {
 	if req.bytestr().contains('/delay') {
 		ms := 200
 		tfd := C.timerfd_create(C.CLOCK_MONOTONIC, 0)
@@ -39,7 +39,7 @@ fn handle(req []u8, mut out []u8, mut ctx core.Ctx) core.Step {
 		spec[2] = i64(ms / 1000)
 		spec[3] = i64(ms % 1000) * 1_000_000
 		C.timerfd_settime(tfd, 0, voidptr(&spec[0]), unsafe { nil })
-		ctx.watch(tfd, .readable, timer_done, unsafe { nil })
+		worker.watch(tfd, .readable, timer_done, unsafe { nil })
 		return .suspend
 	}
 	out << resp_ok
@@ -48,10 +48,10 @@ fn handle(req []u8, mut out []u8, mut ctx core.Ctx) core.Step {
 
 // timer_done runs when the timerfd is readable: drain it, close it (the request
 // owns it), append the response, and finish.
-fn timer_done(mut out []u8, mut ctx core.Ctx) core.Step {
+fn timer_done(mut out []u8, mut worker core.Worker) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ctx.ready_fd(), &tmp[0], 8)
-	C.close(ctx.ready_fd())
+	C.read(worker.ready_fd(), &tmp[0], 8)
+	C.close(worker.ready_fd())
 	body := 'delayed'
 	out << 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ${body.len}\r\nConnection: keep-alive\r\n\r\n${body}'.bytes()
 	return .done

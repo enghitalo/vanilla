@@ -19,7 +19,7 @@ import http_server
 import http_server.core
 import os
 
-fn handle(req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+fn handle(req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
 	out << 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 	return .done
 }

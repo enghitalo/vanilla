@@ -90,23 +90,23 @@ fn arm_periodic(tfd int, ms int) {
 
 // on_start runs once per worker (client_fd = -1): build the cache now so the very
 // first request has a Date, then arm a 1s timerfd as a clientless background watch.
-fn on_start(mut ctx core.Ctx) {
-	mut dc := unsafe { &DateCache(ctx.state) }
+fn on_start(mut worker core.Worker) {
+	mut dc := unsafe { &DateCache(worker.state) }
 	rebuild(mut dc)
 	tfd := C.timerfd_create(C.CLOCK_MONOTONIC, 0)
 	arm_periodic(tfd, 1000)
-	ctx.watch(tfd, .readable, date_tick, unsafe { nil })
+	worker.watch(tfd, .readable, date_tick, unsafe { nil })
 }
 
 // date_tick fires once a second: drain the timerfd, refresh this worker's cache,
 // and re-arm. Returns .suspend (keep the background watch alive). It never writes
 // to `out` (there is no client) and lives for the worker's whole lifetime.
-fn date_tick(mut out []u8, mut ctx core.Ctx) core.Step {
+fn date_tick(mut out []u8, mut worker core.Worker) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ctx.ready_fd(), &tmp[0], 8) // drain the expiration count to re-level the fd
-	mut dc := unsafe { &DateCache(ctx.state) }
+	C.read(worker.ready_fd(), &tmp[0], 8) // drain the expiration count to re-level the fd
+	mut dc := unsafe { &DateCache(worker.state) }
 	rebuild(mut dc)
-	ctx.watch(ctx.ready_fd(), .readable, date_tick, unsafe { nil })
+	worker.watch(worker.ready_fd(), .readable, date_tick, unsafe { nil })
 	return .suspend
 }
 
@@ -115,8 +115,8 @@ const head = 'HTTP/1.1 200 OK\r\n'.bytes()
 const tail = 'Content-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
 
 // handle is a plain sync handler: zero time work — just append the cached Date.
-fn handle(req []u8, mut out []u8, mut ctx core.Ctx) core.Step {
-	dc := unsafe { &DateCache(ctx.state) }
+fn handle(req []u8, mut out []u8, mut worker core.Worker) core.Step {
+	dc := unsafe { &DateCache(worker.state) }
 	out << head
 	unsafe { out.push_many(&dc.line[0], date_line_len) }
 	out << tail

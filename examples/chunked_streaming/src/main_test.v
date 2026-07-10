@@ -71,8 +71,8 @@ fn test_next_chunk_yields_views() ! {
 // buffer) to the return-a-string shape the assertions expect.
 fn serve(req string) string {
 	mut out := []u8{}
-	mut tctx := core.Ctx{}
-	handle(req.bytes(), mut out, mut tctx)
+	mut worker := core.Worker{}
+	handle(req.bytes(), mut out, mut worker)
 	return out.bytestr()
 }
 
@@ -104,15 +104,15 @@ fn test_smuggling_guard_via_validate_http1() {
 		'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n' +
 		'5\r\nhello\r\n0\r\n\r\n'
 	mut out := []u8{}
-	mut tctx := core.Ctx{}
-	assert handle(req.bytes(), mut out, mut tctx) == .close
+	mut worker := core.Worker{}
+	assert handle(req.bytes(), mut out, mut worker) == .close
 	assert out == response.tiny_bad_request_response
 }
 
 fn test_malformed_request_errors() {
 	// Malformed input gets the canned 400 and the connection is closed.
 	mut out := []u8{}
-	mut tctx := core.Ctx{}
-	assert handle('garbage'.bytes(), mut out, mut tctx) == .close
+	mut worker := core.Worker{}
+	assert handle('garbage'.bytes(), mut out, mut worker) == .close
 	assert out == response.tiny_bad_request_response
 }

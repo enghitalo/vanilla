@@ -127,7 +127,7 @@ fn cookie_value(buf []u8, hdr request_parser.Slice, name string) (int, int) {
 	return 0, -1
 }
 
-fn handle(req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
+fn handle(req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {
 		out << response.tiny_bad_request_response
 		return .close

@@ -124,7 +124,7 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_state fn () voidptr, on_worker_start core.WorkerStartFn, limits core.Limits, counter &core.Counter, active_conns &core.Counter) {
 	maybe_pin_worker(worker_id)
 	// Build THIS worker's per-thread state once (e.g. its own DB connection);
-	// every handler call on this worker reaches it via ctx.state.
+	// every handler call on this worker reaches it via worker.state.
 	mut state := voidptr(unsafe { nil })
 	if make_state != unsafe { nil } {
 		state = make_state()
@@ -138,17 +138,17 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut st := new_plain_state()
 	// Arm clientless background watches (timerfd refresh, signalfd, ...) on THIS
-	// worker's loop, once, before serving. The ctx carries client_fd = -1 so the
+	// worker's loop, once, before serving. The handle carries client_fd = -1 so the
 	// watch + its continuation take the clientless path (no conn, scratch buffer).
 	if on_worker_start != unsafe { nil } {
-		mut start_ctx := core.Ctx{
+		mut startup := core.Worker{
 			client_fd: -1
 			state:     state
 			loop_fd:   epoll_fd
 			reactor:   unsafe { voidptr(&reactor) }
 			register:  register_watch
 		}
-		on_worker_start(mut start_ctx)
+		on_worker_start(mut startup)
 	}
 	// Only arm the timeout sweep if a deadline is actually configured.
 	sweep_on := limits.read_timeout_ms > 0 || limits.write_timeout_ms > 0
@@ -219,7 +219,7 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 fn process_events_tls(worker_id int, epoll_fd int, handler core.Handler, make_state fn () voidptr, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config) {
 	maybe_pin_worker(worker_id)
 	// Build THIS worker's per-thread state ONCE — same as the plaintext worker;
-	// every handler call reaches it via ctx.state.
+	// every handler call reaches it via worker.state.
 	mut state := voidptr(unsafe { nil })
 	if make_state != unsafe { nil } {
 		state = make_state()

@@ -141,12 +141,12 @@ fn client_key(req request_parser.HttpRequest, fd int) string {
 	return 'unknown'
 }
 
-fn handle(req_buffer []u8, mut out []u8, mut ctx core.Ctx, mut limiter Limiter) core.Step {
+fn handle(req_buffer []u8, mut out []u8, mut worker core.Worker, mut limiter Limiter) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {
 		out << response.tiny_bad_request_response
 		return .close
 	}
-	key := client_key(req, ctx.client_fd)
+	key := client_key(req, worker.client_fd)
 
 	// sys_mono_now: monotonic ns, no calendar conversion, immune to NTP jumps —
 	// exactly what elapsed-time refill needs (time.now() reads CLOCK_REALTIME
@@ -178,8 +178,8 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		handler:         fn [mut limiter] (req_buffer []u8, mut out []u8, mut ctx core.Ctx) core.Step {
-			return handle(req_buffer, mut out, mut ctx, mut limiter)
+		handler:         fn [mut limiter] (req_buffer []u8, mut out []u8, mut worker core.Worker) core.Step {
+			return handle(req_buffer, mut out, mut worker, mut limiter)
 		}
 	})!
 	println('Rate-limit demo on http://localhost:3000/  (token bucket per client IP)')
