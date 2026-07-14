@@ -9,43 +9,17 @@
 //
 // The tests bring the server up themselves: `spawn server.run()` on a thread and
 // use ServerConfig.after_server_start (fired the instant the server is accepting)
-// to drive the client workload / signal readiness. testkit only provides the
-// client-side primitives: dial + the byte-scanning framed readers below.
+// to drive the client workload / signal readiness. testkit only holds the read
+// loops the stdlib lacks: `net` offers a single `read()` and a `\n`-framed
+// `read_line()`, and `io.read_all` blocks forever on a keep-alive connection (no
+// EOF) — none reads "until a marker / a byte count / a full Content-Length-framed
+// message, bounded by a deadline". Connecting is just `net.dial_tcp` and counting
+// occurrences is `string.count`, so those are used inline at the call sites rather
+// than wrapped here.
 module testkit
 
 import net
 import time
-
-// dial opens a client connection to `port` on loopback.
-pub fn dial(port int) !&net.TcpConn {
-	return net.dial_tcp('127.0.0.1:${port}')
-}
-
-// count_marker counts non-overlapping occurrences of `needle` in `haystack`.
-// Byte-wise (no allocation, no decoding), so it is safe on partial/binary bodies.
-pub fn count_marker(haystack []u8, needle string) int {
-	if needle.len == 0 || haystack.len < needle.len {
-		return 0
-	}
-	mut count := 0
-	mut i := 0
-	for i <= haystack.len - needle.len {
-		mut hit := true
-		for j in 0 .. needle.len {
-			if haystack[i + j] != needle[j] {
-				hit = false
-				break
-			}
-		}
-		if hit {
-			count++
-			i += needle.len
-		} else {
-			i++
-		}
-	}
-	return count
-}
 
 // read_until accumulates bytes from `c` (deadline per read) until `done(acc)` is
 // true, the peer closes, or a read times out; returns everything read. The three
@@ -71,9 +45,9 @@ fn read_until(mut c net.TcpConn, deadline_ms int, done fn (acc []u8) bool) []u8 
 // closes / a read times out); returns how many were seen.
 pub fn read_until_count(mut c net.TcpConn, needle string, want int, deadline_ms int) int {
 	acc := read_until(mut c, deadline_ms, fn [needle, want] (acc []u8) bool {
-		return count_marker(acc, needle) >= want
+		return acc.bytestr().count(needle) >= want
 	})
-	return count_marker(acc, needle)
+	return acc.bytestr().count(needle)
 }
 
 // read_full reads until at least `min_len` bytes accumulate; returns everything

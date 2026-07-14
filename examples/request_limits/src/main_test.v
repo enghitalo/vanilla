@@ -24,21 +24,22 @@ fn serve(req []u8) []u8 {
 
 /*
 ASPIRATIONAL — Solution 2 (programmable raw client) + Solution 4 (fake clock).
-These verify CORE behavior that no handler test can reach. Requires the proposed
-testkit and the `Limits`/timeout support in the core (see ROADMAP.md):
+These verify CORE behavior that no handler test can reach. Requires the
+`Limits`/timeout support in the core (see ROADMAP.md); the client side is
+net.dial_tcp + testkit.read_response:
 
   fn test_slowloris_times_out() {
-      mut c := testkit.dial(port)
-      c.send('GET / HTTP/1.1\r\n')        // partial request line...
+      mut c := net.dial_tcp('127.0.0.1:${port}')!
+      c.write('GET / HTTP/1.1\r\n'.bytes())!    // partial request line...
       fake_clock.advance(read_header_timeout + 1)   // ...and then stall
-      assert c.read_response().contains('408 Request Timeout')
+      assert testkit.read_response(mut c, 2000).bytestr().contains('408 Request Timeout')
   }
 
   fn test_header_flood_rejected() {
-      mut c := testkit.dial(port)
-      c.send('GET / HTTP/1.1\r\n')
-      for _ in 0 .. 100_000 { c.send('X-Pad: ' + 'a'.repeat(100) + '\r\n') }
-      assert c.read_response().contains('431')   // before buffering it all
+      mut c := net.dial_tcp('127.0.0.1:${port}')!
+      c.write('GET / HTTP/1.1\r\n'.bytes())!
+      for _ in 0 .. 100_000 { c.write(('X-Pad: ' + 'a'.repeat(100) + '\r\n').bytes())! }
+      assert testkit.read_response(mut c, 2000).bytestr().contains('431')   // before buffering it all
   }
 
   fn test_oversized_body_rejected_before_buffering() {

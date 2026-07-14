@@ -26,7 +26,7 @@ The behavior to assert once the lifecycle API exists:
   inflight := spawn slow_request(port)          // a request that takes ~1s
   os.kill(pid, .term)                           // SIGTERM mid-flight
   assert inflight.wait().contains('200 OK')     // in-flight request COMPLETES
-  assert testkit.dial(port) fails               // new connections REFUSED
+  assert net.dial_tcp('127.0.0.1:${port}') fails // new connections REFUSED
   assert server_process_exits_within(grace)     // and the process exits cleanly
 
 This is the difference between a deploy that returns a burst of 502s and one

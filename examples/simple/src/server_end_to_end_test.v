@@ -1,5 +1,6 @@
 module main
 
+import net
 import http_server
 import http_server.testkit
 import http_server.http1_1.response
@@ -40,7 +41,7 @@ mut:
 // its args by value — the loop variable can't race. Panics on a connection error
 // (a spawned []u8-returning fn cannot propagate a Result).
 fn drive(port int, req []u8) []u8 {
-	mut conn := testkit.dial(port) or { panic('dial: ${err}') }
+	mut conn := net.dial_tcp('127.0.0.1:${port}') or { panic('dial: ${err}') }
 	conn.write(req) or { panic('write: ${err}') }
 	resp := testkit.read_response(mut conn, 2000)
 	conn.close() or {}

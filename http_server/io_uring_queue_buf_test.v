@@ -1,5 +1,6 @@
 module http_server
 
+import net
 import time
 import sync.stdatomic
 import http_server.testkit
@@ -61,7 +62,7 @@ fn (mut h QbHarness) await() []u8 {
 // verification happens on the main thread (below).
 fn qb_cli(port int) []u8 {
 	req := 'GET /static/x HTTP/1.1\r\nHost: localhost\r\n\r\n'
-	mut c := testkit.dial(port) or { return 'dial: ${err}'.bytes() }
+	mut c := net.dial_tcp('127.0.0.1:${port}') or { return 'dial: ${err}'.bytes() }
 	c.write(req.repeat(2).bytes()) or { return 'write: ${err}'.bytes() }
 	acc := testkit.read_full(mut c, 140212, 5000)
 	c.close() or {}
@@ -94,8 +95,7 @@ fn test_io_uring_queue_buf_borrowed_send() ! {
 		acc := h.await()
 		server.shutdown(500)
 
-		assert testkit.count_marker(acc, 'HTTP/1.1 200') == 2, 'expected 2 borrowed-send responses, got ${testkit.count_marker(acc,
-			'HTTP/1.1 200')}'
+		assert acc.bytestr().count('HTTP/1.1 200') == 2, 'expected 2 borrowed-send responses, got ${acc.bytestr().count('HTTP/1.1 200')}'
 
 		assert acc.len >= 140212, 'short read: got ${acc.len} of 140212 bytes'
 

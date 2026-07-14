@@ -41,8 +41,9 @@ fn bb_upload_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr
 
 const bb_req = 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'
 
-// The byte-scanning / framed-read client helpers (count_marker, read_until_count,
-// read_full) live in http_server.testkit and are called with the `testkit.` prefix.
+// The deadline-bounded framed readers (read_until_count, read_full) live in
+// http_server.testkit; connecting is net.dial_tcp and counting occurrences is
+// `string.count` on the response bytes, used inline below.
 
 // BbHarness carries a client thread's result string from the after_server_start
 // hook (server thread) to the test's main thread. `done` is the atomic
@@ -75,7 +76,7 @@ fn (mut h BbHarness) bb_await() string {
 // bb_cli_pipelining: 8 pipelined requests → 8 responses (one write), then a request
 // split across two writes → 1 response (partial-read framing). "ok" or diagnostic.
 fn bb_cli_pipelining(port int) string {
-	mut c := testkit.dial(port) or { return 'dial: ${err}' }
+	mut c := net.dial_tcp('127.0.0.1:${port}') or { return 'dial: ${err}' }
 	c.write(bb_req.repeat(8).bytes()) or { return 'write8: ${err}' }
 	got := testkit.read_until_count(mut c, 'HTTP/1.1 200', 8, 2000)
 	c.close() or {}
@@ -83,7 +84,7 @@ fn bb_cli_pipelining(port int) string {
 		return 'pipelining expected 8 responses, got ${got}'
 	}
 
-	mut c2 := testkit.dial(port) or { return 'dial2: ${err}' }
+	mut c2 := net.dial_tcp('127.0.0.1:${port}') or { return 'dial2: ${err}' }
 	c2.write('GET / HTTP/1.1\r\nHo'.bytes()) or { return 'write2a: ${err}' }
 	time.sleep(50 * time.millisecond)
 	c2.write('st: x\r\n\r\n'.bytes()) or { return 'write2b: ${err}' }
@@ -100,7 +101,7 @@ fn bb_cli_pipelining(port int) string {
 fn bb_cli_max_connections(port int) string {
 	mut conns := []&net.TcpConn{}
 	for i in 0 .. 4 {
-		mut c := testkit.dial(port) or { return 'dial ${i}: ${err}' }
+		mut c := net.dial_tcp('127.0.0.1:${port}') or { return 'dial ${i}: ${err}' }
 		c.write(bb_req.bytes()) or { return 'write ${i}: ${err}' }
 		got := testkit.read_until_count(mut c, 'HTTP/1.1 200', 1, 2000)
 		if got != 1 {
@@ -109,7 +110,7 @@ fn bb_cli_max_connections(port int) string {
 		conns << c
 	}
 	mut served5 := 0
-	if mut c5 := testkit.dial(port) {
+	if mut c5 := net.dial_tcp('127.0.0.1:${port}') {
 		c5.write(bb_req.bytes()) or {}
 		served5 = testkit.read_until_count(mut c5, 'HTTP/1.1 200', 1, 1500)
 		c5.close() or {}
@@ -127,7 +128,7 @@ fn bb_cli_max_connections(port int) string {
 // END it promptly (408-then-close on epoll, EOF on io_uring) — never a 200, and
 // well under the 2s client wait. "ok" or diagnostic.
 fn bb_cli_read_timeout(port int) string {
-	mut c := testkit.dial(port) or { return 'dial: ${err}' }
+	mut c := net.dial_tcp('127.0.0.1:${port}') or { return 'dial: ${err}' }
 	c.write('GET / HTTP/1.1\r\nHo'.bytes()) or { return 'write: ${err}' } // partial: never completes
 	c.set_read_timeout(2 * time.second)
 	mut buf := []u8{len: 1024}
@@ -149,7 +150,7 @@ fn bb_cli_read_timeout(port int) string {
 // and require the full response still arrives on the open read side (RFC 9112 §9.6,
 // issue #103). "ok" or diagnostic.
 fn bb_cli_half_close(port int) string {
-	mut c := testkit.dial(port) or { return 'dial: ${err}' }
+	mut c := net.dial_tcp('127.0.0.1:${port}') or { return 'dial: ${err}' }
 	c.write(bb_req.bytes()) or { return 'write: ${err}' }
 	net.shutdown(c.sock.handle, how: .write)
 	got := testkit.read_until_count(mut c, 'HTTP/1.1 200', 1, 3000)
@@ -163,7 +164,7 @@ fn bb_cli_half_close(port int) string {
 // bb_cli_expect_100: send the head with Expect: 100-continue and hold the body; the
 // server must prompt an interim 100, then the final 200 after the body. "ok" or diag.
 fn bb_cli_expect_100(port int) string {
-	mut c := testkit.dial(port) or { return 'dial: ${err}' }
+	mut c := net.dial_tcp('127.0.0.1:${port}') or { return 'dial: ${err}' }
 	c.write('POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n'.bytes()) or {
 		return 'write head: ${err}'
 	}
@@ -187,7 +188,7 @@ fn bb_cli_large_upload(port int) string {
 	body_len := 2 * 1024 * 1024 // 2 MiB > 1 MiB threshold ⇒ drain path
 	chunk := []u8{len: 64 * 1024, init: u8(0x61)}
 	head := 'POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: ${body_len}\r\n\r\n'.bytes()
-	mut c := testkit.dial(port) or { return 'dial: ${err}' }
+	mut c := net.dial_tcp('127.0.0.1:${port}') or { return 'dial: ${err}' }
 
 	// Upload 0 ORDERING probe: head + ONE chunk, then the server must stay SILENT.
 	c.write(head) or { return 'u0 head: ${err}' }
@@ -205,7 +206,7 @@ fn bb_cli_large_upload(port int) string {
 		sent += n
 	}
 	acc0 := bb_read_one_200(mut c, 5000)
-	if testkit.count_marker(acc0, 'HTTP/1.1 200') != 1 {
+	if acc0.bytestr().count('HTTP/1.1 200') != 1 {
 		return 'upload 0 not answered after the body completed'
 	}
 	if !acc0.bytestr().contains('\r\n\r\n${body_len}') {
@@ -222,7 +223,7 @@ fn bb_cli_large_upload(port int) string {
 	}
 	acc1 := bb_read_one_200(mut c, 5000)
 	c.close() or {}
-	if testkit.count_marker(acc1, 'HTTP/1.1 200') != 1 {
+	if acc1.bytestr().count('HTTP/1.1 200') != 1 {
 		return 'keep-alive after a drained upload broke (drain over-read or under-read?)'
 	}
 	if !acc1.bytestr().contains('\r\n\r\n${body_len}') {
@@ -304,7 +305,7 @@ fn check_read_timeout(backend IOBackend, port int) ! {
 // (`phase=2`), then confirm all 10 new connections are refused. The main thread
 // does the shutdown + times it BETWEEN the two phases. Returns "ok" or diagnostic.
 fn bb_cli_graceful(port int, mut h BbHarness) string {
-	mut c := testkit.dial(port) or { return 'dial: ${err}' }
+	mut c := net.dial_tcp('127.0.0.1:${port}') or { return 'dial: ${err}' }
 	c.write(bb_req.bytes()) or { return 'write: ${err}' }
 	got := testkit.read_until_count(mut c, 'HTTP/1.1 200', 1, 2000)
 	c.close() or {}
@@ -319,7 +320,7 @@ fn bb_cli_graceful(port int, mut h BbHarness) string {
 	// Every listener is now stopped → all new connections refused.
 	mut refused := 0
 	for _ in 0 .. 10 {
-		mut nc := testkit.dial(port) or {
+		mut nc := net.dial_tcp('127.0.0.1:${port}') or {
 			refused++
 			continue
 		}
@@ -372,7 +373,7 @@ fn bb_read_one_200(mut c net.TcpConn, deadline_ms int) []u8 {
 	c.set_read_timeout(deadline_ms * time.millisecond)
 	mut buf := []u8{len: 65536}
 	mut acc := []u8{}
-	for testkit.count_marker(acc, 'HTTP/1.1 200') < 1 {
+	for acc.bytestr().count('HTTP/1.1 200') < 1 {
 		nr := c.read(mut buf) or { break }
 		if nr <= 0 {
 			break

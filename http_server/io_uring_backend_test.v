@@ -17,6 +17,7 @@ module http_server
 // the hook `spawn`s the client fn — so it returns and the accept loop starts —
 // records the thread handle in an IouHarness, and flips the atomic `done` barrier
 // that publishes it; the main thread spins on `done`, joins, and asserts.
+import net
 import time
 import sync.stdatomic
 import http_server.testkit
@@ -48,7 +49,7 @@ fn (mut h IouHarness) await() []u8 {
 
 // iou_cli_routing: 200 then 404 on ONE keep-alive connection. "ok" or a diagnostic.
 fn iou_cli_routing(port int) []u8 {
-	mut c := testkit.dial(port) or { return 'dial: ${err}'.bytes() }
+	mut c := net.dial_tcp('127.0.0.1:${port}') or { return 'dial: ${err}'.bytes() }
 	c.write('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()) or {
 		return 'write1: ${err}'.bytes()
 	}
@@ -67,7 +68,7 @@ fn iou_cli_routing(port int) []u8 {
 
 // iou_cli_pipelined: 4 requests in ONE write → 4 responses. "ok" or a diagnostic.
 fn iou_cli_pipelined(port int) []u8 {
-	mut c := testkit.dial(port) or { return 'dial: ${err}'.bytes() }
+	mut c := net.dial_tcp('127.0.0.1:${port}') or { return 'dial: ${err}'.bytes() }
 	req := 'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n'
 	c.write(req.repeat(4).bytes()) or { return 'write: ${err}'.bytes() }
 	got := testkit.read_until_count(mut c, 'HTTP/1.1 200', 4, 3000)

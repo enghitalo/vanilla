@@ -15,6 +15,7 @@ module http_server
 // barrier that publishes the handle). The main thread spins on `done`, then
 // wait()s the client thread and asserts on its returned bytes. No polling, no
 // testkit.serve.
+import net
 import time
 import sync.stdatomic
 import http_server.testkit
@@ -66,7 +67,7 @@ fn (mut h Harness) await() []u8 {
 // read fully before the next is sent (kqueue-safe). Returns "ok" on success,
 // otherwise a diagnostic string the main thread asserts against.
 fn cli_get_and_notfound(port int) []u8 {
-	mut c := testkit.dial(port) or { return 'dial: ${err}'.bytes() }
+	mut c := net.dial_tcp('127.0.0.1:${port}') or { return 'dial: ${err}'.bytes() }
 	c.write('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()) or {
 		return 'write1: ${err}'.bytes()
 	}
@@ -86,7 +87,7 @@ fn cli_get_and_notfound(port int) []u8 {
 // cli_body: fetch GET / and return the FULL raw response bytes (head + body), so
 // the main thread can assert the body was delivered through the real send path.
 fn cli_body(port int) []u8 {
-	mut c := testkit.dial(port) or { return 'dial: ${err}'.bytes() }
+	mut c := net.dial_tcp('127.0.0.1:${port}') or { return 'dial: ${err}'.bytes() }
 	c.write('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()) or {
 		return 'write: ${err}'.bytes()
 	}
@@ -98,7 +99,7 @@ fn cli_body(port int) []u8 {
 // cli_malformed: send a malformed request line, confirm a 400 arrives, then that
 // the connection is CLOSED (follow-up read hits EOF). Returns "ok" or a diagnostic.
 fn cli_malformed(port int) []u8 {
-	mut c := testkit.dial(port) or { return 'dial: ${err}'.bytes() }
+	mut c := net.dial_tcp('127.0.0.1:${port}') or { return 'dial: ${err}'.bytes() }
 	// No space after the method token: the head frames (ends in \r\n\r\n) so the
 	// handler runs, but decode_http_request rejects the request line → 400 + .close.
 	c.write('GET/HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()) or { return 'write: ${err}'.bytes() }
@@ -156,7 +157,7 @@ fn test_server_body_delivery() ! {
 	}()
 	acc := h.await()
 	server.shutdown(500)
-	assert testkit.count_marker(acc, 'HTTP/1.1 200') == 1, 'expected one 200, got: ${acc.bytestr()}'
+	assert acc.bytestr().count('HTTP/1.1 200') == 1, 'expected one 200, got: ${acc.bytestr()}'
 	assert acc.bytestr().contains('\r\n\r\nOK'), 'body not delivered: ${acc.bytestr()}'
 }
 
@@ -204,7 +205,7 @@ fn test_after_server_start_fires_when_ready() ! {
 		}
 	}
 
-	mut c := testkit.dial(8156)!
+	mut c := net.dial_tcp('127.0.0.1:8156')!
 	c.write('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes())!
 	assert testkit.read_until_count(mut c, 'HTTP/1.1 200', 1, 2000) == 1, 'server must be serving the instant after_server_start fired'
 	c.close() or {}

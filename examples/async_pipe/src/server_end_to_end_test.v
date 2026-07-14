@@ -1,5 +1,6 @@
 module main
 
+import net
 import http_server
 import http_server.testkit
 import sync.stdatomic
@@ -33,7 +34,7 @@ fn (mut h Harness) await() []u8 {
 }
 
 fn cli_async(port int) []u8 {
-	mut c := testkit.dial(port) or { return 'dial: ${err}'.bytes() }
+	mut c := net.dial_tcp('127.0.0.1:${port}') or { return 'dial: ${err}'.bytes() }
 	c.write('GET /async HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()) or {
 		return 'write: ${err}'.bytes()
 	}
