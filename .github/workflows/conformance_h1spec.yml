@@ -52,11 +52,16 @@ jobs:
           sudo apt-get install -y liburing-dev linux-libc-dev
 
       # --- Hard gate: deterministic handler-level conformance assertions --------
-      # `-cc gcc -no-parallel`: the default (non -prod) build hits two V-toolchain
-      # flakes — tcc can't parse liburing's <stdatomic.h> (and the tcc->gcc
-      # fallback is a race), and parallel debug codegen non-deterministically emits
-      # an unmangled `array_free` (undefined-reference link error). Pinning gcc +
-      # serial codegen removes both, matching the example matrix workflows.
+      # `-cc gcc -no-parallel`: the default build hits two V-toolchain flakes —
+      #   * -no-parallel fixes the codegen data race in vlang/v#27749: parallel
+      #     codegen races on g.table.find_sym() and emits builtin methods
+      #     unmangled (`array_free` vs `builtin__array_free`) → intermittent
+      #     `undefined reference` at link. It is a codegen bug, so it is NOT
+      #     C-compiler-dependent; only -no-parallel eliminates it.
+      #   * -cc gcc avoids the separate tcc<->gcc fallback race on liburing's
+      #     <stdatomic.h> (which every http_server build pulls in).
+      # Matches the example matrix workflows. -prod is not immune to #27749, so
+      # keep -no-parallel here even though these are debug builds.
       - name: Build examples/conformance
         shell: bash
         run: v -cc gcc -no-parallel examples/conformance/src

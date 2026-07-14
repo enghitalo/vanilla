@@ -57,8 +57,9 @@ jobs:
           sudo apt-get install -y liburing-dev linux-libc-dev
       - name: Build examples/conformance
         shell: bash
-        # `-cc gcc -no-parallel`: avoids the default-build V-toolchain flakes
-        # (tcc + <stdatomic.h>, and a non-deterministic unmangled `array_free`).
+        # `-cc gcc -no-parallel`: -no-parallel fixes the codegen data race
+        # vlang/v#27749 (unmangled `array_free` -> undefined reference at link),
+        # -cc gcc avoids the tcc<->gcc fallback race on liburing's <stdatomic.h>.
         # Matches the example matrix and the h1spec conformance workflow.
         run: v -cc gcc -no-parallel examples/conformance/src
       - name: Start the conformance server
