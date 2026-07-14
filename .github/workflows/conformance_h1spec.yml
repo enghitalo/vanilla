@@ -68,6 +68,13 @@ jobs:
       - name: Unit tests (hard gate)
         shell: bash
         run: v -cc gcc -no-parallel test examples/conformance/src
+      - name: Backend behaviour tests (hard gate)
+        shell: bash
+        # Drives real epoll + io_uring servers over raw sockets: pipelining,
+        # framing, max-connections, timeouts, graceful shutdown, and the #103
+        # half-close-then-respond regression test. The example matrices don't
+        # cover http_server/ tests, so run them here.
+        run: v -cc gcc -no-parallel test http_server/backend_behaviors_test.v
 
       # --- Report: live-server probe with h1spec --------------------------------
       - name: Install h1spec (uv)

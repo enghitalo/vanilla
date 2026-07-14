@@ -64,20 +64,25 @@ and
 ## Known limitations (tracked as core-vanilla issues)
 
 A handler can only decide a request the framer has already accepted as a complete
-message. Two conformance gaps therefore cannot be closed from the example — they
-need a change in `http_server` core and are tracked as issues:
+message, so a few conformance gaps live in `http_server` core, not this example.
+They are tracked as issues:
 
 - **`Content-Length` + `Transfer-Encoding` sent together**
   ([#104](https://github.com/enghitalo/vanilla/issues/104)) is rejected only when
   the bytes happen to form a complete chunked frame. When they don't, the framer
   waits for more input instead of rejecting the ambiguous message up front. The
   fix is to reject CL+TE at the framing layer (`frame_request_length_lim_idx`).
-- **Half-closed clients** ([#103](https://github.com/enghitalo/vanilla/issues/103)).
-  A client that sends a full request and then `shutdown(SHUT_WR)` (the technique
-  h1spec uses for most tests) can have its already-computed response dropped: the
-  backend sees the EOF and tears the connection down before flushing the queued
-  response. This is why the handler is also covered by `src/main_test.v`, which
-  exercises the exact same decisions without a socket.
+- **Chunked body with a missing CRLF terminator**
+  ([#109](https://github.com/enghitalo/vanilla/issues/109)) is accepted on the
+  epoll backend (served `200` instead of `400`): `frame_chunked_total` assumes
+  the post-data CRLF is present without checking it.
+
+The **half-closed-client** bug that used to drop the response
+([#103](https://github.com/enghitalo/vanilla/issues/103)) is **fixed** — a client
+that `shutdown(SHUT_WR)`s after a complete request now receives its full reply on
+both epoll and kqueue. The handler is still covered by `src/main_test.v` (the
+same decisions asserted without a socket), so the deterministic gate stays
+independent of backend I/O.
 
 The unit tests in [`src/main_test.v`](src/main_test.v) assert every row of the
 table above and always pass regardless of backend I/O behavior.
