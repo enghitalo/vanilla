@@ -1,18 +1,16 @@
 name: (Linux) HTTP/1.1 Conformance (h1spec)
 
 # Runs the h1spec RFC 9112/9110 conformance probe against the examples/conformance
-# server on the epoll backend. Two layers:
+# server on the epoll backend. Two gates:
 #
-#   1. HARD GATE — `v test examples/conformance/src`: the handler's conformance
-#      decisions asserted directly (no socket), so this is deterministic and
-#      blocks the merge on any regression.
-#   2. REPORT — h1spec probes the LIVE server over TCP and posts the scorecard to
-#      the Job Summary (and, on push, a PR comment). This layer is informational:
-#      h1spec's technique half-closes the client write side after each request,
-#      and vanilla's backend currently drops the response on that half-close
-#      (tracked in issue #103 — see examples/conformance/README.md), so a red
-#      h1spec score does not fail the build. The unit-test gate is the source of
-#      truth.
+#   1. `v test` (handler / framer / backend behaviour): every conformance decision
+#      asserted deterministically without a socket — the primary source of truth.
+#   2. h1spec LIVE probe over TCP: fails the build on a 🔴 REAL conformance
+#      regression (a wrong answer). It does NOT gate on ⚪ blocked (no response),
+#      which can be transient socket timing on a noisy hosted runner or a tracked
+#      backend edge — the `v test` layer already covers those decisions. Promoted
+#      from report-only once the live epoll score reached 33/33 (#103 fixed).
+#      Always posts the colored scorecard to the Job Summary + the PR.
 #
 # h1spec: https://github.com/dropseed/h1spec (Python, plain-TCP, exit 0/1/2).
 
@@ -108,35 +106,50 @@ jobs:
             sleep 0.25
           done
           head -2 /tmp/conf_server.log || true
-      - name: Run h1spec and build the colored scorecard (report-only)
+      - name: Run h1spec and build the colored scorecard (hard gate on 🔴)
         id: h1spec
-        continue-on-error: true
         shell: bash
         run: |
           set +e
           uvx --from git+https://github.com/dropseed/h1spec h1spec --strict localhost:3000 > /tmp/h1spec_raw.txt 2>&1
-          code=$?
           run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          # Render the per-check colored scorecard (🟢 pass / ⚪ blocked-#103 / 🔴 fail).
+          # Render the per-check colored scorecard (🟢 pass / ⚪ blocked / 🔴 fail).
+          # The generator writes the markdown to stdout and a `SCORECARD_COUNTS
+          # pass=N fail=N blocked=N` tally to stderr.
           sed -E 's/\x1b\[[0-9;]*m//g' /tmp/h1spec_raw.txt \
             | python3 .github/scripts/conformance_scorecard.py "${{ github.sha }}" "$run_url" \
-            > /tmp/scorecard.md
-          # Job summary + a copy for the PR comment.
+            > /tmp/scorecard.md 2> /tmp/scorecard.err
           cat /tmp/scorecard.md >> "$GITHUB_STEP_SUMMARY"
-          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          fail=$(sed -nE 's/.*fail=([0-9]+).*/\1/p' /tmp/scorecard.err)
+          fail=${fail:-0}
+          echo "fail_count=$fail" >> "$GITHUB_OUTPUT"
+          # GATE: fail the build ONLY on a 🔴 real conformance regression (a wrong
+          # answer). ⚪ blocked (no response — transient socket timing on a noisy
+          # runner, or a tracked backend edge) does NOT gate: the deterministic
+          # `v test` steps above already assert every handler decision without a
+          # socket. Promoted from report-only once the live epoll score reached 33/33.
+          if [ "$fail" -gt 0 ]; then
+            echo "::error::h1spec found $fail real conformance failure(s) — see the scorecard in the job summary."
+            exit 1
+          fi
+          echo "h1spec: no real conformance failures (🔴 = 0)."
       - name: Stop the server
         if: always()
         shell: bash
         run: |
           [ -f /tmp/conf_server.pid ] && kill "$(cat /tmp/conf_server.pid)" 2>/dev/null || true
       - name: Comment the scorecard on the PR
-        if: github.event_name == 'pull_request'
+        # always(): post the scorecard even when the gate failed, so the 🔴 that
+        # broke the build is visible on the PR (the gate step exits non-zero).
+        if: always() && github.event_name == 'pull_request'
         continue-on-error: true
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/scorecard.md
+          if [ -f /tmp/scorecard.md ]; then
+            gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/scorecard.md
+          fi
 
       # --- On merge to main: rewrite the auto-managed README scorecard block -----
       # Best-effort: never fail the job if the commit/push loses a race with

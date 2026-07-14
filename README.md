@@ -222,11 +222,13 @@ Two probes drive it from CI — [h1spec](https://github.com/dropseed/h1spec)
 (~215 tests incl. request-smuggling, on merge).
 
 The scorecard below is the live `h1spec --strict` result, **rewritten by CI on
-every merge to `main`** — 🟢 passed, ⚪ blocked by a known backend bug (not a
-handler failure), 🔴 a real conformance gap. The authoritative gate is
-`v test examples/conformance/src` (the same decisions asserted without a socket,
-deterministic, must be green); the live socket probe is report-only because both
-probes half-close per request and hit [#103](https://github.com/enghitalo/vanilla/issues/103).
+every merge to `main`** — 🟢 passed, ⚪ blocked (no response — transient or a
+tracked backend edge), 🔴 a real conformance gap. Both the deterministic
+`v test examples/conformance/src` layer **and** the live `h1spec` probe gate the
+build: a merge is blocked by any handler-decision regression *and* by any 🔴 real
+conformance failure over a live socket. (⚪ blocked does not gate — it can be
+socket-timing noise on a hosted runner, and the `v test` layer already asserts
+those decisions.)
 
 <!-- CONFORMANCE_SCORECARD:START -->
 **Live `h1spec --strict` scorecard** — 33/33 of the checks that get an answer pass.
