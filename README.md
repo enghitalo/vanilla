@@ -212,45 +212,97 @@ fn main() {
 
 ## Conformance Testing
 
-vanilla ships [`examples/conformance/`](examples/conformance/) — a handler
-written to be **correct under an HTTP/1.1 conformance probe** rather than to show
-off a feature. It calls the stdlib `request_parser.validate_http1()` plus extra
-field-syntax and framing checks, so malformed requests get the RFC-mandated
-status (`400` / `405` / `501` / `505`) instead of being served as if valid.
+[`examples/conformance/`](examples/conformance/) is a handler written to be
+**correct under an HTTP/1.1 conformance probe** rather than to show off a feature:
+it calls the stdlib `request_parser.validate_http1()` plus the field-syntax and
+framing checks in [`validate.v`](examples/conformance/src/validate.v), so
+malformed requests get the RFC-mandated status instead of being served as valid.
+Two probes drive it from CI — [h1spec](https://github.com/dropseed/h1spec)
+(RFC 9112/9110, every push) and [Http11Probe](https://github.com/MDA2AV/Http11Probe)
+(~215 tests incl. request-smuggling, on merge).
 
-Two probes run against it, both driven from CI:
+The scorecard below is the live `h1spec --strict` result, **rewritten by CI on
+every merge to `main`** — 🟢 passed, ⚪ blocked by a known backend bug (not a
+handler failure), 🔴 a real conformance gap. The authoritative gate is
+`v test examples/conformance/src` (the same decisions asserted without a socket,
+deterministic, must be green); the live socket probe is report-only because both
+probes half-close per request and hit [#103](https://github.com/enghitalo/vanilla/issues/103).
 
-| Tool | What it checks | In CI |
-|---|---|---|
-| [h1spec](https://github.com/dropseed/h1spec) | RFC 9112/9110 request-line, header, body, connection, and hardening checks (Python, plain TCP) | [`conformance_h1spec.yml`](.github/workflows/conformance_h1spec.yml) — every push/PR |
-| [Http11Probe](https://github.com/MDA2AV/Http11Probe) | ~215 tests incl. request-smuggling, normalization, cookies (.NET 10) | [`conformance_http11probe.yml`](.github/workflows/conformance_http11probe.yml) — push to `main` + manual, non-blocking |
+<!-- CONFORMANCE_SCORECARD:START -->
+**Live `h1spec --strict` scorecard** — 13/13 of the checks that get an answer pass.
 
-Latest h1spec result on `main` (auto-updated by CI on merge):
+🟢 **13 pass**  ·  ⚪ 20 blocked by [#103](https://github.com/enghitalo/vanilla/issues/103)
 
-<!-- CONFORMANCE_H1SPEC:START -->
-h1spec (`--strict`, live socket): **20/33 passed** on commit `c8f7d76` · [run log](https://github.com/enghitalo/vanilla/actions/runs/29339997143)<br>_Live probes half-close per request (#103); the authoritative gate is `v test examples/conformance/src` (deterministic, must be green)._
-<!-- CONFORMANCE_H1SPEC:END -->
+> [!TIP]
+> **Every check that gets an answer passes.** The ⚪ rows are *not* conformance failures — they are the backend half-close bug ([#103](https://github.com/enghitalo/vanilla/issues/103)): h1spec half-closes the socket after each request and vanilla drops the queued response, so no answer arrives. The deterministic `v test examples/conformance/src` gate asserts these same decisions without a socket and is green.
 
-Run the server and probe it yourself:
+**Request line — RFC 9112 §3**
 
-```sh
-v -prod run examples/conformance/src
-# then, in another shell:
-uvx --from git+https://github.com/dropseed/h1spec h1spec --strict localhost:3000
-```
+| | Check | |
+|:--:|---|---|
+| ⚪ | Simple GET accepted | blocked · #103 |
+| ⚪ | POST with Content-Length body | blocked · #103 |
+| 🟢 | OPTIONS * request-target accepted | pass |
+| ⚪ | Absolute-form request-target accepted | blocked · #103 |
+| 🟢 | CONNECT authority-form accepted | pass |
+| ⚪ | Invalid HTTP version rejected | blocked · #103 |
+| ⚪ | Malformed request line rejected | blocked · #103 |
 
-**How CI gates it.** The authoritative check is `v test examples/conformance/src`
-— the handler's conformance decisions asserted directly (no socket), so it is
-deterministic and blocks merges on any regression. The live-socket probes are
-**report-only**: they post a scorecard to the run summary and PR, but do not fail
-the build. This is deliberate — both probes half-close the client write side
-after each request, and vanilla's backend currently drops the response on that
-half-close ([#103](https://github.com/enghitalo/vanilla/issues/103)), which would
-otherwise make a fully-conformant handler look red. See the example's
-[README](examples/conformance/README.md) for the full check list and the two
-tracked core-vanilla limitations
-([#103](https://github.com/enghitalo/vanilla/issues/103),
-[#104](https://github.com/enghitalo/vanilla/issues/104)).
+**Headers — RFC 9112 §5**
+
+| | Check | |
+|:--:|---|---|
+| 🟢 | Missing Host header rejected | pass |
+| ⚪ | Duplicate Host rejected | blocked · #103 |
+| ⚪ | Invalid Host value rejected | blocked · #103 |
+| ⚪ | Invalid header name rejected | blocked · #103 |
+| ⚪ | Obsolete line folding rejected | blocked · #103 |
+| ⚪ | Space before colon rejected | blocked · #103 |
+| ⚪ | Null byte in header rejected | blocked · #103 |
+
+**Body — RFC 9112 §6–7**
+
+| | Check | |
+|:--:|---|---|
+| 🟢 | Chunked encoding accepted | pass |
+| ⚪ | Chunked + HTTP/1.0 rejected | blocked · #103 |
+| ⚪ | Chunked + Content-Length rejected | blocked · #103 |
+| 🟢 | Chunked + Content-Length closes connection | pass |
+| ⚪ | Unknown transfer-coding rejected | blocked · #103 |
+| 🟢 | Chunked not-final coding rejected | pass |
+| 🟢 | Invalid Content-Length rejected | pass |
+| ⚪ | Conflicting Content-Length rejected | blocked · #103 |
+| 🟢 | Invalid chunk-size rejected | pass |
+| 🟢 | Missing chunk terminator rejected | pass |
+| 🟢 | Expect: 100-continue handling | pass |
+
+**Response semantics — RFC 9110**
+
+| | Check | |
+|:--:|---|---|
+| ⚪ | HEAD response has no body | blocked · #103 |
+| ⚪ | Error response is self-delimiting | blocked · #103 |
+
+**Connection — RFC 9112 §9**
+
+| | Check | |
+|:--:|---|---|
+| 🟢 | Keep-alive default (HTTP/1.1) | pass |
+| 🟢 | Connection: close honored | pass |
+| 🟢 | HTTP/1.0 closes by default | pass |
+
+**Hardening — implementation-defined limits**
+
+| | Check | |
+|:--:|---|---|
+| ⚪ | Oversized request line | blocked · #103 |
+| ⚪ | Header flood | blocked · #103 |
+| ⚪ | Oversized header | blocked · #103 |
+
+_h1spec `--strict`, live socket · commit `c8f7d76` · [run log](https://github.com/enghitalo/vanilla/actions/runs/29339997143) · regenerated by CI on every merge_
+<!-- CONFORMANCE_SCORECARD:END -->
+
+<sub>Live-probe pass/blocked split shifts run to run (the [#103](https://github.com/enghitalo/vanilla/issues/103) half-close teardown is timing-dependent); the `v test` gate and [`examples/conformance/README.md`](examples/conformance/README.md) are the stable references. Two tracked core gaps: [#103](https://github.com/enghitalo/vanilla/issues/103) (half-close) and [#104](https://github.com/enghitalo/vanilla/issues/104) (CL+TE framing).</sub>
 
 ---
 
