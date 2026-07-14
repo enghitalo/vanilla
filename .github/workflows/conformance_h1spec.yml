@@ -78,7 +78,7 @@ jobs:
             sleep 0.25
           done
           head -2 /tmp/conf_server.log || true
-      - name: Run h1spec (report-only)
+      - name: Run h1spec and build the colored scorecard (report-only)
         id: h1spec
         continue-on-error: true
         shell: bash
@@ -86,24 +86,14 @@ jobs:
           set +e
           uvx --from git+https://github.com/dropseed/h1spec h1spec --strict localhost:3000 > /tmp/h1spec_raw.txt 2>&1
           code=$?
-          # Strip ANSI colors and pull out the "N/M passed" summary line.
-          score=$(sed -E 's/\x1b\[[0-9;]*m//g' /tmp/h1spec_raw.txt | grep -Eo '[0-9]+/[0-9]+ passed' | tail -1)
-          {
-            echo '## HTTP/1.1 Conformance — h1spec'
-            echo
-            echo '```'
-            sed -E 's/\x1b\[[0-9;]*m//g' /tmp/h1spec_raw.txt
-            echo '```'
-            echo
-            case $code in
-              0) echo '✅ All h1spec checks passed.';;
-              1) echo '⚠️ Some h1spec checks failed. This is informational — the backend half-close limitation (#103) makes most live-socket probes look red even though the handler is conformant. The `v test` gate is authoritative.';;
-              2) echo '❓ No h1spec tests matched.';;
-              *) echo "❓ h1spec exited with code $code.";;
-            esac
-          } | tee /tmp/h1spec_report.md >> "$GITHUB_STEP_SUMMARY"
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # Render the per-check colored scorecard (🟢 pass / ⚪ blocked-#103 / 🔴 fail).
+          sed -E 's/\x1b\[[0-9;]*m//g' /tmp/h1spec_raw.txt \
+            | python3 .github/scripts/conformance_scorecard.py "${{ github.sha }}" "$run_url" \
+            > /tmp/scorecard.md
+          # Job summary + a copy for the PR comment.
+          cat /tmp/scorecard.md >> "$GITHUB_STEP_SUMMARY"
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
-          echo "score=${score:-unknown}" >> "$GITHUB_OUTPUT"
       - name: Stop the server
         if: always()
         shell: bash
@@ -116,38 +106,34 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/h1spec_report.md
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/scorecard.md
 
-      # --- On merge to main: refresh the auto-managed README status block -------
+      # --- On merge to main: rewrite the auto-managed README scorecard block -----
       # Best-effort: never fail the job if the commit/push loses a race with
       # another push to main (the block just refreshes on the next run).
-      - name: Update README conformance status (main only)
+      - name: Update README scorecard (main only)
         if: github.event_name == 'push'
         continue-on-error: true
         shell: bash
         run: |
-          score='${{ steps.h1spec.outputs.score }}'
-          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          sha_short="$(echo '${{ github.sha }}' | cut -c1-7)"
-          # Live socket probe (half-close, #103), so frame it as the live score with
-          # a pointer to the authoritative gate.
-          export BLOCK="h1spec (\`--strict\`, live socket): **${score:-unknown}** on commit \`${sha_short}\` · [run log](${run_url})<br>_Live probes half-close per request (#103); the authoritative gate is \`v test examples/conformance/src\` (deterministic, must be green)._"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           # The push event checks out a detached SHA; work on a fresh main so the
-          # awk edit applies to the up-to-date README (avoids a stash/pop dance).
+          # rewrite applies to the up-to-date README (avoids a stash/pop dance).
           git fetch origin main
           git checkout -B main origin/main
-          # Rewrite the text between the markers with awk (no language-in-YAML trap).
-          awk '
-            /<!-- CONFORMANCE_H1SPEC:START -->/ { print; print ENVIRON["BLOCK"]; skip=1; next }
-            /<!-- CONFORMANCE_H1SPEC:END -->/   { skip=0 }
+          # Regenerate the scorecard against THIS main's HEAD sha (the fetched sha
+          # may differ from the run's sha if another push landed meanwhile).
+          # Splice /tmp/scorecard.md between the markers with awk (no language-in-YAML trap).
+          awk -v f=/tmp/scorecard.md '
+            /<!-- CONFORMANCE_SCORECARD:START -->/ { print; while ((getline l < f) > 0) print l; skip=1; next }
+            /<!-- CONFORMANCE_SCORECARD:END -->/   { skip=0 }
             !skip { print }
           ' README.md > README.md.tmp && mv README.md.tmp README.md
           if git diff --quiet -- README.md; then
-            echo "README status unchanged — nothing to commit."
+            echo "Scorecard unchanged — nothing to commit."
             exit 0
           fi
           git add README.md
-          git commit -m "docs(readme): refresh h1spec conformance status [skip ci]"
+          git commit -m "docs(readme): refresh conformance scorecard [skip ci]"
           git push origin main
