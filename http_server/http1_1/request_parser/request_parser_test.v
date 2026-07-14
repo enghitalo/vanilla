@@ -475,6 +475,27 @@ fn test_frame_malformed_content_length() {
 	}
 }
 
+// head_expects_100_continue detects `Expect: 100-continue` in a buffered head so
+// the backend can prompt the client (RFC 9110 §10.1.1). Case-insensitive on both
+// the field-name and the value; must not false-match another header or a request
+// that merely mentions the token in a different field.
+fn test_head_expects_100_continue() {
+	// Present (exact) — head_len is the whole buffer (head only, no body yet).
+	h1 := 'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n'.bytes()
+	assert head_expects_100_continue(h1, h1.len)
+	// Case-insensitive name + value.
+	h2 := 'POST / HTTP/1.1\r\nHost: x\r\nEXPECT: 100-Continue\r\n\r\n'.bytes()
+	assert head_expects_100_continue(h2, h2.len)
+	// Absent.
+	h3 := 'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n'.bytes()
+	assert !head_expects_100_continue(h3, h3.len)
+	// The token in a DIFFERENT header must not match.
+	h4 := 'POST / HTTP/1.1\r\nHost: x\r\nX-Note: 100-continue please\r\n\r\n'.bytes()
+	assert !head_expects_100_continue(h4, h4.len)
+	// A prefix that hasn't reached the header yet: no false positive.
+	assert !head_expects_100_continue('POST / HTTP/1.1\r\n'.bytes(), 17)
+}
+
 // Split-point fuzzing: the regression guard for the read-loop framing. For a
 // full request, EVERY prefix shorter than the message reports incomplete (-1),
 // and the exact full length reports complete. No sockets involved.

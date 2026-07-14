@@ -465,6 +465,23 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 			}
 			return
 		}
+		// Expect: 100-continue (RFC 9110 §10.1.1). drain_requests left a partial
+		// request in read_buf (its body has not fully arrived); if its head is
+		// complete and asks for 100-continue, prompt the client ONCE by queueing an
+		// interim 100 for the end-of-burst flush. Gated so the hot path pays nothing:
+		// only reached when bytes remain buffered (drain consumed a complete request
+		// otherwise) and never re-scanned once sent_100 is set.
+		if cs.read_buf.len == 0 {
+			if cs.sent_100 {
+				cs.sent_100 = false // request fully consumed — re-arm for the next one
+			}
+		} else if !cs.sent_100 && cs.body_drain == 0 {
+			head_len := request_parser.frame_head_len(cs.read_buf)
+			if head_len > 0 && request_parser.head_expects_100_continue(cs.read_buf, head_len) {
+				cs.write_buf << response.status_100_continue_response
+				cs.sent_100 = true
+			}
+		}
 	}
 	// Read-timeout bookkeeping — BEFORE the flush below, which may close the
 	// connection (close_conn resets the state; arming after it would leak a

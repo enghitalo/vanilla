@@ -351,6 +351,33 @@ fn check_half_close_after_request(backend IOBackend, port int) ! {
 	server.shutdown(500)
 }
 
+// check_expect_100_continue: a client that sends the head with
+// `Expect: 100-continue` and holds the body must be prompted with an interim
+// `100 Continue` (RFC 9110 §10.1.1); after it sends the body it gets the final
+// response. Without the prompt the server would wait for a body the client is
+// deliberately withholding, and the request would stall.
+fn check_expect_100_continue(backend IOBackend, port int) ! {
+	mut server := new_server(ServerConfig{
+		port:            port
+		io_multiplexing: backend
+		handler:         bb_ok_handler
+	})!
+	bb_start(mut server, port)
+
+	mut c := net.dial_tcp('127.0.0.1:${port}')!
+	// Head only — the 5-byte body is withheld until we see 100 Continue.
+	c.write('POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n'.bytes())!
+	got100 := read_until_count(mut c, 'HTTP/1.1 100', 1, 3000)
+	assert got100 == 1, '${backend}: Expect: 100-continue must be answered with an interim 100, got ${got100}'
+	// Now send the body; the final 200 must follow.
+	c.write('hello'.bytes())!
+	got200 := read_until_count(mut c, 'HTTP/1.1 200', 1, 3000)
+	c.close() or {}
+	assert got200 == 1, '${backend}: final response must follow the body after 100 Continue, got ${got200}'
+
+	server.shutdown(500)
+}
+
 // --- io_uring -------------------------------------------------------------
 
 fn test_iouring_large_upload_drain() ! {
@@ -424,5 +451,11 @@ fn test_epoll_graceful_shutdown() ! {
 fn test_epoll_half_close_after_request() ! {
 	$if linux {
 		check_half_close_after_request(.epoll, 8136)!
+	}
+}
+
+fn test_epoll_expect_100_continue() ! {
+	$if linux {
+		check_expect_100_continue(.epoll, 8137)!
 	}
 }
