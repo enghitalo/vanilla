@@ -62,6 +62,11 @@ fn classify(req request_parser.HttpRequest) Verdict {
 	// it treats "nonsense" or "chunked, gzip" as a bodyless request, so we gate
 	// them here (501 for unknown coding, 400 for chunked-not-final).
 	if te := req.get_header_value_slice('Transfer-Encoding') {
+		// Transfer-Encoding is an HTTP/1.1 feature; a 1.0 sender cannot use it
+		// (RFC 9112 §6.1 — a server MUST NOT interpret chunked from a 1.0 peer).
+		if version_is(buf, req.version, 'HTTP/1.0') {
+			return .bad_request
+		}
 		match transfer_encoding_ok(buf, te) {
 			.ok {
 				// chunked, final — fine

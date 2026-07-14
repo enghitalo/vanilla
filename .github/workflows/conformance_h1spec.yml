@@ -68,6 +68,18 @@ jobs:
       - name: Unit tests (hard gate)
         shell: bash
         run: v -cc gcc -no-parallel test examples/conformance/src
+      - name: Backend behaviour tests (epoll, hard gate)
+        shell: bash
+        # Drives a real epoll server over raw sockets: pipelining, framing,
+        # max-connections, timeouts, graceful shutdown, and the #103
+        # half-close-then-respond regression test. The example matrices don't
+        # cover http_server/ tests, so run them here.
+        #
+        # -run-only test_epoll_*: the io_uring tests are EXCLUDED because GitHub's
+        # hosted runners block io_uring (io_uring_queue_init fails under their
+        # seccomp policy), so those servers can't start here. io_uring has its OWN
+        # read path and is verified locally on kernels that permit it.
+        run: v -cc gcc -no-parallel test -run-only 'test_epoll_*' http_server/backend_behaviors_test.v
 
       # --- Report: live-server probe with h1spec --------------------------------
       - name: Install h1spec (uv)
