@@ -228,7 +228,7 @@ Two probes run against it, both driven from CI:
 Latest h1spec result on `main` (auto-updated by CI on merge):
 
 <!-- CONFORMANCE_H1SPEC:START -->
-_Not yet recorded — runs on the next push to `main`._
+h1spec (`--strict`, live socket): **20/33 passed** on commit `c8f7d76` · [run log](https://github.com/enghitalo/vanilla/actions/runs/29339997143)<br>_Live probes half-close per request (#103); the authoritative gate is `v test examples/conformance/src` (deterministic, must be green)._
 <!-- CONFORMANCE_H1SPEC:END -->
 
 Run the server and probe it yourself:
