@@ -1,0 +1,153 @@
+name: (Linux) HTTP/1.1 Conformance (h1spec)
+
+# Runs the h1spec RFC 9112/9110 conformance probe against the examples/conformance
+# server on the epoll backend. Two layers:
+#
+#   1. HARD GATE — `v test examples/conformance/src`: the handler's conformance
+#      decisions asserted directly (no socket), so this is deterministic and
+#      blocks the merge on any regression.
+#   2. REPORT — h1spec probes the LIVE server over TCP and posts the scorecard to
+#      the Job Summary (and, on push, a PR comment). This layer is informational:
+#      h1spec's technique half-closes the client write side after each request,
+#      and vanilla's backend currently drops the response on that half-close
+#      (tracked in issue #103 — see examples/conformance/README.md), so a red
+#      h1spec score does not fail the build. The unit-test gate is the source of
+#      truth.
+#
+# h1spec: https://github.com/dropseed/h1spec (Python, plain-TCP, exit 0/1/2).
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'examples/conformance/**'
+      - 'http_server/**'
+      - '.github/workflows/conformance_h1spec.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'examples/conformance/**'
+      - 'http_server/**'
+      - '.github/workflows/conformance_h1spec.yml'
+
+permissions:
+  contents: write        # to refresh the auto-managed README status block on merge
+  pull-requests: write   # to post the conformance scorecard on the PR
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up V
+        uses: vlang/setup-v@v1.7
+      - name: Remove Vlang folder to avoid conflicts
+        shell: bash
+        run: |
+          rm -rf -v ./vlang || true
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev linux-libc-dev
+
+      # --- Hard gate: deterministic handler-level conformance assertions --------
+      - name: Build examples/conformance
+        shell: bash
+        run: v examples/conformance/src
+      - name: Unit tests (hard gate)
+        shell: bash
+        run: v test examples/conformance/src
+
+      # --- Report: live-server probe with h1spec --------------------------------
+      - name: Install h1spec (uv)
+        shell: bash
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Start the conformance server
+        shell: bash
+        run: |
+          ./examples/conformance/src/src > /tmp/conf_server.log 2>&1 &
+          echo $! > /tmp/conf_server.pid
+          # Wait for the listener to come up (max ~10s).
+          for i in $(seq 1 40); do
+            if python3 -c "import socket;socket.create_connection(('127.0.0.1',3000),0.3)" 2>/dev/null; then
+              echo "server up after $((i))*0.25s"; break
+            fi
+            sleep 0.25
+          done
+          head -2 /tmp/conf_server.log || true
+      - name: Run h1spec (report-only)
+        id: h1spec
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          uvx --from git+https://github.com/dropseed/h1spec h1spec --strict localhost:3000 > /tmp/h1spec_raw.txt 2>&1
+          code=$?
+          # Strip ANSI colors and pull out the "N/M passed" summary line.
+          score=$(sed -E 's/\x1b\[[0-9;]*m//g' /tmp/h1spec_raw.txt | grep -Eo '[0-9]+/[0-9]+ passed' | tail -1)
+          {
+            echo '## HTTP/1.1 Conformance — h1spec'
+            echo
+            echo '```'
+            sed -E 's/\x1b\[[0-9;]*m//g' /tmp/h1spec_raw.txt
+            echo '```'
+            echo
+            case $code in
+              0) echo '✅ All h1spec checks passed.';;
+              1) echo '⚠️ Some h1spec checks failed. This is informational — the backend half-close limitation (#103) makes most live-socket probes look red even though the handler is conformant. The `v test` gate is authoritative.';;
+              2) echo '❓ No h1spec tests matched.';;
+              *) echo "❓ h1spec exited with code $code.";;
+            esac
+          } | tee /tmp/h1spec_report.md >> "$GITHUB_STEP_SUMMARY"
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          echo "score=${score:-unknown}" >> "$GITHUB_OUTPUT"
+      - name: Stop the server
+        if: always()
+        shell: bash
+        run: |
+          [ -f /tmp/conf_server.pid ] && kill "$(cat /tmp/conf_server.pid)" 2>/dev/null || true
+      - name: Comment the scorecard on the PR
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/h1spec_report.md
+
+      # --- On merge to main: refresh the auto-managed README status block -------
+      # Best-effort: never fail the job if the commit/push loses a race with
+      # another push to main (the block just refreshes on the next run).
+      - name: Update README conformance status (main only)
+        if: github.event_name == 'push'
+        continue-on-error: true
+        shell: bash
+        run: |
+          score='${{ steps.h1spec.outputs.score }}'
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          sha_short="$(echo '${{ github.sha }}' | cut -c1-7)"
+          # Live socket probe (half-close, #103), so frame it as the live score with
+          # a pointer to the authoritative gate.
+          export BLOCK="h1spec (\`--strict\`, live socket): **${score:-unknown}** on commit \`${sha_short}\` · [run log](${run_url})<br>_Live probes half-close per request (#103); the authoritative gate is \`v test examples/conformance/src\` (deterministic, must be green)._"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # The push event checks out a detached SHA; work on a fresh main so the
+          # awk edit applies to the up-to-date README (avoids a stash/pop dance).
+          git fetch origin main
+          git checkout -B main origin/main
+          # Rewrite the text between the markers with awk (no language-in-YAML trap).
+          awk '
+            /<!-- CONFORMANCE_H1SPEC:START -->/ { print; print ENVIRON["BLOCK"]; skip=1; next }
+            /<!-- CONFORMANCE_H1SPEC:END -->/   { skip=0 }
+            !skip { print }
+          ' README.md > README.md.tmp && mv README.md.tmp README.md
+          if git diff --quiet -- README.md; then
+            echo "README status unchanged — nothing to commit."
+            exit 0
+          fi
+          git add README.md
+          git commit -m "docs(readme): refresh h1spec conformance status [skip ci]"
+          git push origin main

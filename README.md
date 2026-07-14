@@ -18,7 +18,7 @@ A minimalist, high-performance HTTP server written in [V](https://vlang.io).
 - **Multiple Backends**: epoll, io_uring (Linux), kqueue (macOS), IOCP (Windows).
 - **Async Handler**: Suspend/resume requests on any fd (DB sockets, timers, upstream proxies) — all in the worker's event loop, zero extra threads.
 - **Stateful Handler**: Lock-free per-worker state (e.g. a per-thread DB connection — no shared pool, no mutex).
-- **Compliant with HTTP standards**: Follows [RFC 9112](https://datatracker.ietf.org/doc/rfc9112/) and the [IANA Field Name Registry](https://www.iana.org/assignments/http-fields/http-fields.xhtml).
+- **Compliant with HTTP standards**: Follows [RFC 9112](https://datatracker.ietf.org/doc/rfc9112/) and the [IANA Field Name Registry](https://www.iana.org/assignments/http-fields/http-fields.xhtml). A dedicated [`examples/conformance/`](examples/conformance/) handler is probed in CI by [h1spec](https://github.com/dropseed/h1spec) and [Http11Probe](https://github.com/MDA2AV/Http11Probe) — see [Conformance Testing](#conformance-testing).
 
 ---
 
@@ -167,6 +167,7 @@ fn main() {
 | `examples/auth/` | Argon2id password hashing (RFC 9106), JWT with `exp` (HMAC-SHA256), API key auth |
 | `examples/chunked_streaming/` | Chunked transfer encoding |
 | `examples/compression/` | `Accept-Encoding` negotiation over precompressed brotli/zstd/gzip const responses |
+| `examples/conformance/` | RFC 9112/9110-conformant handler (rejects malformed requests with the right 4xx/5xx); probed in CI by h1spec + Http11Probe |
 | `examples/cookies_sessions/` | Cookie-based sessions |
 | `examples/cors/` | CORS preflight and origin allowlist |
 | `examples/csrf/` | CSRF token protection |
@@ -201,6 +202,50 @@ fn main() {
 ## Test Mode
 
 `Server.test` accepts an array of raw HTTP requests, sends them directly to the server socket, and processes each one sequentially. After receiving the response for the last request, the server shuts down automatically. This enables efficient end-to-end testing without running a persistent server process.
+
+---
+
+## Conformance Testing
+
+vanilla ships [`examples/conformance/`](examples/conformance/) — a handler
+written to be **correct under an HTTP/1.1 conformance probe** rather than to show
+off a feature. It calls the stdlib `request_parser.validate_http1()` plus extra
+field-syntax and framing checks, so malformed requests get the RFC-mandated
+status (`400` / `405` / `501` / `505`) instead of being served as if valid.
+
+Two probes run against it, both driven from CI:
+
+| Tool | What it checks | In CI |
+|---|---|---|
+| [h1spec](https://github.com/dropseed/h1spec) | RFC 9112/9110 request-line, header, body, connection, and hardening checks (Python, plain TCP) | [`conformance_h1spec.yml`](.github/workflows/conformance_h1spec.yml) — every push/PR |
+| [Http11Probe](https://github.com/MDA2AV/Http11Probe) | ~215 tests incl. request-smuggling, normalization, cookies (.NET 10) | [`conformance_http11probe.yml`](.github/workflows/conformance_http11probe.yml) — push to `main` + manual, non-blocking |
+
+Latest h1spec result on `main` (auto-updated by CI on merge):
+
+<!-- CONFORMANCE_H1SPEC:START -->
+_Not yet recorded — runs on the next push to `main`._
+<!-- CONFORMANCE_H1SPEC:END -->
+
+Run the server and probe it yourself:
+
+```sh
+v -prod run examples/conformance/src
+# then, in another shell:
+uvx --from git+https://github.com/dropseed/h1spec h1spec --strict localhost:3000
+```
+
+**How CI gates it.** The authoritative check is `v test examples/conformance/src`
+— the handler's conformance decisions asserted directly (no socket), so it is
+deterministic and blocks merges on any regression. The live-socket probes are
+**report-only**: they post a scorecard to the run summary and PR, but do not fail
+the build. This is deliberate — both probes half-close the client write side
+after each request, and vanilla's backend currently drops the response on that
+half-close ([#103](https://github.com/enghitalo/vanilla/issues/103)), which would
+otherwise make a fully-conformant handler look red. See the example's
+[README](examples/conformance/README.md) for the full check list and the two
+tracked core-vanilla limitations
+([#103](https://github.com/enghitalo/vanilla/issues/103),
+[#104](https://github.com/enghitalo/vanilla/issues/104)).
 
 ---
 
@@ -268,8 +313,10 @@ See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark 
 - [ ] Per-worker `SO_REUSEPORT` accept on epoll — eliminate the single central accept thread (the io_uring backend already does per-worker accept; epoll still round-robins fds from one acceptor). Blocked by clean multi-server shutdown lifecycle.
 - [ ] Dynamic route matching (`/user/:id`) with a trie or radix tree
 - [ ] Query-string parser (`?key=value&…`) as a zero-copy slice view
-- [ ] Case-insensitive header lookup (IANA registry compliance)
-- [ ] `Host` header validation (RFC 9112 §7.2)
+- [x] Case-insensitive header lookup (IANA registry compliance) — `get_header_value_slice` / `count_header` fold ASCII case
+- [x] `Host` header validation (RFC 9112 §3.2) — `validate_http1()` (exactly-one Host); demonstrated end-to-end in `examples/conformance/`
+- [ ] Reject `Content-Length` + `Transfer-Encoding` at the framing layer ([#104](https://github.com/enghitalo/vanilla/issues/104)) — the smuggling case the conformance handler can't fix alone
+- [ ] Flush a queued response before tearing down a half-closed connection ([#103](https://github.com/enghitalo/vanilla/issues/103)) — unblocks the live h1spec/Http11Probe gate
 - [x] Request timeouts — `Limits.read_timeout_ms` (408) / `write_timeout_ms`, enforced by the per-worker deadline sweep
 - [x] Chunked transfer-encoding in the request parser (`frame_chunked_total`)
 - [ ] HTTP/2 support (multiplexing, HPACK, server push)

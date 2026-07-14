@@ -15,6 +15,7 @@ jobs:
       matrix:
         folder:
           - examples/compression/src
+          - examples/conformance/src
           - examples/database/src
           - examples/etag/src
           - examples/hexagonal/src
