@@ -63,6 +63,20 @@ pub const drain_batch = 256
 pub const op_accept = u8(1)
 pub const op_read = u8(2)
 pub const op_write = u8(3)
+// op_poll: a oneshot IORING_OP_POLL_ADD on an EXTERNAL fd (a watched DB socket,
+// timerfd, ...) armed by the watch runtime (Worker.watch). Its user_data packs
+// the WATCHED fd in the pointer bits — NOT a &Connection — because the reactor's
+// watch table is fd-indexed and can be reallocated by growth (a packed pointer
+// into it would dangle); the fd is stable and re-looked-up on completion.
+pub const op_poll = u8(4)
+
+// poll(2) event bits (asm-generic/poll.h; identical values to the epoll bits) for
+// prepare_poll masks and for decoding a poll CQE's res (which carries the RETURNED
+// EVENT MASK, not a byte count).
+pub const pollin = u32(0x001)
+pub const pollout = u32(0x004)
+pub const pollerr = u32(0x008)
+pub const pollhup = u32(0x010)
 
 // IO uring CQE flags
 pub const ioring_cqe_f_more = u32(1 << 1)
@@ -97,6 +111,13 @@ pub fn decode_op_type(data u64) u8 {
 @[inline]
 pub fn decode_connection_ptr(data u64) voidptr {
 	return voidptr(data & ptr_mask)
+}
+
+// decode_ext_fd recovers the watched fd an op_poll CQE was tagged with (see
+// prepare_poll: the pointer bits carry the fd, not a &Connection).
+@[inline]
+pub fn decode_ext_fd(data u64) int {
+	return int(data & ptr_mask)
 }
 
 // ==================== C Bindings ====================
@@ -151,6 +172,7 @@ fn C.io_uring_prep_multishot_accept(sqe &C.io_uring_sqe, fd int, addr voidptr, a
 fn C.io_uring_sqe_set_data64(sqe &C.io_uring_sqe, data u64)
 fn C.io_uring_prep_recv(sqe &C.io_uring_sqe, fd int, buf voidptr, nbytes usize, flags int)
 fn C.io_uring_prep_send(sqe &C.io_uring_sqe, fd int, buf voidptr, nbytes usize, flags int)
+fn C.io_uring_prep_poll_add(sqe &C.io_uring_sqe, fd int, poll_mask u32)
 fn C.io_uring_submit(ring &C.io_uring) int
 
 // One syscall per loop iteration: flush every SQE queued since the last call
@@ -243,6 +265,15 @@ pub mut:
 	// borrowed: never freed or modified here, and guaranteed to outlive the send.
 	send_buf   voidptr
 	send_total int
+
+	// >= 0 while a request on this connection is PARKED on the async runtime
+	// (Worker.watch returned .suspend awaiting this external fd). A parked
+	// connection has NO client-side op in flight — no recv (so the slot cannot be
+	// freed under a stale CQE) and no send (responses buffered before/at the park
+	// are HELD in response_buffer until resume: an in-flight send's captured data
+	// pointer would dangle if a resume appended to, and thereby reallocated, the
+	// buffer). The op_poll CQE on awaiting_fd is what eventually resumes it.
+	awaiting_fd int = -1
 }
 
 // ==================== Worker Structure ====================
@@ -308,6 +339,7 @@ pub fn pool_acquire(mut w Worker, fd int) &Connection {
 	c.body_drain = 0
 	c.send_buf = unsafe { nil }
 	c.send_total = 0
+	c.awaiting_fd = -1
 	// Lock-free buffer REUSE: the per-worker pool is single-issuer (only this
 	// worker thread ever touches w.conns/free_stack), so a slot's buffers persist
 	// across connections with zero atomics. Reuse the pooled buffer (reset len,
@@ -384,6 +416,7 @@ pub fn pool_release(mut w Worker, mut c Connection) {
 	c.body_drain = 0
 	c.send_buf = unsafe { nil }
 	c.send_total = 0
+	c.awaiting_fd = -1
 	c.owner = unsafe { nil }
 	unsafe {
 		idx := int(u64(&c) - u64(&w.conns[0])) / int(sizeof(Connection))
@@ -476,6 +509,24 @@ pub fn prepare_send(ring &C.io_uring, mut c Connection, data &u8, data_len usize
 	}
 	C.io_uring_prep_send(sqe, c.fd, unsafe { data }, data_len, C.MSG_NOSIGNAL)
 	C.io_uring_sqe_set_data64(sqe, encode_user_data(op_write, &c))
+	return true
+}
+
+// prepare_poll posts a ONESHOT IORING_OP_POLL_ADD on an external fd (a watched DB
+// socket / timerfd) for the async runtime. Oneshot on purpose: it fires exactly one
+// CQE and is gone — the continuation re-arms per park (mirrors the epoll runtime's
+// consume-then-re-arm), so there is never a dangling poll on a pooled fd to cancel
+// at release time. POLL_ADD reports CURRENT readiness at submit, so an fd that is
+// already readable completes immediately (no lost wakeup). The CQE's res carries
+// the returned poll mask (or a negative errno). user_data packs the fd itself, not
+// a pointer (see op_poll). Returns false if the SQ is full.
+pub fn prepare_poll(ring &C.io_uring, fd int, poll_mask u32) bool {
+	sqe := C.io_uring_get_sqe(ring)
+	if unsafe { sqe == nil } {
+		return false
+	}
+	C.io_uring_prep_poll_add(sqe, fd, poll_mask)
+	C.io_uring_sqe_set_data64(sqe, encode_user_data(op_poll, voidptr(usize(fd))))
 	return true
 }
 

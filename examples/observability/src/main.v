@@ -37,7 +37,9 @@ module main
 // WORKS TODAY. The one core dependency for perfect timing is a request-start
 // timestamp; we stamp it at handler entry, which is close enough.
 import http_server
+import http_server.core
 import http_server.http1_1.request_parser
+import http_server.http1_1.response
 import strconv
 import sync
 import time
@@ -142,7 +144,7 @@ fn slice_eq(buf []u8, s request_parser.Slice, lit string) bool {
 	return true
 }
 
-fn app(req_buffer []u8, _ int, mut m Metrics, mut out []u8) ! {
+fn app(req_buffer []u8, mut m Metrics, mut out []u8) ! {
 	req := request_parser.decode_http_request(req_buffer)!
 	if slice_eq(req.buffer, req.path, '/healthz') {
 		out << resp_healthz
@@ -263,29 +265,34 @@ fn log_line(req_buffer []u8, status int, dur_us i64) {
 
 // observed wraps a handler: access log + metrics around every request. No
 // request decode here — the wrapped handler parses; the log only needs the
-// request-line prefix and the status digits already sitting in `out`.
-fn observed(next fn (req []u8, fd int, mut out []u8) !, mut m Metrics) fn (req []u8, fd int, mut out []u8) ! {
-	return fn [next, mut m] (req_buffer []u8, fd int, mut out []u8) ! {
+// request-line prefix and the status digits already sitting in `out`. The
+// wrapped `next` stays fallible so the err value reaches the diagnostic log;
+// on failure the wrapper answers the canned 400 and closes (what the old
+// runtime did on a handler error).
+fn observed(next fn (req []u8, mut out []u8) !, mut m Metrics) core.Handler {
+	return fn [next, mut m] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 		start := time.now()
 		start_len := out.len
-		next(req_buffer, fd, mut out) or {
+		next(req_buffer, mut out) or {
 			m.record(500)
 			// `${}` is sanctioned off the hot path (BEST_PRACTICES §3):
 			// error diagnostics, not request serving.
 			eprintln('level=error err=${err}')
-			return err
+			out << response.tiny_bad_request_response
+			return .close
 		}
 		status := status_of(out, start_len)
 		m.record(status)
 		dur_us := time.since(start).microseconds()
 		log_line(req_buffer, status, dur_us)
+		return .done
 	}
 }
 
 fn main() {
 	mut m := &Metrics{}
-	handler := observed(fn [mut m] (req_buffer []u8, fd int, mut out []u8) ! {
-		app(req_buffer, fd, mut m, mut out)!
+	handler := observed(fn [mut m] (req_buffer []u8, mut out []u8) ! {
+		app(req_buffer, mut m, mut out)!
 	}, mut m)
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
 	mut backend := unsafe { http_server.IOBackend(0) }
@@ -298,7 +305,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: handler
+		handler:         handler
 	})!
 	println('Observability demo on http://localhost:3000/  (/healthz, /readyz, /metrics)')
 	server.run()

@@ -1,11 +1,14 @@
 module http_server
 
-fn dummy_handler(req []u8, _ int, mut out []u8) ! {
+import http_server.core
+
+fn dummy_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if req.bytestr().contains('/notfound') {
-		out << 'HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found'.bytes()
-		return
+		res << 'HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found'.bytes()
+		return .done
 	}
-	out << 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK'.bytes()
+	res << 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK'.bytes()
+	return .done
 }
 
 fn test_server_end_to_end() ! {
@@ -18,7 +21,7 @@ fn test_server_end_to_end() ! {
 	mut server := new_server(ServerConfig{
 		port:            8083
 		io_multiplexing: unsafe { IOBackend(0) }
-		request_handler: dummy_handler
+		handler:         dummy_handler
 	})!
 	println('[test] Running server.test...')
 	responses := server.test(requests) or {

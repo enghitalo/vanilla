@@ -88,7 +88,7 @@
   2. Handle partial sends
   3. Remove kevent filter when write complete
   ```v
-  callbacks.on_write: fn [request_handler] (fd int) {
+  callbacks.on_write: fn [handler] (fd int) {
       // Send pending response data
       // Remove EV_WRITE filter when done
   }
@@ -1063,7 +1063,7 @@
 
          mut server := http_server.new_server(http_server.ServerConfig{
              port: 3000
-             request_handler: handle_request
+             handler: handle_request
              io_multiplexing: $if linux { .epoll } $else $if darwin { .kqueue } $else { .iocp }
          })!
 
@@ -1150,7 +1150,7 @@
          // Create server with TLS handler
          mut server := http_server.new_server(http_server.ServerConfig{
              port: 8443
-             request_handler: fn [mut tls_ctx] (req_buffer []u8, client_fd int) ![]u8 {
+             handler: fn [mut tls_ctx] (req_buffer []u8, client_fd int) ![]u8 {
                  return handle_https_request(req_buffer, client_fd, mut tls_ctx)
              }
          })!
@@ -1250,7 +1250,7 @@
 
          mut server := http_server.new_server(http_server.ServerConfig{
              port: 3000
-             request_handler: handler
+             handler: handler
          })!
 
          server.run()

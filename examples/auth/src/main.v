@@ -43,7 +43,9 @@ module main
 // must not short-circuit, or timing leaks the secret. `hmac.equal()` for
 // every token/hash check; argon2's verifier uses it internally.
 import http_server
+import http_server.core
 import http_server.http1_1.request_parser
+import http_server.http1_1.response
 import crypto.argon2
 import crypto.hmac
 import crypto.sha256
@@ -154,7 +156,7 @@ fn jwt_verify(token []u8) bool {
 	}
 	payload_b64 := unsafe { tos(&token[first + 1], last - first - 1) } // view string
 	exp := exp_of(base64.url_decode(payload_b64))
-	return exp > 0 && exp > time.utc().unix()
+	return exp > 0 && exp > time.unix_now()
 }
 
 // ---- API key ---------------------------------------------------------------
@@ -227,30 +229,33 @@ fn bearer_token(req request_parser.HttpRequest) []u8 {
 	return unsafe { (&req.buffer[s.start + prefix.len]).vbytes(s.len - prefix.len) }
 }
 
-fn handle(req_buffer []u8, _ int, mut out []u8) ! {
-	req := request_parser.decode_http_request(req_buffer)!
+fn handle(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	req := request_parser.decode_http_request(req_buffer) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
 
 	if slice_eq(req.buffer, req.path, '/token') {
 		// LOGIN — the deliberately slow path (argon2id ~200 ms dominates);
 		// still zero concatenation: builder for the payload, ws/wi into out.
 		if !slice_eq(req.buffer, req.method, 'POST') {
 			out << resp_405
-			return
+			return .done
 		}
 		if req.body.len <= 0 {
 			out << resp_401 // empty password: reject before paying for argon2
-			return
+			return .done
 		}
 		password := unsafe { (&req.buffer[req.body.start]).vbytes(req.body.len) } // view
 		if !verify_password(password, demo_password_phc) {
 			out << resp_401
-			return
+			return .done
 		}
 		mut payload := strings.new_builder(48)
 		payload.write_string('{"sub":"')
 		payload.write_string(demo_user)
 		payload.write_string('","exp":')
-		payload.write_decimal(time.utc().unix() + 3600)
+		payload.write_decimal(time.unix_now() + 3600)
 		payload.write_u8(`}`)
 		token := jwt_sign(payload)
 		ws(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ')
@@ -262,28 +267,29 @@ fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 		// FAST PATH — per-request JWT check over a view, const responses.
 		if !jwt_verify(bearer_token(req)) {
 			out << resp_401_bearer
-			return
+			return .done
 		}
 		out << resp_ok_empty
 	} else if slice_eq(req.buffer, req.path, '/service') {
 		// FAST PATH — API-key check over a view of the header bytes.
 		s := req.get_header_value_slice('X-API-Key') or {
 			out << resp_401
-			return
+			return .done
 		}
 		if s.len <= 0 {
 			out << resp_401
-			return
+			return .done
 		}
 		key := unsafe { (&req.buffer[s.start]).vbytes(s.len) } // view
 		if !check_api_key(key) {
 			out << resp_401
-			return
+			return .done
 		}
 		out << resp_ok_empty
 	} else {
 		out << resp_404
 	}
+	return .done
 }
 
 fn main() {
@@ -298,7 +304,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: handle
+		handler:         handle
 	})!
 	println('Auth demo on http://localhost:3000/')
 	println('  POST /token      (body = password)           -> JWT')

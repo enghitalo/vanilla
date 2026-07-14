@@ -7,13 +7,15 @@ module http_server
 // every io_uring_submit_and_wait fail (the server answered nothing).
 //
 // io_uring is Linux-only, so the test is a no-op elsewhere.
+import http_server.core
 
-fn iou_dummy_handler(req []u8, _ int, mut out []u8) ! {
+fn iou_dummy_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if req.bytestr().contains('/notfound') {
-		out << 'HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found'.bytes()
-		return
+		res << 'HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found'.bytes()
+		return .done
 	}
-	out << 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK'.bytes()
+	res << 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK'.bytes()
+	return .done
 }
 
 // Guards the multishot-accept gate: the previous code keyed off a non-existent
@@ -48,7 +50,7 @@ fn test_io_uring_end_to_end() ! {
 		mut server := new_server(ServerConfig{
 			port:            8087
 			io_multiplexing: .io_uring
-			request_handler: iou_dummy_handler
+			handler:         iou_dummy_handler
 		})!
 
 		responses := server.test(requests) or {

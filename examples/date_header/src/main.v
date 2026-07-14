@@ -23,11 +23,17 @@ module main
 // never the one being written (the writer touches `1 - active`), so there are no
 // torn reads, no mutex, and no pointer-as-integer tricks for the GC to mishandle.
 import http_server
+import http_server.core
 import time
 import sync.stdatomic
 
-// "Date: " (6) + "Wed, 21 Oct 2015 07:28:00" (25) + " GMT" (4) + "\r\n" (2) = 37
+// "Date: " (6) + "Wed, 21 Oct 2015 07:28:00 GMT" (29) + "\r\n" (2) = 37
 const date_line_len = 37
+
+// The static frame every buffer starts from: only the 29 date bytes at offset 6
+// ever change (write_http_header rewrites exactly those), so the "Date: " prefix
+// and trailing CRLF are seeded once and never touched on the refresh path.
+const line_template = 'Date: Xxx, 00 Xxx 0000 00:00:00 GMT\r\n'
 
 struct DateCache {
 mut:
@@ -35,20 +41,24 @@ mut:
 	idx  u64 // active buffer index (0/1); read/written atomically
 }
 
+// seed lays down the static frame ("Date: " + placeholder + CRLF) in BOTH
+// buffers once, so every later refresh only rewrites the 29 date bytes.
+fn (mut c DateCache) seed() {
+	for i in 0 .. 2 {
+		unsafe { vmemcpy(&c.bufs[i][0], line_template.str, date_line_len) }
+	}
+}
+
 // refresh formats the current UTC time into the INACTIVE buffer, then publishes
 // it by flipping the atomic index. Called once per second by the ticker, so even
-// this off-hot-path work is cheap: `time.push_to_http_header` writes the 29-byte
-// RFC 7231 date straight into the buffer with hand-placed bytes — no format
-// template to parse (unlike `custom_format`), no intermediate string.
+// this off-hot-path work is cheap: `time.write_http_header` writes the 29-byte
+// RFC 9110 IMF-fixdate straight into the buffer at offset 6 (after "Date: "),
+// allocation-free — no format template to parse, no intermediate string.
 fn (mut c DateCache) refresh() {
-	mut line := 'Date: '.bytes() // 6 bytes
-	time.utc().push_to_http_header(mut line) // + "Wed, 21 Oct 2015 07:28:00 GMT" (29)
-	line << `\r`
-	line << `\n` // 37 total
 	cur := stdatomic.load_u64(&c.idx)
 	next := 1 - cur
-	for j in 0 .. date_line_len {
-		c.bufs[int(next)][j] = line[j]
+	unsafe {
+		time.utc().write_http_header(&c.bufs[int(next)][6], date_line_len - 6) or {}
 	}
 	stdatomic.store_u64(&c.idx, next) // publish atomically
 }
@@ -70,7 +80,8 @@ const resp_tail = 'Content-Type: text/plain\r\nContent-Length: 2\r\nConnection: 
 
 fn main() {
 	mut cache := &DateCache{}
-	cache.refresh() // seed before the first request is served
+	cache.seed() // lay down the static frame in both buffers once
+	cache.refresh() // format the date before the first request is served
 
 	// One ticker for the whole server (not per connection): refresh ~1×/second.
 	spawn fn [mut cache] () {
@@ -91,7 +102,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: fn [cache] (req_buffer []u8, fd int, mut out []u8) ! {
+		handler:         fn [cache] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 			// Zero per-request allocation: append the two static halves and the
 			// pre-built cached Date line (one atomic load, zero-copy slice) straight
 			// into the server-owned `out` buffer — no per-request strings.Builder, no
@@ -99,6 +110,7 @@ fn main() {
 			out << status_head
 			out << cache.date_line()
 			out << resp_tail
+			return .done
 		}
 	})!
 	println('Date-header demo on http://localhost:3000/  (cached, refreshed 1x/s)')

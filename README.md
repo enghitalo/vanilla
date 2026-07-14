@@ -16,8 +16,7 @@ A minimalist, high-performance HTTP server written in [V](https://vlang.io).
 - **Database Friendly**: Example with PostgreSQL connection pool.
 - **Graceful Shutdown**: Drain in-flight requests on `SIGTERM`/`SIGINT` via `server.shutdown(grace_ms)`.
 - **Multiple Backends**: epoll, io_uring (Linux), kqueue (macOS), IOCP (Windows).
-- **Async Handler**: Suspend/resume requests on any fd (DB sockets, timers, upstream proxies) — all in the worker's event loop, zero extra threads.
-- **Stateful Handler**: Lock-free per-worker state (e.g. a per-thread DB connection — no shared pool, no mutex).
+- **One Handler Contract**: a single `handler` signature covers every use case, with every input as an explicit, self-describing parameter — append the response and return `.done`, suspend/resume on any fd (DB sockets, timers, upstream proxies) with `event_loop.watch_fd(...)` + `.suspend`, and reach lock-free per-worker state (e.g. a per-thread DB connection — no shared pool, no mutex) via the `worker_state` parameter.
 - **Compliant with HTTP standards**: Follows [RFC 9112](https://datatracker.ietf.org/doc/rfc9112/) and the [IANA Field Name Registry](https://www.iana.org/assignments/http-fields/http-fields.xhtml). A dedicated [`examples/conformance/`](examples/conformance/) handler is probed in CI by [h1spec](https://github.com/dropseed/h1spec) and [Http11Probe](https://github.com/MDA2AV/Http11Probe) — see [Conformance Testing](#conformance-testing).
 
 ---
@@ -28,13 +27,17 @@ A minimalist, high-performance HTTP server written in [V](https://vlang.io).
 
 ```v
 import http_server
+import http_server.core
 
-fn handle_request(req_buffer []u8, client_conn_fd int, mut out []u8) ! {
+fn handle_request(request []u8, mut response []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	// Parse the request and APPEND the complete raw HTTP response
-	// (status line + headers + body) to `out`. The server owns `out`,
+	// (status line + headers + body) to `response`. The server owns it,
 	// reuses it across requests and batches pipelined responses into a
-	// single send — never free or keep it.
-	out << 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'.bytes()
+	// single send — never free or keep it. Return `.done` when the
+	// response is complete, `.close` to flush-and-drop the connection, or
+	// `.suspend` after parking the request via `event_loop.watch_fd(...)`.
+	response << 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'.bytes()
+	return .done
 }
 
 fn main() {
@@ -47,7 +50,7 @@ fn main() {
 	}
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
-		request_handler: handle_request
+		handler:         handle_request
 		io_multiplexing: backend
 	})!
 	server.run()
@@ -61,9 +64,10 @@ Call the handler directly — no server needed:
 ```v
 fn test_handle_request() {
 	request := 'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
-	mut out := []u8{}
-	handle_request(request, -1, mut out)!
-	assert out.starts_with('HTTP/1.1 200 OK'.bytes())
+	mut response := []u8{}
+	mut event_loop := core.EventLoop{}
+	assert handle_request(request, mut response, -1, unsafe { nil }, mut event_loop) == .done
+	assert response.starts_with('HTTP/1.1 200 OK'.bytes())
 }
 ```
 
@@ -145,9 +149,10 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: fn [mut pool] (req_buffer []u8, fd int, mut out []u8) ! {
+		handler:         fn [mut pool] (request []u8, mut response []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 			// Use pool.acquire() / pool.release() for DB access;
-			// append the raw HTTP response to `out`.
+			// append the raw HTTP response to `response`.
+			return .done
 		}
 	})!
 	server.run()

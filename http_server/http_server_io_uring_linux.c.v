@@ -193,7 +193,7 @@ fn handle_io_uring_accept(worker &io_uring.Worker, cqe &C.io_uring_cqe, limits L
 	}
 }
 
-fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn (req []u8, fd int, mut out []u8) !, limits Limits, active_conns &core.Counter) {
+fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, mut env IouEnv, limits Limits, active_conns &core.Counter) {
 	track := limits.max_connections > 0
 	res := cqe.res
 	c_ptr := io_uring.decode_connection_ptr(C.io_uring_cqe_get_data64(cqe))
@@ -225,8 +225,16 @@ fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn
 		conn.read_buf.len += res
 	}
 	// Answer every complete request now buffered (pipelining), appending each
-	// raw response to response_buffer and compacting the partial leftover.
-	drain_iou_requests(mut conn, handler, limits)
+	// raw response to response_buffer and compacting the partial leftover. The
+	// drain PARKS the connection at the first .suspend.
+	env.cur_conn = conn
+	iou_drain_requests(mut env, mut *conn, limits)
+	if conn.awaiting_fd >= 0 {
+		// Parked: hold every buffered response and arm NO client op — the op_poll
+		// completion on awaiting_fd resumes this connection (iou_finish_resume
+		// then flushes / re-arms). See the runtime module comment for the invariant.
+		return
+	}
 	req_cap := if limits.max_request_bytes > 0 {
 		limits.max_request_bytes
 	} else {
@@ -246,13 +254,21 @@ fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn
 		iou_flush_response(worker, mut *conn, limits)
 		return
 	}
+	if conn.close_after_send {
+		// A .close (or error) can leave nothing pending to send — drop now
+		// rather than fall through to arming a recv on a condemned connection.
+		iou_release(worker, mut *conn, active_conns, track)
+		return
+	}
 	// Nothing complete yet. A body too large to be worth buffering is STREAMED:
 	// answer it from the head alone, then drain+discard the body. This keeps memory
 	// at O(read_buf_cap) instead of growing read_buf into a multi-MB block and
 	// ping-ponging recv→CQE→re-arm thousands of times for a 20 MiB upload.
 	total := request_parser.frame_expected_total(conn.read_buf)
 	if total > iou_stream_body_above && total <= req_cap {
-		if start_iou_body_drain(mut conn, handler, total) {
+		env.cur_conn = conn
+		started := iou_start_body_drain(mut env, mut *conn, total, limits)
+		if started {
 			if conn.close_after_send || conn.body_drain == 0 {
 				// Handler errored on the head (send the error, then close), or the
 				// whole body happened to be buffered already — either way send now.
@@ -295,138 +311,7 @@ fn buf_view(buf []u8, start int, length int) []u8 {
 	return v
 }
 
-// drain_iou_requests parses and answers every complete request in read_buf,
-// appending responses to response_buffer, then compacts the leftover partial
-// bytes to the front. On a framing error, an oversized payload, or a handler
-// error it appends the canned response and sets close_after_send so the worker
-// releases the connection once that final batch has been flushed.
-@[direct_array_access; manualfree]
-fn drain_iou_requests(mut conn io_uring.Connection, handler fn (req []u8, fd int, mut out []u8) !, limits Limits) {
-	mut pos := 0
-	// A borrowed static-asset buffer a handler queued via queue_buf, deferred so it
-	// can either be sent DIRECTLY (sole response) or, if more pipelined responses
-	// follow, copied into response_buffer IN ORDER before them.
-	mut pend := voidptr(unsafe { nil })
-	mut pend_len := i64(0)
-	for pos < conn.read_buf.len {
-		// Emit a borrow from the previous request before this request's response, so
-		// a pipelined batch stays in order. (A sole static response has no next
-		// iteration, so its borrow survives to the post-loop direct send below.)
-		if pend != unsafe { nil } {
-			unsafe { conn.response_buffer.push_many(pend, int(pend_len)) }
-			pend = unsafe { nil }
-		}
-		// _idx twin: plain int, no per-request !int boxing. The error sentinel is
-		// the negated HTTP status, so `-total` recovers the old err.code() value.
-		total := request_parser.frame_request_length_lim_idx(buf_view(conn.read_buf, pos,
-			conn.read_buf.len - pos), limits.max_header_bytes, limits.max_body_bytes)
-		if total == -1 {
-			break // incomplete — wait for more bytes
-		}
-		if total < -1 {
-			match -total {
-				413 { conn.response_buffer << response.status_413_response }
-				431 { conn.response_buffer << response.status_431_response }
-				else { conn.response_buffer << response.tiny_bad_request_response }
-			}
-
-			conn.close_after_send = true
-			return
-		}
-		req := buf_view(conn.read_buf, pos, total) // zero-copy, non-marking view (no array_slice)
-		// Borrowing is allowed only when the write buffer is empty, so a borrowed send
-		// is the WHOLE response and is never reordered against other pending bytes.
-		core.set_queue_buf_allowed(conn.response_buffer.len == 0)
-		handler(req, conn.fd, mut conn.response_buffer) or {
-			conn.response_buffer << response.tiny_bad_request_response
-			conn.close_after_send = true
-			return
-		}
-		if qb := core.take_queued_buf() {
-			pend = qb.ptr
-			pend_len = qb.len
-		}
-		pos += total
-		// Peer pipelines requests but never reads responses: bail before the
-		// pending batch grows without bound.
-		if conn.response_buffer.len - conn.bytes_sent > iou_max_pending_write {
-			conn.close_after_send = true
-			return
-		}
-	}
-	core.set_queue_buf_allowed(false)
-	// A sole borrowed response (write buffer still empty) is sent DIRECTLY from the
-	// borrowed buffer — the asset never touches the per-conn write buffer. Otherwise
-	// it was already copied into response_buffer in order by the loop above.
-	if pend != unsafe { nil } {
-		if conn.response_buffer.len == 0 {
-			conn.send_buf = pend
-			conn.send_total = int(pend_len)
-		} else {
-			unsafe { conn.response_buffer.push_many(pend, int(pend_len)) }
-		}
-	}
-	// Compact the leftover partial request to the buffer start (keeps capacity).
-	if pos > 0 {
-		leftover := conn.read_buf.len - pos
-		if leftover > 0 {
-			unsafe {
-				C.memmove(conn.read_buf.data, &u8(conn.read_buf.data) + pos, usize(leftover))
-			}
-		}
-		unsafe {
-			conn.read_buf.len = leftover
-		}
-	}
-}
-
-// start_iou_body_drain answers a large-body request from its HEAD alone and puts
-// the connection into streaming-drain mode for the body (consumed and discarded by
-// the conn.body_drain branch in handle_io_uring_read). The handler is given only
-// the head — no body is buffered — so such handlers must answer by the declared
-// Content-Length (request_parser.HttpRequest.content_length()); the /upload profile
-// is exactly this shape. The prepared response is HELD in response_buffer and sent
-// once the body has fully drained. The io_uring counterpart of the epoll backend's
-// start_body_drain. Returns true when the large body is now being handled — drain
-// armed (body_drain > 0), the head-only handler errored (close_after_send), or the
-// whole body was already buffered (body_drain == 0) — and false when the head is
-// not yet fully buffered (the caller keeps buffering normally).
-@[direct_array_access]
-fn start_iou_body_drain(mut conn io_uring.Connection, handler fn (req []u8, fd int, mut out []u8) !, total int) bool {
-	head_len := request_parser.frame_head_len(conn.read_buf)
-	if head_len <= 0 || head_len > conn.read_buf.len {
-		return false // head not complete in the buffer yet — keep buffering
-	}
-	head :=
-		buf_view(conn.read_buf, 0, head_len) // zero-copy, non-marking view; handler consumes it now
-	// A streamed-body request answers from its head and then drains the body; its
-	// response must flow through response_buffer (not a borrowed direct send, which
-	// would race the body drain), so borrowing is disallowed for this handler call.
-	core.set_queue_buf_allowed(false)
-	handler(head, conn.fd, mut conn.response_buffer) or {
-		conn.response_buffer << response.tiny_bad_request_response
-		conn.close_after_send = true
-		unsafe {
-			conn.read_buf.len = 0
-		}
-		return true
-	}
-	// Body bytes already received after the head count toward the drain. Detection
-	// runs before read_buf ever grows past its base cap, so body_in_buf is always
-	// < content_length (the request is still incomplete) — no next-request bytes
-	// are present to be lost.
-	body_in_buf := conn.read_buf.len - head_len
-	conn.body_drain = i64(total - head_len) - i64(body_in_buf)
-	if conn.body_drain < 0 {
-		conn.body_drain = 0
-	}
-	unsafe {
-		conn.read_buf.len = 0 // head + buffered body consumed; reuse buffer to drain
-	}
-	return true
-}
-
-fn handle_io_uring_write(worker &io_uring.Worker, cqe &C.io_uring_cqe, limits Limits, active_conns &core.Counter) {
+fn handle_io_uring_write(worker &io_uring.Worker, cqe &C.io_uring_cqe, mut env IouEnv, limits Limits, active_conns &core.Counter) {
 	track := limits.max_connections > 0
 	res := cqe.res
 	c_ptr := io_uring.decode_connection_ptr(C.io_uring_cqe_get_data64(cqe))
@@ -477,18 +362,50 @@ fn handle_io_uring_write(worker &io_uring.Worker, cqe &C.io_uring_cqe, limits Li
 		conn.response_buffer.clear() // len = 0, capacity kept for the next batch
 	}
 	conn.bytes_sent = 0
+	// Requests pipelined BEHIND a parked/answered one may still sit in read_buf
+	// (the resume drained before flushing, but a burst that parked during THIS
+	// send's completion re-drain can leave more). Drain them now instead of
+	// arming a recv that would wait for bytes that never come.
+	if conn.awaiting_fd >= 0 {
+		return
+	}
+	if conn.read_buf.len > 0 {
+		env.cur_conn = conn
+		iou_drain_requests(mut env, mut *conn, limits)
+		if conn.awaiting_fd >= 0 {
+			return
+		}
+		if conn.send_buf != unsafe { nil } || conn.response_buffer.len > conn.bytes_sent {
+			iou_flush_response(worker, mut *conn, limits)
+			return
+		}
+		if conn.close_after_send {
+			iou_release(worker, mut *conn, active_conns, track)
+			return
+		}
+	}
 	// Keep-alive: read the next request. read_buf still holds any pipelined
 	// leftover; iou_arm_recv re-arms the read deadline iff that leftover is a
 	// partial request, and leaves an idle keep-alive wait deadline-free.
 	iou_arm_recv(worker, mut *conn, limits)
 }
 
-fn dispatch_io_uring_cqe(worker &io_uring.Worker, cqe &C.io_uring_cqe, handler fn (req []u8, fd int, mut out []u8) !, limits Limits, active_conns &core.Counter) {
+fn dispatch_io_uring_cqe(worker &io_uring.Worker, cqe &C.io_uring_cqe, mut env IouEnv, limits Limits, active_conns &core.Counter) {
 	op := io_uring.decode_op_type(C.io_uring_cqe_get_data64(cqe))
 	match op {
-		io_uring.op_accept { handle_io_uring_accept(worker, cqe, limits, active_conns) }
-		io_uring.op_read { handle_io_uring_read(worker, cqe, handler, limits, active_conns) }
-		io_uring.op_write { handle_io_uring_write(worker, cqe, limits, active_conns) }
+		io_uring.op_accept {
+			handle_io_uring_accept(worker, cqe, limits, active_conns)
+		}
+		io_uring.op_read {
+			handle_io_uring_read(worker, cqe, mut env, limits, active_conns)
+		}
+		io_uring.op_write {
+			handle_io_uring_write(worker, cqe, mut env, limits, active_conns)
+		}
+		io_uring.op_poll {
+			// A watched external fd became ready: resume the parked continuation(s).
+			handle_io_uring_poll(cqe, mut env, limits, active_conns)
+		}
 		else {}
 	}
 }
@@ -528,7 +445,7 @@ fn iou_sweep_timeouts(worker &io_uring.Worker) {
 // up on the main thread and driving it here would make every submit_and_wait
 // fail; doing it all here keeps the ring single-owner (and matches how every
 // thread-per-core io_uring server sets up).
-fn io_uring_worker_main(listener int, cpu_id int, handler fn (req []u8, fd int, mut out []u8) !, stateful_handler core.StatefulHandler, make_state fn () voidptr, limits Limits, active_conns &core.Counter, inflight &core.Counter, draining &core.Counter) {
+fn io_uring_worker_main(listener int, cpu_id int, handler core.Handler, make_state fn () voidptr, limits Limits, active_conns &core.Counter, inflight &core.Counter, draining &core.Counter) {
 	maybe_pin_worker(cpu_id)
 	mut worker := &io_uring.Worker{}
 	worker.cpu_id = cpu_id
@@ -562,36 +479,30 @@ fn io_uring_worker_main(listener int, cpu_id int, handler fn (req []u8, fd int, 
 	// Skip the per-enter fget/fput on the ring fd.
 	C.io_uring_register_ring_fd(&worker.ring)
 
-	// Per-worker state (issue #93): build THIS worker's thread-local state once (e.g.
-	// its own DB pool / reused render scratch), then fold it into a plain
-	// RequestHandler-shaped closure so the ring hot path stays a plain handler and the
-	// state needs no sharing and no lock. make_state runs HERE — on the worker thread,
-	// after CPU pinning — so its allocations are thread- and NUMA-local. Mirrors the
-	// epoll backend's process_events_plain + build_handler.
+	// Per-worker state (issue #93): build THIS worker's thread-local state once
+	// (e.g. its own DB pool / reused render scratch); every handler call on this
+	// worker reaches it as the worker_state parameter — no sharing, no lock. make_state runs HERE
+	// — on the worker thread, after CPU pinning — so its allocations are thread-
+	// and NUMA-local. Mirrors the epoll backend's process_events_plain.
 	mut state := voidptr(unsafe { nil })
 	if make_state != unsafe { nil } {
 		state = make_state()
 	}
-	eff_handler := build_iou_handler(handler, stateful_handler, state)
 
-	io_uring_worker_loop(worker, eff_handler, limits, active_conns)
-}
+	// This worker's runtime env: the handler, its state, the watch registry for
+	// parked requests (issue #83) and ring access for arming polls.
+	mut env := &IouEnv{
+		h:       handler
+		state:   state
+		worker:  worker
+		watches: []IouWatchEntry{len: iou_watch_table_min}
+	}
 
-// build_iou_handler resolves the effective synchronous per-worker handler: with no
-// stateful_handler it is just the stateless request_handler; otherwise it binds this
-// worker's `state` into a plain RequestHandler-shaped closure so the ring hot path
-// stays a plain handler and the state is thread-local. Mirrors backend_epoll.build_handler.
-fn build_iou_handler(request_handler fn (req []u8, fd int, mut out []u8) !, stateful_handler core.StatefulHandler, state voidptr) fn (req []u8, fd int, mut out []u8) ! {
-	if stateful_handler == unsafe { nil } {
-		return request_handler
-	}
-	return fn [state, stateful_handler] (req []u8, fd int, mut out []u8) ! {
-		stateful_handler(req, fd, mut out, state)!
-	}
+	io_uring_worker_loop(worker, mut env, limits, active_conns)
 }
 
 @[direct_array_access]
-fn io_uring_worker_loop(worker &io_uring.Worker, handler fn (req []u8, fd int, mut out []u8) !, limits Limits, active_conns &core.Counter) {
+fn io_uring_worker_loop(worker &io_uring.Worker, mut env IouEnv, limits Limits, active_conns &core.Counter) {
 	io_uring.prepare_accept(&worker.ring, worker.socket_fd, worker.use_multishot)
 
 	// Only arm the periodic timeout wake when a read or write timeout is
@@ -632,7 +543,7 @@ fn io_uring_worker_loop(worker &io_uring.Worker, handler fn (req []u8, fd int, m
 				break
 			}
 			for i in 0 .. int(n) {
-				dispatch_io_uring_cqe(worker, cqes[i], handler, limits, active_conns)
+				dispatch_io_uring_cqe(worker, cqes[i], mut env, limits, active_conns)
 			}
 			C.io_uring_cq_advance(&worker.ring, n)
 			if int(n) < io_uring.drain_batch {
@@ -642,6 +553,12 @@ fn io_uring_worker_loop(worker &io_uring.Worker, handler fn (req []u8, fd int, m
 			// to free SQ slots before draining the rest (keeps the SQ from ever
 			// overflowing, regardless of how many completions piled up).
 			C.io_uring_submit(&worker.ring)
+		}
+		// Re-queue watch polls that hit a momentarily-full SQ during the drain —
+		// the submit at the top of the next iteration flushes them. A park is
+		// never silently dropped (see iou_register_watch).
+		if env.pending_polls.len > 0 {
+			iou_retry_pending_polls(mut env)
 		}
 		if sweep_on {
 			iou_sweep_timeouts(worker)
@@ -742,8 +659,8 @@ pub fn run_io_uring_backend(server Server, mut threads []thread) {
 			eprintln('Failed to create listener for worker ${i}')
 			exit(1)
 		}
-		threads[i] = spawn io_uring_worker_main(listener, i, server.request_handler, server.stateful_handler,
-			server.make_state, server.limits, server.active_conns, server.inflight[i], server.draining)
+		threads[i] = spawn io_uring_worker_main(listener, i, server.handler, server.make_state,
+			server.limits, server.active_conns, server.inflight[i], server.draining)
 	}
 
 	println('listening on http://localhost:${server.port}/ (io_uring)')

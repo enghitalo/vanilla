@@ -8,7 +8,7 @@ import pg_async
 // End-to-end demo of the native async Postgres driver (pg_async) on the epoll
 // async runtime. Each worker owns its own connection pool (via make_state); a
 // GET /db request acquires a connection, issues a query, parks on the PG socket
-// with ac.watch, and the continuation renders the rows once they arrive — all on
+// with event_loop.watch_fd, and the continuation renders the rows once they arrive — all on
 // the worker's single epoll loop, never blocking it. This is the template the
 // HttpArena framework's async-db/fortunes endpoints follow.
 //
@@ -53,12 +53,12 @@ fn targets_db(req []u8) bool {
 
 // handler: GET /db runs a query via the pool + a watch on the PG socket; any
 // other path replies synchronously.
-fn handler(req []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
+fn handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if !targets_db(req) {
 		out << resp_ok
 		return .done
 	}
-	mut pool := unsafe { &pg_async.PgPool(ac.state) }
+	mut pool := unsafe { &pg_async.PgPool(worker_state) }
 	idx := pool.acquire() or {
 		out << resp_503
 		return .done
@@ -81,15 +81,15 @@ fn handler(req []u8, mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 		out << resp_500
 		return .done
 	}
-	ac.watch(pool.fd(idx), .readable, on_db_ready, unsafe { nil })
+	event_loop.watch_fd(pool.fd(idx), .readable, on_db_ready, unsafe { nil })
 	return .suspend
 }
 
 // on_db_ready runs when the watched PG socket is readable: it pumps the result
 // and, once complete, renders the rows as JSON and releases the connection.
-fn on_db_ready(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
-	mut pool := unsafe { &pg_async.PgPool(ac.state) }
-	idx := pool.idx_of_fd(ac.ready_fd) or { return .close }
+fn on_db_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	mut pool := unsafe { &pg_async.PgPool(worker_state) }
+	idx := pool.idx_of_fd(ready_fd) or { return .close }
 	mut conn := pool.conn(idx)
 	poll := conn.async_on_readable() or {
 		pool.release(idx)
@@ -97,7 +97,7 @@ fn on_db_ready(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 		return .done
 	}
 	if !poll.ready {
-		ac.watch(pool.fd(idx), .readable, on_db_ready, unsafe { nil }) // re-arm: more bytes to come
+		event_loop.watch_fd(pool.fd(idx), .readable, on_db_ready, unsafe { nil }) // re-arm: more bytes to come
 		return .suspend
 	}
 	mut body := []u8{cap: 512}
@@ -125,9 +125,9 @@ fn on_db_ready(mut out []u8, mut ac core.AsyncCtx) core.AsyncStep {
 
 fn main() {
 	mut s := http_server.new_server(http_server.ServerConfig{
-		port:          8099
-		async_handler: handler
-		make_state:    build_pool
+		port:       8099
+		handler:    handler
+		make_state: build_pool
 	})!
 	println('async_db_pg listening on http://localhost:8099/ (GET /db, GET /health)')
 	s.run()

@@ -10,7 +10,7 @@ fn test_async_pipe_end_to_end() ! {
 
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            8096
-		async_handler:   handle
+		handler:         handle
 		io_multiplexing: unsafe { http_server.IOBackend(0) } // .epoll on Linux, .kqueue on macOS
 	})!
 	responses := server.test([req]) or { panic('[test] server.test failed: ${err}') }

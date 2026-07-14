@@ -30,7 +30,9 @@ module main
 // examples (examples/async_sse). The frames below are still byte-exact wire
 // format; curl decodes them like any chunked response.
 import http_server
+import http_server.core
 import http_server.http1_1.request_parser
+import http_server.http1_1.response
 
 // Escaped rune literals are broken in this toolchain (docs/V_PERF_TOOLBOX.md
 // gotcha) — CR/LF as explicit byte values, same as the core parser.
@@ -176,11 +178,17 @@ fn is_chunked(req request_parser.HttpRequest) bool {
 	return true
 }
 
-fn handle(req_buffer []u8, _ int, mut out []u8) ! {
-	req := request_parser.decode_http_request(req_buffer)!
+fn handle(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	req := request_parser.decode_http_request(req_buffer) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
 	// The RFC 9112 MUSTs, incl. the CL+TE request-smuggling rejection (§6.1).
 	// Anything that processes bodies should pay this one call.
-	req.validate_http1()!
+	req.validate_http1() or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
 	out << resp_head_chunked
 	if req.body.len > 0 && is_chunked(req) {
 		// ECHO: walk the request's chunk frames and re-frame each data window
@@ -188,7 +196,10 @@ fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 		limit := req.body.start + req.body.len
 		mut pos := req.body.start
 		for {
-			data_start, data_len, next_pos := next_chunk(req.buffer, pos, limit)!
+			data_start, data_len, next_pos := next_chunk(req.buffer, pos, limit) or {
+				out << response.tiny_bad_request_response
+				return .close
+			}
 			if data_len == 0 {
 				break
 			}
@@ -202,6 +213,7 @@ fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 		}
 	}
 	out << last_chunk
+	return .done
 }
 
 fn main() {
@@ -216,7 +228,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: handle
+		handler:         handle
 	})!
 	println('Chunked streaming demo on http://localhost:3000/')
 	println('  GET  /  -> three chunked pieces')

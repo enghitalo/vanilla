@@ -18,13 +18,8 @@ module main
 // but that needs a worker-start hook for a watch not tied to any request — a
 // noted async-runtime follow-up. Lazy refresh is simpler and just as cheap.
 import http_server
+import http_server.core
 import time
-
-#include <time.h>
-
-// C.time returns the current Unix second (time_t) directly — far cheaper than
-// building a full calendar Time per request just to read its second.
-fn C.time(t voidptr) i64
 
 // DateCache is one worker's cached Date line + the unix second it is valid for.
 struct DateCache {
@@ -44,18 +39,21 @@ fn make_state() voidptr {
 // refresh rebuilds the cached Date line only when the second has advanced.
 @[direct_array_access]
 fn (mut dc DateCache) refresh() {
-	// Hot path: ONE cheap C.time() (no calendar decomposition, no allocation) to
-	// detect a second boundary. Only when the second actually advances do we pay
-	// for time.utc()'s full RFC-1123 formatting — once per second, not per request.
+	// Hot path: ONE cheap time.unix_now() (a bare time() call, ~2 ns, served from
+	// the vDSO — no calendar decomposition, no allocation) to detect a second
+	// boundary. Only when the second actually advances do we pay for time.utc()'s
+	// full RFC-1123 formatting — once per second, not per request.
 	// (Was: time.utc() on EVERY request just to read its .unix() second.)
-	now_sec := C.time(unsafe { nil })
+	now_sec := time.unix_now()
 	if now_sec == dc.sec {
 		return
 	}
 	dc.sec = now_sec
 	dc.line.clear()
 	dc.line << 'Date: '.bytes()
-	time.utc().push_to_http_header(mut dc.line) // appends "Sun, 06 Nov 1994 08:49:37 GMT"
+	// push_to_http_header writes "Sun, 06 Nov 1994 08:49:37 GMT" — now allocation-free
+	// itself (wraps time.write_http_header), so this once-a-second rebuild is cheap.
+	time.utc().push_to_http_header(mut dc.line)
 	dc.line << '\r\n'.bytes()
 }
 
@@ -65,20 +63,21 @@ const head = 'HTTP/1.1 200 OK\r\n'.bytes()
 
 const tail = 'Content-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
 
-fn handle(req []u8, fd int, mut out []u8, state voidptr) ! {
-	mut dc := unsafe { &DateCache(state) }
+fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	mut dc := unsafe { &DateCache(worker_state) }
 	dc.refresh()
 	out << head
 	out << dc.line // cached: no per-request formatting in the common case
 	out << tail
+	return .done
 }
 
 fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
-		port:             8096
-		io_multiplexing:  .epoll
-		stateful_handler: handle
-		make_state:       make_state
+		port:            8096
+		io_multiplexing: .epoll
+		handler:         handle
+		make_state:      make_state
 	})!
 	server.run()
 }

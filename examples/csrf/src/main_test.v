@@ -1,17 +1,20 @@
 module main
 
+import http_server.core
 import http_server.http1_1.request_parser
+import http_server.http1_1.response
 
 // SOLUTION: pure handler test — works today.
 // Token issuance, cookie scanning and safe/unsafe method gating are pure, so
 // the full CSRF policy is testable without a server. `${}` is fine here:
 // tests are scaffolding, not request-serving code.
 
-// serve adapts the raw-handler contract (writes into a caller-owned buffer) to
-// the return-a-buffer shape the assertions expect.
-fn serve(req []u8) ![]u8 {
+// serve adapts the unified handler contract (writes into a caller-owned
+// buffer) to the return-a-buffer shape the assertions expect.
+fn serve(req []u8) []u8 {
 	mut out := []u8{}
-	handle(req, -1, mut out)!
+	mut event_loop := core.EventLoop{}
+	handle(req, mut out, -1, unsafe { nil }, mut event_loop)
 	return out
 }
 
@@ -21,9 +24,9 @@ fn set_cookie_token(resp string) string {
 	return rest.all_before(';')
 }
 
-fn test_form_sets_fresh_token() ! {
+fn test_form_sets_fresh_token() {
 	req := 'GET /form HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
-	out := serve(req)!.bytestr()
+	out := serve(req).bytestr()
 	assert out.contains('200 OK')
 	assert out.contains('Set-Cookie: csrf=')
 	assert out.contains('Secure; SameSite=Strict')
@@ -32,7 +35,7 @@ fn test_form_sets_fresh_token() ! {
 	for c in a {
 		assert (c >= `0` && c <= `9`) || (c >= `a` && c <= `f`)
 	}
-	b := set_cookie_token(serve(req)!.bytestr())
+	b := set_cookie_token(serve(req).bytestr())
 	assert a != b // CSPRNG, never repeats
 }
 
@@ -78,49 +81,51 @@ fn test_unsafe_methods_gated() {
 	}
 }
 
-fn test_post_without_token_forbidden() ! {
+fn test_post_without_token_forbidden() {
 	req := 'POST /save HTTP/1.1\r\nContent-Length: 0\r\n\r\n'.bytes()
-	assert serve(req)!.bytestr().contains('403 Forbidden')
+	assert serve(req).bytestr().contains('403 Forbidden')
 }
 
-fn test_post_with_matching_token_ok() ! {
+fn test_post_with_matching_token_ok() {
 	tok := 'deadbeefcafe'
 	req :=
 		'POST /save HTTP/1.1\r\nCookie: csrf=${tok}\r\nX-CSRF-Token: ${tok}\r\nContent-Length: 0\r\n\r\n'.bytes()
-	assert serve(req)!.bytestr().contains('200 OK')
+	assert serve(req).bytestr().contains('200 OK')
 }
 
-fn test_post_with_mismatched_token_forbidden() ! {
+fn test_post_with_mismatched_token_forbidden() {
 	req :=
 		'POST /save HTTP/1.1\r\nCookie: csrf=aaaa\r\nX-CSRF-Token: bbbb\r\nContent-Length: 0\r\n\r\n'.bytes()
-	assert serve(req)!.bytestr().contains('403 Forbidden')
+	assert serve(req).bytestr().contains('403 Forbidden')
 }
 
-fn test_header_token_without_cookie_forbidden() ! {
+fn test_header_token_without_cookie_forbidden() {
 	// Half a double-submit is no submit: the attacker CAN set the header via
 	// their own fetch, but cannot make the browser attach the cookie.
 	req := 'POST /save HTTP/1.1\r\nX-CSRF-Token: aaaa\r\nContent-Length: 0\r\n\r\n'.bytes()
-	assert serve(req)!.bytestr().contains('403 Forbidden')
+	assert serve(req).bytestr().contains('403 Forbidden')
 }
 
-fn test_empty_cookie_token_forbidden() ! {
+fn test_empty_cookie_token_forbidden() {
 	req :=
 		'POST /save HTTP/1.1\r\nCookie: csrf=\r\nX-CSRF-Token: \r\nContent-Length: 0\r\n\r\n'.bytes()
-	assert serve(req)!.bytestr().contains('403 Forbidden')
+	assert serve(req).bytestr().contains('403 Forbidden')
 }
 
-fn test_safe_get_passes_through() ! {
+fn test_safe_get_passes_through() {
 	// Safe methods need no token — GET must be side-effect free anyway.
 	req := 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
-	assert serve(req)!.bytestr().contains('200 OK')
+	assert serve(req).bytestr().contains('200 OK')
 }
 
 fn test_malformed_request_errors() {
-	// Malformed input must surface as a handler error, never a response.
-	if _ := serve('garbage'.bytes()) {
-		assert false, 'garbage request must not produce a response'
-	}
-	if _ := serve('POST /save HTTP/1.1\r\nTrunc'.bytes()) {
-		assert false, 'truncated request must not produce a response'
-	}
+	// Malformed input gets the canned 400 and the connection is closed.
+	mut out := []u8{}
+	mut event_loop := core.EventLoop{}
+	assert handle('garbage'.bytes(), mut out, -1, unsafe { nil }, mut event_loop) == .close
+	assert out == response.tiny_bad_request_response
+	mut out2 := []u8{}
+	assert handle('POST /save HTTP/1.1\r\nTrunc'.bytes(), mut out2, -1, unsafe { nil }, mut
+		event_loop) == .close
+	assert out2 == response.tiny_bad_request_response
 }

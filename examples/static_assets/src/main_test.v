@@ -3,10 +3,14 @@ module main
 // Pure handler test — no socket. `handle` is a total function of the request
 // bytes, so we feed a raw request and assert the raw response, exactly like the
 // rest of vanilla. `assets` is loaded once from `../dist` at program start.
+import http_server.core
 
 fn serve(line string) string {
 	mut out := []u8{}
-	handle((line + '\r\n\r\n').bytes(), 0, mut out) or { return 'ERR: ${err}' }
+	mut event_loop := core.EventLoop{}
+	if handle((line + '\r\n\r\n').bytes(), mut out, -1, unsafe { nil }, mut event_loop) != .done {
+		return 'ERR'
+	}
 	return out.bytestr()
 }
 

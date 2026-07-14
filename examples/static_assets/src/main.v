@@ -11,6 +11,8 @@ module main
 //
 // THE WHOLE HANDLER IS TWO LINES. Everything below `handle` is just wiring.
 import http_server
+import http_server.core
+import http_server.http1_1.response
 import http_server.static_assets
 import os
 
@@ -32,8 +34,12 @@ const assets = static_assets.new(static_assets.Config{
 // it hands the file to the worker to stream with sendfile(2) — no userspace
 // copy — and falls back to copying the bytes on backends that can't (TLS,
 // non-Linux). Use respond_into (not respond) to get that fast path.
-fn handle(req []u8, _ int, mut out []u8) ! {
-	assets.respond_into(req, mut out)!
+fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	assets.respond_into(req, mut out) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
+	return .done
 }
 
 fn main() {
@@ -47,7 +53,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: handle
+		handler:         handle
 	})!
 	println('SPA/WASM server on http://localhost:3000/  (root: ${dist_dir})')
 	println('try: curl -v http://localhost:3000/main.7b2e10.wasm           # Content-Type: application/wasm')

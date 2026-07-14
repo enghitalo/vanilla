@@ -38,7 +38,9 @@ module main
 // threshold; see `examples/static_assets`. This example keeps the explicit
 // read-into-RAM path for teaching.
 import http_server
+import http_server.core
 import http_server.http1_1.request_parser
+import http_server.http1_1.response
 import os
 import strconv
 import hash as wyhash
@@ -273,13 +275,16 @@ fn parse_range(h []u8, size i64) ?(i64, i64) {
 	return start, end
 }
 
-fn handle(req_buffer []u8, _ int, mut out []u8) ! {
-	req := request_parser.decode_http_request(req_buffer)!
+fn handle(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	req := request_parser.decode_http_request(req_buffer) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
 	// Method routing IN PLACE over the request buffer — no `.to_string()`.
 	is_get := slice_eq(req.buffer, req.method, 'GET')
 	if !is_get && !slice_eq(req.buffer, req.method, 'HEAD') {
 		out << resp_405
-		return
+		return .done
 	}
 
 	// Strip the query string by SHRINKING the path view — offsets, no substr.
@@ -297,15 +302,15 @@ fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 
 	fs_path := safe_path(url_path) or {
 		out << resp_404
-		return
+		return .done
 	}
 	if !os.is_file(fs_path) {
 		out << resp_404
-		return
+		return .done
 	}
 	content := os.read_bytes(fs_path) or {
 		out << resp_404
-		return
+		return .done
 	}
 	ctype := mime_type(fs_path)
 	// ETag = 64-bit wyhash of the content, hex-encoded into a stack scratch —
@@ -319,7 +324,7 @@ fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 			ws(mut out, 'HTTP/1.1 304 Not Modified\r\nETag: "')
 			unsafe { out.push_many(&etag[0], 16) }
 			ws(mut out, '"\r\n\r\n')
-			return
+			return .done
 		}
 	}
 
@@ -347,7 +352,7 @@ fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 					// non-empty: parse_range guarantees 0 <= start <= end < len.
 					unsafe { out.push_many(&content[int(start)], int(end + 1 - start)) }
 				}
-				return
+				return .done
 			}
 		}
 	}
@@ -362,6 +367,7 @@ fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 	if is_get {
 		out << content // HEAD gets the headers only
 	}
+	return .done
 }
 
 fn main() {
@@ -376,7 +382,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: handle
+		handler:         handle
 	})!
 	// One-time init prints — `${}` is fine here, nothing below runs per request.
 	println('Static server on http://localhost:3000/  (root: ${web_root})')

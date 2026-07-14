@@ -1,5 +1,6 @@
 module main
 
+import http_server.core
 import http_server.http1_1.response
 
 fn test_simple_without_init_the_server() {
@@ -13,16 +14,17 @@ fn test_simple_without_init_the_server() {
 
 	app := App{}
 
-	assert serve(app, request1)! == http_ok_response
-	assert serve(app, request2)! == request2_response
-	assert serve(app, request3)! == http_created_response
-	assert serve(app, request4)! == response.tiny_bad_request_response
+	assert serve(app, request1) == http_ok_response
+	assert serve(app, request2) == request2_response
+	assert serve(app, request3) == http_created_response
+	assert serve(app, request4) == response.tiny_bad_request_response
 }
 
-// serve adapts the raw-handler contract (writes into a caller-owned buffer) to
-// the return-a-buffer shape the assertions expect.
-fn serve(app App, req []u8) ![]u8 {
+// serve adapts the unified handler contract (writes into a caller-owned
+// buffer) to the return-a-buffer shape the assertions expect.
+fn serve(app App, req []u8) []u8 {
 	mut out := []u8{}
-	app.handle_request(req, -1, mut out)!
+	mut event_loop := core.EventLoop{}
+	app.handle_request(req, mut out, -1, unsafe { nil }, mut event_loop)
 	return out
 }

@@ -1,5 +1,7 @@
 module main
 
+import http_server.core
+import http_server.http1_1.response
 import time
 
 // SOLUTION: pure crypto/round-trip + raw-request E2E (BEST_PRACTICES §9).
@@ -55,25 +57,26 @@ fn test_api_key_constant_time_check() {
 	assert !check_api_key([]u8{})
 }
 
-// serve adapts the raw-handler contract (writes into a caller-owned buffer) to
-// the return-a-string shape the assertions expect.
-fn serve(req string) !string {
+// serve adapts the unified handler contract (writes into a caller-owned
+// buffer) to the return-a-string shape the assertions expect.
+fn serve(req string) string {
 	mut out := []u8{}
-	handle(req.bytes(), -1, mut out)!
+	mut event_loop := core.EventLoop{}
+	handle(req.bytes(), mut out, -1, unsafe { nil }, mut event_loop)
 	return out.bytestr()
 }
 
-fn test_token_login_flow() ! {
+fn test_token_login_flow() {
 	// wrong password -> 401
-	bad := serve('POST /token HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nwrong')!
+	bad := serve('POST /token HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nwrong')
 	assert bad.contains('401')
 	// wrong method -> 405 with Allow
-	notpost := serve('GET /token HTTP/1.1\r\nHost: x\r\n\r\n')!
+	notpost := serve('GET /token HTTP/1.1\r\nHost: x\r\n\r\n')
 	assert notpost.contains('405')
 	assert notpost.contains('Allow: POST')
 	// correct password -> 200, correct Content-Length, token that verifies
 	body := demo_password
-	ok := serve('POST /token HTTP/1.1\r\nHost: x\r\nContent-Length: ${body.len}\r\n\r\n${body}')!
+	ok := serve('POST /token HTTP/1.1\r\nHost: x\r\nContent-Length: ${body.len}\r\n\r\n${body}')
 	assert ok.contains('200 OK')
 	json_body := ok.all_after('\r\n\r\n')
 	clen := ok.all_after('Content-Length: ').all_before('\r\n').int()
@@ -82,38 +85,34 @@ fn test_token_login_flow() ! {
 	assert jwt_verify(token.bytes())
 }
 
-fn test_protected_route_requires_valid_bearer() ! {
+fn test_protected_route_requires_valid_bearer() {
 	// no token -> 401 with challenge
-	no_tok := serve('GET /protected HTTP/1.1\r\nHost: x\r\n\r\n')!
+	no_tok := serve('GET /protected HTTP/1.1\r\nHost: x\r\n\r\n')
 	assert no_tok.contains('401')
 	assert no_tok.contains('WWW-Authenticate: Bearer')
 	// valid token -> 200 (scheme is case-insensitive: `bearer` must work too)
 	token := jwt_sign('{"sub":"user-42","exp":${future_exp()}}'.bytes()).bytestr()
-	ok := serve('GET /protected HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${token}\r\n\r\n')!
+	ok := serve('GET /protected HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${token}\r\n\r\n')
 	assert ok.contains('200 OK')
-	ok2 := serve('GET /protected HTTP/1.1\r\nHost: x\r\nAuthorization: bearer ${token}\r\n\r\n')!
+	ok2 := serve('GET /protected HTTP/1.1\r\nHost: x\r\nAuthorization: bearer ${token}\r\n\r\n')
 	assert ok2.contains('200 OK')
 	// expired token -> 401
 	old_token := jwt_sign('{"exp":1}'.bytes()).bytestr()
-	old :=
-		serve('GET /protected HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${old_token}\r\n\r\n')!
+	old := serve('GET /protected HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${old_token}\r\n\r\n')
 	assert old.contains('401')
 }
 
-fn test_service_route_requires_api_key() ! {
-	assert serve('GET /service HTTP/1.1\r\nHost: x\r\n\r\n')!.contains('401')
-	assert serve('GET /service HTTP/1.1\r\nHost: x\r\nX-API-Key: nope\r\n\r\n')!.contains('401')
-	assert serve('GET /service HTTP/1.1\r\nHost: x\r\nX-API-Key: secret-api-key-123\r\n\r\n')!.contains('200 OK')
+fn test_service_route_requires_api_key() {
+	assert serve('GET /service HTTP/1.1\r\nHost: x\r\n\r\n').contains('401')
+	assert serve('GET /service HTTP/1.1\r\nHost: x\r\nX-API-Key: nope\r\n\r\n').contains('401')
+	assert serve('GET /service HTTP/1.1\r\nHost: x\r\nX-API-Key: secret-api-key-123\r\n\r\n').contains('200 OK')
 }
 
 fn test_unknown_route_and_malformed() {
-	if resp := serve('GET /nope HTTP/1.1\r\nHost: x\r\n\r\n') {
-		assert resp.contains('404')
-	} else {
-		assert false, '404 route must still produce a response'
-	}
-	// Malformed input must surface as a handler error, never a response.
-	if _ := serve('garbage') {
-		assert false, 'garbage request must not produce a response'
-	}
+	assert serve('GET /nope HTTP/1.1\r\nHost: x\r\n\r\n').contains('404')
+	// Malformed input gets the canned 400 and the connection is closed.
+	mut out := []u8{}
+	mut event_loop := core.EventLoop{}
+	assert handle('garbage'.bytes(), mut out, -1, unsafe { nil }, mut event_loop) == .close
+	assert out == response.tiny_bad_request_response
 }

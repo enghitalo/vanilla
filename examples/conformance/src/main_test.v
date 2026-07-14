@@ -1,13 +1,24 @@
 module main
 
+import http_server.core
+
 // Handler-level conformance tests: feed raw request bytes to handle_request and
 // assert the status line, mirroring the checks an external probe (h1spec) makes.
 // This runs the SAME logic the probe exercises, but without a socket — so it is
 // deterministic and immune to the backend half-close behavior (see README).
 
-fn status_of(req string) int {
+// serve drives the handler with the current contract and returns the bytes it
+// appended. client_fd = -1, no worker state, a scratch EventLoop — this server
+// is stateless and synchronous, so none of them are consulted.
+fn serve(req string) []u8 {
 	mut out := []u8{}
-	handle_request(req.bytes(), -1, mut out) or { return -1 }
+	mut event_loop := core.EventLoop{}
+	handle_request(req.bytes(), mut out, -1, unsafe { nil }, mut event_loop)
+	return out
+}
+
+fn status_of(req string) int {
+	out := serve(req)
 	// Parse "HTTP/1.1 NNN ..." → NNN.
 	if out.len < 12 {
 		return 0
@@ -88,11 +99,7 @@ fn test_valid_chunked_accepted() {
 }
 
 fn test_head_has_no_body() {
-	mut out := []u8{}
-	handle_request('HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes(), -1, mut out) or {
-		assert false, 'HEAD handler errored: ${err}'
-		return
-	}
+	out := serve('HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n')
 	s := out.bytestr()
 	idx := s.index('\r\n\r\n') or {
 		assert false, 'no header terminator in HEAD response'
@@ -108,16 +115,12 @@ fn test_unsupported_method_405() {
 
 fn test_error_response_is_self_delimiting() {
 	// Every 400 must carry Content-Length (or chunked / Connection: close).
-	mut out := []u8{}
-	handle_request('get / HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes(), -1, mut out) or {}
-	s := out.bytestr().to_lower()
+	s := serve('get / HTTP/1.1\r\nHost: localhost\r\n\r\n').bytestr().to_lower()
 	assert s.contains('content-length:') || s.contains('transfer-encoding: chunked')
 		|| s.contains('connection: close')
 }
 
 fn test_connection_close_honored() {
-	mut out := []u8{}
-	handle_request('GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'.bytes(), -1, mut
-		out) or {}
+	out := serve('GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n')
 	assert out.bytestr().to_lower().contains('connection: close')
 }

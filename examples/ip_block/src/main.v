@@ -4,8 +4,8 @@ module main
 //
 // Rejects requests from denied client IPs with 403 Forbidden, using the socket
 // peer address exposed by Phase 2 (`socket.peer_addr(fd)`). The handler keeps
-// the plain `fn ([]u8, int, mut []u8)` contract — it just reads the fd's peer
-// when it needs to decide.
+// the unified `core.Handler` contract — it just reads the client fd's peer
+// (client_fd) when it needs to decide.
 //
 // SECURITY / DESIGN notes:
 //   - Blocks by the SOCKET peer. Behind a proxy/CDN the peer IS the proxy, so
@@ -21,6 +21,7 @@ module main
 //   - The most efficient block is at CONNECTION time (drop on accept). That
 //     needs a core accept-hook; here we answer 403 per request at handler level.
 import http_server
+import http_server.core
 import http_server.socket
 import sync
 
@@ -53,14 +54,15 @@ fn (mut b Blocklist) is_blocked(ip string) bool {
 const forbidden_response = 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 const ok_response = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\nConnection: keep-alive\r\n\r\nallowed'.bytes()
 
-fn handle(req_buffer []u8, fd int, mut out []u8, mut blocklist Blocklist) ! {
-	ip := socket.peer_addr(fd)
+fn handle(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop, mut blocklist Blocklist) core.Step {
+	ip := socket.peer_addr(client_fd)
 	if blocklist.is_blocked(ip) {
 		eprintln('[ip-block] denied ${ip}')
 		out << forbidden_response
-		return
+		return .done
 	}
 	out << ok_response
+	return .done
 }
 
 fn main() {
@@ -80,8 +82,9 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: fn [mut blocklist] (req_buffer []u8, fd int, mut out []u8) ! {
-			handle(req_buffer, fd, mut out, mut blocklist)!
+		handler:         fn [mut blocklist] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+			return handle(req_buffer, mut out, client_fd, worker_state, mut event_loop, mut
+				blocklist)
 		}
 	})!
 	println('IP-block demo on http://localhost:3000/  (denied IPs get 403)')

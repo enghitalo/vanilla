@@ -35,7 +35,9 @@ module main
 //   - If an encoder fails, fall back to identity and OMIT `Content-Encoding` —
 //     never label uncompressed bytes as compressed.
 import http_server
+import http_server.core
 import http_server.http1_1.request_parser
+import http_server.http1_1.response
 import compress.brotli
 import compress.gzip
 import compress.zstd
@@ -130,8 +132,11 @@ fn pick_encoding(buf []u8, start int, len int, brotli_ok bool) Encoding {
 	return .identity
 }
 
-fn handle(req_buffer []u8, _ int, mut out []u8) ! {
-	req := request_parser.decode_http_request(req_buffer)!
+fn handle(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	req := request_parser.decode_http_request(req_buffer) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
 	mut enc := Encoding.identity
 	if s := req.get_header_value_slice('Accept-Encoding') {
 		enc = pick_encoding(req.buffer, s.start, s.len, resp_br.len > 0)
@@ -142,6 +147,8 @@ fn handle(req_buffer []u8, _ int, mut out []u8) ! {
 		.gzip { out << resp_gzip }
 		.identity { out << resp_identity }
 	}
+
+	return .done
 }
 
 fn main() {
@@ -156,7 +163,7 @@ fn main() {
 	mut server := http_server.new_server(http_server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		request_handler: handle
+		handler:         handle
 	})!
 	println('Compression demo on http://localhost:3000/  (try: curl --compressed -v localhost:3000)')
 	if resp_br.len == 0 {
