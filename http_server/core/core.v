@@ -197,6 +197,20 @@ pub fn reject_register(mut event_loop EventLoop, ext_fd int, interest WatchInter
 // handling. epoll backend only.
 pub type WorkerStartFn = fn (worker_state voidptr, mut event_loop EventLoop)
 
+// AfterStartFn runs ONCE, on the main thread, the moment the server is accepting
+// connections — every listener is bound + listening and the worker threads are
+// spawned — right before run() blocks in its accept/idle loop. Unlike
+// WorkerStartFn (which is per-worker, on the worker thread, epoll-only), this is a
+// single process-level lifecycle hook and works on EVERY backend.
+//
+// It takes no arguments: it is the "server is up" signal. Use it to log
+// "listening on :3000", register in service discovery, write a PID/health/ready
+// file, notify a supervisor (systemd sd_notify), or — in tests — signal a channel
+// so the client proceeds the instant the server is ready instead of polling. It
+// runs synchronously in run() before the loop, so keep it quick (or hand heavy
+// work to a spawned thread); a panic in it propagates out of run().
+pub type AfterStartFn = fn ()
+
 // Counter is a single i64 padded to a full cache line, so independent counters
 // (per-worker in-flight, global active-connections) never false-share. Mutated
 // via atomic add, read via atomic load (sync.stdatomic free funcs on &n).

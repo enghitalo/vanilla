@@ -10,7 +10,7 @@ A minimalist, high-performance HTTP server written in [V](https://vlang.io).
 - **Modular**: Easy to extend with custom controllers and handlers.
 - **Memory Safety**: No race conditions.
 - **No Magic**: Transparent and straightforward.
-- **E2E Testing**: End-to-end testing without running a persistent server — pass raw requests directly to `handle_request()` or use `server.test(...)`.
+- **E2E Testing**: Test handlers in-process by passing raw requests directly to `handle_request()`, or drive a running server over a real socket with `net.dial_tcp` and a read deadline (see [`http_server/backend_behaviors_test.v`](http_server/backend_behaviors_test.v)).
 - **SSE Friendly**: Built-in Server-Sent Events support (sync and async).
 - **ETag Friendly**: Conditional GETs with `ETag` and `If-None-Match` headers.
 - **Database Friendly**: Example with PostgreSQL connection pool.
@@ -71,12 +71,14 @@ fn test_handle_request() {
 }
 ```
 
-Or use the server's built-in test mode:
-
-```v
-mut server := http_server.new_server(http_server.ServerConfig{ ... })!
-responses := server.test([request1, request2]) or { panic(err) }
-```
+Or drive a running server over a real client socket — spawn `server.run()` on a
+thread, then send raw requests with `net.dial_tcp` and read the responses under a
+deadline. This exercises the full framing / keep-alive / suspend-resume path and
+never hangs on a stalled stream. See
+[`http_server/backend_behaviors_test.v`](http_server/backend_behaviors_test.v)
+for the pattern (pipelining, framing across TCP segments, timeouts, graceful
+shutdown) and the `*_end_to_end_test.v` files under [`examples/`](examples/) for
+per-app end-to-end tests.
 
 ### 3. Graceful Shutdown
 
@@ -96,7 +98,31 @@ fn main() {
 }
 ```
 
-### 4. Server-Sent Events (SSE)
+### 4. Startup hook (`after_server_start`)
+
+`run()` blocks in the accept loop, so there is no "server is up" return to hook
+onto. `after_server_start` fills that gap: a callback that fires **once**, on the
+main thread, the moment every listener is bound and the workers are spawned —
+right before `run()` blocks. Works on every backend (epoll / io_uring / kqueue /
+IOCP). Use it to log readiness, register in service discovery, write a
+PID/health/ready file, notify a supervisor, or — in tests — signal a channel so a
+client proceeds the instant the server is ready instead of polling for it:
+
+```v
+ready := chan bool{cap: 1}
+mut server := http_server.new_server(http_server.ServerConfig{
+	handler:            handle_request
+	after_server_start: fn [ready] () {
+		ready <- true
+	}
+})!
+spawn fn [mut server] () {
+	server.run()
+}()
+_ := <-ready // deterministic readiness — the server is now accepting
+```
+
+### 5. Server-Sent Events (SSE)
 
 **Run the example:**
 
@@ -119,14 +145,14 @@ v -prod run examples/sse
 curl -X POST http://localhost:3000/broadcast
 ```
 
-### 5. ETag Support
+### 6. ETag Support
 
 ```sh
 curl -v http://localhost:3000/user/1
 curl -v -H "If-None-Match: c4ca4238a0b923820dcc509a6f75849b" http://localhost:3000/user/1
 ```
 
-### 6. Database Example (PostgreSQL)
+### 7. Database Example (PostgreSQL)
 
 **Start the database:**
 
@@ -204,9 +230,21 @@ fn main() {
 
 ---
 
-## Test Mode
+## End-to-End Testing
 
-`Server.test` accepts an array of raw HTTP requests, sends them directly to the server socket, and processes each one sequentially. After receiving the response for the last request, the server shuts down automatically. This enables efficient end-to-end testing without running a persistent server process.
+Two layers, no bespoke test mode on the server:
+
+- **In-process** — call the handler directly (`handle_request(req, mut out, ...)`)
+  and assert on the bytes it appends. Deterministic, no sockets, no threads; ideal
+  for routing and response-shape assertions.
+- **Over a real socket** — spawn `server.run()` on a thread, connect with
+  `net.dial_tcp`, and read responses under a per-read deadline (so a broken stream
+  fails fast instead of hanging). This drives the real backend end to end —
+  epoll / io_uring / kqueue — including pipelining, request framing across TCP
+  segments, keep-alive, `Expect: 100-continue`, half-close, read timeouts, and the
+  async suspend/resume path. See
+  [`http_server/backend_behaviors_test.v`](http_server/backend_behaviors_test.v)
+  and the `*_end_to_end_test.v` files under [`examples/`](examples/).
 
 ---
 

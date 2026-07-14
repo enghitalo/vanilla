@@ -15,8 +15,8 @@ fn run_selected_backend(server Server, mut threads []thread) {
 	match server.io_multiplexing {
 		.epoll {
 			backend_epoll.run_epoll_backend(server.socket_fd, server.handler, server.make_state,
-				server.on_worker_start, server.port, server.limits, server.inflight,
-				server.active_conns, server.tls_config, mut threads)
+				server.on_worker_start, server.after_server_start, server.port, server.limits,
+				server.inflight, server.active_conns, server.tls_config, mut threads)
 		}
 		.io_uring {
 			run_io_uring_backend(server, mut threads)

@@ -62,13 +62,14 @@ fn test_malformed_request_errors() {
 
 /*
 ASPIRATIONAL — Solution 2 (programmable client) + Solution 7 (concurrency).
-This is the test that proves real push fan-out; it needs the raw streaming
-client (Server.test() can't: it frames by Content-Length and would hang on an
-open stream). Run under V's thread sanitizer to catch races on the client set:
+This is the test that proves real push fan-out; it needs a raw streaming client
+that reads incrementally with a deadline (a Content-Length-framed reader would
+hang on an open stream). Build it on `net.dial_tcp` as backend_behaviors_test.v
+does, and run under V's thread sanitizer to catch races on the client set:
 
-  mut subs := []TestConn{}
-  for _ in 0 .. 50 { mut s := testkit.dial(port); s.send('GET /events HTTP/1.1\r\n\r\n')
-                     s.read_until('\r\n\r\n'); subs << s }          // 50 open streams
-  mut pub := testkit.dial(port); pub.send('POST /broadcast ... hello')
-  for mut s in subs { assert s.read_until('\n\n').contains('data: hello') }  // ALL receive
+  mut subs := []&net.TcpConn{}
+  for _ in 0 .. 50 { mut s := net.dial_tcp('127.0.0.1:${port}')!; s.write('GET /events HTTP/1.1\r\n\r\n'.bytes())!
+                     read_until(mut s, '\r\n\r\n'); subs << s }     // 50 open streams
+  mut pub := net.dial_tcp('127.0.0.1:${port}')!; pub.write('POST /broadcast ... hello'.bytes())!
+  for mut s in subs { assert read_until(mut s, '\n\n').contains('data: hello') }  // ALL receive
 */

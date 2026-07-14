@@ -305,7 +305,7 @@ fn accept_thread(listen_socket int, iocp_handle voidptr) {
 	println('[iocp-accept] Accept thread exiting')
 }
 
-pub fn run_iocp_backend(socket_fd int, handler core.Handler, make_state fn () voidptr, port int, mut threads []thread) {
+pub fn run_iocp_backend(socket_fd int, handler core.Handler, make_state fn () voidptr, after_server_start core.AfterStartFn, port int, mut threads []thread) {
 	println('[iocp] Starting IOCP backend on port ${port}')
 
 	// Create IOCP handle
@@ -338,6 +338,11 @@ pub fn run_iocp_backend(socket_fd int, handler core.Handler, make_state fn () vo
 	accept_thread_id := spawn accept_thread(socket_fd, iocp_handle)
 
 	println('listening on http://localhost:${port}/ (IOCP)')
+	// Server is accepting (listener associated + workers + accept thread up); fire
+	// the one-shot lifecycle hook on this (main) thread right before we block.
+	if after_server_start != unsafe { nil } {
+		after_server_start()
+	}
 
 	// Wait for shutdown signal (in real implementation, this would be controlled)
 	mut dummy := 0
@@ -366,12 +371,18 @@ pub fn run_iocp_backend(socket_fd int, handler core.Handler, make_state fn () vo
 fn run_selected_backend(server Server, mut threads []thread) {
 	match server.io_multiplexing {
 		.iocp {
-			run_iocp_backend(server.socket_fd, server.handler, server.make_state, server.port, mut
-				threads)
+			run_iocp_backend(server.socket_fd, server.handler, server.make_state,
+				server.after_server_start, server.port, mut threads)
 		}
 	}
 }
 
 pub fn (mut server Server) run() {
 	run_selected_backend(server, mut server.threads)
+}
+
+// iou_backend_available: io_uring is Linux-only, so it is never available here.
+// See the Linux definition (http_server_io_uring_linux.c.v) for the real probe.
+pub fn iou_backend_available() bool {
+	return false
 }

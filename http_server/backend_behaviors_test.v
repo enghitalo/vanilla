@@ -13,6 +13,8 @@ module http_server
 // so they assert behaviour, not exact latency.
 import net
 import time
+import sync.stdatomic
+import http_server.testkit
 import http1_1.request_parser
 import http1_1.response
 import http_server.core
@@ -39,149 +41,94 @@ fn bb_upload_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr
 
 const bb_req = 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'
 
-// count_marker counts non-overlapping occurrences of `needle` in `haystack`.
-fn count_marker(haystack []u8, needle string) int {
-	if needle.len == 0 || haystack.len < needle.len {
-		return 0
-	}
-	mut count := 0
-	mut i := 0
-	for i <= haystack.len - needle.len {
-		mut hit := true
-		for j in 0 .. needle.len {
-			if haystack[i + j] != needle[j] {
-				hit = false
-				break
-			}
-		}
-		if hit {
-			count++
-			i += needle.len
-		} else {
-			i++
-		}
-	}
-	return count
+// The byte-scanning / framed-read client helpers (count_marker, read_until_count,
+// read_full) live in http_server.testkit and are called with the `testkit.` prefix.
+
+// BbHarness carries a client thread's result string from the after_server_start
+// hook (server thread) to the test's main thread. `done` is the atomic
+// happens-before barrier that publishes `th`. `phase` is a second barrier for the
+// few checks that need the main thread to act (e.g. server.shutdown) BETWEEN client
+// steps: the client stores/spins on it to hand control back and forth.
+struct BbHarness {
+mut:
+	th    thread string
+	done  u64
+	phase u64
 }
 
-// read_until_count reads until `needle` has appeared `want` times, the peer
-// closes, or `deadline_ms` elapses; returns how many were seen.
-fn read_until_count(mut c net.TcpConn, needle string, want int, deadline_ms int) int {
-	c.set_read_timeout(deadline_ms * time.millisecond)
-	mut acc := []u8{}
-	mut buf := []u8{len: 65536}
-	for {
-		nr := c.read(mut buf) or { break }
-		if nr <= 0 {
-			break
-		}
-		acc << buf[..nr]
-		if count_marker(acc, needle) >= want {
-			break
-		}
+// bb_await spins on the `done` barrier, then joins the client thread and returns
+// its result string ("ok" on success, else a diagnostic the caller asserts on).
+fn (mut h BbHarness) bb_await() string {
+	for stdatomic.load_u64(&h.done) == 0 {
+		time.sleep(time.millisecond)
 	}
-	return count_marker(acc, needle)
+	return h.th.wait()
 }
 
-// bb_start spawns `server.run()` on a thread and blocks until the server
-// answers (or panics after ~3s). The CALLER owns `server`, so the spawned
-// thread's reference stays valid for the test's lifetime; after the test
-// returns the run() thread only sleeps / blocks in the event loop and the
-// workers use copied parameters, so it never dereferences the freed value.
-fn bb_start(mut server Server, port int) {
-	spawn fn [mut server] () {
-		server.run()
-	}()
-	for _ in 0 .. 200 {
-		mut c := net.dial_tcp('127.0.0.1:${port}') or {
-			time.sleep(15 * time.millisecond)
-			continue
-		}
-		c.close() or {}
-		return
-	}
-	panic('server never came up on port ${port}')
-}
+// bb_spawn wires the standard shape: the hook spawns `client` (so it returns and
+// the accept loop starts), then flips `done` to publish the handle. Returns a
+// closure suitable for ServerConfig.after_server_start.
+// (Inlined per-test below because V closures capture the specific client fn.)
 
-// --- backend-agnostic behaviour checks ------------------------------------
+// --- client workloads -----------------------------------------------------
 
-fn check_pipelining_and_framing(backend IOBackend, port int) ! {
-	mut server := new_server(ServerConfig{
-		port:            port
-		io_multiplexing: backend
-		handler:         bb_ok_handler
-	})!
-	bb_start(mut server, port)
-
-	// 8 requests in ONE write must yield 8 responses (pipelining).
-	mut c := net.dial_tcp('127.0.0.1:${port}')!
-	c.write(bb_req.repeat(8).bytes())!
-	got := read_until_count(mut c, 'HTTP/1.1 200', 8, 2000)
+// bb_cli_pipelining: 8 pipelined requests → 8 responses (one write), then a request
+// split across two writes → 1 response (partial-read framing). "ok" or diagnostic.
+fn bb_cli_pipelining(port int) string {
+	mut c := testkit.dial(port) or { return 'dial: ${err}' }
+	c.write(bb_req.repeat(8).bytes()) or { return 'write8: ${err}' }
+	got := testkit.read_until_count(mut c, 'HTTP/1.1 200', 8, 2000)
 	c.close() or {}
-	assert got == 8, '${backend}: pipelining expected 8 responses, got ${got}'
+	if got != 8 {
+		return 'pipelining expected 8 responses, got ${got}'
+	}
 
-	// A request split across two writes must frame correctly (partial reads).
-	mut c2 := net.dial_tcp('127.0.0.1:${port}')!
-	c2.write('GET / HTTP/1.1\r\nHo'.bytes())!
+	mut c2 := testkit.dial(port) or { return 'dial2: ${err}' }
+	c2.write('GET / HTTP/1.1\r\nHo'.bytes()) or { return 'write2a: ${err}' }
 	time.sleep(50 * time.millisecond)
-	c2.write('st: x\r\n\r\n'.bytes())!
-	got2 := read_until_count(mut c2, 'HTTP/1.1 200', 1, 2000)
+	c2.write('st: x\r\n\r\n'.bytes()) or { return 'write2b: ${err}' }
+	got2 := testkit.read_until_count(mut c2, 'HTTP/1.1 200', 1, 2000)
 	c2.close() or {}
-	assert got2 == 1, '${backend}: split request expected 1 response, got ${got2}'
-
-	server.shutdown(500)
+	if got2 != 1 {
+		return 'split request expected 1 response, got ${got2}'
+	}
+	return 'ok'
 }
 
-fn check_max_connections(backend IOBackend, port int) ! {
-	mut server := new_server(ServerConfig{
-		port:            port
-		io_multiplexing: backend
-		handler:         bb_ok_handler
-		limits:          Limits{
-			max_connections: 4
-		}
-	})!
-	bb_start(mut server, port)
-	time.sleep(200 * time.millisecond) // let the readiness probe's close settle
-
-	// Hold 4 served keep-alive connections (each accept is counted before its 200).
+// bb_cli_max_connections: hold 4 served keep-alive conns, then confirm the 5th
+// (over max_connections=4) is refused / gets no response. "ok" or diagnostic.
+fn bb_cli_max_connections(port int) string {
 	mut conns := []&net.TcpConn{}
 	for i in 0 .. 4 {
-		mut c := net.dial_tcp('127.0.0.1:${port}')!
-		c.write(bb_req.bytes())!
-		got := read_until_count(mut c, 'HTTP/1.1 200', 1, 2000)
-		assert got == 1, '${backend}: connection ${i} should be served, got ${got}'
+		mut c := testkit.dial(port) or { return 'dial ${i}: ${err}' }
+		c.write(bb_req.bytes()) or { return 'write ${i}: ${err}' }
+		got := testkit.read_until_count(mut c, 'HTTP/1.1 200', 1, 2000)
+		if got != 1 {
+			return 'connection ${i} should be served, got ${got}'
+		}
 		conns << c
 	}
-	// The 5th is over the cap: the server accepts then immediately closes it (no
-	// response / EOF), or the connect itself is refused.
 	mut served5 := 0
-	if mut c5 := net.dial_tcp('127.0.0.1:${port}') {
+	if mut c5 := testkit.dial(port) {
 		c5.write(bb_req.bytes()) or {}
-		served5 = read_until_count(mut c5, 'HTTP/1.1 200', 1, 1500)
+		served5 = testkit.read_until_count(mut c5, 'HTTP/1.1 200', 1, 1500)
 		c5.close() or {}
 	}
 	for mut c in conns {
 		c.close() or {}
 	}
-	assert served5 == 0, '${backend}: connection over max_connections=4 must be refused, got ${served5} responses'
-
-	server.shutdown(500)
+	if served5 != 0 {
+		return 'connection over max_connections=4 must be refused, got ${served5} responses'
+	}
+	return 'ok'
 }
 
-fn check_read_timeout(backend IOBackend, port int) ! {
-	mut server := new_server(ServerConfig{
-		port:            port
-		io_multiplexing: backend
-		handler:         bb_ok_handler
-		limits:          Limits{
-			read_timeout_ms: 400
-		}
-	})!
-	bb_start(mut server, port)
-
-	mut c := net.dial_tcp('127.0.0.1:${port}')!
-	c.write('GET / HTTP/1.1\r\nHo'.bytes())! // partial: never completes
+// bb_cli_read_timeout: send a partial request that never completes; the server must
+// END it promptly (408-then-close on epoll, EOF on io_uring) — never a 200, and
+// well under the 2s client wait. "ok" or diagnostic.
+fn bb_cli_read_timeout(port int) string {
+	mut c := testkit.dial(port) or { return 'dial: ${err}' }
+	c.write('GET / HTTP/1.1\r\nHo'.bytes()) or { return 'write: ${err}' } // partial: never completes
 	c.set_read_timeout(2 * time.second)
 	mut buf := []u8{len: 1024}
 	sw := time.new_stopwatch()
@@ -189,44 +136,190 @@ fn check_read_timeout(backend IOBackend, port int) ! {
 	elapsed := sw.elapsed().milliseconds()
 	c.close() or {}
 	resp := if nr > 0 { buf[..nr].bytestr() } else { '' }
-	// read_timeout (400ms) + sweep interval (250ms) ⇒ the server acts on the
-	// stalled request well under the 2s client wait. If the timeout did NOT fire,
-	// the read would block until the 2s client timeout instead — caught by the
-	// elapsed bound. The two backends end a timed-out partial request differently
-	// (both correct): epoll sends a 408 then closes; io_uring half-closes (EOF).
-	// Either way the partial must NEVER be answered with a normal 200.
-	assert elapsed < 1500, '${backend}: server should end the stalled request promptly, took ${elapsed}ms'
-	assert !resp.contains('200 OK'), '${backend}: stalled partial request must not be served a 200, got: ${resp}'
-
-	server.shutdown(500)
+	if elapsed >= 1500 {
+		return 'server should end the stalled request promptly, took ${elapsed}ms'
+	}
+	if resp.contains('200 OK') {
+		return 'stalled partial request must not be served a 200, got: ${resp}'
+	}
+	return 'ok'
 }
 
-fn check_graceful_shutdown(backend IOBackend, port int) ! {
-	mut server := new_server(ServerConfig{
-		port:            port
-		io_multiplexing: backend
-		handler:         bb_ok_handler
-	})!
-	bb_start(mut server, port)
-
-	// Serves before shutdown.
-	mut c := net.dial_tcp('127.0.0.1:${port}')!
-	c.write(bb_req.bytes())!
-	got := read_until_count(mut c, 'HTTP/1.1 200', 1, 2000)
+// bb_cli_half_close: send a complete request, half-close the WRITE side (SHUT_WR),
+// and require the full response still arrives on the open read side (RFC 9112 §9.6,
+// issue #103). "ok" or diagnostic.
+fn bb_cli_half_close(port int) string {
+	mut c := testkit.dial(port) or { return 'dial: ${err}' }
+	c.write(bb_req.bytes()) or { return 'write: ${err}' }
+	net.shutdown(c.sock.handle, how: .write)
+	got := testkit.read_until_count(mut c, 'HTTP/1.1 200', 1, 3000)
 	c.close() or {}
-	assert got == 1, '${backend}: server should serve before shutdown, got ${got}'
+	if got != 1 {
+		return 'response must arrive after a half-close (SHUT_WR), got ${got} — issue #103'
+	}
+	return 'ok'
+}
 
-	// Idle drain returns promptly.
-	sw := time.new_stopwatch()
-	server.shutdown(2000)
-	assert sw.elapsed().milliseconds() < 1000, '${backend}: idle shutdown should be fast'
+// bb_cli_expect_100: send the head with Expect: 100-continue and hold the body; the
+// server must prompt an interim 100, then the final 200 after the body. "ok" or diag.
+fn bb_cli_expect_100(port int) string {
+	mut c := testkit.dial(port) or { return 'dial: ${err}' }
+	c.write('POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n'.bytes()) or {
+		return 'write head: ${err}'
+	}
+	got100 := testkit.read_until_count(mut c, 'HTTP/1.1 100', 1, 3000)
+	if got100 != 1 {
+		return 'Expect: 100-continue must be answered with an interim 100, got ${got100}'
+	}
+	c.write('hello'.bytes()) or { return 'write body: ${err}' }
+	got200 := testkit.read_until_count(mut c, 'HTTP/1.1 200', 1, 3000)
+	c.close() or {}
+	if got200 != 1 {
+		return 'final response must follow the body after 100 Continue, got ${got200}'
+	}
+	return 'ok'
+}
 
-	// Every listener is now stopped → all new connections refused. (For io_uring
-	// this is the fix: previously only worker 0's listener was closed.)
-	time.sleep(100 * time.millisecond)
+// bb_cli_large_upload: two 2 MiB uploads on ONE keep-alive connection. Upload 0
+// probes drain-then-respond ORDERING (head + one chunk must draw NO response yet);
+// upload 1 probes EXACT-drain + keep-alive. "ok" or diagnostic.
+fn bb_cli_large_upload(port int) string {
+	body_len := 2 * 1024 * 1024 // 2 MiB > 1 MiB threshold ⇒ drain path
+	chunk := []u8{len: 64 * 1024, init: u8(0x61)}
+	head := 'POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: ${body_len}\r\n\r\n'.bytes()
+	mut c := testkit.dial(port) or { return 'dial: ${err}' }
+
+	// Upload 0 ORDERING probe: head + ONE chunk, then the server must stay SILENT.
+	c.write(head) or { return 'u0 head: ${err}' }
+	c.write(chunk) or { return 'u0 chunk: ${err}' }
+	c.set_read_timeout(500 * time.millisecond)
+	mut probe := []u8{len: 256}
+	pn := c.read(mut probe) or { 0 }
+	if pn != 0 {
+		return 'response arrived before the body finished — respond-before-drain (desyncs wrk/curl), got ${pn} bytes'
+	}
+	mut sent := chunk.len
+	for sent < body_len {
+		n := if body_len - sent < chunk.len { body_len - sent } else { chunk.len }
+		c.write(chunk[..n]) or { return 'u0 body: ${err}' }
+		sent += n
+	}
+	acc0 := bb_read_one_200(mut c, 5000)
+	if testkit.count_marker(acc0, 'HTTP/1.1 200') != 1 {
+		return 'upload 0 not answered after the body completed'
+	}
+	if !acc0.bytestr().contains('\r\n\r\n${body_len}') {
+		return 'upload 0 must echo Content-Length ${body_len}, got: ${acc0.bytestr()#[-40..]}'
+	}
+
+	// Upload 1 EXACT-drain + keep-alive: a second full upload on the SAME connection.
+	c.write(head) or { return 'u1 head: ${err}' }
+	mut sent1 := 0
+	for sent1 < body_len {
+		n := if body_len - sent1 < chunk.len { body_len - sent1 } else { chunk.len }
+		c.write(chunk[..n]) or { return 'u1 body: ${err}' }
+		sent1 += n
+	}
+	acc1 := bb_read_one_200(mut c, 5000)
+	c.close() or {}
+	if testkit.count_marker(acc1, 'HTTP/1.1 200') != 1 {
+		return 'keep-alive after a drained upload broke (drain over-read or under-read?)'
+	}
+	if !acc1.bytestr().contains('\r\n\r\n${body_len}') {
+		return 'upload 1 must echo Content-Length ${body_len}, got: ${acc1.bytestr()#[-40..]}'
+	}
+	return 'ok'
+}
+
+// --- backend-agnostic behaviour checks ------------------------------------
+// Each builds the server with an after_server_start hook that spawns the client
+// workload and publishes the handle via the atomic barrier; the main thread awaits,
+// tears the server down, and asserts on the returned string.
+
+fn check_pipelining_and_framing(backend IOBackend, port int) ! {
+	mut h := &BbHarness{}
+	mut server := new_server(ServerConfig{
+		port:               port
+		io_multiplexing:    backend
+		handler:            bb_ok_handler
+		after_server_start: fn [mut h, port] () {
+			h.th = spawn bb_cli_pipelining(port)
+			stdatomic.store_u64(&h.done, 1)
+		}
+	})!
+	spawn fn [mut server] () {
+		server.run()
+	}()
+	got := h.bb_await()
+	server.shutdown(500)
+	assert got == 'ok', '${backend}: ${got}'
+}
+
+fn check_max_connections(backend IOBackend, port int) ! {
+	mut h := &BbHarness{}
+	mut server := new_server(ServerConfig{
+		port:               port
+		io_multiplexing:    backend
+		handler:            bb_ok_handler
+		after_server_start: fn [mut h, port] () {
+			h.th = spawn bb_cli_max_connections(port)
+			stdatomic.store_u64(&h.done, 1)
+		}
+		limits:             Limits{
+			max_connections: 4
+		}
+	})!
+	spawn fn [mut server] () {
+		server.run()
+	}()
+	got := h.bb_await()
+	server.shutdown(500)
+	assert got == 'ok', '${backend}: ${got}'
+}
+
+fn check_read_timeout(backend IOBackend, port int) ! {
+	mut h := &BbHarness{}
+	mut server := new_server(ServerConfig{
+		port:               port
+		io_multiplexing:    backend
+		handler:            bb_ok_handler
+		after_server_start: fn [mut h, port] () {
+			h.th = spawn bb_cli_read_timeout(port)
+			stdatomic.store_u64(&h.done, 1)
+		}
+		limits:             Limits{
+			read_timeout_ms: 400
+		}
+	})!
+	spawn fn [mut server] () {
+		server.run()
+	}()
+	got := h.bb_await()
+	server.shutdown(500)
+	assert got == 'ok', '${backend}: ${got}'
+}
+
+// bb_cli_graceful: FIRST phase runs in the client thread — get served once, then
+// signal `phase=1` and spin until the main thread has called server.shutdown()
+// (`phase=2`), then confirm all 10 new connections are refused. The main thread
+// does the shutdown + times it BETWEEN the two phases. Returns "ok" or diagnostic.
+fn bb_cli_graceful(port int, mut h BbHarness) string {
+	mut c := testkit.dial(port) or { return 'dial: ${err}' }
+	c.write(bb_req.bytes()) or { return 'write: ${err}' }
+	got := testkit.read_until_count(mut c, 'HTTP/1.1 200', 1, 2000)
+	c.close() or {}
+	if got != 1 {
+		return 'server should serve before shutdown, got ${got}'
+	}
+	// Hand control to main: it will shut the server down (and time it), then set phase=2.
+	stdatomic.store_u64(&h.phase, 1)
+	for stdatomic.load_u64(&h.phase) != 2 {
+		time.sleep(time.millisecond)
+	}
+	// Every listener is now stopped → all new connections refused.
 	mut refused := 0
 	for _ in 0 .. 10 {
-		mut nc := net.dial_tcp('127.0.0.1:${port}') or {
+		mut nc := testkit.dial(port) or {
 			refused++
 			continue
 		}
@@ -238,7 +331,39 @@ fn check_graceful_shutdown(backend IOBackend, port int) ! {
 		}
 		nc.close() or {}
 	}
-	assert refused == 10, '${backend}: after shutdown all 10 new connections should be refused, got ${refused}'
+	if refused != 10 {
+		return 'after shutdown all 10 new connections should be refused, got ${refused}'
+	}
+	return 'ok'
+}
+
+fn check_graceful_shutdown(backend IOBackend, port int) ! {
+	mut h := &BbHarness{}
+	mut server := new_server(ServerConfig{
+		port:               port
+		io_multiplexing:    backend
+		handler:            bb_ok_handler
+		after_server_start: fn [mut h, port] () {
+			h.th = spawn bb_cli_graceful(port, mut h)
+			stdatomic.store_u64(&h.done, 1)
+		}
+	})!
+	spawn fn [mut server] () {
+		server.run()
+	}()
+	// Wait for the client's phase-1 signal (it has been served once), then do the
+	// idle drain on THIS thread and time it, and hand phase-2 back to the client.
+	for stdatomic.load_u64(&h.phase) != 1 {
+		time.sleep(time.millisecond)
+	}
+	sw := time.new_stopwatch()
+	server.shutdown(2000)
+	assert sw.elapsed().milliseconds() < 1000, '${backend}: idle shutdown should be fast'
+	time.sleep(100 * time.millisecond) // let the listeners fully stop before the refusal probe
+	stdatomic.store_u64(&h.phase, 2)
+
+	got := h.bb_await()
+	assert got == 'ok', '${backend}: ${got}'
 }
 
 // bb_read_one_200 reads from c (up to deadline_ms) until one '200' status line has
@@ -247,7 +372,7 @@ fn bb_read_one_200(mut c net.TcpConn, deadline_ms int) []u8 {
 	c.set_read_timeout(deadline_ms * time.millisecond)
 	mut buf := []u8{len: 65536}
 	mut acc := []u8{}
-	for count_marker(acc, 'HTTP/1.1 200') < 1 {
+	for testkit.count_marker(acc, 'HTTP/1.1 200') < 1 {
 		nr := c.read(mut buf) or { break }
 		if nr <= 0 {
 			break
@@ -273,57 +398,25 @@ fn bb_read_one_200(mut c net.TcpConn, deadline_ms int) []u8 {
 //     keep-alive survived the drain.
 //   • the head-only handler answers by the declared Content-Length.
 fn check_large_upload_drain(backend IOBackend, port int) ! {
+	mut h := &BbHarness{}
 	mut server := new_server(ServerConfig{
-		port:            port
-		io_multiplexing: backend
-		handler:         bb_upload_handler
-		limits:          Limits{
+		port:               port
+		io_multiplexing:    backend
+		handler:            bb_upload_handler
+		after_server_start: fn [mut h, port] () {
+			h.th = spawn bb_cli_large_upload(port)
+			stdatomic.store_u64(&h.done, 1)
+		}
+		limits:             Limits{
 			max_request_bytes: 8 * 1024 * 1024 // headroom for the 2 MiB bodies
 		}
 	})!
-	bb_start(mut server, port)
-
-	body_len := 2 * 1024 * 1024 // 2 MiB > 1 MiB threshold ⇒ drain path
-	chunk := []u8{len: 64 * 1024, init: u8(0x61)}
-	head := 'POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: ${body_len}\r\n\r\n'.bytes()
-	mut c := net.dial_tcp('127.0.0.1:${port}')!
-
-	// ── Upload 0: ORDERING probe ──
-	// Send the head + ONE chunk (body far from complete), then assert the server
-	// stays SILENT: drain-then-respond must withhold the answer until the body is
-	// fully drained. An early answer here is the respond-before-drain bug.
-	c.write(head)!
-	c.write(chunk)!
-	c.set_read_timeout(500 * time.millisecond)
-	mut probe := []u8{len: 256}
-	pn := c.read(mut probe) or { 0 }
-	assert pn == 0, '${backend}: response arrived before the body finished — respond-before-drain (desyncs wrk/curl), got ${pn} bytes'
-	// Finish upload 0's body; now the response must arrive, echoing the declared length.
-	mut sent := chunk.len
-	for sent < body_len {
-		n := if body_len - sent < chunk.len { body_len - sent } else { chunk.len }
-		c.write(chunk[..n])!
-		sent += n
-	}
-	acc0 := bb_read_one_200(mut c, 5000)
-	assert count_marker(acc0, 'HTTP/1.1 200') == 1, '${backend}: upload 0 not answered after the body completed'
-	assert acc0.bytestr().contains('\r\n\r\n${body_len}'), '${backend}: upload 0 must echo Content-Length ${body_len}, got: ${acc0.bytestr()#[-40..]}'
-
-	// ── Upload 1: EXACT-drain + keep-alive guard ──
-	// A second full upload on the SAME connection must frame correctly.
-	c.write(head)!
-	mut sent1 := 0
-	for sent1 < body_len {
-		n := if body_len - sent1 < chunk.len { body_len - sent1 } else { chunk.len }
-		c.write(chunk[..n])!
-		sent1 += n
-	}
-	acc1 := bb_read_one_200(mut c, 5000)
-	c.close() or {}
-	assert count_marker(acc1, 'HTTP/1.1 200') == 1, '${backend}: keep-alive after a drained upload broke (drain over-read or under-read?)'
-	assert acc1.bytestr().contains('\r\n\r\n${body_len}'), '${backend}: upload 1 must echo Content-Length ${body_len}, got: ${acc1.bytestr()#[-40..]}'
-
+	spawn fn [mut server] () {
+		server.run()
+	}()
+	got := h.bb_await()
 	server.shutdown(500)
+	assert got == 'ok', '${backend}: ${got}'
 }
 
 // check_half_close_after_request: a client that sends a complete request and
@@ -332,23 +425,22 @@ fn check_large_upload_drain(backend IOBackend, port int) ! {
 // §9.6). Regression test for issue #103, where the recv→0 (EOF) tore the
 // connection down before the already-computed response was flushed.
 fn check_half_close_after_request(backend IOBackend, port int) ! {
+	mut h := &BbHarness{}
 	mut server := new_server(ServerConfig{
-		port:            port
-		io_multiplexing: backend
-		handler:         bb_ok_handler
+		port:               port
+		io_multiplexing:    backend
+		handler:            bb_ok_handler
+		after_server_start: fn [mut h, port] () {
+			h.th = spawn bb_cli_half_close(port)
+			stdatomic.store_u64(&h.done, 1)
+		}
 	})!
-	bb_start(mut server, port)
-
-	mut c := net.dial_tcp('127.0.0.1:${port}')!
-	c.write(bb_req.bytes())!
-	// Signal "done sending" WITHOUT closing the read side — the probe technique
-	// h1spec/Http11Probe use for most tests.
-	net.shutdown(c.sock.handle, how: .write)
-	got := read_until_count(mut c, 'HTTP/1.1 200', 1, 3000)
-	c.close() or {}
-	assert got == 1, '${backend}: response must arrive after a half-close (SHUT_WR), got ${got} — issue #103'
-
+	spawn fn [mut server] () {
+		server.run()
+	}()
+	got := h.bb_await()
 	server.shutdown(500)
+	assert got == 'ok', '${backend}: ${got}'
 }
 
 // check_expect_100_continue: a client that sends the head with
@@ -357,62 +449,77 @@ fn check_half_close_after_request(backend IOBackend, port int) ! {
 // response. Without the prompt the server would wait for a body the client is
 // deliberately withholding, and the request would stall.
 fn check_expect_100_continue(backend IOBackend, port int) ! {
+	mut h := &BbHarness{}
 	mut server := new_server(ServerConfig{
-		port:            port
-		io_multiplexing: backend
-		handler:         bb_ok_handler
+		port:               port
+		io_multiplexing:    backend
+		handler:            bb_ok_handler
+		after_server_start: fn [mut h, port] () {
+			h.th = spawn bb_cli_expect_100(port)
+			stdatomic.store_u64(&h.done, 1)
+		}
 	})!
-	bb_start(mut server, port)
-
-	mut c := net.dial_tcp('127.0.0.1:${port}')!
-	// Head only — the 5-byte body is withheld until we see 100 Continue.
-	c.write('POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n'.bytes())!
-	got100 := read_until_count(mut c, 'HTTP/1.1 100', 1, 3000)
-	assert got100 == 1, '${backend}: Expect: 100-continue must be answered with an interim 100, got ${got100}'
-	// Now send the body; the final 200 must follow.
-	c.write('hello'.bytes())!
-	got200 := read_until_count(mut c, 'HTTP/1.1 200', 1, 3000)
-	c.close() or {}
-	assert got200 == 1, '${backend}: final response must follow the body after 100 Continue, got ${got200}'
-
+	spawn fn [mut server] () {
+		server.run()
+	}()
+	got := h.bb_await()
 	server.shutdown(500)
+	assert got == 'ok', '${backend}: ${got}'
 }
 
 // --- io_uring -------------------------------------------------------------
+//
+// Each io_uring test compiles only on Linux ($if linux — the .io_uring enum value
+// is Linux-only) AND self-skips at runtime when io_uring_setup is blocked
+// (iou_backend_available() — true of GitHub's hosted runners under seccomp). That
+// lets `v test http_server/` run the whole file without a -run-only filter: the
+// io_uring cases simply skip where the syscall is denied, the epoll cases run.
 
 fn test_iouring_large_upload_drain() ! {
 	$if linux {
-		check_large_upload_drain(.io_uring, 8125)!
+		if iou_backend_available() {
+			check_large_upload_drain(.io_uring, 8125)!
+		}
 	}
 }
 
 fn test_iouring_pipelining_and_framing() ! {
 	$if linux {
-		check_pipelining_and_framing(.io_uring, 8121)!
+		if iou_backend_available() {
+			check_pipelining_and_framing(.io_uring, 8121)!
+		}
 	}
 }
 
 fn test_iouring_max_connections() ! {
 	$if linux {
-		check_max_connections(.io_uring, 8122)!
+		if iou_backend_available() {
+			check_max_connections(.io_uring, 8122)!
+		}
 	}
 }
 
 fn test_iouring_read_timeout() ! {
 	$if linux {
-		check_read_timeout(.io_uring, 8123)!
+		if iou_backend_available() {
+			check_read_timeout(.io_uring, 8123)!
+		}
 	}
 }
 
 fn test_iouring_graceful_shutdown() ! {
 	$if linux {
-		check_graceful_shutdown(.io_uring, 8124)!
+		if iou_backend_available() {
+			check_graceful_shutdown(.io_uring, 8124)!
+		}
 	}
 }
 
 fn test_iouring_half_close_after_request() ! {
 	$if linux {
-		check_half_close_after_request(.io_uring, 8126)!
+		if iou_backend_available() {
+			check_half_close_after_request(.io_uring, 8126)!
+		}
 	}
 }
 

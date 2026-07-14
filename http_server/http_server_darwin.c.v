@@ -49,7 +49,7 @@ fn handle_accept_loop(socket_fd int, main_kq int, worker_kqs []int) {
 	}
 }
 
-pub fn run_kqueue_backend(socket_fd int, handler core.Handler, make_state fn () voidptr, port int, limits Limits, mut threads []thread) {
+pub fn run_kqueue_backend(socket_fd int, handler core.Handler, make_state fn () voidptr, after_server_start core.AfterStartFn, port int, limits Limits, mut threads []thread) {
 	main_kq := kqueue.create_kqueue_fd()
 	if main_kq < 0 {
 		return
@@ -82,6 +82,11 @@ pub fn run_kqueue_backend(socket_fd int, handler core.Handler, make_state fn () 
 	}
 
 	println('listening on http://localhost:${port}/ (kqueue)')
+	// Server is accepting (listener + worker kqueues up); fire the one-shot
+	// lifecycle hook on this (main) thread right before we block in the accept loop.
+	if after_server_start != unsafe { nil } {
+		after_server_start()
+	}
 	handle_accept_loop(socket_fd, main_kq, worker_kqs)
 }
 
@@ -91,12 +96,18 @@ pub fn run_kqueue_backend(socket_fd int, handler core.Handler, make_state fn () 
 fn run_selected_backend(server Server, mut threads []thread) {
 	match server.io_multiplexing {
 		.kqueue {
-			run_kqueue_backend(server.socket_fd, server.handler, server.make_state, server.port,
-				server.limits, mut threads)
+			run_kqueue_backend(server.socket_fd, server.handler, server.make_state,
+				server.after_server_start, server.port, server.limits, mut threads)
 		}
 	}
 }
 
 pub fn (mut server Server) run() {
 	run_selected_backend(server, mut server.threads)
+}
+
+// iou_backend_available: io_uring is Linux-only, so it is never available here.
+// See the Linux definition (http_server_io_uring_linux.c.v) for the real probe.
+pub fn iou_backend_available() bool {
+	return false
 }

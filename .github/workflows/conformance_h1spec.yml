@@ -66,26 +66,25 @@ jobs:
       - name: Unit tests (hard gate)
         shell: bash
         run: v -cc gcc -no-parallel test examples/conformance/src
-      - name: Request-parser framer tests (hard gate)
+      - name: http_server package tests (hard gate)
         shell: bash
-        # Split-point framing tests incl. the CL+TE (#104), missing-chunk-terminator
-        # (#109) and chunk-size / Content-Length overflow regression cases — the
-        # last guard against a hostile request re-crashing a worker (SIGSEGV) or
-        # smuggling. Not covered by the example matrices; runs here on Linux (glibc
-        # provides memmem — this test can't build on macOS, a separate gotcha).
-        run: v -cc gcc -no-parallel test http_server/http1_1/request_parser/
-      - name: Backend behaviour tests (epoll, hard gate)
-        shell: bash
-        # Drives a real epoll server over raw sockets: pipelining, framing,
-        # max-connections, timeouts, graceful shutdown, and the #103
-        # half-close-then-respond regression test. The example matrices don't
-        # cover http_server/ tests, so run them here.
-        #
-        # -run-only test_epoll_*: the io_uring tests are EXCLUDED because GitHub's
-        # hosted runners block io_uring (io_uring_queue_init fails under their
-        # seccomp policy), so those servers can't start here. io_uring has its OWN
-        # read path and is verified locally on kernels that permit it.
-        run: v -cc gcc -no-parallel test -run-only 'test_epoll_*' http_server/backend_behaviors_test.v
+        # Runs the WHOLE http_server package test tree (recursive) — the example
+        # matrices don't cover http_server/ tests, so they run here on Linux:
+        #   • http1_1/request_parser/ — split-point framing incl. CL+TE (#104),
+        #     missing-chunk-terminator (#109) and chunk-size / Content-Length
+        #     overflow regressions (guards against a hostile request re-crashing a
+        #     worker or smuggling). Needs glibc memmem, so it is Linux-only.
+        #   • backend_behaviors_test.v — a real server over raw sockets: pipelining,
+        #     framing, max-connections, timeouts, graceful shutdown, #103 half-close.
+        #   • server_test.v — default-backend routing / body delivery / .close path.
+        #   • io_uring_*_test.v + the io_uring cases in backend_behaviors — these
+        #     SELF-SKIP at runtime (iou_backend_available()): GitHub's hosted runners
+        #     deny io_uring_setup under seccomp, so the probe returns false and the
+        #     io_uring servers are never started here. io_uring has its OWN read path
+        #     and is verified on kernels that permit it (locally / self-hosted).
+        #   • tls/ (stub build, no -d vanilla_tls) and static_assets/ — socket-free,
+        #     pass trivially.
+        run: v -cc gcc -no-parallel test http_server/
 
       # --- Report: live-server probe with h1spec --------------------------------
       - name: Install h1spec (uv)

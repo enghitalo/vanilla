@@ -530,6 +530,26 @@ pub fn prepare_poll(ring &C.io_uring, fd int, poll_mask u32) bool {
 	return true
 }
 
+// io_uring_available reports whether this process can actually set up an io_uring
+// instance RIGHT NOW. It sets up a tiny ring and tears it straight back down, so
+// it costs one syscall pair and leaks nothing. It returns false when the kernel is
+// too old (io_uring_setup absent) OR the syscall is blocked by a sandbox — the
+// case that matters for CI: GitHub's hosted runners deny io_uring_setup under
+// their default seccomp policy, so a server that tries to run the io_uring backend
+// there would abort. Callers (tests, and any runtime backend auto-selection) probe
+// with this and fall back / skip instead of crashing.
+pub fn io_uring_available() bool {
+	mut ring := C.io_uring{}
+	mut p := C.io_uring_params{}
+	// A minimal ring: 8 entries, default flags (no SINGLE_ISSUER/DEFER_TASKRUN, so
+	// this probes the plainest setup path the kernel offers).
+	if C.io_uring_queue_init_params(8, &ring, &p) != 0 {
+		return false
+	}
+	C.io_uring_queue_exit(&ring)
+	return true
+}
+
 // ==================== Type Definitions ====================
 
 pub type WorkerFn = fn (&Worker) voidptr
