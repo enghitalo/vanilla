@@ -666,6 +666,43 @@ pub fn frame_head_len(buf []u8) int {
 	return -1
 }
 
+// head_expects_100_continue reports whether the request head buffered in
+// `buf[..head_len]` carries `Expect: 100-continue` (RFC 9110 §10.1.1). Scans the
+// header lines for an `Expect` field whose value contains `100-continue`
+// (case-insensitive). Off the hot path: the backend calls this ONCE per
+// connection, and only while a body is still pending (a rare shape), so the walk
+// never touches the GET/no-body or fully-buffered request path.
+@[direct_array_access]
+pub fn head_expects_100_continue(buf []u8, head_len int) bool {
+	if head_len <= 0 || head_len > buf.len {
+		return false
+	}
+	// Skip the request line (first LF); Expect can only be a header field.
+	rl := find_byte_idx(&buf[0], head_len, lf_char)
+	if rl < 0 {
+		return false
+	}
+	mut pos := rl + 1
+	for pos < head_len {
+		if buf[pos] == cr_char {
+			break // blank line => end of headers
+		}
+		line_lf := find_byte_idx(&buf[pos], head_len - pos, lf_char)
+		if line_lf < 0 {
+			break
+		}
+		line_start := pos
+		line_len := line_lf - 1 // bytes before the CR
+		pos = line_start + line_lf + 1
+		if v := line_header_value(buf, line_start, line_len, 'Expect') {
+			if ci_contains(buf, v, '100-continue') {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // content_length returns the request's Content-Length header value, or -1 if it
 // is absent or unparseable. Lets a handler answer by declared length even when
 // the engine drained (never buffered) the body.

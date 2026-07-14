@@ -121,6 +121,12 @@ mut:
 	// paths close the connection once the buffer drains instead of keeping it
 	// alive — a half-closed peer will never send another request. See issue #103.
 	close_after_flush bool
+	// Set once a 100 Continue interim response has been sent for the request
+	// currently mid-read, so a peer that sends `Expect: 100-continue` and dribbles
+	// its body across edges is prompted exactly once (RFC 9110 §10.1.1). Reset per
+	// connection (a keep-alive connection may carry several Expect requests, but
+	// only one is ever mid-read at a time, and close_conn clears it).
+	sent_100 bool
 }
 
 // PlainState is the per-worker connection table. `parked` counts connections
@@ -437,6 +443,7 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			cs.body_drain = 0
 			cs.awaiting_fd = -1
 			cs.close_after_flush = false
+			cs.sent_100 = false
 			st.conns[fd] = unsafe { nil }
 			st.free_conns << cs
 		}

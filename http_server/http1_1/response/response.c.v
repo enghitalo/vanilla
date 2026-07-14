@@ -13,6 +13,14 @@ pub const status_413_response = 'HTTP/1.1 413 Payload Too Large\r\nContent-Lengt
 pub const status_431_response = 'HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 const status_408_response = 'HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 
+// Interim 100 Continue (RFC 9110 §10.1.1): sent when a request carries
+// `Expect: 100-continue` and the server is willing to receive the body, to
+// prompt the client to send it. It is an informational (1xx) response — no
+// body, no Content-Length — and is followed by the normal final response once
+// the body arrives. pub so the epoll backend can APPEND it to the batched write
+// buffer ahead of the eventual final response.
+pub const status_100_continue_response = 'HTTP/1.1 100 Continue\r\n\r\n'.bytes()
+
 // HTTP response helpers.
 
 // send_response writes the full response, looping over partial writes.
