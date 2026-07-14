@@ -68,6 +68,14 @@ jobs:
       - name: Unit tests (hard gate)
         shell: bash
         run: v -cc gcc -no-parallel test examples/conformance/src
+      - name: Request-parser framer tests (hard gate)
+        shell: bash
+        # Split-point framing tests incl. the CL+TE (#104), missing-chunk-terminator
+        # (#109) and chunk-size / Content-Length overflow regression cases — the
+        # last guard against a hostile request re-crashing a worker (SIGSEGV) or
+        # smuggling. Not covered by the example matrices; runs here on Linux (glibc
+        # provides memmem — this test can't build on macOS, a separate gotcha).
+        run: v -cc gcc -no-parallel test http_server/http1_1/request_parser/
       - name: Backend behaviour tests (epoll, hard gate)
         shell: bash
         # Drives a real epoll server over raw sockets: pipelining, framing,
