@@ -89,11 +89,31 @@ fn process_kqueue_worker(kq int, handler core.Handler, make_state fn () voidptr,
 				continue
 			}
 			// Client connection.
-			if (events[i].flags & (kqueue.ev_eof | kqueue.ev_error)) != 0 {
+			eof := (events[i].flags & (kqueue.ev_eof | kqueue.ev_error)) != 0
+			if eof && events[i].data == 0 {
+				// EOF with no unread bytes: the peer closed and there is nothing left
+				// to answer — drop the connection.
 				kq_close(mut reactor, kq, fd)
 				continue
 			}
+			// Either a normal readable event, OR EV_EOF WITH unread bytes still
+			// queued: a client that sent a complete request and then half-closed its
+			// write side (SHUT_WR) shows up here. We MUST still read and answer that
+			// request on the open write half (RFC 9112 §9.6, issue #103) instead of
+			// closing on the EOF flag alone.
 			kq_handle_request(handler, mut reactor, kq, fd, limits, state)
+			// After answering a half-closed peer, close — it can send nothing more,
+			// so keep-alive is pointless. But NOT if the handler parked the request
+			// on a watch (.suspend): its continuation still owes a response on the
+			// open write half, and kq_close would abort it. kq_handle_request may
+			// also have already closed the fd (send error / .close); re-closing a
+			// gone fd is a harmless no-op, but skip it when the request parked.
+			if eof {
+				parked := if conn := reactor.conns[fd] { conn.awaiting_fd >= 0 } else { false }
+				if !parked {
+					kq_close(mut reactor, kq, fd)
+				}
+			}
 		}
 	}
 }

@@ -98,6 +98,11 @@ fn test_valid_chunked_accepted() {
 	assert status_of('POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n') == 200
 }
 
+fn test_chunked_http10_rejected() {
+	// Transfer-Encoding is HTTP/1.1+; a 1.0 request carrying it is 400 (RFC 9112 §6.1).
+	assert status_of('POST / HTTP/1.0\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n') == 400
+}
+
 fn test_head_has_no_body() {
 	out := serve('HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n')
 	s := out.bytestr()
