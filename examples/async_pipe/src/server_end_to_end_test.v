@@ -1,3 +1,6 @@
+// vtest build: !windows
+// main.v needs POSIX pipe(2)/<unistd.h> and the .suspend watch reactor, which
+// exist on epoll (Linux) and kqueue (macOS) but not on the Windows/IOCP backend.
 module main
 
 import net

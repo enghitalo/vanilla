@@ -1,3 +1,7 @@
+// vtest build: linux
+// The assertions here are pure (Date-line formatting vs the vlib oracle), but the
+// test binary compiles main.v, which is deliberately Linux-only: it demos the
+// epoll-exclusive on_worker_start hook driving a timerfd (<sys/timerfd.h>).
 module main
 
 import time
