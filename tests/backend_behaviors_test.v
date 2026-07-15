@@ -290,6 +290,47 @@ fn check_large_upload_drain(backend http_server.IOBackend) ! {
 	assert out.inflight_after == 0
 }
 
+// check_streamed_body_over_max_body_bytes: regression for the streamed-path
+// limit bypass. A body declared ABOVE max_body_bytes but large enough to take
+// the streaming path (> the 1 MiB threshold) must be rejected from the head
+// alone — 413 and close, exactly like the framed path — instead of reaching
+// the handler. Before the fix the streamed gate only checked
+// max_request_bytes, so such a body bypassed max_body_bytes entirely and was
+// answered 200. The 413 bytes themselves are asserted only when they arrived:
+// the server closes with the body unread, so the kernel may RST and discard
+// the response in flight — the hard contract is "no 200, connection ended".
+fn check_streamed_body_over_max_body_bytes(backend http_server.IOBackend) ! {
+	head :=
+		'POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: ${bb_upload_body_len}\r\n\r\n'.bytes()
+	first_chunk := []u8{len: bb_upload_chunk_len, init: u8(0x61)}
+	out := vtest.drive(http_server.ServerConfig{
+		io_multiplexing: backend
+		handler:         bb_upload_handler
+		limits:          http_server.Limits{
+			max_body_bytes:    64 * 1024 // far below the 2 MiB declared body
+			max_request_bytes: 8 * 1024 * 1024
+		}
+	}, [
+		vtest.Script{
+			rounds:   [
+				vtest.Round{
+					send: bb_concat(head, first_chunk) // enough to trip the streaming decision, then stop
+					want: 0
+				},
+			]
+			then_eof: true // completion can only come from the server's 413+close
+		},
+	])!
+	c := out.conns[0]
+	assert c.connect_err == '', c.connect_err
+	assert c.eof, '${backend}: oversized streamed body must end in a server close'
+	raw := c.raw.bytestr()
+	assert !raw.contains('200'), '${backend}: a streamed body over max_body_bytes must never reach the handler, got: ${raw}'
+	if c.raw.len > 0 {
+		assert raw.starts_with('HTTP/1.1 413'), '${backend}: expected the 413 rejection, got: ${raw}'
+	}
+}
+
 // check_half_close_after_request: a client that sends a complete request and
 // then half-closes its WRITE side (shut_wr == shutdown(SHUT_WR)) must still
 // receive the full response on the still-open read side (RFC 9112 §9.6).
@@ -417,6 +458,16 @@ fn test_iouring_large_upload_drain() ! {
 	}
 }
 
+fn test_iouring_streamed_body_over_max_body_bytes() ! {
+	$if linux {
+		if !http_server.iou_backend_available() {
+			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
+			return
+		}
+		check_streamed_body_over_max_body_bytes(.io_uring)!
+	}
+}
+
 fn test_iouring_pipelining_and_framing() ! {
 	$if linux {
 		if !http_server.iou_backend_available() {
@@ -479,6 +530,12 @@ fn test_iocp_large_upload_drain() ! {
 	}
 }
 
+fn test_iocp_streamed_body_over_max_body_bytes() ! {
+	$if windows {
+		check_streamed_body_over_max_body_bytes(unsafe { http_server.IOBackend(0) })!
+	}
+}
+
 fn test_iocp_pipelining_and_framing() ! {
 	$if windows {
 		check_pipelining_and_framing(unsafe { http_server.IOBackend(0) })!
@@ -514,6 +571,12 @@ fn test_iocp_half_close_after_request() ! {
 fn test_epoll_large_upload_drain() ! {
 	$if linux {
 		check_large_upload_drain(.epoll)!
+	}
+}
+
+fn test_epoll_streamed_body_over_max_body_bytes() ! {
+	$if linux {
+		check_streamed_body_over_max_body_bytes(.epoll)!
 	}
 }
 

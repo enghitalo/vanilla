@@ -101,7 +101,7 @@ fn on_start(worker_state voidptr, mut event_loop core.EventLoop) {
 // date_tick fires once a second: drain the timerfd, refresh this worker's cache,
 // and re-arm. Returns .suspend (keep the background watch alive). It never writes
 // to `out` (there is no client) and lives for the worker's whole lifetime.
-fn date_tick(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+fn date_tick(mut _out []u8, ready_fd int, _ready_fd_error bool, _watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
 	C.read(ready_fd, &tmp[0], 8) // drain the expiration count to re-level the fd
 	mut dc := unsafe { &DateCache(worker_state) }
@@ -115,7 +115,7 @@ const head = 'HTTP/1.1 200 OK\r\n'.bytes()
 const tail = 'Content-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
 
 // handle is a plain sync handler: zero time work — just append the cached Date.
-fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+fn handle(_req []u8, mut out []u8, _client_fd int, worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
 	dc := unsafe { &DateCache(worker_state) }
 	out << head
 	unsafe { out.push_many(&dc.line[0], date_line_len) }

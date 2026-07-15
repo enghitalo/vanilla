@@ -857,7 +857,7 @@ fn parse_u64_window(buf []u8, lo int, hi int) i64 {
 
 // Above any int-sized asset (`size` is an `int`, < 2^31) yet far below i64 max,
 // so accumulation never wraps.
-const range_num_ceiling = i64(1) << 40
+const range_num_ceiling = i64(u64(1) << 40)
 
 // glob_match matches `name` against a pattern where `*` matches any run of
 // characters and `[hash]` matches a content-hash segment (>=6 hex chars). All

@@ -469,6 +469,19 @@ fn iou_start_body_drain(mut env IouEnv, mut conn io_uring.Connection, total int,
 	if head_len <= 0 || head_len > conn.read_buf.len {
 		return false // head not complete in the buffer yet — keep buffering
 	}
+	// max_body_bytes must hold on the STREAMED path too (mirrors the epoll
+	// backend's start_body_drain): the framed path 413s an oversized declared
+	// body, and a body large enough to stream must not bypass that limit just
+	// because it skips buffering. Close: the unread body makes the stream
+	// unrecoverable.
+	if limits.max_body_bytes > 0 && total - head_len > limits.max_body_bytes {
+		conn.response_buffer << response.status_413_response
+		conn.close_after_send = true
+		unsafe {
+			conn.read_buf.len = 0
+		}
+		return true
+	}
 	head := buf_view(conn.read_buf, 0, head_len)
 	core.set_queue_buf_allowed(false)
 	mut event_loop := iou_event_loop(mut env, conn.fd)

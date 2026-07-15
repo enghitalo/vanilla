@@ -386,6 +386,18 @@ fn win_start_body_drain(h core.Handler, mut cs WinConn, limits core.Limits, stat
 		return 0 // head not complete in the buffer yet — grow/recv more
 	}
 	content_length := total - head_len
+	// max_body_bytes must hold on the STREAMED path too (mirrors the epoll and
+	// io_uring backends): the framed path 413s an oversized declared body, and a
+	// body large enough to stream must not bypass that limit just because it
+	// skips buffering. Close: the unread body makes the stream unrecoverable.
+	if limits.max_body_bytes > 0 && content_length > limits.max_body_bytes {
+		cs.write_buf << response.status_413_response
+		cs.close_after = true
+		unsafe {
+			cs.read_buf.len = 0
+		}
+		return 2
+	}
 	head := win_buf_view(cs.read_buf, 0, head_len)
 	mut event_loop := core.EventLoop{
 		client_fd: cs.fd

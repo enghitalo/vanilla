@@ -34,7 +34,7 @@ const assets = static_assets.new(static_assets.Config{
 // it hands the file to the worker to stream with sendfile(2) — no userspace
 // copy — and falls back to copying the bytes on backends that can't (TLS,
 // non-Linux). Use respond_into (not respond) to get that fast path.
-fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+fn handle(req []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
 	assets.respond_into(req, mut out) or {
 		out << response.tiny_bad_request_response
 		return .close
