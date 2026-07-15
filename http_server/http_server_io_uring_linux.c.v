@@ -29,7 +29,11 @@ fn C.sched_setaffinity(pid int, cpusetsize usize, mask &u64) int
 // (e.g. GitHub's hosted runners deny io_uring_setup under their seccomp policy,
 // which is why CI cannot run the io_uring end-to-end tests).
 pub fn iou_backend_available() bool {
-	return io_uring.io_uring_available()
+	// Probe one minimum-size ring PER worker the backend would spawn, held
+	// concurrently: hosts that allow io_uring but cap it (tight memlock/memcg,
+	// GitHub hosted runners) pass a single-ring probe and then kill worker N
+	// mid-startup — probing the real fan-out skips instead of aborting.
+	return io_uring.io_uring_available_for(max_thread_pool_size)
 }
 
 // Default ceiling on a single buffered request (headers+body) when the server
