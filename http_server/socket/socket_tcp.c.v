@@ -10,10 +10,9 @@ pub const max_connection_size = 1024
 // the same 65536.
 pub const listen_backlog = 65536
 
-#include <fcntl.h>
-#include <sys/socket.h>
-
 $if !windows {
+	#include <fcntl.h>
+	#include <sys/socket.h>
 	#include <netinet/in.h>
 	// superset of previous
 	#include <netinet/ip.h>
@@ -108,8 +107,7 @@ pub fn connect_to_server(port int) !int {
 pub fn set_blocking(fd int, blocking bool) {
 	$if windows {
 		mut mode := u32(if blocking { 0 } else { 1 })
-		if C.ioctlsocket(u64(fd), 0x8004667E, &mode) != 0 // FIONBIO
-		  {
+		if C.ioctlsocket(fd, C.FIONBIO, &mode) != 0 {
 			eprintln(@LOCATION + ' ioctlsocket failed: ${C.WSAGetLastError()}')
 		}
 	} $else {
@@ -127,10 +125,9 @@ pub fn set_blocking(fd int, blocking bool) {
 // immediately instead of waiting to coalesce. Standard for request/response
 // HTTP servers; the win shows on real networks (negligible on loopback).
 pub fn set_tcp_nodelay(fd int) {
-	$if !windows {
-		opt := 1
-		C.setsockopt(fd, C.IPPROTO_TCP, C.TCP_NODELAY, &opt, sizeof(opt))
-	}
+	// IPPROTO_TCP/TCP_NODELAY exist on every platform (winsock2.h on Windows).
+	opt := 1
+	C.setsockopt(fd, C.IPPROTO_TCP, C.TCP_NODELAY, &opt, sizeof(opt))
 }
 
 // set_nosigpipe stops send() to a dead peer from raising SIGPIPE on
@@ -150,9 +147,15 @@ pub fn accept_client(server_fd int) int {
 	$if linux {
 		return C.accept4(server_fd, C.NULL, C.NULL, C.SOCK_NONBLOCK)
 	} $else $if windows {
-		// Winsock SOCKET is u64; kernel handles are 32-bit-significant, so the
-		// int fd convention holds (INVALID_SOCKET truncates to -1).
-		fd := int(C.accept(u64(server_fd), C.NULL, C.NULL))
+		// Winsock SOCKET handles are 32-bit-significant, so the int fd
+		// convention holds (INVALID_SOCKET truncates to -1). The accepted
+		// socket is made NON-BLOCKING like on every other backend: overlapped
+		// (IOCP) operations are asynchronous regardless of the mode, and the
+		// mode makes the timeout sweep's synchronous courtesy 408 BEST-EFFORT —
+		// against a full kernel send buffer it fails with WSAEWOULDBLOCK
+		// instead of blocking the whole worker thread behind one stalled peer
+		// (the epoll backend gets the same safety from O_NONBLOCK + EAGAIN).
+		fd := C.accept(server_fd, C.NULL, C.NULL)
 		if fd >= 0 {
 			set_blocking(fd, false)
 		}
@@ -172,25 +175,23 @@ pub fn accept_client(server_fd int) int {
 // client IP (rate limiting, proxy trust) — it costs one getpeername syscall and
 // nothing otherwise, keeping the `fn ([]u8, int)` handler contract intact.
 pub fn peer_addr(fd int) string {
-	$if windows {
+	// One body for every platform: ws2_32 exports getpeername and inet_ntop
+	// with the same shapes the unix headers declare.
+	mut a := C.sockaddr_in{}
+	mut l := u32(sizeof(a))
+	if C.getpeername(fd, voidptr(&a), &l) != 0 {
 		return ''
-	} $else {
-		mut a := C.sockaddr_in{}
-		mut l := u32(sizeof(a))
-		if C.getpeername(fd, voidptr(&a), &l) != 0 {
-			return ''
-		}
-		mut buf := [46]u8{} // INET6_ADDRSTRLEN
-		if C.inet_ntop(C.AF_INET, voidptr(&a.sin_addr), &char(&buf[0]), 46) == 0 {
-			return ''
-		}
-		return unsafe { cstring_to_vstring(&char(&buf[0])) }
 	}
+	mut buf := [46]u8{} // INET6_ADDRSTRLEN
+	if C.inet_ntop(C.AF_INET, voidptr(&a.sin_addr), &char(&buf[0]), 46) == 0 {
+		return ''
+	}
+	return unsafe { cstring_to_vstring(&char(&buf[0])) }
 }
 
 pub fn close_socket(fd int) {
 	$if windows {
-		C.closesocket(u64(fd))
+		C.closesocket(fd)
 	} $else {
 		C.close(fd)
 	}

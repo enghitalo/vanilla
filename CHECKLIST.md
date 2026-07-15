@@ -60,22 +60,16 @@
   - Multiple parameters: `/users/:id/posts/:post_id`
   - 404 handling, query strings, method validation
 
-### 3. Windows IOCP Overlapped Structure
+### 3. Windows IOCP Overlapped Structure — ✅ RESOLVED
 - **File:** `http_server/http_server_windows.c.v`
 - **Issue:** `h_event` in OVERLAPPED structure never initialized
-- **Impact:** Undefined behavior on Windows async operations
-- **Priority:** 🟡 MEDIUM (Windows only)
-- **Effort:** 30 minutes
-- **Strategy:**
-  ```v
-  // Create event handle properly:
-  overlapped := C.OVERLAPPED{
-      h_event: C.CreateEventA(0, 0, 0, 0)
-  }
-  // Clean up event on connection close:
-  C.CloseHandle(overlapped.h_event)
-  ```
-- **Testing:** Test on Windows with multiple concurrent connections
+- **Resolution:** The IOCP backend was rewritten around completion-port
+  dispatch only — no event handles at all. Each connection embeds two
+  `WinOp` contexts (OVERLAPPED first field, zeroed before every post); a
+  completion's `lpOverlapped` pointer IS the op context, so `hEvent` is
+  never used and nothing leaks.
+- **Testing:** Covered by the backend behaviour suite
+  (`http_server/backend_behaviors_test.v`) running against IOCP on Windows.
 
 ### 4. Empty Kqueue Write Callback
 - **File:** `http_server/kqueue/kqueue_darwin.c.v:114`
@@ -570,19 +564,18 @@
 - **Dependencies:** #4 (fix write callback)
 - **Testing:** Test on macOS with persistent connections
 
-### 20. Complete IOCP Keep-Alive Implementation
+### 20. Complete IOCP Keep-Alive Implementation — ✅ RESOLVED
 - **File:** `http_server/http_server_windows.c.v`
 - **Issue:** Partial keep-alive implementation
-- **Impact:** Windows performance degraded
-- **Priority:** 🟡 MEDIUM
-- **Effort:** 3 hours
-- **Strategy:**
-  - Track connection state in IOCP context
-  - Re-post WSARecv after response
-  - Handle connection timeouts
-  - Proper cleanup of OVERLAPPED structures
-- **Dependencies:** #3 (fix overlapped)
-- **Testing:** Test on Windows with concurrent persistent connections
+- **Resolution:** Full rewrite: per-worker IOCP ports (shared-nothing),
+  persistent pooled per-connection buffers, request framing via
+  `request_parser`, HTTP/1.1 keep-alive + pipelining (batch answered in one
+  WSASend), large-body streaming drain (drain-then-respond), limits
+  (max_connections / 413 / 431), read+write timeout sweep, and graceful
+  shutdown through the shared `draining` flag.
+- **Testing:** `http_server/backend_behaviors_test.v` (pipelining, split
+  framing, max_connections, read timeout, graceful shutdown, 2 MiB upload
+  drain) passes on Windows; sustained-load run: ~287K req/s, 0 errors.
 
 ### 21. Add Timeout Support to Event Loops
 - **Files:** All backend files

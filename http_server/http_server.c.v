@@ -137,7 +137,7 @@ pub fn (mut s Server) test(requests [][]u8) ![][]u8 {
 			n := C.send(client_fd, &req[sent], req.len - sent, 0)
 			if n <= 0 {
 				println('[test] Failed to send request at byte ${sent}')
-				C.close(client_fd)
+				socket.close_socket(client_fd)
 				return error('Failed to send request')
 			}
 			sent += n
@@ -194,7 +194,7 @@ pub fn (mut s Server) test(requests [][]u8) ![][]u8 {
 		responses << buf.clone()
 	}
 
-	C.close(client_fd)
+	socket.close_socket(client_fd) // closesocket on Windows, close elsewhere
 	println('[test] Client closed, shutting down server socket...')
 	// Shutdown server after last response: stop every listener (the io_uring
 	// backend has one per worker), falling back to socket_fd if unset.
@@ -284,6 +284,9 @@ pub fn new_server(config ServerConfig) !Server {
 	$if windows {
 		if io_multiplexing != .iocp {
 			return error('Windows only supports IOCP backend')
+		}
+		if config.tls_config != unsafe { nil } {
+			return error('TLS is not yet supported on the Windows/IOCP backend')
 		}
 	} $else $if linux {
 		if io_multiplexing != .epoll && io_multiplexing != .io_uring {

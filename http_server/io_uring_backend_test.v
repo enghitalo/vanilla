@@ -1,3 +1,4 @@
+// vtest build: linux
 module http_server
 
 // End-to-end smoke test for the io_uring backend. It guards the rewrite that

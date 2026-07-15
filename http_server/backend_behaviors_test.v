@@ -416,6 +416,48 @@ fn test_iouring_half_close_after_request() ! {
 	}
 }
 
+// --- iocp (Windows) ---------------------------------------------------------
+// The same backend-agnostic checks, against the Windows IOCP backend. On
+// Windows `IOBackend` has the single member `iocp` (= 0), so the casts keep
+// this file compiling on every OS. (check_expect_100_continue is NOT invoked
+// here: the interim-100 prompt is implemented on epoll only so far.)
+
+fn test_iocp_large_upload_drain() ! {
+	$if windows {
+		check_large_upload_drain(unsafe { IOBackend(0) }, 8145)!
+	}
+}
+
+fn test_iocp_pipelining_and_framing() ! {
+	$if windows {
+		check_pipelining_and_framing(unsafe { IOBackend(0) }, 8141)!
+	}
+}
+
+fn test_iocp_max_connections() ! {
+	$if windows {
+		check_max_connections(unsafe { IOBackend(0) }, 8142)!
+	}
+}
+
+fn test_iocp_read_timeout() ! {
+	$if windows {
+		check_read_timeout(unsafe { IOBackend(0) }, 8143)!
+	}
+}
+
+fn test_iocp_graceful_shutdown() ! {
+	$if windows {
+		check_graceful_shutdown(unsafe { IOBackend(0) }, 8144)!
+	}
+}
+
+fn test_iocp_half_close_after_request() ! {
+	$if windows {
+		check_half_close_after_request(unsafe { IOBackend(0) }, 8146)!
+	}
+}
+
 // --- epoll (default backend) ----------------------------------------------
 
 fn test_epoll_large_upload_drain() ! {
