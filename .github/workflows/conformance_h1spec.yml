@@ -78,12 +78,16 @@ jobs:
         #     framing, max-connections, timeouts, graceful shutdown, #103 half-close.
         #   • server_test.v — default-backend routing / body delivery / .close path.
         #   • io_uring_*_test.v + the io_uring cases in backend_behaviors — these
-        #     SELF-SKIP at runtime (iou_backend_available()): GitHub's hosted runners
-        #     deny io_uring_setup under seccomp, so the probe returns false and the
-        #     io_uring servers are never started here. io_uring has its OWN read path
-        #     and is verified on kernels that permit it (locally / self-hosted).
+        #     SELF-SKIP at runtime (iou_backend_available()): VANILLA_NO_IOURING is
+        #     set below because hosted runners stopped hard-blocking io_uring_setup
+        #     and now CAP it instead (memcg/memlock) — probes race the real ring
+        #     creation across parallel test binaries, so capability is declared, not
+        #     probed, here. io_uring has its OWN read path and is verified on
+        #     kernels that permit it (locally / self-hosted).
         #   • tls/ (stub build, no -d vanilla_tls) and static_assets/ — socket-free,
         #     pass trivially.
+        env:
+          VANILLA_NO_IOURING: 1
         run: v -cc gcc -no-parallel test http_server/ tests/
 
       # --- Report: live-server probe with h1spec --------------------------------
