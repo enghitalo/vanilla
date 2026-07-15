@@ -680,6 +680,12 @@ pub fn run_iocp_backend(server Server, mut threads []thread) {
 		workers[i] = t
 	}
 	println('listening on http://localhost:${server.port}/ (IOCP)')
+	// Server is accepting (listeners bound, workers spawned); fire the one-shot
+	// lifecycle hook on this (main) thread right before we block in the accept
+	// loop. Same contract as the epoll/io_uring/kqueue backends.
+	if server.after_server_start != unsafe { nil } {
+		server.after_server_start()
+	}
 	win_accept_loop(server.socket_fd, ports, server.limits, server.active_conns, server.draining)
 	// The accept loop only returns when the listener is gone (graceful
 	// shutdown or test teardown). Wake every worker out of its blocking wait
@@ -712,4 +718,10 @@ fn run_selected_backend(server Server, mut threads []thread) {
 
 pub fn (mut server Server) run() {
 	run_selected_backend(server, mut server.threads)
+}
+
+// iou_backend_available: io_uring is Linux-only, so it is never available here.
+// See the Linux definition (http_server_io_uring_linux.c.v) for the real probe.
+pub fn iou_backend_available() bool {
+	return false
 }

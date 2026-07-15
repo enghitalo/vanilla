@@ -6,6 +6,16 @@ on:
   pull_request:
     branches: [ main ]
 
+# `brew update` re-syncs every tap on each job (~20s) and is a network flake
+# waiting to happen — a run died here on `curl: (28) Operation too slow`
+# fetching the formula index, in the `etag` job that needs no brew deps at all.
+# So: never `brew update`, disable brew's implicit auto-update/cleanup, and
+# install a formula only in the one job that actually needs it (below).
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+  HOMEBREW_NO_ANALYTICS: 1
+
 jobs:
   examples-building-and-testing:
     runs-on: macos-latest
@@ -27,6 +37,13 @@ jobs:
           - examples/sse/src
     steps:
       - uses: actions/checkout@v4
+      # Cache the V toolchain so setup-v restores a prebuilt compiler instead of
+      # rebuilding V from source (make fresh_vc/fresh_tcc, ~40s) on every job.
+      - name: Cache V toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/hostedtoolcache/v
+          key: v-toolchain-${{ runner.os }}-${{ runner.arch }}
       - name: Set up V
         uses: vlang/setup-v@v1.7
         with:
@@ -36,13 +53,18 @@ jobs:
         run: |
           rm -rf -v ./vlang || true
 
-      - name: Install dependencies
+      # brotli: compress.brotli dlopens /opt/homebrew/lib/libbrotli{enc,dec}.dylib,
+      # so the compression example exercises the `br` path for real. Only this job
+      # needs it — the others skip brew entirely.
+      - name: Install brotli (compression only)
+        if: matrix.folder == 'examples/compression/src'
         shell: bash
-        run: |
-            brew update
-            # brotli: compress.brotli dlopens /opt/homebrew/lib/libbrotli{enc,dec}.dylib,
-            # so the compression example exercises the `br` path for real.
-            brew install sqlite3 brotli
+        run: brew install brotli
+      # sqlite3: the hexagonal example links against it for its user repository.
+      - name: Install sqlite3 (hexagonal only)
+        if: matrix.folder == 'examples/hexagonal/src'
+        shell: bash
+        run: brew install sqlite3
       - name: Build ${{ matrix.folder }}
         shell: bash
         run: |

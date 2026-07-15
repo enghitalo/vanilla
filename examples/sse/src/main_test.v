@@ -1,8 +1,8 @@
 module main
 
-// Handler-state tests (run today) + an aspirational raw-streaming note below.
-// We can assert the KEY property of the rewrite without a socket: subscribing
-// registers an fd in epoll-resident state and spawns NO per-client thread.
+// Handler-state tests: assert the KEY property of the rewrite without a socket —
+// subscribing registers an fd in epoll-resident state and spawns NO per-client
+// thread. The real push fan-out is proven in server_end_to_end_test.v.
 import http_server.core
 
 // serve adapts the raw-handler contract (writes into a caller-owned buffer) to
@@ -60,15 +60,5 @@ fn test_malformed_request_errors() {
 	assert clients.snapshot().len == 0 // nothing was registered along the way
 }
 
-/*
-ASPIRATIONAL — Solution 2 (programmable client) + Solution 7 (concurrency).
-This is the test that proves real push fan-out; it needs the raw streaming
-client (Server.test() can't: it frames by Content-Length and would hang on an
-open stream). Run under V's thread sanitizer to catch races on the client set:
-
-  mut subs := []TestConn{}
-  for _ in 0 .. 50 { mut s := testkit.dial(port); s.send('GET /events HTTP/1.1\r\n\r\n')
-                     s.read_until('\r\n\r\n'); subs << s }          // 50 open streams
-  mut pub := testkit.dial(port); pub.send('POST /broadcast ... hello')
-  for mut s in subs { assert s.read_until('\n\n').contains('data: hello') }  // ALL receive
-*/
+// Real push fan-out (N live streams → POST /broadcast → all receive) is proven
+// end to end in server_end_to_end_test.v, on vtest (docs/VTEST.md).

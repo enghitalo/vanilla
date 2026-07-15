@@ -21,6 +21,29 @@ fn C.shutdown(sockfd int, how int) int
 fn C.memmove(dest voidptr, src voidptr, n usize) voidptr
 fn C.sched_setaffinity(pid int, cpusetsize usize, mask &u64) int
 
+// iou_backend_available reports whether the io_uring backend can actually run in
+// THIS process (kernel supports io_uring_setup AND it is not blocked by a
+// sandbox). Platform-dispatched: this Linux definition probes for real; the
+// darwin/windows facades return false. Exposed so callers — tests especially —
+// can skip the io_uring backend instead of aborting where it is unavailable
+// (e.g. GitHub's hosted runners deny io_uring_setup under their seccomp policy,
+// which is why CI cannot run the io_uring end-to-end tests).
+pub fn iou_backend_available() bool {
+	// VANILLA_NO_IOURING is the operator/CI kill-switch. A probe cannot be
+	// atomic with server startup: on a host that caps io_uring (memcg/memlock —
+	// GitHub hosted runners), concurrent processes race for ring capacity, so a
+	// probe that passes at time T does not stop worker N's ring from failing a
+	// moment later. Environments like that declare themselves unfit explicitly.
+	if os.getenv('VANILLA_NO_IOURING') != '' {
+		return false
+	}
+	// Probe one minimum-size ring PER worker the backend would spawn, held
+	// concurrently: hosts that allow io_uring but cap it pass a single-ring
+	// probe and then kill worker N mid-startup — probing the real fan-out
+	// skips instead of aborting.
+	return io_uring.io_uring_available_for(max_thread_pool_size)
+}
+
 // Default ceiling on a single buffered request (headers+body) when the server
 // configures no max_request_bytes. Mirrors the epoll backend (sm_max_request_bytes).
 const iou_max_request_bytes = 8 * 1024 * 1024
@@ -664,6 +687,11 @@ pub fn run_io_uring_backend(server Server, mut threads []thread) {
 	}
 
 	println('listening on http://localhost:${server.port}/ (io_uring)')
+	// Server is accepting (per-worker listeners + rings up); fire the one-shot
+	// lifecycle hook on this (main) thread right before we block.
+	if server.after_server_start != unsafe { nil } {
+		server.after_server_start()
+	}
 
 	// Keep main thread alive.
 	for {

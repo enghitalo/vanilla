@@ -1,3 +1,6 @@
+// vtest build: !windows
+// The pg_async module is a POSIX-socket native driver (conn.v includes
+// <sys/socket.h>/<netdb.h>), so every _test.v in it compiles on Linux/macOS only.
 module pg_async
 
 import os

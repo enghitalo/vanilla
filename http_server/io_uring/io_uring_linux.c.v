@@ -122,17 +122,13 @@ pub fn decode_ext_fd(data u64) int {
 
 // ==================== C Bindings ====================
 
-// io_uring structures and functions
-pub struct C.io_uring {
-	mu            int
-	cq            int
-	sq            int
-	ring_fd       int
-	compat        int
-	int_flags     u32
-	pad           [1]u8
-	enter_ring_fd int
-}
+// io_uring structures and functions.
+// Deliberately field-less: no member is ever accessed from V (the ring is only
+// passed by pointer to liburing), and V cgen emits designated initializers for
+// every V-declared field on `C.io_uring{}` literals — any field list that does
+// not match the compiling liburing header verbatim is a C error
+// (https://github.com/vlang/v/issues/27793).
+pub struct C.io_uring {}
 
 pub struct C.io_uring_sqe {}
 
@@ -529,6 +525,45 @@ pub fn prepare_poll(ring &C.io_uring, fd int, poll_mask u32) bool {
 	C.io_uring_sqe_set_data64(sqe, encode_user_data(op_poll, voidptr(usize(fd))))
 	return true
 }
+
+// io_uring_available reports whether this process can actually set up an io_uring
+// instance RIGHT NOW — see io_uring_available_for. Callers that will run the full
+// backend should prefer io_uring_available_for(n_workers).
+pub fn io_uring_available() bool {
+	return io_uring_available_for(1)
+}
+
+// io_uring_available_for reports whether this process can set up `workers`
+// io_uring instances CONCURRENTLY, right now, each at the smallest ring size the
+// worker init ladder accepts (256 entries, default flags — the ladder's last
+// resort, so success here means every worker will negotiate at least that). It
+// holds all probe rings at once before tearing them down because the failure
+// modes are cumulative, not per-ring: a false positive from a one-ring probe is
+// exactly how a constrained host (tight memlock/memcg, or a sandbox that allows
+// io_uring_setup but caps it — GitHub hosted runners started doing this) lets
+// worker 0 up but kills worker N mid-startup. Returns false when the kernel is
+// too old, the syscall is sandbox-blocked, or the host can't hold all rings.
+// Costs a handful of syscalls and leaks nothing; off the hot path.
+pub fn io_uring_available_for(workers int) bool {
+	n := if workers < 1 { 1 } else { workers }
+	mut rings := []C.io_uring{len: n}
+	mut ok := 0
+	for i in 0 .. n {
+		mut p := C.io_uring_params{}
+		if C.io_uring_queue_init_params(min_probe_ring_entries, unsafe { &rings[i] }, &p) != 0 {
+			break
+		}
+		ok++
+	}
+	for i in 0 .. ok {
+		C.io_uring_queue_exit(unsafe { &rings[i] })
+	}
+	return ok == n
+}
+
+// min_probe_ring_entries mirrors the smallest candidate in the backend's
+// iou_init_ring fallback ladder (http_server_io_uring_linux.c.v).
+pub const min_probe_ring_entries = u32(256)
 
 // ==================== Type Definitions ====================
 

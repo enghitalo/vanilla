@@ -260,7 +260,7 @@ fn process_events_tls(worker_id int, epoll_fd int, handler core.Handler, make_st
 	}
 }
 
-pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () voidptr, on_worker_start core.WorkerStartFn, port int, limits core.Limits, inflight []&core.Counter, active_conns &core.Counter, tls_config &tls.Config, mut threads []thread) {
+pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () voidptr, on_worker_start core.WorkerStartFn, after_server_start core.AfterStartFn, port int, limits core.Limits, inflight []&core.Counter, active_conns &core.Counter, tls_config &tls.Config, mut threads []thread) {
 	if socket_fd < 0 {
 		return
 	}
@@ -312,5 +312,10 @@ pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () v
 	}
 
 	println('listening on http://localhost:${port}/')
+	// Server is accepting (listener + workers up); fire the one-shot lifecycle hook
+	// on this (main) thread right before we block in the accept loop.
+	if after_server_start != unsafe { nil } {
+		after_server_start()
+	}
 	handle_accept_loop(socket_fd, main_epoll_fd, epoll_fds, limits, active_conns)
 }
