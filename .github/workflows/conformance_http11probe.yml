@@ -1,0 +1,137 @@
+name: HTTP/1.1 Conformance (Http11Probe, deep)
+
+# Deep, NON-BLOCKING conformance + hardening report using Http11Probe
+# (https://github.com/MDA2AV/Http11Probe): ~215 tests across Compliance,
+# Smuggling, MalformedInput, Normalization, Cookies, Capabilities, WebSockets.
+#
+# This complements the fast h1spec gate (conformance_h1spec.yml). It is heavier
+# (builds the .NET 10 CLI from source) and, like Http11Probe itself, never fails
+# the build — it always exits 0 and reports. It runs on push to main and on
+# manual dispatch, writing a scorecard to the Job Summary (and, on push, a PR
+# comment). The JSON artifact is uploaded for offline inspection.
+#
+# NOTE: Http11Probe drives the server over raw TCP and half-closes the client
+# write side for many tests. vanilla's backend currently drops the response on
+# that half-close (issue #103 — see examples/conformance/README.md), so a low
+# score here is expected until that is fixed — the report tracks the trend, it
+# does not gate.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'examples/conformance/**'
+      - 'http_server/**'
+      - '.github/workflows/conformance_http11probe.yml'
+  workflow_dispatch:
+    inputs:
+      category:
+        description: 'Restrict to one category (Compliance/Smuggling/MalformedInput/Normalization/Cookies/Capabilities). Blank = all.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: http11probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- Build & start the vanilla conformance server -------------------------
+      - name: Set up V
+        uses: vlang/setup-v@v1.7
+      - name: Remove Vlang folder to avoid conflicts
+        shell: bash
+        run: rm -rf -v ./vlang || true
+      - name: Install V build deps
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev linux-libc-dev
+      - name: Build examples/conformance
+        shell: bash
+        # `-cc gcc -no-parallel`: -no-parallel fixes the codegen data race
+        # vlang/v#27749 (unmangled `array_free` -> undefined reference at link),
+        # -cc gcc avoids the tcc<->gcc fallback race on liburing's <stdatomic.h>.
+        # Matches the example matrix and the h1spec conformance workflow.
+        run: v -cc gcc -no-parallel examples/conformance/src
+      - name: Start the conformance server
+        shell: bash
+        run: |
+          ./examples/conformance/src/src > /tmp/conf_server.log 2>&1 &
+          echo $! > /tmp/conf_server.pid
+          for _ in $(seq 1 40); do
+            if python3 -c "import socket;socket.create_connection(('127.0.0.1',3000),0.3)" 2>/dev/null; then break; fi
+            sleep 0.25
+          done
+          head -2 /tmp/conf_server.log || true
+
+      # --- Build & run Http11Probe ---------------------------------------------
+      - name: Set up .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Clone Http11Probe
+        shell: bash
+        run: git clone --depth 1 https://github.com/MDA2AV/Http11Probe /tmp/Http11Probe
+      - name: Run Http11Probe (report-only)
+        shell: bash
+        run: |
+          args=(--host localhost --port 3000 --timeout 5 --output /tmp/http11probe.json)
+          category="${{ github.event.inputs.category }}"
+          if [ -n "$category" ]; then
+            args+=(--category "$category")
+          fi
+          # Http11Probe always exits 0; it reports rather than gates.
+          dotnet run --project /tmp/Http11Probe/src/Http11Probe.Cli -c Release -- \
+            "${args[@]}" 2>&1 | tee /tmp/http11probe_console.txt || true
+      - name: Stop the server
+        if: always()
+        shell: bash
+        run: |
+          [ -f /tmp/conf_server.pid ] && kill "$(cat /tmp/conf_server.pid)" 2>/dev/null || true
+
+      # --- Report ---------------------------------------------------------------
+      - name: Build the scorecard
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## HTTP/1.1 Conformance — Http11Probe (deep, non-blocking)'
+            echo
+            if [ -f /tmp/http11probe.json ]; then
+              echo '| metric | count |'
+              echo '|---|---|'
+              jq -r '.summary | to_entries[]
+                       | select(.key | IN("total","scored","passed","failed","warnings","errors","skipped"))
+                       | "| \(.key) | \(.value) |"' /tmp/http11probe.json
+              echo
+              # Failing tests grouped by category.
+              fail_count=$(jq '[.results[] | select(.verdict=="Fail")] | length' /tmp/http11probe.json)
+              if [ "$fail_count" -gt 0 ]; then
+                echo "### ${fail_count} failing tests"
+                jq -r '[.results[] | select(.verdict=="Fail")] | group_by(.category)[]
+                         | "- **\(.[0].category)**: \(length)"' /tmp/http11probe.json
+              fi
+            else
+              echo '_Http11Probe produced no JSON — see the console log artifact._'
+            fi
+            echo
+            echo '> Non-blocking: Http11Probe always exits 0. Many failures are the backend half-close limitation (#103), not handler bugs.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload JSON + console artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: http11probe-report
+          path: |
+            /tmp/http11probe.json
+            /tmp/http11probe_console.txt
+          if-no-files-found: warn

@@ -1,0 +1,182 @@
+name: (Linux) HTTP/1.1 Conformance (h1spec)
+
+# Runs the h1spec RFC 9112/9110 conformance probe against the examples/conformance
+# server on the epoll backend. Two gates:
+#
+#   1. `v test` (handler / framer / backend behaviour): every conformance decision
+#      asserted deterministically without a socket — the primary source of truth.
+#   2. h1spec LIVE probe over TCP: fails the build on a 🔴 REAL conformance
+#      regression (a wrong answer). It does NOT gate on ⚪ blocked (no response),
+#      which can be transient socket timing on a noisy hosted runner or a tracked
+#      backend edge — the `v test` layer already covers those decisions. Promoted
+#      from report-only once the live epoll score reached 33/33 (#103 fixed).
+#      Always posts the colored scorecard to the Job Summary + the PR.
+#
+# h1spec: https://github.com/dropseed/h1spec (Python, plain-TCP, exit 0/1/2).
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'examples/conformance/**'
+      - 'http_server/**'
+      - '.github/workflows/conformance_h1spec.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'examples/conformance/**'
+      - 'http_server/**'
+      - '.github/workflows/conformance_h1spec.yml'
+
+permissions:
+  contents: write        # to refresh the auto-managed README status block on merge
+  pull-requests: write   # to post the conformance scorecard on the PR
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up V
+        uses: vlang/setup-v@v1.7
+      - name: Remove Vlang folder to avoid conflicts
+        shell: bash
+        run: |
+          rm -rf -v ./vlang || true
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev linux-libc-dev
+
+      # --- Hard gate: deterministic handler-level conformance assertions --------
+      # `-cc gcc -no-parallel`: the default build hits two V-toolchain flakes —
+      #   * -no-parallel fixes the codegen data race in vlang/v#27749: parallel
+      #     codegen races on g.table.find_sym() and emits builtin methods
+      #     unmangled (`array_free` vs `builtin__array_free`) → intermittent
+      #     `undefined reference` at link. It is a codegen bug, so it is NOT
+      #     C-compiler-dependent; only -no-parallel eliminates it.
+      #   * -cc gcc avoids the separate tcc<->gcc fallback race on liburing's
+      #     <stdatomic.h> (which every http_server build pulls in).
+      # Matches the example matrix workflows. -prod is not immune to #27749, so
+      # keep -no-parallel here even though these are debug builds.
+      - name: Build examples/conformance
+        shell: bash
+        run: v -cc gcc -no-parallel examples/conformance/src
+      - name: Unit tests (hard gate)
+        shell: bash
+        run: v -cc gcc -no-parallel test examples/conformance/src
+      - name: Request-parser framer tests (hard gate)
+        shell: bash
+        # Split-point framing tests incl. the CL+TE (#104), missing-chunk-terminator
+        # (#109) and chunk-size / Content-Length overflow regression cases — the
+        # last guard against a hostile request re-crashing a worker (SIGSEGV) or
+        # smuggling. Not covered by the example matrices; runs here on Linux (glibc
+        # provides memmem — this test can't build on macOS, a separate gotcha).
+        run: v -cc gcc -no-parallel test http_server/http1_1/request_parser/
+      - name: Backend behaviour tests (epoll, hard gate)
+        shell: bash
+        # Drives a real epoll server over raw sockets: pipelining, framing,
+        # max-connections, timeouts, graceful shutdown, and the #103
+        # half-close-then-respond regression test. The example matrices don't
+        # cover http_server/ tests, so run them here.
+        #
+        # -run-only test_epoll_*: the io_uring tests are EXCLUDED because GitHub's
+        # hosted runners block io_uring (io_uring_queue_init fails under their
+        # seccomp policy), so those servers can't start here. io_uring has its OWN
+        # read path and is verified locally on kernels that permit it.
+        run: v -cc gcc -no-parallel test -run-only 'test_epoll_*' http_server/backend_behaviors_test.v
+
+      # --- Report: live-server probe with h1spec --------------------------------
+      - name: Install h1spec (uv)
+        shell: bash
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Start the conformance server
+        shell: bash
+        run: |
+          ./examples/conformance/src/src > /tmp/conf_server.log 2>&1 &
+          echo $! > /tmp/conf_server.pid
+          # Wait for the listener to come up (max ~10s).
+          for i in $(seq 1 40); do
+            if python3 -c "import socket;socket.create_connection(('127.0.0.1',3000),0.3)" 2>/dev/null; then
+              echo "server up after $((i))*0.25s"; break
+            fi
+            sleep 0.25
+          done
+          head -2 /tmp/conf_server.log || true
+      - name: Run h1spec and build the colored scorecard (hard gate on 🔴)
+        id: h1spec
+        shell: bash
+        run: |
+          set +e
+          uvx --from git+https://github.com/dropseed/h1spec h1spec --strict localhost:3000 > /tmp/h1spec_raw.txt 2>&1
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # Render the per-check colored scorecard (🟢 pass / ⚪ blocked / 🔴 fail).
+          # The generator writes the markdown to stdout and a `SCORECARD_COUNTS
+          # pass=N fail=N blocked=N` tally to stderr.
+          sed -E 's/\x1b\[[0-9;]*m//g' /tmp/h1spec_raw.txt \
+            | python3 .github/scripts/conformance_scorecard.py "${{ github.sha }}" "$run_url" \
+            > /tmp/scorecard.md 2> /tmp/scorecard.err
+          cat /tmp/scorecard.md >> "$GITHUB_STEP_SUMMARY"
+          fail=$(sed -nE 's/.*fail=([0-9]+).*/\1/p' /tmp/scorecard.err)
+          fail=${fail:-0}
+          echo "fail_count=$fail" >> "$GITHUB_OUTPUT"
+          # GATE: fail the build ONLY on a 🔴 real conformance regression (a wrong
+          # answer). ⚪ blocked (no response — transient socket timing on a noisy
+          # runner, or a tracked backend edge) does NOT gate: the deterministic
+          # `v test` steps above already assert every handler decision without a
+          # socket. Promoted from report-only once the live epoll score reached 33/33.
+          if [ "$fail" -gt 0 ]; then
+            echo "::error::h1spec found $fail real conformance failure(s) — see the scorecard in the job summary."
+            exit 1
+          fi
+          echo "h1spec: no real conformance failures (🔴 = 0)."
+      - name: Stop the server
+        if: always()
+        shell: bash
+        run: |
+          [ -f /tmp/conf_server.pid ] && kill "$(cat /tmp/conf_server.pid)" 2>/dev/null || true
+      - name: Comment the scorecard on the PR
+        # always(): post the scorecard even when the gate failed, so the 🔴 that
+        # broke the build is visible on the PR (the gate step exits non-zero).
+        if: always() && github.event_name == 'pull_request'
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f /tmp/scorecard.md ]; then
+            gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/scorecard.md
+          fi
+
+      # --- On merge to main: rewrite the auto-managed README scorecard block -----
+      # Best-effort: never fail the job if the commit/push loses a race with
+      # another push to main (the block just refreshes on the next run).
+      - name: Update README scorecard (main only)
+        if: github.event_name == 'push'
+        continue-on-error: true
+        shell: bash
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # The push event checks out a detached SHA; work on a fresh main so the
+          # rewrite applies to the up-to-date README (avoids a stash/pop dance).
+          git fetch origin main
+          git checkout -B main origin/main
+          # Regenerate the scorecard against THIS main's HEAD sha (the fetched sha
+          # may differ from the run's sha if another push landed meanwhile).
+          # Splice /tmp/scorecard.md between the markers with awk (no language-in-YAML trap).
+          awk -v f=/tmp/scorecard.md '
+            /<!-- CONFORMANCE_SCORECARD:START -->/ { print; while ((getline l < f) > 0) print l; skip=1; next }
+            /<!-- CONFORMANCE_SCORECARD:END -->/   { skip=0 }
+            !skip { print }
+          ' README.md > README.md.tmp && mv README.md.tmp README.md
+          if git diff --quiet -- README.md; then
+            echo "Scorecard unchanged — nothing to commit."
+            exit 0
+          fi
+          git add README.md
+          git commit -m "docs(readme): refresh conformance scorecard [skip ci]"
+          git push origin main

@@ -17,7 +17,7 @@ A minimalist, high-performance HTTP server written in [V](https://vlang.io).
 - **Graceful Shutdown**: Drain in-flight requests on `SIGTERM`/`SIGINT` via `server.shutdown(grace_ms)`.
 - **Multiple Backends**: epoll, io_uring (Linux), kqueue (macOS), IOCP (Windows).
 - **One Handler Contract**: a single `handler` signature covers every use case, with every input as an explicit, self-describing parameter — append the response and return `.done`, suspend/resume on any fd (DB sockets, timers, upstream proxies) with `event_loop.watch_fd(...)` + `.suspend`, and reach lock-free per-worker state (e.g. a per-thread DB connection — no shared pool, no mutex) via the `worker_state` parameter.
-- **Compliant with HTTP standards**: Follows [RFC 9112](https://datatracker.ietf.org/doc/rfc9112/) and the [IANA Field Name Registry](https://www.iana.org/assignments/http-fields/http-fields.xhtml).
+- **Compliant with HTTP standards**: Follows [RFC 9112](https://datatracker.ietf.org/doc/rfc9112/) and the [IANA Field Name Registry](https://www.iana.org/assignments/http-fields/http-fields.xhtml). A dedicated [`examples/conformance/`](examples/conformance/) handler is probed in CI by [h1spec](https://github.com/dropseed/h1spec) and [Http11Probe](https://github.com/MDA2AV/Http11Probe) — see [Conformance Testing](#conformance-testing).
 
 ---
 
@@ -172,6 +172,7 @@ fn main() {
 | `examples/auth/` | Argon2id password hashing (RFC 9106), JWT with `exp` (HMAC-SHA256), API key auth |
 | `examples/chunked_streaming/` | Chunked transfer encoding |
 | `examples/compression/` | `Accept-Encoding` negotiation over precompressed brotli/zstd/gzip const responses |
+| `examples/conformance/` | RFC 9112/9110-conformant handler (rejects malformed requests with the right 4xx/5xx); probed in CI by h1spec + Http11Probe |
 | `examples/cookies_sessions/` | Cookie-based sessions |
 | `examples/cors/` | CORS preflight and origin allowlist |
 | `examples/csrf/` | CSRF token protection |
@@ -206,6 +207,104 @@ fn main() {
 ## Test Mode
 
 `Server.test` accepts an array of raw HTTP requests, sends them directly to the server socket, and processes each one sequentially. After receiving the response for the last request, the server shuts down automatically. This enables efficient end-to-end testing without running a persistent server process.
+
+---
+
+## Conformance Testing
+
+[`examples/conformance/`](examples/conformance/) is a handler written to be
+**correct under an HTTP/1.1 conformance probe** rather than to show off a feature:
+it calls the stdlib `request_parser.validate_http1()` plus the field-syntax and
+framing checks in [`validate.v`](examples/conformance/src/validate.v), so
+malformed requests get the RFC-mandated status instead of being served as valid.
+Two probes drive it from CI — [h1spec](https://github.com/dropseed/h1spec)
+(RFC 9112/9110, every push) and [Http11Probe](https://github.com/MDA2AV/Http11Probe)
+(~215 tests incl. request-smuggling, on merge).
+
+The scorecard below is the live `h1spec --strict` result, **rewritten by CI on
+every merge to `main`** — 🟢 passed, ⚪ blocked (no response — transient or a
+tracked backend edge), 🔴 a real conformance gap. Both the deterministic
+`v test examples/conformance/src` layer **and** the live `h1spec` probe gate the
+build: a merge is blocked by any handler-decision regression *and* by any 🔴 real
+conformance failure over a live socket. (⚪ blocked does not gate — it can be
+socket-timing noise on a hosted runner, and the `v test` layer already asserts
+those decisions.)
+
+<!-- CONFORMANCE_SCORECARD:START -->
+**Live `h1spec --strict` scorecard** — 33/33 of the checks that get an answer pass.
+
+🟢 **33 pass**
+
+> [!TIP]
+> **Fully conformant.** Every `h1spec --strict` check passes over a live socket — [#103](https://github.com/enghitalo/vanilla/issues/103) is fixed, so the probe is now a hard gate.
+
+**Request line — RFC 9112 §3**
+
+| | Check | |
+|:--:|---|---|
+| 🟢 | Simple GET accepted | pass |
+| 🟢 | POST with Content-Length body | pass |
+| 🟢 | OPTIONS * request-target accepted | pass |
+| 🟢 | Absolute-form request-target accepted | pass |
+| 🟢 | CONNECT authority-form accepted | pass |
+| 🟢 | Invalid HTTP version rejected | pass |
+| 🟢 | Malformed request line rejected | pass |
+
+**Headers — RFC 9112 §5**
+
+| | Check | |
+|:--:|---|---|
+| 🟢 | Missing Host header rejected | pass |
+| 🟢 | Duplicate Host rejected | pass |
+| 🟢 | Invalid Host value rejected | pass |
+| 🟢 | Invalid header name rejected | pass |
+| 🟢 | Obsolete line folding rejected | pass |
+| 🟢 | Space before colon rejected | pass |
+| 🟢 | Null byte in header rejected | pass |
+
+**Body — RFC 9112 §6–7**
+
+| | Check | |
+|:--:|---|---|
+| 🟢 | Chunked encoding accepted | pass |
+| 🟢 | Chunked + HTTP/1.0 rejected | pass |
+| 🟢 | Chunked + Content-Length rejected | pass |
+| 🟢 | Chunked + Content-Length closes connection | pass |
+| 🟢 | Unknown transfer-coding rejected | pass |
+| 🟢 | Chunked not-final coding rejected | pass |
+| 🟢 | Invalid Content-Length rejected | pass |
+| 🟢 | Conflicting Content-Length rejected | pass |
+| 🟢 | Invalid chunk-size rejected | pass |
+| 🟢 | Missing chunk terminator rejected | pass |
+| 🟢 | Expect: 100-continue handling | pass |
+
+**Response semantics — RFC 9110**
+
+| | Check | |
+|:--:|---|---|
+| 🟢 | HEAD response has no body | pass |
+| 🟢 | Error response is self-delimiting | pass |
+
+**Connection — RFC 9112 §9**
+
+| | Check | |
+|:--:|---|---|
+| 🟢 | Keep-alive default (HTTP/1.1) | pass |
+| 🟢 | Connection: close honored | pass |
+| 🟢 | HTTP/1.0 closes by default | pass |
+
+**Hardening — implementation-defined limits**
+
+| | Check | |
+|:--:|---|---|
+| 🟢 | Oversized request line | pass |
+| 🟢 | Header flood | pass |
+| 🟢 | Oversized header | pass |
+
+_h1spec `--strict`, live socket · commit `08458bd` · [run log](https://github.com/enghitalo/vanilla/actions/runs/29355805642) · regenerated by CI on every merge_
+<!-- CONFORMANCE_SCORECARD:END -->
+
+<sub>Live-probe pass/blocked split shifts run to run (the [#103](https://github.com/enghitalo/vanilla/issues/103) half-close teardown is timing-dependent); the `v test` gate and [`examples/conformance/README.md`](examples/conformance/README.md) are the stable references. Two tracked core gaps: [#103](https://github.com/enghitalo/vanilla/issues/103) (half-close) and [#104](https://github.com/enghitalo/vanilla/issues/104) (CL+TE framing).</sub>
 
 ---
 
@@ -273,8 +372,10 @@ See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark 
 - [ ] Per-worker `SO_REUSEPORT` accept on epoll — eliminate the single central accept thread (the io_uring backend already does per-worker accept; epoll still round-robins fds from one acceptor). Blocked by clean multi-server shutdown lifecycle.
 - [ ] Dynamic route matching (`/user/:id`) with a trie or radix tree
 - [ ] Query-string parser (`?key=value&…`) as a zero-copy slice view
-- [ ] Case-insensitive header lookup (IANA registry compliance)
-- [ ] `Host` header validation (RFC 9112 §7.2)
+- [x] Case-insensitive header lookup (IANA registry compliance) — `get_header_value_slice` / `count_header` fold ASCII case
+- [x] `Host` header validation (RFC 9112 §3.2) — `validate_http1()` (exactly-one Host); demonstrated end-to-end in `examples/conformance/`
+- [ ] Reject `Content-Length` + `Transfer-Encoding` at the framing layer ([#104](https://github.com/enghitalo/vanilla/issues/104)) — the smuggling case the conformance handler can't fix alone
+- [ ] Flush a queued response before tearing down a half-closed connection ([#103](https://github.com/enghitalo/vanilla/issues/103)) — unblocks the live h1spec/Http11Probe gate
 - [x] Request timeouts — `Limits.read_timeout_ms` (408) / `write_timeout_ms`, enforced by the per-worker deadline sweep
 - [x] Chunked transfer-encoding in the request parser (`frame_chunked_total`)
 - [ ] HTTP/2 support (multiplexing, HPACK, server push)

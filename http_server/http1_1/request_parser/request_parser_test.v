@@ -383,6 +383,86 @@ fn test_frame_chunked() {
 	assert frame_request_length(req[..req.len - 1])! == -1 // missing final CRLF
 }
 
+// issue #104: Content-Length + Transfer-Encoding together must be REJECTED at
+// the framing layer (400), not stall as "incomplete". The framer previously
+// committed to chunked framing and, with a non-chunked body, returned -1 forever
+// (stalling the connection until the read timeout) so the 400 never surfaced.
+fn test_frame_cl_te_conflict_rejected() {
+	// TE + CL with a plain (non-chunked) body: must be a hard 400, not -1.
+	req :=
+		'POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello'.bytes()
+	if _ := frame_request_length(req) {
+		assert false, 'CL+TE must be rejected (#104)'
+	} else {
+		assert err.code() == 400, 'CL+TE must map to 400, got ${err.code()}'
+	}
+	// Header order must not matter, and it must reject as soon as the blank line
+	// is seen — even before any body bytes arrive.
+	no_body :=
+		'POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n'.bytes()
+	if _ := frame_request_length(no_body) {
+		assert false, 'CL+TE (no body yet) must be rejected (#104)'
+	} else {
+		assert err.code() == 400
+	}
+}
+
+// issue #109: chunk-data MUST be followed by CRLF (RFC 9112 §7.1). A body where
+// the data runs straight into the next token (no terminator) must be rejected
+// 400, not framed to a bogus length that desyncs the connection.
+fn test_frame_chunked_missing_terminator() {
+	// `5\r\nhello0\r\n\r\n`: the 5-byte "hello" chunk is NOT followed by CRLF.
+	req :=
+		'POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello0\r\n\r\n'.bytes()
+	if _ := frame_request_length(req) {
+		assert false, 'chunk-data without a CRLF terminator must be rejected (#109)'
+	} else {
+		assert err.code() == 400, 'missing chunk terminator must map to 400, got ${err.code()}'
+	}
+	// A correctly-terminated single chunk still frames exactly.
+	ok :=
+		'POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n'.bytes()
+	assert frame_request_length(ok)! == ok.len
+}
+
+// Overflow hardening (found by adversarial review of the #109 change). V's `int`
+// is 32-bit signed; a chunk-size or Content-Length that overflows it must be
+// rejected 400, never wrapped: a wrap-to-negative chunk size made crlf_at go
+// out of bounds (segfault under -prod's @[direct_array_access]); a wrap-to-zero
+// (0x100000000) hijacked the size==0 terminating branch (smuggling desync); an
+// overflowing Content-Length framed a present header as absent.
+fn test_frame_chunk_size_overflow_negative() {
+	// 0x80000000 = 2^31 wraps to a negative int without the cap.
+	req := 'POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n80000000\r\nAB'.bytes()
+	if _ := frame_request_length(req) {
+		assert false, 'overflowing chunk size must be rejected, not wrapped'
+	} else {
+		assert err.code() == 400
+	}
+}
+
+fn test_frame_chunk_size_overflow_to_zero() {
+	// 0x100000000 = 2^32 wraps to EXACTLY 0 without the cap → must NOT be treated
+	// as a terminating chunk that frames the message early.
+	req :=
+		'POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n100000000\r\n\r\nSMUGGLED'.bytes()
+	if got := frame_request_length(req) {
+		assert false, 'chunk size 0x100000000 must be rejected, framed to ${got} (smuggling)'
+	} else {
+		assert err.code() == 400
+	}
+}
+
+fn test_frame_content_length_overflow() {
+	// 2147483648 = 2^31 overflows a 32-bit int; must be rejected, not wrapped < 0.
+	req := 'POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 2147483648\r\n\r\n'.bytes()
+	if _ := frame_request_length(req) {
+		assert false, 'overflowing Content-Length must be rejected'
+	} else {
+		assert err.code() == 400
+	}
+}
+
 fn test_frame_incomplete_request_line() {
 	assert frame_request_length('GET / HTT'.bytes())! == -1
 	assert frame_request_length('GET'.bytes())! == -1
@@ -393,6 +473,27 @@ fn test_frame_malformed_content_length() {
 	if _ := frame_request_length(req) {
 		assert false, 'non-numeric Content-Length must error'
 	}
+}
+
+// head_expects_100_continue detects `Expect: 100-continue` in a buffered head so
+// the backend can prompt the client (RFC 9110 §10.1.1). Case-insensitive on both
+// the field-name and the value; must not false-match another header or a request
+// that merely mentions the token in a different field.
+fn test_head_expects_100_continue() {
+	// Present (exact) — head_len is the whole buffer (head only, no body yet).
+	h1 := 'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n'.bytes()
+	assert head_expects_100_continue(h1, h1.len)
+	// Case-insensitive name + value.
+	h2 := 'POST / HTTP/1.1\r\nHost: x\r\nEXPECT: 100-Continue\r\n\r\n'.bytes()
+	assert head_expects_100_continue(h2, h2.len)
+	// Absent.
+	h3 := 'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n'.bytes()
+	assert !head_expects_100_continue(h3, h3.len)
+	// The token in a DIFFERENT header must not match.
+	h4 := 'POST / HTTP/1.1\r\nHost: x\r\nX-Note: 100-continue please\r\n\r\n'.bytes()
+	assert !head_expects_100_continue(h4, h4.len)
+	// A prefix that hasn't reached the header yet: no false positive.
+	assert !head_expects_100_continue('POST / HTTP/1.1\r\n'.bytes(), 17)
 }
 
 // Split-point fuzzing: the regression guard for the read-loop framing. For a

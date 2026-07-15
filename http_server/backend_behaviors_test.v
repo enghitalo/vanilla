@@ -326,6 +326,58 @@ fn check_large_upload_drain(backend IOBackend, port int) ! {
 	server.shutdown(500)
 }
 
+// check_half_close_after_request: a client that sends a complete request and
+// then half-closes its WRITE side (net.shutdown .write == shutdown(SHUT_WR))
+// must still receive the full response on the still-open read side (RFC 9112
+// §9.6). Regression test for issue #103, where the recv→0 (EOF) tore the
+// connection down before the already-computed response was flushed.
+fn check_half_close_after_request(backend IOBackend, port int) ! {
+	mut server := new_server(ServerConfig{
+		port:            port
+		io_multiplexing: backend
+		handler:         bb_ok_handler
+	})!
+	bb_start(mut server, port)
+
+	mut c := net.dial_tcp('127.0.0.1:${port}')!
+	c.write(bb_req.bytes())!
+	// Signal "done sending" WITHOUT closing the read side — the probe technique
+	// h1spec/Http11Probe use for most tests.
+	net.shutdown(c.sock.handle, how: .write)
+	got := read_until_count(mut c, 'HTTP/1.1 200', 1, 3000)
+	c.close() or {}
+	assert got == 1, '${backend}: response must arrive after a half-close (SHUT_WR), got ${got} — issue #103'
+
+	server.shutdown(500)
+}
+
+// check_expect_100_continue: a client that sends the head with
+// `Expect: 100-continue` and holds the body must be prompted with an interim
+// `100 Continue` (RFC 9110 §10.1.1); after it sends the body it gets the final
+// response. Without the prompt the server would wait for a body the client is
+// deliberately withholding, and the request would stall.
+fn check_expect_100_continue(backend IOBackend, port int) ! {
+	mut server := new_server(ServerConfig{
+		port:            port
+		io_multiplexing: backend
+		handler:         bb_ok_handler
+	})!
+	bb_start(mut server, port)
+
+	mut c := net.dial_tcp('127.0.0.1:${port}')!
+	// Head only — the 5-byte body is withheld until we see 100 Continue.
+	c.write('POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n'.bytes())!
+	got100 := read_until_count(mut c, 'HTTP/1.1 100', 1, 3000)
+	assert got100 == 1, '${backend}: Expect: 100-continue must be answered with an interim 100, got ${got100}'
+	// Now send the body; the final 200 must follow.
+	c.write('hello'.bytes())!
+	got200 := read_until_count(mut c, 'HTTP/1.1 200', 1, 3000)
+	c.close() or {}
+	assert got200 == 1, '${backend}: final response must follow the body after 100 Continue, got ${got200}'
+
+	server.shutdown(500)
+}
+
 // --- io_uring -------------------------------------------------------------
 
 fn test_iouring_large_upload_drain() ! {
@@ -358,10 +410,17 @@ fn test_iouring_graceful_shutdown() ! {
 	}
 }
 
+fn test_iouring_half_close_after_request() ! {
+	$if linux {
+		check_half_close_after_request(.io_uring, 8126)!
+	}
+}
+
 // --- iocp (Windows) ---------------------------------------------------------
 // The same backend-agnostic checks, against the Windows IOCP backend. On
 // Windows `IOBackend` has the single member `iocp` (= 0), so the casts keep
-// this file compiling on every OS.
+// this file compiling on every OS. (check_expect_100_continue is NOT invoked
+// here: the interim-100 prompt is implemented on epoll only so far.)
 
 fn test_iocp_large_upload_drain() ! {
 	$if windows {
@@ -390,6 +449,12 @@ fn test_iocp_read_timeout() ! {
 fn test_iocp_graceful_shutdown() ! {
 	$if windows {
 		check_graceful_shutdown(unsafe { IOBackend(0) }, 8144)!
+	}
+}
+
+fn test_iocp_half_close_after_request() ! {
+	$if windows {
+		check_half_close_after_request(unsafe { IOBackend(0) }, 8146)!
 	}
 }
 
@@ -422,5 +487,17 @@ fn test_epoll_read_timeout() ! {
 fn test_epoll_graceful_shutdown() ! {
 	$if linux {
 		check_graceful_shutdown(.epoll, 8134)!
+	}
+}
+
+fn test_epoll_half_close_after_request() ! {
+	$if linux {
+		check_half_close_after_request(.epoll, 8136)!
+	}
+}
+
+fn test_epoll_expect_100_continue() ! {
+	$if linux {
+		check_expect_100_continue(.epoll, 8137)!
 	}
 }

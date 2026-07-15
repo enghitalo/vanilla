@@ -39,6 +39,7 @@ jobs:
         folder:
           - examples/auth/src
           - examples/compression/src
+          - examples/conformance/src
           - examples/etag/src
           - examples/io_uring_demo/src
           - examples/json_api/src

@@ -436,6 +436,15 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 			return
 		}
 		if n == 0 {
+			// Client half-closed its write side (EOF). If a response is already
+			// pending, we still owe it on the open write half (RFC 9112 §9.6, issue
+			// #103): mark the connection to close once the buffer drains and break to
+			// the end-of-burst flush below, instead of dropping the reply. With no
+			// pending response there is nothing to send — close now.
+			if cs.body_drain == 0 && (cs.write_buf.len > cs.write_off || cs.file_remaining > 0) {
+				cs.close_after_flush = true
+				break
+			}
 			close_conn(epoll_fd, fd, active_conns, mut st)
 			return
 		}
@@ -456,6 +465,23 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 			}
 			return
 		}
+		// Expect: 100-continue (RFC 9110 §10.1.1). drain_requests left a partial
+		// request in read_buf (its body has not fully arrived); if its head is
+		// complete and asks for 100-continue, prompt the client ONCE by queueing an
+		// interim 100 for the end-of-burst flush. Gated so the hot path pays nothing:
+		// only reached when bytes remain buffered (drain consumed a complete request
+		// otherwise) and never re-scanned once sent_100 is set.
+		if cs.read_buf.len == 0 {
+			if cs.sent_100 {
+				cs.sent_100 = false // request fully consumed — re-arm for the next one
+			}
+		} else if !cs.sent_100 && cs.body_drain == 0 {
+			head_len := request_parser.frame_head_len(cs.read_buf)
+			if head_len > 0 && request_parser.head_expects_100_continue(cs.read_buf, head_len) {
+				cs.write_buf << response.status_100_continue_response
+				cs.sent_100 = true
+			}
+		}
 	}
 	// Read-timeout bookkeeping — BEFORE the flush below, which may close the
 	// connection (close_conn resets the state; arming after it would leak a
@@ -464,7 +490,20 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 	// Hold a streamed upload's response until its body is fully drained (body_drain
 	// == 0), so the client never sees the response mid-body (see start_body_drain).
 	if cs.body_drain == 0 && (cs.write_buf.len > cs.write_off || cs.file_remaining > 0) {
-		flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs)
+		if !flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
+			return
+		}
+		// Half-closed peer (issue #103): the reply is out (or, if the socket
+		// buffer was full, flush_batch parked it on EPOLLOUT and handle_writable_plain
+		// will finish + close via close_after_flush). If it drained synchronously
+		// here — write_off caught up and nothing parked — close now; the peer can
+		// send nothing more.
+		if cs.close_after_flush && cs.write_off >= cs.write_buf.len && cs.file_remaining <= 0 {
+			close_conn(epoll_fd, fd, active_conns, mut st)
+		}
+	} else if cs.close_after_flush {
+		// EOF with nothing left to flush (already sent) — close.
+		close_conn(epoll_fd, fd, active_conns, mut st)
 	}
 }
 

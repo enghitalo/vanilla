@@ -542,6 +542,15 @@ pub fn frame_request_length_lim_idx(buf []u8, max_header int, max_body int) int 
 			}
 			if buf[pos + 1] == lf_char {
 				body_start := pos + 2
+				// RFC 9112 §6.1: a message with BOTH Content-Length and
+				// Transfer-Encoding is the classic request-smuggling ambiguity and
+				// MUST be rejected. Do it here — the moment both are known — instead
+				// of letting the chunked framer run: with a non-chunked body it would
+				// return -1 (incomplete) forever and stall the connection until the
+				// read timeout, never surfacing the 400 (issue #104).
+				if chunked && content_length >= 0 {
+					return frame_err_malformed
+				}
 				if chunked {
 					// Cold path: the chunked framer still returns a Result; map it
 					// to a sentinel (the one boxing here is off the GET hot path).
@@ -677,6 +686,43 @@ pub fn frame_head_len(buf []u8) int {
 	return -1
 }
 
+// head_expects_100_continue reports whether the request head buffered in
+// `buf[..head_len]` carries `Expect: 100-continue` (RFC 9110 §10.1.1). Scans the
+// header lines for an `Expect` field whose value contains `100-continue`
+// (case-insensitive). Off the hot path: the backend calls this ONCE per
+// connection, and only while a body is still pending (a rare shape), so the walk
+// never touches the GET/no-body or fully-buffered request path.
+@[direct_array_access]
+pub fn head_expects_100_continue(buf []u8, head_len int) bool {
+	if head_len <= 0 || head_len > buf.len {
+		return false
+	}
+	// Skip the request line (first LF); Expect can only be a header field.
+	rl := find_byte_idx(&buf[0], head_len, lf_char)
+	if rl < 0 {
+		return false
+	}
+	mut pos := rl + 1
+	for pos < head_len {
+		if buf[pos] == cr_char {
+			break // blank line => end of headers
+		}
+		line_lf := find_byte_idx(&buf[pos], head_len - pos, lf_char)
+		if line_lf < 0 {
+			break
+		}
+		line_start := pos
+		line_len := line_lf - 1 // bytes before the CR
+		pos = line_start + line_lf + 1
+		if v := line_header_value(buf, line_start, line_len, 'Expect') {
+			if ci_contains(buf, v, '100-continue') {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // content_length returns the request's Content-Length header value, or -1 if it
 // is absent or unparseable. Lets a handler answer by declared length even when
 // the engine drained (never buffered) the body.
@@ -707,19 +753,34 @@ fn line_header_value(buf []u8, line_start int, line_len int, name string) ?Slice
 	}
 }
 
+// max_declared bounds a declared length (Content-Length or a chunk-size). A body
+// larger than this is refused outright — no legitimate request needs it, and it
+// keeps the value well inside a 32-bit `int` so the accumulator below can never
+// overflow into a negative/wrapped value (which previously produced a wrong
+// content_length, and for chunk-sizes an out-of-bounds index / smuggling desync).
+// ~1 GiB: comfortably above any real upload, far below int overflow.
+const max_declared = 1 << 30
+
 fn parse_content_length(buf []u8, s Slice) !int {
 	if s.len == 0 {
 		return error('empty Content-Length')
 	}
-	mut n := 0
+	// Accumulate in i64 so the arithmetic can't wrap a 32-bit int; reject over the
+	// cap. A 32-bit accumulator let a Content-Length of 2147483648 wrap to < 0, so
+	// a textually-present header framed as if absent. Checking i64 > cap each step
+	// also bounds a long digit run before it can grow without limit.
+	mut n := i64(0)
 	for i in s.start .. s.start + s.len {
 		c := buf[i]
 		if c < `0` || c > `9` {
 			return error('non-digit in Content-Length')
 		}
-		n = n * 10 + int(c - `0`)
+		n = n * 10 + i64(c - `0`)
+		if n > max_declared {
+			return error('Content-Length exceeds ${max_declared} bytes')
+		}
 	}
-	return n
+	return int(n)
 }
 
 // ci_contains reports whether the value slice contains `needle` (ASCII, CI).
@@ -761,7 +822,13 @@ fn frame_chunked_total(buf []u8, body_start int, max_body int) !int {
 		}
 		line_lf := find_byte(&buf[pos], buf.len - pos, lf_char) or { return -1 }
 		size_end := pos + line_lf // index of LF
-		mut size := 0
+		// Accumulate the chunk-size in i64 so the arithmetic itself can never wrap a
+		// 32-bit int, then reject anything over max_declared. A 32-bit accumulator
+		// let 0x80000000 wrap NEGATIVE (crlf_at went out of bounds → segfault under
+		// @[direct_array_access]) and 0x100000000 wrap to EXACTLY 0 (hijacking the
+		// size==0 terminating-chunk branch → smuggling desync). Checking i64 > cap
+		// after each digit catches both before size is ever used as an index.
+		mut size64 := i64(0)
 		mut j := pos
 		for j < size_end && buf[j] != cr_char {
 			c := buf[j]
@@ -769,9 +836,13 @@ fn frame_chunked_total(buf []u8, body_start int, max_body int) !int {
 				break // chunk extensions: ignore the rest of the size line
 			}
 			d := hex_digit(c) or { return error_with_code('invalid chunk size', 400) }
-			size = size * 16 + d
+			size64 = size64 * 16 + d
+			if size64 > max_declared {
+				return error_with_code('chunk size exceeds ${max_declared} bytes', 400)
+			}
 			j++
 		}
+		size := int(size64)
 		data_start := size_end + 1
 		if size == 0 {
 			// Terminating chunk; require the closing CRLF (trailers not modeled).
@@ -783,10 +854,19 @@ fn frame_chunked_total(buf []u8, body_start int, max_body int) !int {
 			}
 			return -1
 		}
-		next := data_start + size + 2 // data + trailing CRLF
-		if next > buf.len {
-			return -1
+		// chunk-data is followed by a REQUIRED CRLF (RFC 9112 §7.1). Verify those
+		// two bytes really are CR LF instead of assuming them — a body like
+		// `5\r\nhello0\r\n\r\n` (data runs straight into the next chunk-size, no
+		// terminator) would otherwise frame to a bogus length and desync the
+		// connection, serving the malformed request as if valid (issue #109).
+		crlf_at := data_start + size
+		if crlf_at + 1 >= buf.len {
+			return -1 // terminator not buffered yet
 		}
+		if buf[crlf_at] != cr_char || buf[crlf_at + 1] != lf_char {
+			return error_with_code('chunk-data not terminated by CRLF', 400)
+		}
+		next := crlf_at + 2 // data + trailing CRLF
 		pos = next
 	}
 	return -1

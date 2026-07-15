@@ -115,6 +115,18 @@ mut:
 	// (-1 = not parked). Lets the worker tear the watch down if the client
 	// closes mid-await.
 	awaiting_fd int = -1
+	// Set when the client half-closed its write side (recv → 0 / EOF) while a
+	// response was still pending: the request half is done, but we still owe the
+	// already-computed reply on the open write half (RFC 9112 §9.6). The flush
+	// paths close the connection once the buffer drains instead of keeping it
+	// alive — a half-closed peer will never send another request. See issue #103.
+	close_after_flush bool
+	// Set once a 100 Continue interim response has been sent for the request
+	// currently mid-read, so a peer that sends `Expect: 100-continue` and dribbles
+	// its body across edges is prompted exactly once (RFC 9110 §10.1.1). Reset per
+	// connection (a keep-alive connection may carry several Expect requests, but
+	// only one is ever mid-read at a time, and close_conn clears it).
+	sent_100 bool
 }
 
 // PlainState is the per-worker connection table. `parked` counts connections
@@ -363,6 +375,13 @@ fn handle_writable_plain(epoll_fd int, fd int, active_conns &core.Counter, mut s
 		cs.write_deadline = 0
 		st.parked--
 	}
+	// The client half-closed (issue #103) and this was the last, backpressured
+	// chunk of its reply — the response is now fully out, so close instead of
+	// keeping the connection alive for a request that can never come.
+	if cs.close_after_flush {
+		close_conn(epoll_fd, fd, active_conns, mut st)
+		return false
+	}
 	epoll.mod_fd_in_epoll(epoll_fd, fd, (u32(C.EPOLLIN) | u32(C.EPOLLET))) // stop watching writability
 	return true
 }
@@ -423,6 +442,8 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			cs.file_remaining = 0
 			cs.body_drain = 0
 			cs.awaiting_fd = -1
+			cs.close_after_flush = false
+			cs.sent_100 = false
 			st.conns[fd] = unsafe { nil }
 			st.free_conns << cs
 		}
