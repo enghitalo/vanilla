@@ -1,5 +1,6 @@
 module socket
 
+#flag windows -lws2_32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -22,35 +23,22 @@ pub fn cleanup_winsock() {
 	C.WSACleanup()
 }
 
-type SOCKET = u64
-
-pub const invalid_socket = u64(~u64(0))
 pub const socket_error = -1
 
+// C declarations follow the int-fd convention everywhere (Windows SOCKET
+// handles are 32-bit-significant, INVALID_SOCKET truncates to -1) — and they
+// MUST: V registers C function signatures program-wide (vlang/v#27791), so a
+// u64-typed duplicate of a function vlib also declares int-typed (vlib/net,
+// builtin) breaks vlib's own call sites in any program importing both.
+// Functions already declared by socket_tcp.c.v (bind/connect/listen/
+// setsockopt/htons/getpeername/inet_ntop/socket/accept) are NOT redeclared
+// here.
 fn C.WSAStartup(wVersionRequired u16, lpWSAData voidptr) int
 fn C.WSACleanup() int
 fn C.WSAGetLastError() int
-fn C.closesocket(s u64) int
-fn C.ioctlsocket(s u64, cmd int, argptr &u32) int
-fn C.WSAIoctl(s u64, dwIoControlCode u32, lpvInBuffer voidptr, cbInBuffer u32,
-	lpvOutBuffer voidptr, cbOutBuffer u32, lpcbBytesReturned &u32,
-	lpOverlapped voidptr, lpCompletionRoutine voidptr) int
-fn C.accept(s u64, addr voidptr, addrlen &int) u64
-fn C.bind(s u64, name voidptr, namelen int) int
-fn C.connect(s u64, name voidptr, namelen int) int
-fn C.listen(s u64, backlog int) int
-fn C.socket(socket_family int, socket_type int, protocol int) u64
-fn C.setsockopt(s u64, level int, optname int, optval voidptr, optlen int) int
-fn C.htons(hostshort u16) u16
+fn C.closesocket(s int) int
+fn C.ioctlsocket(s int, cmd int, argptr &u32) int
 fn C.htonl(hostlong u32) u32
-fn C.ntohs(netshort u16) u16
-fn C.ntohl(netlong u32) u32
-fn C.getaddrinfo(nodename &char, servname &char, hints voidptr, res &&voidptr) int
-fn C.freeaddrinfo(res voidptr)
-fn C.getnameinfo(sa voidptr, salen int, host &char, hostlen int,
-	serv &char, servlen int, flags int) int
-fn C.inet_pton(af int, src &char, dst voidptr) int
-fn C.inet_ntop(af int, src voidptr, dst &char, size int) &char
 
 // struct C.in_addr {
 // 	s_addr u32
@@ -71,24 +59,26 @@ pub fn connect_to_server_on_windows(port int) !int {
 	}
 
 	println('[client] Creating client socket...')
-	client_fd := int(C.socket(C.AF_INET, C.SOCK_STREAM, 0))
-	if client_fd == int(invalid_socket) {
+	client_fd := C.socket(C.AF_INET, C.SOCK_STREAM, 0)
+	if client_fd < 0 {
 		println('[client] Failed to create client socket')
 		return error('Failed to create client socket')
 	}
 
 	// sin_zero padding is left out of the literal: the shared C.sockaddr_in
 	// decl doesn't name it, and C zero-inits unspecified fields anyway.
+	// 127.0.0.1, not 0.0.0.0: unlike Linux, Winsock rejects INADDR_ANY as a
+	// connect() destination with WSAEADDRNOTAVAIL.
 	mut addr := C.sockaddr_in{
 		sin_family: u16(C.AF_INET)
 		sin_port:   C.htons(u16(port))
-		sin_addr:   C.in_addr{u32(0)} // 0.0.0.0
+		sin_addr:   C.in_addr{C.htonl(u32(0x7f000001))} // 127.0.0.1
 	}
 
-	println('[client] Connecting to server on port ${port} (0.0.0.0)...')
-	if C.connect(u64(client_fd), voidptr(&addr), sizeof(addr)) == socket_error {
+	println('[client] Connecting to server on port ${port} (127.0.0.1)...')
+	if C.connect(client_fd, voidptr(&addr), sizeof(addr)) == socket_error {
 		println('[client] Failed to connect to server: error=${C.WSAGetLastError()}')
-		C.closesocket(u64(client_fd))
+		C.closesocket(client_fd)
 		return error('Failed to connect to server')
 	}
 
@@ -102,16 +92,18 @@ pub fn create_server_socket_on_windows(port int) int {
 		exit(1)
 	}
 
-	server_fd := int(C.socket(C.AF_INET, C.SOCK_STREAM, 0))
-	if server_fd == int(invalid_socket) {
+	server_fd := C.socket(C.AF_INET, C.SOCK_STREAM, 0)
+	if server_fd < 0 {
 		eprintln(@LOCATION + ' Socket creation failed: ${C.WSAGetLastError()}')
 		exit(1)
 	}
 
-	set_blocking(server_fd, false)
+	// The listening socket stays BLOCKING on purpose: the IOCP backend accepts
+	// from a plain blocking accept() loop (no readiness reactor exists to poll
+	// it), and closesocket() on shutdown unblocks that loop with an error.
 
 	opt := 1
-	if C.setsockopt(u64(server_fd), C.SOL_SOCKET, C.SO_REUSEADDR, &opt, sizeof(opt)) == socket_error {
+	if C.setsockopt(server_fd, C.SOL_SOCKET, C.SO_REUSEADDR, &opt, sizeof(opt)) == socket_error {
 		eprintln(@LOCATION + ' setsockopt SO_REUSEADDR failed: ${C.WSAGetLastError()}')
 		close_socket(server_fd)
 		exit(1)
@@ -125,13 +117,13 @@ pub fn create_server_socket_on_windows(port int) int {
 		sin_addr:   C.in_addr{u32(C.INADDR_ANY)}
 	}
 
-	if C.bind(u64(server_fd), voidptr(&server_addr), sizeof(server_addr)) == socket_error {
+	if C.bind(server_fd, voidptr(&server_addr), sizeof(server_addr)) == socket_error {
 		eprintln(@LOCATION + ' Bind failed: ${C.WSAGetLastError()}')
 		close_socket(server_fd)
 		exit(1)
 	}
 
-	if C.listen(u64(server_fd), listen_backlog) == socket_error {
+	if C.listen(server_fd, listen_backlog) == socket_error {
 		eprintln(@LOCATION + ' Listen failed: ${C.WSAGetLastError()}')
 		close_socket(server_fd)
 		exit(1)
