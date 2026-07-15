@@ -14,9 +14,11 @@ import vtest
 fn test_async_pipe_end_to_end() ! {
 	out := vtest.drive(http_server.ServerConfig{ handler: handle }, [
 		vtest.Script{
-			rounds: [vtest.Round{
-				send: 'GET /async HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
-			}]
+			rounds: [
+				vtest.Round{
+					send: 'GET /async HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
+				},
+			]
 		},
 	])!
 	assert out.conns[0].connect_err == '', out.conns[0].connect_err

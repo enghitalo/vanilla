@@ -84,7 +84,7 @@ jobs:
         #     and is verified on kernels that permit it (locally / self-hosted).
         #   • tls/ (stub build, no -d vanilla_tls) and static_assets/ — socket-free,
         #     pass trivially.
-        run: v -cc gcc -no-parallel test http_server/
+        run: v -cc gcc -no-parallel test http_server/ tests/
 
       # --- Report: live-server probe with h1spec --------------------------------
       - name: Install h1spec (uv)

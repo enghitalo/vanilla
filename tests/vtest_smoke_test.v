@@ -44,8 +44,7 @@ fn pipeline(req []u8, n int) []u8 {
 // responses, spread across every worker. Position = identity, order per conn
 // guaranteed by HTTP/1.1.
 fn test_pipelined_storm() ! {
-	out := vtest.drive(http_server.ServerConfig{ handler: smoke_handler }, vtest.repeat(64,
-		vtest.Script{
+	out := vtest.drive(http_server.ServerConfig{ handler: smoke_handler }, vtest.repeat(64, vtest.Script{
 		rounds: [vtest.Round{
 			send: pipeline(get_root, 8)
 			want: 8

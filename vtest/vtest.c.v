@@ -20,7 +20,6 @@ module vtest
 // kernel socket buffers hold anything that arrives in between), which is what
 // makes multi-step choreography (SSE subscribe → publish → expect) work with
 // completion-based ordering instead of sleeps.
-
 import net
 import sync.stdatomic
 import http_server
@@ -81,7 +80,7 @@ pub:
 struct HConn {
 mut:
 	tcp         &net.TcpConn = unsafe { nil }
-	fd          int = -1
+	fd          int          = -1
 	rounds      []Round
 	then_eof    bool
 	shut_wr     bool
@@ -368,7 +367,7 @@ fn (mut c HConn) progress() {
 	}
 	if c.round >= c.rounds.len {
 		if c.then_eof && !c.eof {
-			return // completion belongs to the server's clock (reaper/close)
+			return
 		}
 		c.done = true
 		return
