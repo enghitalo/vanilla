@@ -191,6 +191,14 @@ pub fn peer_addr(fd int) string {
 	return unsafe { cstring_to_vstring(&char(&buf[0])) }
 }
 
+// shutdown_write half-closes a socket (SHUT_WR / SD_SEND = 1 on every platform):
+// our side stops sending, the peer reads EOF, but the socket still RECEIVES —
+// how a client says "request done, still waiting for the response" (RFC 9112
+// §9.6 tests exercise exactly this against the server).
+pub fn shutdown_write(fd int) {
+	C.shutdown(fd, 1)
+}
+
 // local_port returns the local port a bound socket actually holds — the kernel's
 // answer, not the requested one — or -1 on error. This is how `port: 0`
 // (ephemeral bind) is resolved to a real port. One body for every platform:
