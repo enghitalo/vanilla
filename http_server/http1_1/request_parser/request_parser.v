@@ -62,27 +62,47 @@ fn find_byte_idx(buf &u8, len int, c u8) int {
 	return int(unsafe { &u8(p) - buf })
 }
 
+// memmem_idx_portable is the Windows stand-in for GNU memmem (msvcrt has no
+// equivalent): memchr hops to each candidate first byte (memchr is the
+// optimized primitive msvcrt does have), then one memcmp confirms the needle.
+// Zero allocation; returns the match index or -1.
 @[inline]
-fn find_sequence(buf &u8, len int, bytes_ptr &u8, bytes_len int) !int {
-	unsafe {
-		p := C.memmem(buf, len, bytes_ptr, bytes_len)
-		if p == nil {
-			return error('bytes not found')
-		}
-		return int(&u8(p) - buf)
-	}
-}
-
-// find_sequence_idx is the no-Result hot-path twin of find_sequence: index of the
-// needle, or -1. Avoids the `!int` Result boxing on the per-request `\r\n\r\n`
-// scan (see find_byte_idx).
-@[inline]
-fn find_sequence_idx(buf &u8, len int, bytes_ptr &u8, bytes_len int) int {
-	p := unsafe { C.memmem(buf, len, bytes_ptr, bytes_len) }
-	if p == unsafe { nil } {
+fn memmem_idx_portable(buf &u8, len int, bytes_ptr &u8, bytes_len int) int {
+	if bytes_len <= 0 || len < bytes_len {
 		return -1
 	}
-	return int(unsafe { &u8(p) - buf })
+	first := unsafe { *bytes_ptr }
+	mut pos := 0
+	for pos <= len - bytes_len {
+		p := unsafe { C.memchr(buf + pos, first, usize(len - bytes_len - pos + 1)) }
+		if p == unsafe { nil } {
+			return -1
+		}
+		idx := int(unsafe { &u8(p) - buf })
+		if unsafe { C.memcmp(&u8(p), bytes_ptr, bytes_len) } == 0 {
+			return idx
+		}
+		pos = idx + 1
+	}
+	return -1
+}
+
+// find_sequence_idx returns the index of the needle, or -1 — a plain int, no
+// `!int` Result boxing on the per-request `\r\n\r\n` scan (see find_byte_idx).
+// libc memmem where it exists (AVX2-accelerated via glibc IFUNC); the
+// memchr+memcmp twin on Windows. (The old `find_sequence` Result wrapper had
+// no callers left and was removed.)
+@[inline]
+fn find_sequence_idx(buf &u8, len int, bytes_ptr &u8, bytes_len int) int {
+	$if windows {
+		return memmem_idx_portable(buf, len, bytes_ptr, bytes_len)
+	} $else {
+		p := unsafe { C.memmem(buf, len, bytes_ptr, bytes_len) }
+		if p == unsafe { nil } {
+			return -1
+		}
+		return int(unsafe { &u8(p) - buf })
+	}
 }
 
 // Fast comparison of two byte slices

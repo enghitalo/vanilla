@@ -1,3 +1,4 @@
+// vtest build: linux
 module backend_epoll
 
 import http_server.core

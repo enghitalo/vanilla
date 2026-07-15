@@ -1,166 +1,101 @@
 module iocp
 
+// Thin Win32 I/O-completion-port wrapper — the Windows counterpart of the
+// `epoll` / `kqueue` helper modules: just the typed syscall surface the
+// backend needs, no policy. The connection state machine lives in
+// http_server_windows.c.v.
+
+#flag windows -lws2_32
 #include <winsock2.h>
 #include <windows.h>
 #include <ws2tcpip.h>
 
+// Field names must match the Win32 definitions EXACTLY (V emits C struct
+// member access verbatim) — same declarations vlib/fasthttp uses.
 @[typedef]
 pub struct C.OVERLAPPED {
 pub mut:
-	internal      u64
-	internal_high u64
-	offset        u64
-	offset_high   u64
-	h_event       voidptr
-}
-
-pub struct CompletionKey {
-pub:
-	socket_handle int
-	operation     IOOperation
-	callback      fn (int, IOOperation, []u8) @[required] // socket_fd, operation, data
-}
-
-pub enum IOOperation {
-	accept
-	read
-	write
-	close
-}
-
-pub struct IOData {
-pub mut:
-	overlapped        C.OVERLAPPED
-	operation         IOOperation
-	socket_fd         int
-	wsabuf            C.WSABUF
-	buffer            []u8
-	bytes_transferred u32
+	Internal     usize
+	InternalHigh usize
+	Offset       u32
+	OffsetHigh   u32
+	hEvent       voidptr
 }
 
 @[typedef]
 pub struct C.WSABUF {
 pub mut:
 	len u32
-	buf &u8
+	buf &char = unsafe { nil }
 }
 
-fn C.CreateIoCompletionPort(file_handle voidptr, existing_completion_port voidptr,
-	completion_key u64, number_of_concurrent_threads u32) voidptr
+// CloseHandle and WSAGetLastError are NOT redeclared here — builtin declares
+// both (i32-typed), and V registers C signatures program-wide (vlang/v#27791),
+// so an incompatible duplicate would break other modules' call sites.
+fn C.CreateIoCompletionPort(file_handle voidptr, existing_completion_port voidptr, completion_key usize, number_of_concurrent_threads u32) voidptr
+fn C.GetQueuedCompletionStatus(completion_port voidptr, lp_number_of_bytes_transferred &u32, lp_completion_key &usize, lp_overlapped &&C.OVERLAPPED, dw_milliseconds u32) bool
+fn C.PostQueuedCompletionStatus(completion_port voidptr, dw_number_of_bytes_transferred u32, dw_completion_key usize, lp_overlapped &C.OVERLAPPED) bool
+fn C.WSARecv(s u64, lp_buffers &C.WSABUF, dw_buffer_count u32, lp_number_of_bytes_recvd &u32, lp_flags &u32, lp_overlapped &C.OVERLAPPED, lp_completion_routine voidptr) int
+fn C.WSASend(s u64, lp_buffers &C.WSABUF, dw_buffer_count u32, lp_number_of_bytes_sent &u32, dw_flags u32, lp_overlapped &C.OVERLAPPED, lp_completion_routine voidptr) int
 
-fn C.GetQueuedCompletionStatus(completion_port voidptr, lp_number_of_bytes_transferred &u32,
-	lp_completion_key &u64, lp_overlapped &&C.OVERLAPPED, dw_milliseconds u32) bool
+pub const infinite = u32(0xFFFFFFFF)
 
-fn C.PostQueuedCompletionStatus(completion_port voidptr, dw_number_of_bytes_transferred u32,
-	dw_completion_key u64, lp_overlapped &C.OVERLAPPED) bool
+// wsa_io_pending is WSA_IO_PENDING: an overlapped op was queued successfully
+// and will complete through the port — the NON-error "error" every post gets.
+pub const wsa_io_pending = 997
 
-fn C.CloseHandle(h_object voidptr) bool
-
-fn C.WSARecv(s u64, lp_buffers &C.WSABUF, dw_buffer_count u32, lp_number_of_bytes_recvd &u32,
-	lp_flags &u32, lp_overlapped &C.OVERLAPPED, lp_completion_routine voidptr) int
-
-fn C.WSASend(s u64, lp_buffers &C.WSABUF, dw_buffer_count u32, lp_number_of_bytes_sent &u32,
-	dw_flags u32, lp_overlapped &C.OVERLAPPED, lp_completion_routine voidptr) int
-
-fn C.AcceptEx(s_listen_socket u64, s_accept_socket u64, lp_output_buffer voidptr,
-	dw_receive_data_length u32, dw_local_address_length u32, dw_remote_address_length u32,
-	lpdw_bytes_received &u32, lp_overlapped &C.OVERLAPPED) bool
-
-fn C.GetAcceptExSockaddrs(lp_output_buffer voidptr, dw_receive_data_length u32,
-	dw_local_address_length u32, dw_remote_address_length u32,
-	local_sockaddr &&voidptr, local_sockaddr_length &int,
-	remote_sockaddr &&voidptr, remote_sockaddr_length &int)
-
-fn C.CreateEventA(lp_event_attributes voidptr, b_manual_reset bool, b_initial_state bool,
-	lp_name &u16) voidptr
-
-fn C.SetEvent(h_event voidptr) bool
-
-fn C.WaitForSingleObject(h_handle voidptr, dw_milliseconds u32) u32
-
-pub const infinity = u32(0xFFFFFFFF)
-
-pub struct IOCP {
-pub mut:
-	handle          voidptr
-	worker_threads  []thread
-	shutdown_signal voidptr
-}
-
+// create_iocp creates a completion port that wakes at most
+// `max_concurrent_threads` threads at once (1 for a single-worker port).
 pub fn create_iocp(max_concurrent_threads u32) !voidptr {
-	handle := C.CreateIoCompletionPort(unsafe { nil }, unsafe { nil }, 0, max_concurrent_threads)
+	handle := C.CreateIoCompletionPort(C.INVALID_HANDLE_VALUE, unsafe { nil }, 0,
+		max_concurrent_threads)
 	if handle == unsafe { nil } {
-		return error('Failed to create IOCP port')
+		return error('CreateIoCompletionPort failed: WSA ${C.WSAGetLastError()}')
 	}
 	return handle
 }
 
-pub fn associate_handle_with_iocp(iocp_handle voidptr, socket_handle int, completion_key u64) ! {
-	handle := C.CreateIoCompletionPort(voidptr(socket_handle), iocp_handle, completion_key, 0)
-	if handle == unsafe { nil } {
-		return error('Failed to associate socket with IOCP')
+// associate associates a socket with a port; every overlapped completion on
+// that socket is then delivered to the port along with `completion_key`.
+pub fn associate(iocp_handle voidptr, socket_fd int, completion_key usize) bool {
+	return C.CreateIoCompletionPort(voidptr(u64(socket_fd)), iocp_handle, completion_key, 0) != unsafe { nil }
+}
+
+// post delivers a manual completion (overlapped may be nil) — used for the
+// accept→worker connection hand-off and for shutdown wake-ups.
+pub fn post(iocp_handle voidptr, bytes u32, completion_key usize, overlapped &C.OVERLAPPED) bool {
+	return C.PostQueuedCompletionStatus(iocp_handle, bytes, completion_key, overlapped)
+}
+
+// wait dequeues ONE completion (or times out). Returns false on a failed /
+// aborted completion AND on timeout; timeout is the case where `overlapped`
+// stays nil.
+pub fn wait(iocp_handle voidptr, bytes &u32, completion_key &usize, overlapped &&C.OVERLAPPED, timeout_ms u32) bool {
+	return C.GetQueuedCompletionStatus(iocp_handle, bytes, completion_key, overlapped, timeout_ms)
+}
+
+// post_recv starts an overlapped receive. Returns true when the op is in
+// flight (its completion WILL arrive at the port — including immediate
+// success) and false on a hard post failure (nothing was queued).
+pub fn post_recv(socket_fd int, wsabuf &C.WSABUF, overlapped &C.OVERLAPPED) bool {
+	mut flags := u32(0)
+	mut recvd := u32(0)
+	if C.WSARecv(u64(socket_fd), wsabuf, 1, &recvd, &flags, overlapped, unsafe { nil }) != 0 {
+		return C.WSAGetLastError() == wsa_io_pending
 	}
+	return true
 }
 
-pub fn post_iocp_status(iocp_handle voidptr, bytes_transferred u32, completion_key u64,
-	overlapped &C.OVERLAPPED) bool {
-	return C.PostQueuedCompletionStatus(iocp_handle, bytes_transferred, completion_key, overlapped)
-}
-
-pub fn get_queued_completion_status(iocp_handle voidptr, bytes_transferred &u32,
-	completion_key &u64, overlapped &&C.OVERLAPPED, timeout_ms u32) bool {
-	return C.GetQueuedCompletionStatus(iocp_handle, bytes_transferred, completion_key, overlapped,
-		timeout_ms)
-}
-
-pub fn create_event() voidptr {
-	return C.CreateEventA(unsafe { nil }, false, false, unsafe { nil })
-}
-
-pub fn wait_for_single_object(handle voidptr, timeout_ms u32) u32 {
-	return C.WaitForSingleObject(handle, timeout_ms)
-}
-
-pub fn set_event(handle voidptr) bool {
-	return C.SetEvent(handle)
+// post_send starts an overlapped send. Same in-flight/failure contract as
+// post_recv.
+pub fn post_send(socket_fd int, wsabuf &C.WSABUF, overlapped &C.OVERLAPPED) bool {
+	mut sent := u32(0)
+	if C.WSASend(u64(socket_fd), wsabuf, 1, &sent, 0, overlapped, unsafe { nil }) != 0 {
+		return C.WSAGetLastError() == wsa_io_pending
+	}
+	return true
 }
 
 pub fn close_handle(handle voidptr) bool {
-	return C.CloseHandle(handle)
-}
-
-pub fn start_accept_ex(listen_socket int, accept_socket int, overlapped &C.OVERLAPPED) bool {
-	return C.AcceptEx(u64(listen_socket), u64(accept_socket), unsafe { nil }, 0,
-
-		sizeof(C.sockaddr_in) + 16, sizeof(C.sockaddr_in) + 16, unsafe { nil }, overlapped)
-}
-
-pub fn post_recv(socket_fd int, buffers &C.WSABUF, buffer_count u32, flags &u32,
-	overlapped &C.OVERLAPPED) int {
-	return C.WSARecv(u64(socket_fd), buffers, buffer_count, unsafe { nil }, flags, overlapped,
-		unsafe { nil })
-}
-
-pub fn post_send(socket_fd int, buffers &C.WSABUF, buffer_count u32, flags u32,
-	overlapped &C.OVERLAPPED) int {
-	return C.WSASend(u64(socket_fd), buffers, buffer_count, unsafe { nil }, flags, overlapped,
-		unsafe { nil })
-}
-
-pub fn create_io_data(socket_fd int, operation IOOperation, buffer_size int) &IOData {
-	mut io_data := &IOData{
-		socket_fd: socket_fd
-		operation: operation
-		buffer:    []u8{len: buffer_size}
-	}
-	io_data.wsabuf.len = u32(buffer_size)
-	io_data.wsabuf.buf = &io_data.buffer[0]
-	return io_data
-}
-
-pub fn free_io_data(io_data &IOData) {
-	unsafe {
-		io_data.buffer.free()
-		free(io_data)
-	}
+	return C.CloseHandle(handle) != 0
 }

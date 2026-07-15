@@ -25,7 +25,7 @@ per-request allocation.
 | Linux | `.epoll` *(default)* | one central acceptor → round-robins fds to per-worker epolls | `.suspend` watches, `make_state`, `on_worker_start`, TLS |
 | Linux | `.io_uring` | per-worker `SO_REUSEPORT` listener + multishot accept (kernel 5.19+) | `.suspend` watches (oneshot `IORING_OP_POLL_ADD`), `make_state` |
 | macOS | kqueue | per-worker | `.suspend` watches, `make_state` |
-| Windows | IOCP | per-worker | `.done`/`.close` only (`.suspend` closes), `make_state` |
+| Windows | IOCP | one central acceptor → round-robins fds to per-worker IOCP ports | `.done`/`.close` only (`.suspend` closes), `make_state`, limits + timeouts |
 
 ## The handler contract
 

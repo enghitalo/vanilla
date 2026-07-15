@@ -177,6 +177,9 @@ pub fn new_server(config ServerConfig) !Server {
 		if io_multiplexing != .iocp {
 			return error('Windows only supports IOCP backend')
 		}
+		if config.tls_config != unsafe { nil } {
+			return error('TLS is not yet supported on the Windows/IOCP backend')
+		}
 	} $else $if linux {
 		if io_multiplexing != .epoll && io_multiplexing != .io_uring {
 			return error('Linux only supports epoll and io_uring backends')

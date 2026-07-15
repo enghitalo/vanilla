@@ -7,19 +7,43 @@ on:
     branches: [ main ]
 
 jobs:
+  # The http_server module tests include the backend-agnostic behaviour suite
+  # (pipelining, split-request framing, max_connections, read timeout,
+  # graceful shutdown, large-upload streaming drain), which runs against the
+  # IOCP backend on Windows.
+  module-tests:
+    runs-on: windows-latest
+    name: http_server module tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up V
+        uses: vlang/setup-v@v1.7
+      - name: Remove Vlang folder to avoid conflicts
+        shell: bash
+        run: |
+          rm -rfv vlang || true
+      - name: Test http_server
+        shell: bash
+        run: |
+          v test http_server
+
   examples-building-and-testing:
     runs-on: windows-latest
     name: ${{ matrix.folder }}
     strategy:
       fail-fast: false # Continue other jobs if one fails
       matrix:
+        # examples/database and examples/hexagonal need libpq (and sqlite),
+        # which the Windows runner does not provide — they are covered by the
+        # Linux workflow.
         folder:
+          - examples/auth/src
           - examples/compression/src
           - examples/conformance/src
-          - examples/database/src
           - examples/etag/src
-          - examples/hexagonal/src
           - examples/io_uring_demo/src
+          - examples/json_api/src
+          - examples/middleware/src
           - examples/simple/src
           - examples/simple2/src
           - examples/sse/src
@@ -31,11 +55,6 @@ jobs:
         shell: bash
         run: |
           rm -rfv vlang || true
-
-      - name: Install dependencies
-        shell: bash
-        run: |
-          echo "No additional dependencies to install on Windows."
 
       - name: Build ${{ matrix.folder }}
         shell: bash
