@@ -33,8 +33,11 @@ module main
 //     no `.to_string()`, no `buf[a..b]` slice-marking.
 //
 // HOT PATH vs SLOW PATH — know which is which:
-//   - `/token` (login) is DELIBERATELY SLOW: argon2id dominates at ~200 ms.
-//     It blocks the worker, so RATE-LIMIT logins (see examples/rate_limit).
+//   - `/token` (login) is DELIBERATELY SLOW: argon2id dominates at ~200 ms. On
+//     epoll/kqueue it is OFFLOADED to a bounded per-worker pool and the
+//     connection is PARKED (.suspend), so the worker is never blocked by a
+//     login — a burst of logins cannot head-of-line-block other connections
+//     (see offload_nix.c.v). Still rate-limit logins to bound CPU/memory.
 //   - `/protected` and `/service` run PER REQUEST: static responses are
 //     consts; the only allocations left are the JWT format's own (split-free
 //     scan, but base64 decode must produce bytes).
@@ -173,6 +176,25 @@ const resp_401_bearer = 'HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r
 const resp_401 = 'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 const resp_404 = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 const resp_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: POST\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const resp_503 = 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+
+// write_token_200 mints a fresh JWT and appends the 200 response. Shared by the
+// synchronous /token path (fallback) and the async resume (token_done) so both
+// emit BYTE-IDENTICAL responses. Reads only consts + time; safe off any stack.
+fn write_token_200(mut out []u8) {
+	mut payload := strings.new_builder(48)
+	payload.write_string('{"sub":"')
+	payload.write_string(demo_user)
+	payload.write_string('","exp":')
+	payload.write_decimal(time.unix_now() + 3600)
+	payload.write_u8(`}`)
+	token := jwt_sign(payload)
+	ws(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ')
+	wi(mut out, token.len + 12) // len of {"token":""} wrapper = 12
+	ws(mut out, '\r\nConnection: keep-alive\r\n\r\n{"token":"')
+	out << token
+	ws(mut out, '"}')
+}
 
 // ---- zero-alloc append helpers (BEST_PRACTICES §3b) -------------------------
 // ws appends a string's bytes straight into `out` — no allocation.
@@ -229,15 +251,22 @@ fn bearer_token(req request_parser.HttpRequest) []u8 {
 	return unsafe { (&req.buffer[s.start + prefix.len]).vbytes(s.len - prefix.len) }
 }
 
-fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
+fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {
 		out << response.tiny_bad_request_response
 		return .close
 	}
 
 	if slice_eq(req.buffer, req.path, '/token') {
-		// LOGIN — the deliberately slow path (argon2id ~200 ms dominates);
-		// still zero concatenation: builder for the payload, ws/wi into out.
+		// LOGIN — argon2id (~200 ms, 64 MiB) verifies the password. It is CPU-heavy
+		// and memory-hard BY DESIGN, so running it INLINE would block this worker
+		// for the whole span, head-of-line-blocking every other connection the
+		// worker is holding. Instead we OFFLOAD the verify to a bounded per-worker
+		// pool and PARK the connection (.suspend): the worker keeps serving others
+		// and resumes this one (token_done) once the verdict is ready. Offload is
+		// epoll/kqueue only, and only when a pool exists — the unit test calls
+		// handle() with worker_state == nil and reads the response on return, so
+		// that path stays synchronous. See offload_nix.c.v.
 		if !slice_eq(req.buffer, req.method, 'POST') {
 			out << resp_405
 			return .done
@@ -247,22 +276,25 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 			return .done
 		}
 		password := unsafe { (&req.buffer[req.body.start]).vbytes(req.body.len) } // view
+		$if !windows {
+			if worker_state != unsafe { nil } {
+				// try_offload copies the password OUT of the request buffer (the
+				// view dies at .suspend), queues the verify on the pool, and arms
+				// the resume on the pipe the pool signals.
+				if try_offload(worker_state, password, mut event_loop) {
+					return .suspend
+				}
+				out << resp_503 // pool saturated: shed load rather than block the worker
+				return .done
+			}
+		}
+		// Fallback — synchronous verify on this worker. Taken by the unit test
+		// (nil worker_state) and by any backend with no watch reactor (IOCP).
 		if !verify_password(password, demo_password_phc) {
 			out << resp_401
 			return .done
 		}
-		mut payload := strings.new_builder(48)
-		payload.write_string('{"sub":"')
-		payload.write_string(demo_user)
-		payload.write_string('","exp":')
-		payload.write_decimal(time.unix_now() + 3600)
-		payload.write_u8(`}`)
-		token := jwt_sign(payload)
-		ws(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ')
-		wi(mut out, token.len + 12) // len of {"token":""} wrapper = 12
-		ws(mut out, '\r\nConnection: keep-alive\r\n\r\n{"token":"')
-		out << token
-		ws(mut out, '"}')
+		write_token_200(mut out)
 	} else if slice_eq(req.buffer, req.path, '/protected') {
 		// FAST PATH — per-request JWT check over a view, const responses.
 		if !jwt_verify(bearer_token(req)) {
@@ -305,6 +337,9 @@ fn main() {
 		port:            3000
 		io_multiplexing: backend
 		handler:         handle
+		// Per-worker argon2 offload pool (real on epoll/kqueue; a nil-returning
+		// stub on Windows, where handle falls back to a synchronous verify).
+		make_state: make_auth_state
 	})!
 	println('Auth demo on http://localhost:3000/')
 	println('  POST /token      (body = password)           -> JWT')
