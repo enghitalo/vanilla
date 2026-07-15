@@ -48,6 +48,8 @@ $if linux {
 	fn C.accept(sockfd int, address voidptr, addrlen &u32) int // Use voidptr here too
 }
 fn C.htons(__hostshort u16) u16
+fn C.ntohs(__netshort u16) u16
+fn C.getsockname(fd int, addr voidptr, addrlen &u32) int
 fn C.fcntl(fd int, cmd int, arg int) int
 fn C.connect(sockfd int, addr &C.sockaddr_in, addrlen u32) int
 
@@ -187,6 +189,20 @@ pub fn peer_addr(fd int) string {
 		return ''
 	}
 	return unsafe { cstring_to_vstring(&char(&buf[0])) }
+}
+
+// local_port returns the local port a bound socket actually holds — the kernel's
+// answer, not the requested one — or -1 on error. This is how `port: 0`
+// (ephemeral bind) is resolved to a real port. One body for every platform:
+// ws2_32 exports getsockname and ntohs with the same shapes the unix headers
+// declare (same convention as peer_addr above).
+pub fn local_port(fd int) int {
+	mut a := C.sockaddr_in{}
+	mut l := u32(sizeof(a))
+	if C.getsockname(fd, voidptr(&a), &l) != 0 {
+		return -1
+	}
+	return int(C.ntohs(a.sin_port))
 }
 
 pub fn close_socket(fd int) {

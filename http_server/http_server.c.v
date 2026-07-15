@@ -171,6 +171,19 @@ pub fn new_server(config ServerConfig) !Server {
 
 	socket_fd := socket.create_server_socket(config.port)
 
+	// port: 0 = ephemeral. The kernel picked a free port at bind time; read it back
+	// ONCE so (a) the io_uring per-worker listeners below bind the SAME port and
+	// actually join the SO_REUSEPORT group (each create_server_socket(0) would pick
+	// a DIFFERENT port), and (b) Server.port tells every consumer — tests dialing
+	// back, co-hosted servers, the startup banners — the real port.
+	mut port := config.port
+	if port == 0 {
+		port = socket.local_port(socket_fd)
+		if port <= 0 {
+			return error('could not resolve ephemeral port for listener fd ${socket_fd}')
+		}
+	}
+
 	// Set default backend based on OS
 	io_multiplexing := config.io_multiplexing
 	$if windows {
@@ -206,13 +219,13 @@ pub fn new_server(config ServerConfig) !Server {
 	$if linux {
 		if io_multiplexing == .io_uring {
 			for _ in 1 .. n_workers {
-				listener_fds << socket.create_server_socket(config.port)
+				listener_fds << socket.create_server_socket(port)
 			}
 		}
 	}
 
 	return Server{
-		port:               config.port
+		port:               port
 		io_multiplexing:    config.io_multiplexing
 		socket_fd:          socket_fd
 		handler:            config.handler
