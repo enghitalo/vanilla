@@ -542,6 +542,19 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 		return 0 // head not complete in the buffer yet — grow/recv more
 	}
 	content_length := total - head_len
+	// max_body_bytes must hold on the STREAMED path too: the framed path rejects
+	// an oversized declared body with 413 (frame_request_length_lim_idx), and a
+	// body large enough to stream must not BYPASS that limit just because it
+	// skips buffering. The length is declared in the head, so reject before the
+	// handler ever runs; close, since the unread body makes the request stream
+	// unrecoverable (same reason the framed 413 closes).
+	if limits.max_body_bytes > 0 && content_length > limits.max_body_bytes {
+		cs.write_buf << response.status_413_response
+		if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
+			close_conn(epoll_fd, fd, active_conns, mut st)
+		}
+		return 2
+	}
 	head := buf_view(cs.read_buf, 0, head_len)
 	mut event_loop := core.EventLoop{
 		client_fd: fd
