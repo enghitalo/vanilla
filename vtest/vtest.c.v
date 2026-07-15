@@ -24,7 +24,6 @@ module vtest
 import net
 import sync.stdatomic
 import http_server
-import http_server.core
 import http_server.socket
 
 fn C.send(__fd int, __buf voidptr, __n usize, __flags int) int
