@@ -122,17 +122,13 @@ pub fn decode_ext_fd(data u64) int {
 
 // ==================== C Bindings ====================
 
-// io_uring structures and functions
-pub struct C.io_uring {
-	mu            int
-	cq            int
-	sq            int
-	ring_fd       int
-	compat        int
-	int_flags     u32
-	pad           [1]u8
-	enter_ring_fd int
-}
+// io_uring structures and functions.
+// Deliberately field-less: no member is ever accessed from V (the ring is only
+// passed by pointer to liburing), and V cgen emits designated initializers for
+// every V-declared field on `C.io_uring{}` literals — any field list that does
+// not match the compiling liburing header verbatim is a C error
+// (https://github.com/vlang/v/issues/27793).
+pub struct C.io_uring {}
 
 pub struct C.io_uring_sqe {}
 
