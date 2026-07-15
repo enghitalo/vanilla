@@ -21,7 +21,7 @@ const home_response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCont
 
 // route decodes the request and dispatches by path. This is the handler passed to
 // chain(); the global decorators wrap it.
-fn route(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+fn route(req_buffer []u8, mut out []u8, _client_fdclient_fd int, _worker_stateworker_state voidptr, mut _event_loopevent_loop core.EventLoop) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {
 		out << response.tiny_bad_request_response
 		return .close

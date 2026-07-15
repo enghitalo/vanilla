@@ -94,7 +94,7 @@ fn route_len(buf []u8, path request_parser.Slice) int {
 	return path.len
 }
 
-fn handle(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop, mut viewers Viewers) core.Step {
+fn handle(req_buffer []u8, mut out []u8, client_fd int, _worker_stateworker_state voidptr, mut _event_loopevent_loop core.EventLoop, mut viewers Viewers) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {
 		out << bad_request
 		return .done

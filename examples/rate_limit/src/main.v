@@ -141,7 +141,7 @@ fn client_key(req request_parser.HttpRequest, fd int) string {
 	return 'unknown'
 }
 
-fn handle(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop, mut limiter Limiter) core.Step {
+fn handle(req_buffer []u8, mut out []u8, client_fd int, _worker_stateworker_state voidptr, mut _event_loopevent_loop core.EventLoop, mut limiter Limiter) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {
 		out << response.tiny_bad_request_response
 		return .close

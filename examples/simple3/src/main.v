@@ -13,7 +13,7 @@ pub mut:
 	db_pool ?pool.ConnectionPool
 }
 
-fn (app App) handle_request(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+fn (app App) handle_request(req_buffer []u8, mut out []u8, _client_fdclient_fd int, _worker_stateworker_state voidptr, mut _event_loopevent_loop core.EventLoop) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {
 		out << response.tiny_bad_request_response
 		return .close

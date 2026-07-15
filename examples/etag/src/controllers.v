@@ -44,11 +44,11 @@ fn etag_matches(buf []u8, s request_parser.Slice, etag [16]u8) bool {
 	return true
 }
 
-fn home_controller(params []string) ![]u8 {
+fn home_controller(_paramsparams []string) ![]u8 {
 	return http_ok_response
 }
 
-fn get_users_controller(params []string) ![]u8 {
+fn get_users_controller(_paramsparams []string) ![]u8 {
 	return http_ok_response
 }
 
@@ -79,6 +79,6 @@ fn get_user_controller(params []string, req request_parser.HttpRequest) ![]u8 {
 	return sb
 }
 
-fn create_user_controller(params []string) ![]u8 {
+fn create_user_controller(_paramsparams []string) ![]u8 {
 	return http_created_response
 }
