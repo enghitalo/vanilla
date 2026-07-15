@@ -22,7 +22,7 @@ fn C.close(fd int) int
 const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
 
 // handle parks /async on a pipe read-end and answers everything else immediately.
-fn handle(req []u8, mut out []u8, _client_fdclient_fd int, _worker_stateworker_state voidptr, mut event_loop core.EventLoop) core.Step {
+fn handle(req []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if req.bytestr().contains('/async') {
 		mut fds := [2]int{}
 		if C.pipe(unsafe { &fds[0] }) != 0 {
@@ -44,7 +44,7 @@ fn handle(req []u8, mut out []u8, _client_fdclient_fd int, _worker_stateworker_s
 
 // pipe_done runs when the pipe read-end is readable: drain it, close it (the
 // request owns the watched fd), and answer.
-fn pipe_done(mut out []u8, ready_fd int, _ready_fd_errorready_fd_error bool, _watch_payloadwatch_payload voidptr, _worker_stateworker_state voidptr, mut _event_loopevent_loop core.EventLoop) core.Step {
+fn pipe_done(mut out []u8, ready_fd int, _ready_fd_error bool, _watch_payload voidptr, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
 	C.read(ready_fd, &tmp[0], 8)
 	C.close(ready_fd)

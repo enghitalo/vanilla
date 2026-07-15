@@ -7,11 +7,11 @@ const http_ok_response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nC
 
 const http_created_response = 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 
-fn home_controller(_paramsparams []string) ![]u8 {
+fn home_controller(_params []string) ![]u8 {
 	return http_ok_response
 }
 
-fn get_users_controller(_paramsparams []string) ![]u8 {
+fn get_users_controller(_params []string) ![]u8 {
 	return http_ok_response
 }
 
@@ -38,6 +38,6 @@ fn get_user_controller(params []string) ![]u8 {
 	return sb
 }
 
-fn create_user_controller(_paramsparams []string) ![]u8 {
+fn create_user_controller(_params []string) ![]u8 {
 	return http_created_response
 }
