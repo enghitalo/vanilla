@@ -31,7 +31,7 @@ import server
 import core
 import http1.request_parser
 import http1.response
-import json
+import json2
 import strconv
 import strings
 
@@ -104,7 +104,7 @@ fn create_user_json(req request_parser.HttpRequest, mut out []u8) {
 	// measures its input with strlen). A `tos` view into the request buffer is
 	// not NUL-terminated at the body's end and would over-read past it.
 	body := req.body.to_string(req.buffer)
-	input := json.decode(CreateUser, body) or {
+	input := json2.decode[CreateUser](body) or {
 		out << resp_400_invalid_json
 		return
 	}
@@ -120,7 +120,7 @@ fn create_user_json(req request_parser.HttpRequest, mut out []u8) {
 	// json.encode escapes the user-controlled strings (§8 — never reflect raw
 	// input); ws/wi frame it straight into `out` — no intermediate response
 	// buffer, no `${}`.
-	payload := json.encode(created)
+	payload := json2.encode(created, escape_unicode: true)
 	ws(mut out, 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: ')
 	wi(mut out, payload.len)
 	ws(mut out, '\r\nConnection: keep-alive\r\n\r\n')
@@ -377,9 +377,9 @@ fn upload(req request_parser.HttpRequest, mut out []u8) {
 		}
 		first = false
 		summary.write_string('{"field":')
-		summary.write_string(json.encode(p.name))
+		summary.write_string(json2.encode(p.name, escape_unicode: true))
 		summary.write_string(',"filename":')
-		summary.write_string(json.encode(p.filename))
+		summary.write_string(json2.encode(p.filename, escape_unicode: true))
 		summary.write_string(',"size":')
 		summary.write_decimal(p.content.len)
 		summary.write_u8(`}`)

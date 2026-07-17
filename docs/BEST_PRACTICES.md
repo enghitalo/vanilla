@@ -431,8 +431,11 @@ Performance claims must be measured, not assumed.
 
 ---
 
-## Checklist before opening a PR
+## Checklist before every commit / PR
 
+- [ ] **`v fmt -w .` run from the repo root, changes included.** CI gates on
+      `v fmt -verify .` with the latest V — an unformatted file (even a
+      pre-existing one a newer formatter rule now rewrites) fails the whole PR.
 - [ ] Handler stays a pure `(request) -> response` function.
 - [ ] No new hidden I/O or shared mutable state on the hot path.
 - [ ] Responses carry correct framing and standard headers.

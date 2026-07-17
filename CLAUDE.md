@@ -54,6 +54,14 @@ registry.
 - **Benchmark before/after** any perf change with `-prod`; verify thread safety
   with `valgrind --tool=helgrind`.
 
+## Before every commit
+
+**Always run `v fmt -w .` from the repo root and include the resulting changes
+in the commit.** CI gates merges on `v fmt -verify .`
+(`.github/workflows/pretty_fmt_checker.yml`) using the latest V, so an
+unformatted file — even a pre-existing one that a newer V formatter rule now
+rewrites — fails the whole PR.
+
 ## Commit messages
 
 Write git commit messages in **English**.
