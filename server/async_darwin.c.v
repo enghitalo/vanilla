@@ -13,8 +13,8 @@
 module server
 
 import kqueue
-import http1.request
-import http1.response
+import http1_1.request
+import http1_1.response
 import core
 
 // KqConn holds a connection's response buffer across a suspend (the macOS sync

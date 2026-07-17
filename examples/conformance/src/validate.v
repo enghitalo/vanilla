@@ -1,6 +1,6 @@
 module main
 
-import http1.request_parser
+import http1_1.request_parser
 
 // Conformance verdict for a decoded request. The handler maps each to a status.
 enum Verdict {

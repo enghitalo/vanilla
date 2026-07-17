@@ -25,7 +25,7 @@
 ## 🔴 Critical Bugs (MUST FIX)
 
 ### 1. Undefined Function `vmemcmp`
-- **File:** `http1/request_parser/request_parser.v:203`
+- **File:** `http1_1/request_parser/request_parser.v:203`
 - **Issue:** Function `vmemcmp` is not defined, should be `C.memcmp`
 - **Impact:** Header parsing will fail at runtime
 - **Priority:** 🔴 CRITICAL
@@ -94,7 +94,7 @@
 ## 🏗️ Foundation Improvements (ENABLES EVERYTHING)
 
 ### 5. Implement Query String Parsing
-- **File:** `http1/request_parser/request_parser.v:234-237`
+- **File:** `http1_1/request_parser/request_parser.v:234-237`
 - **Issue:** `get_query()` returns empty Slice
 - **Impact:** Cannot parse URL query parameters
 - **Priority:** 🔴 HIGH
@@ -122,7 +122,7 @@
 - **Testing:** Test with `?foo=bar&baz=qux`, `?empty=`, `?novalue`
 
 ### 6. Add Standard HTTP Status Codes
-- **File:** `http1/response/response.c.v`
+- **File:** `http1_1/response/response.c.v`
 - **Issue:** Only 400 and 444 status codes exist
 - **Impact:** Cannot send proper status responses
 - **Priority:** 🔴 HIGH
@@ -149,7 +149,7 @@
 - **Testing:** Use in examples and verify with curl -v
 
 ### 7. Build Response Helper Function
-- **File:** `http1/response/response.c.v`
+- **File:** `http1_1/response/response.c.v`
 - **Issue:** No standardized way to build responses
 - **Impact:** Each example builds responses differently
 - **Priority:** 🔴 HIGH
@@ -183,7 +183,7 @@
 - **Testing:** Build various response types
 
 ### 8. Header Injection Utility
-- **File:** `http1/response/response.c.v`
+- **File:** `http1_1/response/response.c.v`
 - **Issue:** No way to add headers to existing responses (needed for middleware)
 - **Impact:** Cannot implement middleware that adds headers
 - **Priority:** 🔴 HIGH
@@ -218,7 +218,7 @@
 ## 🌐 HTTP Protocol Features
 
 ### 9. HTTP Method Validation
-- **File:** `http1/request_parser/request_parser.v`
+- **File:** `http1_1/request_parser/request_parser.v`
 - **Issue:** Any method string is accepted
 - **Impact:** Server accepts invalid methods
 - **Priority:** 🟡 MEDIUM
@@ -239,7 +239,7 @@
 - **Testing:** Test with valid and invalid methods
 
 ### 10. HTTP/1.1 Host Header Requirement
-- **File:** `http1/request_parser/request_parser.v`
+- **File:** `http1_1/request_parser/request_parser.v`
 - **Issue:** Host header not validated (required by RFC 9112 for HTTP/1.1)
 - **Impact:** Non-compliant with HTTP/1.1 spec
 - **Priority:** 🟡 MEDIUM
@@ -261,7 +261,7 @@
 - **Testing:** Test with and without Host header
 
 ### 11. Case-Insensitive Header Names
-- **File:** `http1/request_parser/request_parser.v:189-232`
+- **File:** `http1_1/request_parser/request_parser.v:189-232`
 - **Issue:** Header matching is case-sensitive
 - **Impact:** Headers like "content-type" vs "Content-Type" fail to match
 - **Priority:** 🟡 MEDIUM
@@ -283,7 +283,7 @@
 - **Testing:** Test with various case combinations
 
 ### 12. Content-Length Validation
-- **File:** `http1/request_parser/request_parser.v`
+- **File:** `http1_1/request_parser/request_parser.v`
 - **Issue:** No validation that body matches Content-Length
 - **Impact:** Can accept malformed requests
 - **Priority:** 🟡 MEDIUM
@@ -305,7 +305,7 @@
 - **Testing:** Test with matching and mismatched Content-Length
 
 ### 13. Cookie Parsing
-- **File:** `http1/request_parser/request_parser.v`
+- **File:** `http1_1/request_parser/request_parser.v`
 - **Issue:** No helper to parse Cookie header
 - **Impact:** Cannot easily access cookies
 - **Priority:** 🟢 LOW
@@ -331,7 +331,7 @@
 - **Testing:** Test with multiple cookies
 
 ### 14. Transfer-Encoding: chunked Support
-- **File:** `http1/request_parser/request_parser.v`
+- **File:** `http1_1/request_parser/request_parser.v`
 - **Issue:** Chunked encoding not supported
 - **Impact:** Cannot handle chunked request bodies
 - **Priority:** 🟢 LOW
@@ -474,7 +474,7 @@
 - **Testing:** Create simple HTTPS server, test with curl --cacert
 
 ### 16. Integrate TLS into Request/Response Handlers
-- **Files:** `http1/request/request.c.v`, `http1/response/response.c.v`
+- **Files:** `http1_1/request/request.c.v`, `http1_1/response/response.c.v`
 - **Issue:** No TLS-aware read/write functions
 - **Impact:** Cannot use TLS with existing infrastructure
 - **Priority:** 🔴 HIGH
@@ -698,7 +698,7 @@
 - **Testing:** Run all tests after each refactoring
 
 ### 25. Add Bounds Checking in Parsers
-- **File:** `http1/request_parser/request_parser.v`
+- **File:** `http1_1/request_parser/request_parser.v`
 - **Issue:** Some loops lack bounds checks
 - **Impact:** Buffer overflow risk
 - **Priority:** 🟡 MEDIUM
@@ -810,7 +810,7 @@
 - **Testing:** Benchmark before/after
 
 ### 30. Optimize Header Parsing with Lookup Table
-- **File:** `http1/request_parser/request_parser.v`
+- **File:** `http1_1/request_parser/request_parser.v`
 - **Issue:** Linear search for headers
 - **Impact:** Slow for common headers
 - **Priority:** 🟢 LOW
@@ -1032,7 +1032,7 @@
   5. **Create main handler** (`main.v`):
      ```v
      import server
-     import http1.request_parser
+     import http1_1.request_parser
 
      const public_dir = './public'
 
@@ -1116,8 +1116,8 @@
      ```v
      import server
      import tls
-     import http1.request_parser
-     import http1.response
+     import http1_1.request_parser
+     import http1_1.response
      import os
 
      fn main() {
@@ -1302,7 +1302,7 @@
 ## 🧪 Testing & Validation
 
 ### 38. Request Parser Edge Case Tests
-- **File:** `http1/request_parser/request_parser_test.v`
+- **File:** `http1_1/request_parser/request_parser_test.v`
 - **Issue:** Limited test coverage
 - **Priority:** 🟡 MEDIUM
 - **Effort:** 2 hours

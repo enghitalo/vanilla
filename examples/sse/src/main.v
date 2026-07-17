@@ -19,7 +19,7 @@ module main
 // This is the shape SSE should always take on top of a non-blocking core.
 import server
 import core
-import http1.request_parser
+import http1_1.request_parser
 import sync
 import time
 

@@ -22,8 +22,8 @@ module main
 // WORKS TODAY.
 import server
 import core
-import http1.request_parser
-import http1.response
+import http1_1.request_parser
+import http1_1.response
 
 const security_headers = 'Strict-Transport-Security: max-age=63072000; includeSubDomains\r\n' +
 	"Content-Security-Policy: default-src 'self'\r\n" + 'X-Content-Type-Options: nosniff\r\n' +

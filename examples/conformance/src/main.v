@@ -12,7 +12,7 @@ module main
 
 import server
 import core
-import http1.request_parser
+import http1_1.request_parser
 
 // handle_request appends the complete raw HTTP response to `out` and returns a
 // Step: `.done` keeps the connection alive, `.close` flushes then closes it. It

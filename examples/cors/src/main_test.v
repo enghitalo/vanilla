@@ -1,7 +1,7 @@
 module main
 
 import core
-import http1.response
+import http1_1.response
 
 // SOLUTION: pure handler test — works today.
 // CORS is header logic, so the preflight + allowlist behavior is fully unit

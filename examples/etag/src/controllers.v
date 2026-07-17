@@ -1,8 +1,8 @@
 module main
 
 import strings
-import http1.response
-import http1.request_parser
+import http1_1.response
+import http1_1.request_parser
 import hash as wyhash
 
 const not_modified_response = 'HTTP/1.1 304 Not Modified\r\n\r\n'.bytes()

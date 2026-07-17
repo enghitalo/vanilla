@@ -116,7 +116,7 @@ build responses.
 
 If a response never changes, build it **once at compile time** and send the
 bytes directly. This is exactly what the core does
-([response.c.v](../http1/response/response.c.v)):
+([response.c.v](../http1_1/response/response.c.v)):
 
 ```v
 const status_413_response = 'HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()

@@ -1,7 +1,8 @@
 #!/usr/bin/env sh
 # migrate_imports.sh — rewrite pre-restructure vanilla imports to the new
-# module tree (GitHub issue #122: http_server → server, http1_1 → http1,
-# protocol-neutral modules hoisted to top level).
+# module tree (GitHub issue #122: http_server → server, and the
+# protocol-neutral modules — core, socket, tls, the event wrappers, http1_1,
+# static_assets, testkit — hoisted from under http_server/ to the top level).
 #
 # Usage: scripts/migrate_imports.sh [dir]
 #   dir — root of the consumer project to rewrite (default: .)
@@ -21,15 +22,14 @@ dir=${1:-.}
 
 find "$dir" -name '*.v' -not -path '*/.git/*' -print0 | xargs -0 -r perl -pi -e '
     # --- import lines, longest paths first ---------------------------------
-    s/^(import\s+)vanilla\.http_server\.http1_1\./${1}vanilla.http1./;
+    s/^(import\s+)vanilla\.http_server\.http1_1\./${1}vanilla.http1_1./;
     s/^(import\s+)vanilla\.http_server\.backend_epoll\b/${1}vanilla.server.backend_epoll/;
     s/^(import\s+)vanilla\.http_server\.(core|socket|epoll|tls|static_assets|testkit|io_uring|kqueue|iocp)\b/${1}vanilla.$2/;
     s/^(import\s+)vanilla\.http_server\b/${1}vanilla.server/;
-    s/^(import\s+)http_server\.http1_1\./${1}http1./;
+    s/^(import\s+)http_server\.http1_1\./${1}http1_1./;
     s/^(import\s+)http_server\.backend_epoll\b/${1}server.backend_epoll/;
     s/^(import\s+)http_server\.(core|socket|epoll|tls|static_assets|testkit|io_uring|kqueue|iocp)\b/${1}$2/;
     s/^(import\s+)http_server\b/${1}server/;
-    s/^(import\s+)http1_1\./${1}http1./;
     # --- qualified call sites (leaf names are unchanged, so only the bare
     #     module rename needs call-site rewrites: http_server.X -> server.X) --
     s/\bhttp_server\./server./g;

@@ -16,7 +16,7 @@ import and says nothing). Protocols are **siblings** over one engine:
 | `tls/` | mbedTLS split (`-d vanilla_tls` / stub) — server today, client transports later. |
 | `epoll/` `io_uring/` `kqueue/` `iocp/` | thin per-mechanism syscall wrappers, one dir-module each (`poll/` joins them as the portability floor). |
 | `server/` | **the engine** (was `http_server`) — one engine, N protocols via conn modes. OS facades (`server_linux.c.v`, …) select an `IOBackend`; `server/backend_*` are the reactors. |
-| `http1/` | HTTP/1.1 codecs (was `http1_1`): `request_parser/`, `response/`; a `client/` codec lands here later. |
+| `http1_1/` | HTTP/1.1 codecs: `request_parser/`, `response/`; a `client/` codec lands here later. |
 | `http2/` | frame/hpack/types grow in place: stream mux, flow control, settings. |
 | `websocket/` `grpc/` | reserved siblings (RFC 6455 framing; length-prefixed messages over http2). Future protocols land as siblings here. |
 | `static_assets/` `testkit/` `vtest/` `pg_async/` | reusable handler-side and test-side modules. |
@@ -26,18 +26,18 @@ import and says nothing). Protocols are **siblings** over one engine:
 
 ```
 core  <-  { socket, transport, tls, epoll, io_uring, kqueue, iocp, poll,
-            http1, http2, websocket, grpc, static_assets }  <-  server
+            http1_1, http2, websocket, grpc, static_assets }  <-  server
 ```
 
 - Protocol modules import protocol modules **downward only**
-  (websocket→http1, grpc→http2).
+  (websocket→http1_1, grpc→http2).
 - Protocol modules may import `transport/`, `socket/`, `tls/` (downward) —
   that is what lets a protocol ship its **client** codec without a second
   framework growing under `transport/`.
 - Wrappers, `socket/`, `transport/`, `tls/` **never** import a protocol.
 - `server/backend_*` is the **single sanctioned meeting point** of platform +
   transport + protocol — by design, because that is the measured fast path
-  (reactors keep their *direct* imports of the http1 codec; no interface
+  (reactors keep their *direct* imports of the http1_1 codec; no interface
   dispatch is introduced anywhere).
 
 CI enforces this with `scripts/check_dependency_direction.sh` (grep over
@@ -57,10 +57,10 @@ Arch targets (ARM, RISC-V) are cross-compilation concerns (`-arch` + cross
 ## Imports
 
 Use fully-qualified imports from the repo root (`import server.backend_epoll`,
-`import http1.response`) — never sibling-relative paths — so any future
+`import http1_1.response`) — never sibling-relative paths — so any future
 directory move stays a pure import-line change (CONTRIBUTING.md).
 
 External consumers use the `vanilla.` prefix (`import vanilla.server`,
-`import vanilla.core`, `import vanilla.http1.response`); CI compiles a
+`import vanilla.core`, `import vanilla.http1_1.response`); CI compiles a
 synthetic external consumer to keep that convention honest. Migrating a
 pre-restructure consumer: `scripts/migrate_imports.sh`.

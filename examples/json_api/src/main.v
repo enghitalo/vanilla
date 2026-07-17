@@ -29,8 +29,8 @@ module main
 //     input through strlen — see create_user_json.
 import server
 import core
-import http1.request_parser
-import http1.response
+import http1_1.request_parser
+import http1_1.response
 import json2
 import strconv
 import strings

@@ -32,8 +32,8 @@ module main
 // WORKS TODAY: pure header logic.
 import server
 import core
-import http1.request_parser
-import http1.response
+import http1_1.request_parser
+import http1_1.response
 
 const allowed_origins = ['https://app.example.com', 'http://localhost:5173']
 

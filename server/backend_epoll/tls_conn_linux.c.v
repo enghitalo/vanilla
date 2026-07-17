@@ -18,7 +18,7 @@ module backend_epoll
 // single-threaded, so no locking.
 import core
 import epoll
-import http1.request_parser
+import http1_1.request_parser
 import tls
 import sync.stdatomic
 import time

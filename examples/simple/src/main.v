@@ -2,8 +2,8 @@ module main
 
 import server
 import core
-import http1.response
-import http1.request_parser
+import http1_1.response
+import http1_1.request_parser
 
 fn handle_request(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {

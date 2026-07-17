@@ -1,6 +1,6 @@
 module main
 
-import http1.request_parser { HttpRequest, Slice }
+import http1_1.request_parser { HttpRequest, Slice }
 
 // Responses for the routing outcomes that aren't a handler hit. Built once.
 const bad_request_response = 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()

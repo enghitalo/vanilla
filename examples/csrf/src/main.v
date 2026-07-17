@@ -37,8 +37,8 @@ module main
 // WORKS TODAY: crypto.rand + crypto.hmac.equal + header/cookie plumbing.
 import server
 import core
-import http1.request_parser
-import http1.response
+import http1_1.request_parser
+import http1_1.response
 import crypto.rand
 import crypto.hmac
 

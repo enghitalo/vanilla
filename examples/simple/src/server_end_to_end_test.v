@@ -1,7 +1,7 @@
 module main
 
 import server
-import http1.response
+import http1_1.response
 import vtest
 
 // End-to-end cases against the example's real handler, on vtest (docs/VTEST.md):

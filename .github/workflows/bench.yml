@@ -23,7 +23,7 @@ on:
     paths:
       - 'server/**'
       - 'core/**'
-      - 'http1/**'
+      - 'http1_1/**'
       - 'http2/**'
       - 'socket/**'
       - 'epoll/**'

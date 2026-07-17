@@ -9,7 +9,7 @@
 ## Module imports
 
 Use **fully-qualified imports** from the repo root (`import server.backend_epoll`,
-`import http1.response`) — never sibling-relative paths — so any future directory
+`import http1_1.response`) — never sibling-relative paths — so any future directory
 move stays a pure import-line change. The one-direction dependency rule between
 modules is documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 enforced by CI.

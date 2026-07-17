@@ -21,7 +21,7 @@ on:
       - 'examples/conformance/**'
       - 'server/**'
       - 'core/**'
-      - 'http1/**'
+      - 'http1_1/**'
       - 'http2/**'
       - 'socket/**'
       - 'epoll/**'
@@ -40,7 +40,7 @@ on:
       - 'examples/conformance/**'
       - 'server/**'
       - 'core/**'
-      - 'http1/**'
+      - 'http1_1/**'
       - 'http2/**'
       - 'socket/**'
       - 'epoll/**'
@@ -96,7 +96,7 @@ jobs:
         shell: bash
         # Runs EVERY library module test tree (recursive) — the example
         # matrices do not cover module tests, so they run here on Linux:
-        #   • http1/request_parser/ — split-point framing incl. CL+TE (#104),
+        #   • http1_1/request_parser/ — split-point framing incl. CL+TE (#104),
         #     missing-chunk-terminator (#109) and chunk-size / Content-Length
         #     overflow regressions (guards against a hostile request re-crashing a
         #     worker or smuggling). Needs glibc memmem, so it is Linux-only.
@@ -114,7 +114,7 @@ jobs:
         #     pass trivially.
         env:
           VANILLA_NO_IOURING: 1
-        run: v -cc gcc -no-parallel test server/ core/ http1/ http2/ socket/ epoll/ io_uring/ kqueue/ iocp/ tls/ static_assets/ testkit/ tests/
+        run: v -cc gcc -no-parallel test server/ core/ http1_1/ http2/ socket/ epoll/ io_uring/ kqueue/ iocp/ tls/ static_assets/ testkit/ tests/
 
       # --- Report: live-server probe with h1spec --------------------------------
       - name: Install h1spec (uv)

@@ -38,8 +38,8 @@ module main
 // timestamp; we stamp it at handler entry, which is close enough.
 import server
 import core
-import http1.request_parser
-import http1.response
+import http1_1.request_parser
+import http1_1.response
 import strconv
 import sync
 import time

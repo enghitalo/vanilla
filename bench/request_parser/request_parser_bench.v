@@ -12,7 +12,7 @@ module main
 // (Use -prod: the default debug build is not representative.)
 import benchmark
 import os
-import http1.request_parser
+import http1_1.request_parser
 
 // A realistic request: method + path with a query string + the headers a real
 // client sends. The Host header makes it valid HTTP/1.1.

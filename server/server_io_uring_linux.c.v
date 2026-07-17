@@ -1,8 +1,8 @@
 module server
 
 import io_uring
-import http1.response
-import http1.request_parser
+import http1_1.response
+import http1_1.request_parser
 import socket
 import core
 import sync.stdatomic

@@ -1,7 +1,7 @@
 module main
 
 import core
-import http1.request_parser
+import http1_1.request_parser
 
 // SOLUTION: pure body-parsing unit tests + raw-request E2E through serve().
 // JSON decode and multipart parsing are pure over the body bytes, and the

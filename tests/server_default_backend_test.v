@@ -7,8 +7,8 @@
 // via the post-drain inflight counter.
 import server
 import core
-import http1.request_parser
-import http1.response
+import http1_1.request_parser
+import http1_1.response
 import vtest
 
 const get_root = 'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()

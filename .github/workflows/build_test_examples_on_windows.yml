@@ -25,7 +25,7 @@ jobs:
       - name: Test server modules
         shell: bash
         run: |
-          v test server core http1 http2 socket epoll io_uring kqueue iocp tls static_assets testkit
+          v test server core http1_1 http2 socket epoll io_uring kqueue iocp tls static_assets testkit
 
   examples-building-and-testing:
     runs-on: windows-latest

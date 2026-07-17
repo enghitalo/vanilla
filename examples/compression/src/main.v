@@ -36,8 +36,8 @@ module main
 //     never label uncompressed bytes as compressed.
 import server
 import core
-import http1.request_parser
-import http1.response
+import http1_1.request_parser
+import http1_1.response
 import compress.brotli
 import compress.gzip
 import compress.zstd

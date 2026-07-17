@@ -21,8 +21,8 @@ import strconv
 import time
 import server
 import core
-import http1.request_parser
-import http1.response
+import http1_1.request_parser
+import http1_1.response
 import vtest
 
 const bb_req = 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()

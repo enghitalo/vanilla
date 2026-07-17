@@ -1,7 +1,7 @@
 module main
 
 import core
-import http1.response
+import http1_1.response
 import time
 
 // SOLUTION: pure crypto/round-trip + raw-request E2E (BEST_PRACTICES §9).

@@ -12,7 +12,7 @@
 // Transfer/sec:     25.86MB
 module main
 
-import http1.request_parser
+import http1_1.request_parser
 
 // try_static_route matches an exact route ("METHOD /path"), comparing only up to
 // the end of the path — `path_len` excludes any `?query`, so `/users?foo=bar`

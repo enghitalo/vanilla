@@ -12,7 +12,7 @@
 // Transfer/sec:     29.03MB
 module main
 
-import http1.request_parser { Slice }
+import http1_1.request_parser { Slice }
 
 // match_dynamic_route matches a parameterized route (e.g. `/users/:id`) and, on
 // a match, returns the extracted params. `path_len` is the request path length

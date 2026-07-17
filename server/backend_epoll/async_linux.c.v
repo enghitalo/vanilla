@@ -24,8 +24,8 @@ module backend_epoll
 // landed. Parked-connection timeouts remain a follow-up.
 import core
 import epoll
-import http1.request_parser
-import http1.response
+import http1_1.request_parser
+import http1_1.response
 import sync.stdatomic
 import time
 
