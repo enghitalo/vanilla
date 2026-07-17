@@ -1,7 +1,7 @@
 module main
 
 import core
-import http1.response
+import http1_1.response
 
 // Pure logic tests + raw-request E2E (BEST_PRACTICES §9). The cookie scanner
 // and the session store are pure/in-memory, so the parsing rules, the session

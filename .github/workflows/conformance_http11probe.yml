@@ -23,7 +23,7 @@ on:
       - 'examples/conformance/**'
       - 'server/**'
       - 'core/**'
-      - 'http1/**'
+      - 'http1_1/**'
       - 'http2/**'
       - 'socket/**'
       - 'epoll/**'

@@ -33,8 +33,8 @@ module main
 // on getpeername failure); '' is an UNTRUSTED peer with identity 'unknown'.
 import server
 import core
-import http1.request_parser
-import http1.response
+import http1_1.request_parser
+import http1_1.response
 import socket
 import strconv
 

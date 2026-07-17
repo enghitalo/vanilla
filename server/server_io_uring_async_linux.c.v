@@ -43,8 +43,8 @@ module server
 // follow-up shared with epoll.
 import io_uring
 import core
-import http1.request_parser
-import http1.response
+import http1_1.request_parser
+import http1_1.response
 
 // Initial size of the fd-indexed watch table (grows by doubling; same layout as
 // the epoll reactor and the pool's fd-indexed structures).

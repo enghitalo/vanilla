@@ -16,7 +16,7 @@ module main
 // (Use -prod: the default debug build is not representative.)
 import benchmark
 import os
-import http1.request_parser
+import http1_1.request_parser
 
 fn C.memchr(buf voidptr, c int, n usize) voidptr
 

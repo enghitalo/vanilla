@@ -53,8 +53,8 @@ jobs:
           cat > main.v <<'EOF'
           import vanilla.server
           import vanilla.core
-          import vanilla.http1.response
-          import vanilla.http1.request_parser
+          import vanilla.http1_1.response
+          import vanilla.http1_1.request_parser
 
           fn handle(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
           	request_parser.decode_http_request(req) or {
@@ -67,7 +67,7 @@ jobs:
 
           fn main() {
           	mut srv := server.new_server(server.ServerConfig{
-          		port:    0 // ephemeral — bind proves socket/, core/, http1/ all resolved
+          		port:    0 // ephemeral — bind proves socket/, core/, http1_1/ all resolved
           		handler: handle
           	})!
           	println('external consumer resolves vanilla.server — ephemeral port ${srv.port} bound')

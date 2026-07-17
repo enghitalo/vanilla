@@ -1,7 +1,7 @@
 module main
 
 import core
-import http1.response
+import http1_1.response
 
 // SOLUTION: pure codec tests + raw-request E2E (BEST_PRACTICES §9).
 // The chunk iterator is a pure function over bytes — exactly the thing to

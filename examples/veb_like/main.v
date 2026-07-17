@@ -20,7 +20,7 @@ module main
 //   • graceful shutdown — SIGTERM/SIGINT drain in-flight work, then exit.
 import server
 import core
-import http1.request_parser { HttpRequest, Slice }
+import http1_1.request_parser { HttpRequest, Slice }
 import os
 
 struct App {}

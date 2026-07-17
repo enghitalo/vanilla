@@ -25,7 +25,7 @@ module main
 //     the request buffer — no `.to_string()`, no substr, no split.
 import server
 import core
-import http1.request_parser
+import http1_1.request_parser
 import os
 import strconv
 

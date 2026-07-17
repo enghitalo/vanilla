@@ -1,6 +1,6 @@
 module request
 
-import http1.request_parser
+import http1_1.request_parser
 
 #include <errno.h>
 

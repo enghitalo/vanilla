@@ -12,7 +12,7 @@ module main
 // THE WHOLE HANDLER IS TWO LINES. Everything below `handle` is just wiring.
 import server
 import core
-import http1.response
+import http1_1.response
 import static_assets
 import os
 

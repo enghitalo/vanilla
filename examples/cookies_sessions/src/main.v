@@ -29,8 +29,8 @@ module main
 //     strings, and those run per LOGIN, not per request (see new_token).
 import server
 import core
-import http1.request_parser
-import http1.response
+import http1_1.request_parser
+import http1_1.response
 import sync
 import crypto.rand
 import encoding.hex

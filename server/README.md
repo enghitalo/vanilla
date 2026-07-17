@@ -105,7 +105,7 @@ HTTPS on the **epoll** backend; the other backends are plaintext.
   pool (`conn_state_linux.c.v`), request serving + watch reactor
   (`async_linux.c.v`), TLS (`tls_conn_linux.c.v`).
 - `server_io_uring_linux.c.v` + `../io_uring/` — the io_uring backend.
-- `../http1/request_parser/` — request framing (`frame_request_length_lim`/`_idx`
+- `../http1_1/request_parser/` — request framing (`frame_request_length_lim`/`_idx`
   with the non-marking `buf_view` window; chunked via `frame_chunked_total`).
 - `../kqueue/`, `../iocp/` — macOS / Windows backend syscall wrappers.
 

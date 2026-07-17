@@ -33,8 +33,8 @@ module main
 // Everything here WORKS TODAY — redirects are just a status line + Location.
 import server
 import core
-import http1.request_parser
-import http1.response
+import http1_1.request_parser
+import http1_1.response
 
 // ---- static responses (consts — the fast path appends, never builds) --------
 const resp_301_old = 'HTTP/1.1 301 Moved Permanently\r\nLocation: /new\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()

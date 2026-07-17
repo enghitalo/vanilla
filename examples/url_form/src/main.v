@@ -35,8 +35,8 @@ module main
 //     body is genuinely dynamic (map echo), so it gets ONE strings.Builder.
 import server
 import core
-import http1.request_parser
-import http1.response
+import http1_1.request_parser
+import http1_1.response
 import strconv
 import strings
 

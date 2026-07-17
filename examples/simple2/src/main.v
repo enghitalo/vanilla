@@ -13,8 +13,8 @@ module main
 //     responses are consts appended with `out <<` (see controllers.v).
 import server
 import core
-import http1.request_parser
-import http1.response
+import http1_1.request_parser
+import http1_1.response
 
 // slice_eq compares a request Slice against a literal IN PLACE by offsets —
 // no `.to_string()`, no `buf[a..b]` (V array slicing marks the source buffer

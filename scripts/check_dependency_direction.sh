@@ -3,13 +3,13 @@
 # between vanilla's top-level modules (docs/ARCHITECTURE.md):
 #
 #   core <- { socket, transport, tls, epoll, io_uring, kqueue, iocp, poll,
-#             http1, http2, websocket, grpc, static_assets } <- server
+#             http1_1, http2, websocket, grpc, static_assets } <- server
 #
 #   - core imports no other vanilla module.
 #   - socket/, transport/, tls/ and the event wrappers (epoll, io_uring,
 #     kqueue, iocp, poll) never import a protocol module or the engine.
 #   - protocol modules never import the engine; protocol-to-protocol imports
-#     are downward only (websocket -> http1, grpc -> http2).
+#     are downward only (websocket -> http1_1, grpc -> http2).
 #   - server/backend_* is the single sanctioned meeting point of platform +
 #     transport + protocol, so server/ may import everything.
 #
@@ -34,7 +34,7 @@ check_no_import() {
     fi
 }
 
-protocols='http1|http2|websocket|grpc'
+protocols='http1_1|http2|websocket|grpc'
 wrappers='epoll|io_uring|kqueue|iocp|poll'
 
 # core is the protocol-neutral floor: no vanilla imports at all.
@@ -46,12 +46,12 @@ for d in socket transport tls epoll io_uring kqueue iocp poll; do
 done
 
 # protocol modules: never the engine; protocol imports downward only.
-check_no_import http1 'server|http2|websocket|grpc'
+check_no_import http1_1 'server|http2|websocket|grpc'
 check_no_import http2 'server|websocket|grpc'
 check_no_import websocket 'server|http2|grpc'
-check_no_import grpc 'server|websocket|http1'
+check_no_import grpc 'server|websocket|http1_1'
 
-# static_assets serves through the handler contract: core + http1 only.
+# static_assets serves through the handler contract: core + http1_1 only.
 check_no_import static_assets 'server|http2|websocket|grpc'
 
 # testkit stays dependency-free towards vanilla (docs it relies only on net/time).

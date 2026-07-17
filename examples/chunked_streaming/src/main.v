@@ -31,8 +31,8 @@ module main
 // format; curl decodes them like any chunked response.
 import server
 import core
-import http1.request_parser
-import http1.response
+import http1_1.request_parser
+import http1_1.response
 
 // Escaped rune literals are broken in this toolchain (docs/V_PERF_TOOLBOX.md
 // gotcha) — CR/LF as explicit byte values, same as the core parser.

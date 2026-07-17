@@ -10,8 +10,8 @@ module main
 // there is no `.str()` / concat allocation (§3b).
 import strings
 import core
-import http1.request_parser { HttpRequest }
-import http1.response
+import http1_1.request_parser { HttpRequest }
+import http1_1.response
 
 const not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 

@@ -40,8 +40,8 @@ import socket
 import time
 import sync.stdatomic
 import core
-import http1.request_parser
-import http1.response
+import http1_1.request_parser
+import http1_1.response
 
 // Backend selection
 pub enum IOBackend {

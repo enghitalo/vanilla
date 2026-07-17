@@ -21,7 +21,7 @@ module backend_epoll
 //     pending batch exceeds sm_max_pending_write.
 import core
 import epoll
-import http1.response
+import http1_1.response
 import time
 
 #include <errno.h>

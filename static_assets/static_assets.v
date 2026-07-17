@@ -31,7 +31,7 @@ import os
 import strings
 import hash as wyhash
 import core
-import http1.request_parser
+import http1_1.request_parser
 
 // Encoding is a precompressed representation negotiated via `Accept-Encoding`.
 pub enum Encoding {

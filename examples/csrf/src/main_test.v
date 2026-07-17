@@ -1,8 +1,8 @@
 module main
 
 import core
-import http1.request_parser
-import http1.response
+import http1_1.request_parser
+import http1_1.response
 
 // SOLUTION: pure handler test — works today.
 // Token issuance, cookie scanning and safe/unsafe method gating are pure, so
