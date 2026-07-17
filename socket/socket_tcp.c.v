@@ -184,6 +184,11 @@ pub fn peer_addr(fd int) string {
 	if C.getpeername(fd, voidptr(&a), &l) != 0 {
 		return ''
 	}
+	// Family guard: on an AF_UNIX socket the bytes at sin_addr are path data,
+	// not an IPv4 address — there is no peer IP to report.
+	if int(a.sin_family) != C.AF_INET {
+		return ''
+	}
 	mut buf := [46]u8{} // INET6_ADDRSTRLEN
 	if C.inet_ntop(C.AF_INET, voidptr(&a.sin_addr), &char(&buf[0]), 46) == 0 {
 		return ''
@@ -208,6 +213,11 @@ pub fn local_port(fd int) int {
 	mut a := C.sockaddr_in{}
 	mut l := u32(sizeof(a))
 	if C.getsockname(fd, voidptr(&a), &l) != 0 {
+		return -1
+	}
+	// Family guard: an AF_UNIX listener has no port — the bytes at sin_port
+	// would be the first two path characters.
+	if int(a.sin_family) != C.AF_INET {
 		return -1
 	}
 	return int(C.ntohs(a.sin_port))

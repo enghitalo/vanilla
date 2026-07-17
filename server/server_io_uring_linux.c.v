@@ -677,7 +677,10 @@ pub fn run_io_uring_backend(srv Server, mut threads []thread) {
 		// kernel load-balances accepts across them; none is left un-accepted.
 		// (Listeners aren't ring-bound, so they live on the main thread — only the
 		// ring itself must stay on its worker thread.)
-		listener := srv.listener_fds[i]
+		// UDS has no SO_REUSEPORT group: listener_fds is then just [socket_fd]
+		// and every worker arms its accept on that ONE shared listener (issue
+		// #122 §5) — the modulo collapses to it.
+		listener := srv.listener_fds[i % srv.listener_fds.len]
 		if listener < 0 {
 			eprintln('Failed to create listener for worker ${i}')
 			exit(1)
@@ -686,7 +689,11 @@ pub fn run_io_uring_backend(srv Server, mut threads []thread) {
 			srv.limits, srv.active_conns, srv.inflight[i], srv.draining)
 	}
 
-	println('listening on http://localhost:${srv.port}/ (io_uring)')
+	if srv.unix_socket_path != '' {
+		println('listening on unix:${srv.unix_socket_path} (io_uring)')
+	} else {
+		println('listening on http://localhost:${srv.port}/ (io_uring)')
+	}
 	// Server is accepting (per-worker listeners + rings up); fire the one-shot
 	// lifecycle hook on this (main) thread right before we block.
 	if srv.after_server_start != unsafe { nil } {

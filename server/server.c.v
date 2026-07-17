@@ -20,6 +20,10 @@ pub:
 	socket_fd       int
 	limits          Limits
 	tls_config      &tls.Config = unsafe { nil } // nil ⇒ plain HTTP; set ⇒ HTTPS
+	// Non-empty ⇒ the listener is an AF_UNIX stream socket at this filesystem
+	// path (issue #122 §5) and `port` is meaningless. shutdown() uses it for
+	// the io_uring wake poke and to unlink the socket file.
+	unix_socket_path string
 pub mut:
 	threads []thread     = []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
 	handler core.Handler = unsafe { nil }
@@ -72,6 +76,20 @@ pub fn (s Server) shutdown(grace_ms int) {
 	// Tell the io_uring accept handlers to stop re-arming BEFORE the listeners are
 	// shut, so the resulting accept-error completion already observes the flag.
 	stdatomic.store_i64(&s.draining.n, 1)
+	// UDS + io_uring wake poke (issue #122 §5): shutdown(2) on an AF_UNIX
+	// listener produces NO CQE for armed multishot accepts (unlike TCP), so a
+	// parked worker would never observe `draining`. Wake each worker with a
+	// dummy connect BEFORE the listeners are shut (afterwards connect() fails
+	// and still generates no CQE): every armed accept completes with the dummy
+	// connection, whose handler sees the flag and stops re-arming.
+	$if linux {
+		if s.unix_socket_path != '' && s.io_multiplexing == .io_uring {
+			for _ in 0 .. s.inflight.len {
+				fd := socket.connect_to_unix_server(s.unix_socket_path) or { continue }
+				socket.close_socket(fd)
+			}
+		}
+	}
 	if s.listener_fds.len > 0 {
 		for fd in s.listener_fds {
 			if fd >= 0 {
@@ -97,6 +115,14 @@ pub fn (s Server) shutdown(grace_ms int) {
 		time.sleep(time.millisecond)
 		waited++
 	}
+	// The socket file outlives the process unless removed; clean it up so the
+	// path is free for the next run (create_unix_server_socket also unlinks a
+	// stale one defensively).
+	$if !windows {
+		if s.unix_socket_path != '' {
+			socket.unlink_socket_path(s.unix_socket_path)
+		}
+	}
 }
 
 pub struct Certificates {
@@ -110,6 +136,13 @@ pub struct ServerConfig {
 pub:
 	port            int       = 3000
 	io_multiplexing IOBackend = unsafe { IOBackend(0) }
+	// unix_socket_path, when set, makes the server listen on an AF_UNIX stream
+	// socket at this filesystem path INSTEAD of TCP (`port` is then ignored;
+	// max length socket.max_unix_path). Local IPC: ≈3× lower RTT than TCP
+	// loopback, filesystem permissions as access control. Works on the epoll,
+	// io_uring (single shared listener across workers — no SO_REUSEPORT for
+	// UDS) and kqueue backends; not on Windows/IOCP.
+	unix_socket_path string
 	// handler is THE request handler — one contract for every use case, with
 	// every input as an explicit parameter (see core.Handler): it appends the
 	// raw response to `response` and returns .done, parks the request on an fd
@@ -169,15 +202,34 @@ pub fn new_server(config ServerConfig) !Server {
 		}
 	}
 
-	socket_fd := socket.create_server_socket(config.port)
+	if config.unix_socket_path != '' {
+		$if windows {
+			return error('unix_socket_path is not supported on Windows/IOCP')
+		}
+		if config.tls_config != unsafe { nil } {
+			return error('TLS over a unix socket is not supported')
+		}
+	}
+
+	mut socket_fd := 0
+	$if !windows {
+		if config.unix_socket_path != '' {
+			socket_fd = socket.create_unix_server_socket(config.unix_socket_path)!
+		} else {
+			socket_fd = socket.create_server_socket(config.port)
+		}
+	} $else {
+		socket_fd = socket.create_server_socket(config.port)
+	}
 
 	// port: 0 = ephemeral. The kernel picked a free port at bind time; read it back
 	// ONCE so (a) the io_uring per-worker listeners below bind the SAME port and
 	// actually join the SO_REUSEPORT group (each create_server_socket(0) would pick
 	// a DIFFERENT port), and (b) Server.port tells every consumer — tests dialing
-	// back, co-hosted servers, the startup banners — the real port.
+	// back, co-hosted servers, the startup banners — the real port. A UDS
+	// listener has no port; the address is unix_socket_path.
 	mut port := config.port
-	if port == 0 {
+	if port == 0 && config.unix_socket_path == '' {
 		port = socket.local_port(socket_fd)
 		if port <= 0 {
 			return error('could not resolve ephemeral port for listener fd ${socket_fd}')
@@ -215,9 +267,12 @@ pub fn new_server(config ServerConfig) !Server {
 	// so create the rest up front (worker 0 reuses socket_fd): then shutdown() can
 	// stop them ALL, and there is no extra never-accepted listener. epoll and the
 	// other backends accept on the single socket_fd.
+	// For a UDS listener there is no SO_REUSEPORT group: every io_uring worker
+	// arms its accept on the ONE shared listener (the kernel wakes one armed
+	// accept per connection), so listener_fds stays [socket_fd].
 	mut listener_fds := [socket_fd]
 	$if linux {
-		if io_multiplexing == .io_uring {
+		if io_multiplexing == .io_uring && config.unix_socket_path == '' {
 			for _ in 1 .. n_workers {
 				listener_fds << socket.create_server_socket(port)
 			}
@@ -228,6 +283,7 @@ pub fn new_server(config ServerConfig) !Server {
 		port:               port
 		io_multiplexing:    config.io_multiplexing
 		socket_fd:          socket_fd
+		unix_socket_path:   config.unix_socket_path
 		handler:            config.handler
 		make_state:         config.make_state
 		on_worker_start:    config.on_worker_start
