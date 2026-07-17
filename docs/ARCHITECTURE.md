@@ -20,7 +20,7 @@ import and says nothing). Protocols are **siblings** over one engine:
 | `http2/` | frame/hpack/types grow in place: stream mux, flow control, settings. |
 | `websocket/` `grpc/` | reserved siblings (RFC 6455 framing; length-prefixed messages over http2). Future protocols land as siblings here. |
 | `static_assets/` `testkit/` `vtest/` `pg_async/` | reusable handler-side and test-side modules. |
-| `transport/` | reserved: client-side dialing (`dial_tcp`, `dial_unix`) — bytes + non-blocking fds ONLY; protocol clients compose it, they don't live in it. |
+| `transport/` | client-side dialing (`dial_tcp`, `dial_unix`) — bytes + non-blocking fds ONLY; protocol clients compose it (handler → `dial_*` → `event_loop.watch_fd` → `.suspend`), they don't live in it. |
 
 ## Dependency rule (grep-enforceable, one direction)
 
