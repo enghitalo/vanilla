@@ -7,13 +7,13 @@ on:
     branches: [ main ]
 
 jobs:
-  # The http_server module tests include the backend-agnostic behaviour suite
+  # The server-module tests include the backend-agnostic behaviour suite
   # (pipelining, split-request framing, max_connections, read timeout,
   # graceful shutdown, large-upload streaming drain), which runs against the
   # IOCP backend on Windows.
   module-tests:
     runs-on: windows-latest
-    name: http_server module tests
+    name: server module tests
     steps:
       - uses: actions/checkout@v4
       - name: Set up V
@@ -22,10 +22,10 @@ jobs:
         shell: bash
         run: |
           rm -rfv vlang || true
-      - name: Test http_server
+      - name: Test server modules
         shell: bash
         run: |
-          v test http_server
+          v test server core http1 http2 socket epoll io_uring kqueue iocp tls static_assets testkit
 
   examples-building-and-testing:
     runs-on: windows-latest

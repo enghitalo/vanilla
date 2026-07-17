@@ -1,6 +1,6 @@
 module main
 
-import http_server.core
+import core
 import os
 
 // serve adapts the unified handler contract (writes into a caller-owned

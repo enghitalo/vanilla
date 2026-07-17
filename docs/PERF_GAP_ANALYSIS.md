@@ -233,7 +233,7 @@ req/conn, at 1024 / 4096 / 6800 connections). rps / peak RSS:
    A ~22,000× difference for the same work. A map lookup only hashes the key
    bytes and never retains the key, so a non-owning view (`tos`) is safe as a
    lookup key. The vanilla **library is already the reference for this**:
-   [`http_server/static_assets/static_assets.v:273-281`](../http_server/static_assets/static_assets.v)
+   [`static_assets/static_assets.v:273-281`](../static_assets/static_assets.v)
    builds the key as `key := tos(&buf[rs], rel_len)` — a zero-copy view into the
    request buffer, documented as "never retained, so routing costs no
    allocation." Never imply the lib leaks; the fix belongs in the arena handler.
@@ -246,7 +246,7 @@ req/conn, at 1024 / 4096 / 6800 connections). rps / peak RSS:
 
 4. **Secondary: the 24K/conn baseline floor (a deliberate tradeoff, not the
    balloon).** vanilla's per-conn buffers are read_buf 8K + write_buf 16K = 24K
-   ([`http_server/backend_epoll/conn_state_linux.c.v:54-55`](../http_server/backend_epoll/conn_state_linux.c.v)),
+   ([`server/backend_epoll/conn_state_linux.c.v:54-55`](../server/backend_epoll/conn_state_linux.c.v)),
    pooled in `free_conns` (bounded to peak concurrent conns). On the sendfile
    static path the 16K write_buf carries only a ~200 B header (the body goes
    through the kernel), so it is ~163 MiB of mostly-idle buffer at 6800 conns vs
@@ -267,7 +267,7 @@ req/conn, at 1024 / 4096 / 6800 connections). rps / peak RSS:
 
 ## Why they beat vanilla on io_uring
 
-Vanilla io_uring backend today (`http_server_io_uring_linux.c.v`,
+Vanilla io_uring backend today (`server_io_uring_linux.c.v`,
 `io_uring/io_uring_linux.c.v`):
 
 | Aspect | vanilla | fast servers / liburing guidance |

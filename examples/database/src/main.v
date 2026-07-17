@@ -1,9 +1,9 @@
 module main
 
-import http_server
-import http_server.core
-import http_server.http1_1.response
-import http_server.http1_1.request_parser
+import server
+import core
+import http1.response
+import http1.request_parser
 import db.pg
 
 fn handle_request(req_buffer []u8, mut out []u8, mut pool ConnectionPool) core.Step {
@@ -67,15 +67,15 @@ fn main() {
 
 	// Create and run the server with the handle_request function
 
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
-		io_multiplexing: unsafe { http_server.IOBackend(0) }
+		io_multiplexing: unsafe { server.IOBackend(0) }
 		handler:         fn [mut pool] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 			return handle_request(req_buffer, mut out, mut pool)
 		}
 	})!
 
-	server.run()
+	srv.run()
 
 	pool.close()
 }

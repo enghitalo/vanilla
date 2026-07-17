@@ -3,7 +3,7 @@
 // exist on epoll (Linux) and kqueue (macOS) but not on the Windows/IOCP backend.
 module main
 
-import http_server
+import server
 import vtest
 
 // Drives the async runtime end to end on vtest (docs/VTEST.md): /async parks the
@@ -12,7 +12,7 @@ import vtest
 // `ok` — so the assert is specific to the watch_fd suspend/resume round trip.
 
 fn test_async_pipe_end_to_end() ! {
-	out := vtest.drive(http_server.ServerConfig{ handler: handle }, [
+	out := vtest.drive(server.ServerConfig{ handler: handle }, [
 		vtest.Script{
 			rounds: [
 				vtest.Round{

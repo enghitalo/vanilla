@@ -3,7 +3,7 @@ module main
 // Handler-state tests: assert the KEY property of the rewrite without a socket —
 // subscribing registers an fd in epoll-resident state and spawns NO per-client
 // thread. The real push fan-out is proven in server_end_to_end_test.v.
-import http_server.core
+import core
 
 // serve adapts the raw-handler contract (writes into a caller-owned buffer) to
 // the return-a-string shape the assertions expect, alongside the handler's

@@ -42,7 +42,7 @@ pub fn build_basic_response(status int, body_buffer []u8, content_type_buffer []
 	}
 
 	// ETag = 64-bit wyhash hex-encoded on the stack — a cheap, strong opaque
-	// validator (same as http_server.static_assets); a crypto digest here is
+	// validator (same as server.static_assets); a crypto digest here is
 	// pure cost, and md5 is broken anyway.
 	etag := hex16(wyhash.wyhash_c(body_buffer.data, u64(body_buffer.len), 0))
 

@@ -22,8 +22,8 @@ module main
 // to publish it. A reader atomically loads the index and copies that buffer — it's
 // never the one being written (the writer touches `1 - active`), so there are no
 // torn reads, no mutex, and no pointer-as-integer tricks for the GC to mishandle.
-import http_server
-import http_server.core
+import server
+import core
 import time
 import sync.stdatomic
 
@@ -92,14 +92,14 @@ fn main() {
 	}()
 
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         fn [cache] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
@@ -114,5 +114,5 @@ fn main() {
 		}
 	})!
 	println('Date-header demo on http://localhost:3000/  (cached, refreshed 1x/s)')
-	server.run()
+	srv.run()
 }

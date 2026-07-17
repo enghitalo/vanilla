@@ -9,9 +9,9 @@ module main
 // built with a pre-sized strings.Builder, writing integers via write_decimal so
 // there is no `.str()` / concat allocation (§3b).
 import strings
-import http_server.core
-import http_server.http1_1.request_parser { HttpRequest }
-import http_server.http1_1.response
+import core
+import http1.request_parser { HttpRequest }
+import http1.response
 
 const not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 

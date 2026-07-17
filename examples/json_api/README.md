@@ -28,7 +28,7 @@ curl -F file=@./logo.png localhost:3000/upload
 
 This example assumes `req.body` is the **complete** body — and the core
 delivers that today.
-[`request.read_request`](../../http_server/http1_1/request/request.c.v) loops
+[`request.read_request`](../../http1/request/request.c.v) loops
 `recv()` and asks the pure framer (`request_parser.frame_request_length`)
 whether a whole message is present yet, honoring `Content-Length` and
 `Transfer-Encoding: chunked`. A handler never reads the socket to reassemble a
@@ -38,7 +38,7 @@ Residual core limitation: a request fragmented across epoll readiness bursts
 (`EAGAIN` mid-message) is rejected with an error — it is never delivered
 truncated. Framing correctness is regression-tested in the core by a
 split-fuzz test over every prefix of a framed request
-([`request_parser_test.v`](../../http_server/http1_1/request_parser/request_parser_test.v)).
+([`request_parser_test.v`](../../http1/request_parser/request_parser_test.v)).
 
 ## Notes on purity & byte discipline
 

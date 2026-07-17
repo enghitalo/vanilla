@@ -11,10 +11,10 @@ module main
 //     so the view never outlives the buffer — never retain it past the handler.
 //   - Controllers append STRAIGHT INTO the caller-owned `out` buffer; static
 //     responses are consts appended with `out <<` (see controllers.v).
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
-import http_server.http1_1.response
+import server
+import core
+import http1.request_parser
+import http1.response
 
 // slice_eq compares a request Slice against a literal IN PLACE by offsets —
 // no `.to_string()`, no `buf[a..b]` (V array slicing marks the source buffer
@@ -80,10 +80,10 @@ fn handle_request(req_buffer []u8, mut out []u8, _client_fd int, _worker_state v
 }
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
-		io_multiplexing: unsafe { http_server.IOBackend(0) }
+		io_multiplexing: unsafe { server.IOBackend(0) }
 		handler:         handle_request
 	})!
-	server.run()
+	srv.run()
 }

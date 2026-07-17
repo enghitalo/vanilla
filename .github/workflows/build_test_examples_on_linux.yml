@@ -52,7 +52,7 @@ jobs:
       # Two independent V-toolchain flakes bite otherwise, both only in the
       # default (non -prod) build — real deployments ship -prod, which is
       # unaffected (verified 0 failures in 20 -prod builds):
-      #   1) Every http_server program compiles the Linux io_uring backend,
+      #   1) Every vanilla server program compiles the Linux io_uring backend,
       #      which pulls in <liburing.h> -> barrier.h -> <stdatomic.h>. V's
       #      bundled tcc cannot parse that stdatomic.h, and its automatic
       #      tcc->gcc fallback is a race (reproduced ~1 in 4 of the SAME source

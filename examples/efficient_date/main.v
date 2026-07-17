@@ -17,8 +17,8 @@ module main
 // A background timerfd could refresh the cache proactively instead of lazily,
 // but that needs a worker-start hook for a watch not tied to any request — a
 // noted async-runtime follow-up. Lazy refresh is simpler and just as cheap.
-import http_server
-import http_server.core
+import server
+import core
 import time
 
 // DateCache is one worker's cached Date line + the unix second it is valid for.
@@ -73,11 +73,11 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
 }
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            8096
 		io_multiplexing: .epoll
 		handler:         handle
 		make_state:      make_state
 	})!
-	server.run()
+	srv.run()
 }

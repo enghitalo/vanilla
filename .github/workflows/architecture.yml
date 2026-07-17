@@ -1,0 +1,78 @@
+name: Architecture
+
+# Two invariants from the #122 restructure (docs/ARCHITECTURE.md):
+#   1. the one-direction dependency rule between top-level modules, and
+#   2. the external-consumer import convention (`import vanilla.server`)
+#      that `v install` users rely on.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  dependency-direction:
+    runs-on: ubuntu-latest
+    name: dependency direction (grep)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enforce one-direction dependency rule
+        run: sh scripts/check_dependency_direction.sh
+
+  external-consumer:
+    runs-on: ubuntu-latest
+    name: synthetic external consumer (import vanilla.server)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up V
+        uses: vlang/setup-v@v1.7
+      - name: Remove Vlang folder to avoid conflicts
+        shell: bash
+        run: |
+          rm -rf -v ./vlang || true
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev linux-libc-dev
+      - name: Install checkout as ~/.vmodules/vanilla
+        shell: bash
+        run: |
+          mkdir -p ~/.vmodules
+          cp -r "$PWD" ~/.vmodules/vanilla
+      # A hello-world OUTSIDE the repo tree, importing through the `vanilla.`
+      # prefix — this is the layout a `v install` user gets, and it also
+      # proves the in-repo bare imports (`import core`, `import socket`)
+      # resolve from inside ~/.vmodules/vanilla.
+      - name: Compile and run the consumer
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/consumer"
+          cd "$RUNNER_TEMP/consumer"
+          cat > main.v <<'EOF'
+          import vanilla.server
+          import vanilla.core
+          import vanilla.http1.response
+          import vanilla.http1.request_parser
+
+          fn handle(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+          	request_parser.decode_http_request(req) or {
+          		res << response.tiny_bad_request_response
+          		return .close
+          	}
+          	res << 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
+          	return .done
+          }
+
+          fn main() {
+          	mut srv := server.new_server(server.ServerConfig{
+          		port:    0 // ephemeral — bind proves socket/, core/, http1/ all resolved
+          		handler: handle
+          	})!
+          	println('external consumer resolves vanilla.server — ephemeral port ${srv.port} bound')
+          	srv.shutdown(0)
+          }
+          EOF
+          v -cc gcc -no-parallel -o consumer main.v
+          ./consumer

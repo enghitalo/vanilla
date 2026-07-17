@@ -18,9 +18,9 @@ module main
 //   • safe output — URL-derived values are JSON-escaped (no injection);
 //   • bounded — request size / connection limits and read/write timeouts;
 //   • graceful shutdown — SIGTERM/SIGINT drain in-flight work, then exit.
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser { HttpRequest, Slice }
+import server
+import core
+import http1.request_parser { HttpRequest, Slice }
 import os
 
 struct App {}
@@ -189,14 +189,14 @@ fn (app App) proxy(req HttpRequest, params map[string]Slice) []u8 {
 fn main() {
 	app := App{}
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         fn [app] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
@@ -208,7 +208,7 @@ fn main() {
 		}
 		// Production limits: bound resource use so a single client can't exhaust
 		// the server. All default to 0 (unlimited) — set explicitly here.
-		limits: http_server.Limits{
+		limits: server.Limits{
 			max_header_bytes: 16 * 1024   // 16 KiB headers  -> 431
 			max_body_bytes:   1024 * 1024 // 1 MiB body     -> 413 (from Content-Length)
 			max_connections:  100_000     // refuse past this many concurrent
@@ -219,15 +219,15 @@ fn main() {
 
 	// Graceful shutdown: SIGTERM/SIGINT (docker stop / k8s / Ctrl-C) stop new
 	// accepts and drain in-flight requests before exit, so deploys drop no work.
-	os.signal_opt(.term, fn [server] (_ os.Signal) {
-		server.shutdown(2000)
+	os.signal_opt(.term, fn [srv] (_ os.Signal) {
+		srv.shutdown(2000)
 		exit(0)
 	}) or {}
-	os.signal_opt(.int, fn [server] (_ os.Signal) {
-		server.shutdown(2000)
+	os.signal_opt(.int, fn [srv] (_ os.Signal) {
+		srv.shutdown(2000)
 		exit(0)
 	}) or {}
 
 	println('veb-like (production) on http://localhost:3000/')
-	server.run()
+	srv.run()
 }

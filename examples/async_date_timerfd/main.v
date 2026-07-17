@@ -18,8 +18,8 @@ module main
 // Run:   v run examples/async_date_timerfd/
 // Try:   curl -i http://localhost:8097/        # note Date; re-run after a few
 //        sleep 3; curl -i http://localhost:8097/   # Date advanced with no load
-import http_server
-import http_server.core
+import server
+import core
 import time
 
 #include <sys/timerfd.h>
@@ -124,12 +124,12 @@ fn handle(_req []u8, mut out []u8, _client_fd int, worker_state voidptr, mut _ev
 }
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            8097
 		io_multiplexing: .epoll
 		handler:         handle
 		make_state:      make_state
 		on_worker_start: on_start
 	})!
-	server.run()
+	srv.run()
 }

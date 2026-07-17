@@ -13,8 +13,8 @@ module main
 //
 // The worker is free between stages, so many /chain requests overlap their waits
 // instead of serializing. See core.Handler / core.WakeFn.
-import http_server
-import http_server.core
+import server
+import core
 
 #include <sys/timerfd.h>
 #include <unistd.h>
@@ -69,10 +69,10 @@ fn after_b(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidpt
 }
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            8094
 		io_multiplexing: .epoll
 		handler:         handle
 	})!
-	server.run()
+	srv.run()
 }

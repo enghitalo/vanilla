@@ -17,7 +17,7 @@ module main
 // dynamic dispatch. The handler contract stays bytes-in/bytes-out.
 //
 // WORKS TODAY.
-import http_server
+import server
 import os
 
 fn main() {
@@ -33,14 +33,14 @@ fn main() {
 	handler := chain(route, with_security_headers, access_log_mw(log))
 
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         handler
@@ -61,5 +61,5 @@ fn main() {
 	println('  GET /        public  -> 200')
 	println('  GET /me      private -> 401 without "Authorization: Bearer tok-alice"')
 	println('  GET /admin   admin   -> 403 for tok-alice, 200 for tok-root')
-	server.run()
+	srv.run()
 }

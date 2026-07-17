@@ -1,9 +1,9 @@
 module main
 
-import http_server
-import http_server.core
-import http_server.http1_1.response
-import http_server.http1_1.request_parser
+import server
+import core
+import http1.response
+import http1.request_parser
 
 fn handle_request(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {
@@ -45,18 +45,18 @@ fn handle_request(req_buffer []u8, mut out []u8, _client_fd int, _worker_state v
 
 fn main() {
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		handler:         handle_request
 		io_multiplexing: backend
 	})!
 
-	server.run()
+	srv.run()
 }

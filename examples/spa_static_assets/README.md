@@ -1,0 +1,88 @@
+# static_assets — serve a CSR/WASM SPA bundle
+
+Serves a built single-page-app bundle (HTML + JS + **WASM** + CSS, content-hashed
+and precompressed) with the reusable `static_assets` module. The
+whole request handler is two lines — the module does the four things a bare file
+server doesn't, and that a modern WASM SPA needs (GitHub issue #19):
+
+- **`application/wasm` MIME** — required for `WebAssembly.instantiateStreaming`.
+- **Precompressed negotiation** — serves the prebuilt `.br`/`.gz` sibling per
+  `Accept-Encoding`, with `Content-Encoding` + `Vary: Accept-Encoding`.
+- **Caching policy** — content-hashed assets get
+  `Cache-Control: public, max-age=31536000, immutable`; `index.html` gets
+  `no-cache` so deploys flip atomically by swapping it.
+- **SPA fallback** — unknown, non-asset paths (`/users/42`) serve `index.html`
+  so client-side deep links and refreshes work; asset-looking 404s
+  (`/nope.[hash].wasm`) are still `404`, and `../` traversal is refused.
+
+The `dist/` folder here is a tiny hand-made bundle standing in for the output of
+a build (e.g. [`vcsr`](https://github.com/enghitalo/vcsr)). Everything is
+precomputed once at boot, so the server stays immutable and lock-free.
+
+### Zero-copy large files via `sendfile(2)`
+
+Files at least `sendfile_min_bytes` (default 256 KiB) are served straight from
+disk to the socket with `sendfile(2)` — the body never passes through a
+userspace buffer. The handler calls `respond_into(req, mut out)` (not
+`respond()`): it appends the headers to `out` and hands the body off to the
+worker to stream. This is a Linux/epoll fast path; on TLS, other backends, or
+other OSes it transparently falls back to copying the body, so the response is
+always correct. Smaller files stay preloaded in RAM and are sent from a single
+precomputed buffer. Range, conditional GET, and `Accept-Encoding` negotiation
+all work over the `sendfile` path.
+
+### Memory: flat RAM, no per-request allocation (2026-06)
+
+This module stays flat on RAM under load for two reasons:
+
+- **Body never hits the heap** — large files stream via `sendfile(2)` straight
+  from the page cache to the socket (above), so the response body costs zero
+  userspace allocation.
+- **Lookup key is a zero-copy view** — routing builds the asset key as a
+  non-owning `tos` view straight into the request buffer
+  (`key := tos(&buf[rs], rel_len)`, never retained — see
+  [`static_assets/static_assets.v:273`](../../static_assets/static_assets.v)),
+  not an allocating `substr`, so routing costs no per-request allocation.
+
+A hand-rolled handler that builds its key with `route[8..]` instead would
+allocate a fresh heap string every request (`string.substr` →
+`malloc_noscan(len+1)` + memcpy). Under `-gc none` that string is never freed —
+an unbounded leak. An isolated test (identical `map[string]int`, 20,000,000
+lookups, `-prod -gc none`) measured `route[8..]` at +625 MiB (monotonic,
+~31 B/request) vs the `tos` view at +28 KiB (flat) — same work, ~22,000x the
+RSS. A map lookup only hashes the key bytes and never retains them, so the
+non-owning view is safe as a lookup key.
+
+## Running
+
+```sh
+v -prod run examples/spa_static_assets/src
+```
+
+Then:
+
+```sh
+# WASM is served with the correct type + immutable caching
+curl -v http://localhost:3000/main.7b2e10.wasm
+
+# the .br sibling is negotiated from Accept-Encoding
+curl -v --compressed http://localhost:3000/app.3f5a9c.js
+
+# a client route with no file on disk falls back to index.html
+curl -v http://localhost:3000/any/client/route
+
+# an asset-looking path that doesn't exist is a real 404
+curl -v http://localhost:3000/missing.deadbeef.wasm
+```
+
+## Testing (no socket)
+
+The handler is a pure function of the request bytes, so the behavior is tested
+without opening a socket — exactly like the rest of vanilla:
+
+```sh
+v test examples/spa_static_assets/src/main_test.v
+```
+
+The module's own acceptance tests live in
+[`static_assets/static_assets_test.v`](../../static_assets/static_assets_test.v).

@@ -14,8 +14,8 @@ module main
 // slow upstream, a long query loop): one monotonic check per resume, no extra
 // watch. (A single hard wall-clock deadline can also be a second timerfd — but
 // v1 allows one in-flight watch per conn, so here we check the clock per step.)
-import http_server
-import http_server.core
+import server
+import core
 import time
 
 #include <sys/timerfd.h>
@@ -100,10 +100,10 @@ fn tick(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, 
 }
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            8095
 		io_multiplexing: .epoll
 		handler:         handle
 	})!
-	server.run()
+	srv.run()
 }

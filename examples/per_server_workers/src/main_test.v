@@ -1,7 +1,7 @@
 module main
 
-import http_server
-import http_server.core
+import server
+import core
 import runtime
 
 // ServerConfig.workers sizes each server's worker pool independently. new_server
@@ -18,7 +18,7 @@ fn noop_handler(req_buffer []u8, mut out []u8, client_fd int, worker_state voidp
 // workers:N is honored, and two co-hosted servers size their pools independently.
 fn test_workers_override_sizes_pools_independently() {
 	$if linux {
-		mut a := http_server.new_server(http_server.ServerConfig{
+		mut a := server.new_server(server.ServerConfig{
 			port:            18181
 			io_multiplexing: .epoll
 			workers:         5
@@ -27,7 +27,7 @@ fn test_workers_override_sizes_pools_independently() {
 		assert a.threads.len == 5
 		assert a.inflight.len == 5
 
-		mut b := http_server.new_server(http_server.ServerConfig{
+		mut b := server.new_server(server.ServerConfig{
 			port:            18182
 			io_multiplexing: .epoll
 			workers:         9
@@ -42,7 +42,7 @@ fn test_workers_override_sizes_pools_independently() {
 // $VANILLA_WORKERS is set — CI does not set it).
 fn test_workers_zero_falls_back_to_default() {
 	$if linux {
-		mut s := http_server.new_server(http_server.ServerConfig{
+		mut s := server.new_server(server.ServerConfig{
 			port:            18183
 			io_multiplexing: .epoll
 			handler:         noop_handler
@@ -56,7 +56,7 @@ fn test_workers_zero_falls_back_to_default() {
 // worker) in addition to sizing the thread array.
 fn test_workers_io_uring_one_listener_per_worker() {
 	$if linux {
-		mut s := http_server.new_server(http_server.ServerConfig{
+		mut s := server.new_server(server.ServerConfig{
 			port:            18184
 			io_multiplexing: .io_uring
 			workers:         6

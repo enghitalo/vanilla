@@ -22,8 +22,8 @@ module vtest
 // completion-based ordering instead of sleeps.
 import net
 import sync.stdatomic
-import http_server
-import http_server.socket
+import server
+import socket
 
 fn C.send(__fd int, __buf voidptr, __n usize, __flags int) int
 fn C.recv(__fd int, __buf voidptr, __n usize, __flags int) int
@@ -98,7 +98,7 @@ mut:
 @[heap]
 pub struct Harness {
 mut:
-	server  http_server.Server
+	server  server.Server
 	conns   []HConn
 	stopped bool
 pub mut:
@@ -109,10 +109,10 @@ pub mut:
 // the listeners synchronously, and the returned Harness only exists after
 // after_server_start fired on the run() thread. Always binds port 0 — the
 // resolved port is h.port() / h.server.port; tests never coordinate ports.
-pub fn start(config http_server.ServerConfig) !&Harness {
+pub fn start(config server.ServerConfig) !&Harness {
 	ready := chan bool{cap: 1}
 	user_hook := config.after_server_start
-	cfg := http_server.ServerConfig{
+	cfg := server.ServerConfig{
 		...config
 		port:               0
 		after_server_start: fn [ready, user_hook] () {
@@ -123,7 +123,7 @@ pub fn start(config http_server.ServerConfig) !&Harness {
 		}
 	}
 	mut h := &Harness{
-		server: http_server.new_server(cfg)!
+		server: server.new_server(cfg)!
 	}
 	mut srv := h.server // the run thread's copy shares the &Counter fields
 	spawn fn [mut srv] () {
@@ -140,7 +140,7 @@ pub fn (h &Harness) port() int {
 
 // server exposes the underlying Server for hand-rolled steps a Script cannot
 // express (e.g. calling shutdown() mid-flight in a graceful-drain test).
-pub fn (mut h Harness) server_ref() &http_server.Server {
+pub fn (mut h Harness) server_ref() &server.Server {
 	return &h.server
 }
 
@@ -214,7 +214,7 @@ pub fn (mut h Harness) stop() {
 
 // drive is the one-shot form: start → fire → stop, with the Outcome's server
 // counters sampled AFTER the shutdown drain.
-pub fn drive(config http_server.ServerConfig, scripts []Script) !Outcome {
+pub fn drive(config server.ServerConfig, scripts []Script) !Outcome {
 	mut h := start(config)!
 	o := h.fire(scripts)!
 	h.stop()

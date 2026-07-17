@@ -25,7 +25,7 @@
 ## 🔴 Critical Bugs (MUST FIX)
 
 ### 1. Undefined Function `vmemcmp`
-- **File:** `http_server/http1_1/request_parser/request_parser.v:203`
+- **File:** `http1/request_parser/request_parser.v:203`
 - **Issue:** Function `vmemcmp` is not defined, should be `C.memcmp`
 - **Impact:** Header parsing will fail at runtime
 - **Priority:** 🔴 CRITICAL
@@ -61,7 +61,7 @@
   - 404 handling, query strings, method validation
 
 ### 3. Windows IOCP Overlapped Structure — ✅ RESOLVED
-- **File:** `http_server/http_server_windows.c.v`
+- **File:** `server/server_windows.c.v`
 - **Issue:** `h_event` in OVERLAPPED structure never initialized
 - **Resolution:** The IOCP backend was rewritten around completion-port
   dispatch only — no event handles at all. Each connection embeds two
@@ -69,10 +69,10 @@
   completion's `lpOverlapped` pointer IS the op context, so `hEvent` is
   never used and nothing leaks.
 - **Testing:** Covered by the backend behaviour suite
-  (`http_server/backend_behaviors_test.v`) running against IOCP on Windows.
+  (`tests/backend_behaviors_test.v`) running against IOCP on Windows.
 
 ### 4. Empty Kqueue Write Callback
-- **File:** `http_server/kqueue/kqueue_darwin.c.v:114`
+- **File:** `kqueue/kqueue_darwin.c.v:114`
 - **Issue:** Write callback is empty `fn (_ int) {}`
 - **Impact:** Write events registered but never handled
 - **Priority:** 🟡 MEDIUM (macOS only)
@@ -94,7 +94,7 @@
 ## 🏗️ Foundation Improvements (ENABLES EVERYTHING)
 
 ### 5. Implement Query String Parsing
-- **File:** `http_server/http1_1/request_parser/request_parser.v:234-237`
+- **File:** `http1/request_parser/request_parser.v:234-237`
 - **Issue:** `get_query()` returns empty Slice
 - **Impact:** Cannot parse URL query parameters
 - **Priority:** 🔴 HIGH
@@ -122,7 +122,7 @@
 - **Testing:** Test with `?foo=bar&baz=qux`, `?empty=`, `?novalue`
 
 ### 6. Add Standard HTTP Status Codes
-- **File:** `http_server/http1_1/response/response.c.v`
+- **File:** `http1/response/response.c.v`
 - **Issue:** Only 400 and 444 status codes exist
 - **Impact:** Cannot send proper status responses
 - **Priority:** 🔴 HIGH
@@ -149,7 +149,7 @@
 - **Testing:** Use in examples and verify with curl -v
 
 ### 7. Build Response Helper Function
-- **File:** `http_server/http1_1/response/response.c.v`
+- **File:** `http1/response/response.c.v`
 - **Issue:** No standardized way to build responses
 - **Impact:** Each example builds responses differently
 - **Priority:** 🔴 HIGH
@@ -183,7 +183,7 @@
 - **Testing:** Build various response types
 
 ### 8. Header Injection Utility
-- **File:** `http_server/http1_1/response/response.c.v`
+- **File:** `http1/response/response.c.v`
 - **Issue:** No way to add headers to existing responses (needed for middleware)
 - **Impact:** Cannot implement middleware that adds headers
 - **Priority:** 🔴 HIGH
@@ -218,7 +218,7 @@
 ## 🌐 HTTP Protocol Features
 
 ### 9. HTTP Method Validation
-- **File:** `http_server/http1_1/request_parser/request_parser.v`
+- **File:** `http1/request_parser/request_parser.v`
 - **Issue:** Any method string is accepted
 - **Impact:** Server accepts invalid methods
 - **Priority:** 🟡 MEDIUM
@@ -239,7 +239,7 @@
 - **Testing:** Test with valid and invalid methods
 
 ### 10. HTTP/1.1 Host Header Requirement
-- **File:** `http_server/http1_1/request_parser/request_parser.v`
+- **File:** `http1/request_parser/request_parser.v`
 - **Issue:** Host header not validated (required by RFC 9112 for HTTP/1.1)
 - **Impact:** Non-compliant with HTTP/1.1 spec
 - **Priority:** 🟡 MEDIUM
@@ -261,7 +261,7 @@
 - **Testing:** Test with and without Host header
 
 ### 11. Case-Insensitive Header Names
-- **File:** `http_server/http1_1/request_parser/request_parser.v:189-232`
+- **File:** `http1/request_parser/request_parser.v:189-232`
 - **Issue:** Header matching is case-sensitive
 - **Impact:** Headers like "content-type" vs "Content-Type" fail to match
 - **Priority:** 🟡 MEDIUM
@@ -283,7 +283,7 @@
 - **Testing:** Test with various case combinations
 
 ### 12. Content-Length Validation
-- **File:** `http_server/http1_1/request_parser/request_parser.v`
+- **File:** `http1/request_parser/request_parser.v`
 - **Issue:** No validation that body matches Content-Length
 - **Impact:** Can accept malformed requests
 - **Priority:** 🟡 MEDIUM
@@ -305,7 +305,7 @@
 - **Testing:** Test with matching and mismatched Content-Length
 
 ### 13. Cookie Parsing
-- **File:** `http_server/http1_1/request_parser/request_parser.v`
+- **File:** `http1/request_parser/request_parser.v`
 - **Issue:** No helper to parse Cookie header
 - **Impact:** Cannot easily access cookies
 - **Priority:** 🟢 LOW
@@ -331,7 +331,7 @@
 - **Testing:** Test with multiple cookies
 
 ### 14. Transfer-Encoding: chunked Support
-- **File:** `http_server/http1_1/request_parser/request_parser.v`
+- **File:** `http1/request_parser/request_parser.v`
 - **Issue:** Chunked encoding not supported
 - **Impact:** Cannot handle chunked request bodies
 - **Priority:** 🟢 LOW
@@ -354,7 +354,7 @@
 ## 🔒 TLS/HTTPS Support
 
 ### 15. Complete V TLS Bindings
-- **File:** `http_server/tls/tls.v`
+- **File:** `tls/tls.v`
 - **Issue:** Only C includes, no implementation
 - **Impact:** Cannot use HTTPS
 - **Priority:** 🔴 HIGH (for HTTPS example)
@@ -474,7 +474,7 @@
 - **Testing:** Create simple HTTPS server, test with curl --cacert
 
 ### 16. Integrate TLS into Request/Response Handlers
-- **Files:** `http_server/http1_1/request/request.c.v`, `http_server/http1_1/response/response.c.v`
+- **Files:** `http1/request/request.c.v`, `http1/response/response.c.v`
 - **Issue:** No TLS-aware read/write functions
 - **Impact:** Cannot use TLS with existing infrastructure
 - **Priority:** 🔴 HIGH
@@ -508,7 +508,7 @@
 - **Testing:** Test with HTTPS requests
 
 ### 17. Self-Signed Certificate Generation
-- **File:** `http_server/tls/tls_cert/tls_cert.v`
+- **File:** `tls/tls_cert/tls_cert.v`
 - **Issue:** No certificate generation in V
 - **Impact:** Must manually create certificates for testing
 - **Priority:** 🟡 MEDIUM
@@ -526,7 +526,7 @@
 ## ⚙️ Backend Improvements
 
 ### 18. Implement Keep-Alive in Epoll Backend
-- **File:** `http_server/http_server_epoll_linux.c.v`
+- **File:** `server/server_epoll_linux.c.v`
 - **Issue:** Closes connection after each request
 - **Impact:** High overhead for multiple requests
 - **Priority:** 🟡 MEDIUM
@@ -552,7 +552,7 @@
 - **Testing:** Send multiple requests on same connection
 
 ### 19. Implement Keep-Alive in Kqueue Backend
-- **File:** `http_server/http_server_darwin.c.v`
+- **File:** `server/server_darwin.c.v`
 - **Issue:** Closes connection after each request
 - **Impact:** High overhead on macOS
 - **Priority:** 🟡 MEDIUM
@@ -565,7 +565,7 @@
 - **Testing:** Test on macOS with persistent connections
 
 ### 20. Complete IOCP Keep-Alive Implementation — ✅ RESOLVED
-- **File:** `http_server/http_server_windows.c.v`
+- **File:** `server/server_windows.c.v`
 - **Issue:** Partial keep-alive implementation
 - **Resolution:** Full rewrite: per-worker IOCP ports (shared-nothing),
   persistent pooled per-connection buffers, request framing via
@@ -573,7 +573,7 @@
   WSASend), large-body streaming drain (drain-then-respond), limits
   (max_connections / 413 / 431), read+write timeout sweep, and graceful
   shutdown through the shared `draining` flag.
-- **Testing:** `http_server/backend_behaviors_test.v` (pipelining, split
+- **Testing:** `tests/backend_behaviors_test.v` (pipelining, split
   framing, max_connections, read timeout, graceful shutdown, 2 MiB upload
   drain) passes on Windows; sustained-load run: ~287K req/s, 0 errors.
 
@@ -698,7 +698,7 @@
 - **Testing:** Run all tests after each refactoring
 
 ### 25. Add Bounds Checking in Parsers
-- **File:** `http_server/http1_1/request_parser/request_parser.v`
+- **File:** `http1/request_parser/request_parser.v`
 - **Issue:** Some loops lack bounds checks
 - **Impact:** Buffer overflow risk
 - **Priority:** 🟡 MEDIUM
@@ -810,7 +810,7 @@
 - **Testing:** Benchmark before/after
 
 ### 30. Optimize Header Parsing with Lookup Table
-- **File:** `http_server/http1_1/request_parser/request_parser.v`
+- **File:** `http1/request_parser/request_parser.v`
 - **Issue:** Linear search for headers
 - **Impact:** Slow for common headers
 - **Priority:** 🟢 LOW
@@ -1031,8 +1031,8 @@
 
   5. **Create main handler** (`main.v`):
      ```v
-     import http_server
-     import http_server.http1_1.request_parser
+     import server
+     import http1.request_parser
 
      const public_dir = './public'
 
@@ -1054,7 +1054,7 @@
          println('Static file server running on http://localhost:3000')
          println('Serving files from: ${public_dir}')
 
-         mut server := http_server.new_server(http_server.ServerConfig{
+         mut server := server.new_server(server.ServerConfig{
              port: 3000
              handler: handle_request
              io_multiplexing: $if linux { .epoll } $else $if darwin { .kqueue } $else { .iocp }
@@ -1114,10 +1114,10 @@
 
   3. **Implement HTTPS server** (`main.v`):
      ```v
-     import http_server
-     import http_server.tls
-     import http_server.http1_1.request_parser
-     import http_server.http1_1.response
+     import server
+     import tls
+     import http1.request_parser
+     import http1.response
      import os
 
      fn main() {
@@ -1141,7 +1141,7 @@
          println('TLS context configured')
 
          // Create server with TLS handler
-         mut server := http_server.new_server(http_server.ServerConfig{
+         mut server := server.new_server(server.ServerConfig{
              port: 8443
              handler: fn [mut tls_ctx] (req_buffer []u8, client_fd int) ![]u8 {
                  return handle_https_request(req_buffer, client_fd, mut tls_ctx)
@@ -1241,7 +1241,7 @@
              auth_middleware(validate_token)
          )
 
-         mut server := http_server.new_server(http_server.ServerConfig{
+         mut server := server.new_server(server.ServerConfig{
              port: 3000
              handler: handler
          })!
@@ -1302,7 +1302,7 @@
 ## 🧪 Testing & Validation
 
 ### 38. Request Parser Edge Case Tests
-- **File:** `http_server/http1_1/request_parser/request_parser_test.v`
+- **File:** `http1/request_parser/request_parser_test.v`
 - **Issue:** Limited test coverage
 - **Priority:** 🟡 MEDIUM
 - **Effort:** 2 hours

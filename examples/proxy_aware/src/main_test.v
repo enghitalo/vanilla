@@ -1,7 +1,7 @@
 module main
 
-import http_server.core
-import http_server.http1_1.request_parser
+import core
+import http1.request_parser
 
 // SOLUTION: the trust rule is pure over an INJECTED peer — real_client_ip
 // takes the peer string explicitly, so every branch (trusted, untrusted,

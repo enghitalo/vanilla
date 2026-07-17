@@ -5,7 +5,7 @@ module main
 // are pure given the registry, so they're directly assertable — and the raw
 // requests go through the FULL observed() wrapper (the example's core lesson)
 // via the serve() adapter, no listening socket required (BEST_PRACTICES §9).
-import http_server.core
+import core
 
 fn test_status_of() {
 	assert status_of('HTTP/1.1 200 OK\r\n\r\n'.bytes(), 0) == 200

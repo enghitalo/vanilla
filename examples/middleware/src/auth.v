@@ -4,7 +4,7 @@ module main
 // controller. Public routes call nothing; private routes call require_auth();
 // role-gated routes call require_role(). A guard returns the User, or an error
 // carrying the HTTP status the controller should send.
-import http_server.http1_1.request_parser { HttpRequest }
+import http1.request_parser { HttpRequest }
 
 struct User {
 	id   int

@@ -31,11 +31,11 @@ module main
 // it to the pure trust logic (`real_client_ip`), which tests drive directly
 // with injected peers. On Windows peer_addr returns '' by design (as it does
 // on getpeername failure); '' is an UNTRUSTED peer with identity 'unknown'.
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
-import http_server.http1_1.response
-import http_server.socket
+import server
+import core
+import http1.request_parser
+import http1.response
+import socket
 import strconv
 
 // Trusted proxy networks. Only forwarding headers from these are believed.
@@ -229,18 +229,18 @@ fn handle(req_buffer []u8, mut out []u8, client_fd int, _worker_state voidptr, m
 
 fn main() {
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         handle
 	})!
 	println('Proxy-aware demo on http://localhost:3000/  (trust rule: see header comment)')
-	server.run()
+	srv.run()
 }

@@ -10,11 +10,11 @@ A minimalist, high-performance HTTP server written in [V](https://vlang.io).
 - **Modular**: Easy to extend with custom controllers and handlers.
 - **Memory Safety**: No race conditions.
 - **No Magic**: Transparent and straightforward.
-- **E2E Testing**: Test handlers in-process by passing raw requests directly to `handle_request()`, or drive a running server over a real socket with `net.dial_tcp` and a read deadline (see [`http_server/backend_behaviors_test.v`](http_server/backend_behaviors_test.v)).
+- **E2E Testing**: Test handlers in-process by passing raw requests directly to `handle_request()`, or drive a running server over a real socket with `net.dial_tcp` and a read deadline (see [`tests/backend_behaviors_test.v`](tests/backend_behaviors_test.v)).
 - **SSE Friendly**: Built-in Server-Sent Events support (sync and async).
 - **ETag Friendly**: Conditional GETs with `ETag` and `If-None-Match` headers.
 - **Database Friendly**: Example with PostgreSQL connection pool.
-- **Graceful Shutdown**: Drain in-flight requests on `SIGTERM`/`SIGINT` via `server.shutdown(grace_ms)`.
+- **Graceful Shutdown**: Drain in-flight requests on `SIGTERM`/`SIGINT` via `srv.shutdown(grace_ms)`.
 - **Multiple Backends**: epoll, io_uring (Linux), kqueue (macOS), IOCP (Windows).
 - **One Handler Contract**: a single `handler` signature covers every use case, with every input as an explicit, self-describing parameter — append the response and return `.done`, suspend/resume on any fd (DB sockets, timers, upstream proxies) with `event_loop.watch_fd(...)` + `.suspend`, and reach lock-free per-worker state (e.g. a per-thread DB connection — no shared pool, no mutex) via the `worker_state` parameter.
 - **Compliant with HTTP standards**: Follows [RFC 9112](https://datatracker.ietf.org/doc/rfc9112/) and the [IANA Field Name Registry](https://www.iana.org/assignments/http-fields/http-fields.xhtml). A dedicated [`examples/conformance/`](examples/conformance/) handler is probed in CI by [h1spec](https://github.com/dropseed/h1spec) and [Http11Probe](https://github.com/MDA2AV/Http11Probe) — see [Conformance Testing](#conformance-testing).
@@ -26,8 +26,8 @@ A minimalist, high-performance HTTP server written in [V](https://vlang.io).
 ### 1. Simple HTTP Server
 
 ```v
-import http_server
-import http_server.core
+import server
+import core
 
 fn handle_request(request []u8, mut response []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	// Parse the request and APPEND the complete raw HTTP response
@@ -41,19 +41,19 @@ fn handle_request(request []u8, mut response []u8, client_fd int, worker_state v
 }
 
 fn main() {
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		handler:         handle_request
 		io_multiplexing: backend
 	})!
-	server.run()
+	srv.run()
 }
 ```
 
@@ -71,11 +71,11 @@ fn test_handle_request() {
 }
 ```
 
-Or drive a running server over a real client socket — spawn `server.run()` on a
+Or drive a running server over a real client socket — spawn `srv.run()` on a
 thread, then send raw requests with `net.dial_tcp` and read the responses under a
 deadline. This exercises the full framing / keep-alive / suspend-resume path and
 never hangs on a stalled stream. See
-[`http_server/backend_behaviors_test.v`](http_server/backend_behaviors_test.v)
+[`tests/backend_behaviors_test.v`](tests/backend_behaviors_test.v)
 for the pattern (pipelining, framing across TCP segments, timeouts, graceful
 shutdown) and the `*_end_to_end_test.v` files under [`examples/`](examples/) for
 per-app end-to-end tests.
@@ -83,18 +83,18 @@ per-app end-to-end tests.
 ### 3. Graceful Shutdown
 
 ```v
-import http_server
+import server
 import os
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{ ... })!
+	mut srv := server.new_server(server.ServerConfig{ ... })!
 
-	os.signal_opt(.term, fn [server] (_ os.Signal) {
-		server.shutdown(2000) // drain up to 2 s, then exit
+	os.signal_opt(.term, fn [srv] (_ os.Signal) {
+		srv.shutdown(2000) // drain up to 2 s, then exit
 		exit(0)
 	}) or {}
 
-	server.run()
+	srv.run()
 }
 ```
 
@@ -110,14 +110,14 @@ client proceeds the instant the server is ready instead of polling for it:
 
 ```v
 ready := chan bool{cap: 1}
-mut server := http_server.new_server(http_server.ServerConfig{
+mut srv := server.new_server(server.ServerConfig{
 	handler:            handle_request
 	after_server_start: fn [ready] () {
 		ready <- true
 	}
 })!
-spawn fn [mut server] () {
-	server.run()
+spawn fn [mut srv] () {
+	srv.run()
 }()
 _ := <-ready // deterministic readiness — the server is now accepting
 ```
@@ -172,7 +172,7 @@ v -prod run examples/database
 fn main() {
 	mut pool := new_connection_pool(pg.Config{ ... }, 5) or { panic(err) }
 
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         fn [mut pool] (request []u8, mut response []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
@@ -181,7 +181,7 @@ fn main() {
 			return .done
 		}
 	})!
-	server.run()
+	srv.run()
 }
 ```
 
@@ -218,7 +218,7 @@ fn main() {
 | `examples/request_limits/` | 413/431 body and header size limits |
 | `examples/security_headers/` | HSTS, CSP, and other security headers |
 | `examples/sse/` | Server-Sent Events (sync broadcast) |
-| `examples/static_assets/` | CSR/WASM SPA bundle (`application/wasm`, `.br`/`.gz`, immutable caching, SPA fallback) |
+| `examples/spa_static_assets/` | CSR/WASM SPA bundle (`application/wasm`, `.br`/`.gz`, immutable caching, SPA fallback) |
 | `examples/static_files/` | Static file serving (MIME, Range, ETag, traversal safety) |
 | `examples/url_form/` | Query-string and URL-encoded form parsing |
 | `examples/veb_like/` | veb-style declarative routing |
@@ -237,13 +237,13 @@ Two layers, no bespoke test mode on the server:
 - **In-process** — call the handler directly (`handle_request(req, mut out, ...)`)
   and assert on the bytes it appends. Deterministic, no sockets, no threads; ideal
   for routing and response-shape assertions.
-- **Over a real socket** — spawn `server.run()` on a thread, connect with
+- **Over a real socket** — spawn `srv.run()` on a thread, connect with
   `net.dial_tcp`, and read responses under a per-read deadline (so a broken stream
   fails fast instead of hanging). This drives the real backend end to end —
   epoll / io_uring / kqueue — including pipelining, request framing across TCP
   segments, keep-alive, `Expect: 100-continue`, half-close, read timeouts, and the
   async suspend/resume path. See
-  [`http_server/backend_behaviors_test.v`](http_server/backend_behaviors_test.v)
+  [`tests/backend_behaviors_test.v`](tests/backend_behaviors_test.v)
   and the `*_end_to_end_test.v` files under [`examples/`](examples/).
 
 ---
@@ -395,6 +395,7 @@ See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark 
 | Resource | Description |
 |---|---|
 | [Wiki](https://github.com/enghitalo/vanilla/wiki) | Architecture deep-dives, async reactor, memory management under `-gc none`, Postgres pipelining, and lessons learned |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The module tree, the one-direction dependency rule between modules, and where new protocols/platforms land |
 | [docs/BEST_PRACTICES.md](docs/BEST_PRACTICES.md) | How to write handlers, build responses, allocate, handle concurrency, security, testing, and benchmarking |
 | [docs/V_PERF_TOOLBOX.md](docs/V_PERF_TOOLBOX.md) | V performance attributes, array flags, the C escape hatch, profiling allocations, and known gotchas |
 | [docs/PERF_GAP_ANALYSIS.md](docs/PERF_GAP_ANALYSIS.md) | Comparison against the fastest HTTP servers (tokio, io_uring C, Zig, Rust) and what was done to close the gaps |

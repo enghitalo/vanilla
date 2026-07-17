@@ -1,7 +1,7 @@
 module main
 
 import os
-import http_server.core
+import core
 
 // Pure tests for the middleware reference design. Three layers:
 //   1. the composition mechanics (chain order, single-alloc header injection);

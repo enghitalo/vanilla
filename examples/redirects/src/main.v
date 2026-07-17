@@ -31,10 +31,10 @@ module main
 //     to the first `?` (`route_len`) — otherwise `/old?utm=1` would miss `/old`.
 //
 // Everything here WORKS TODAY — redirects are just a status line + Location.
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
-import http_server.http1_1.response
+import server
+import core
+import http1.request_parser
+import http1.response
 
 // ---- static responses (consts — the fast path appends, never builds) --------
 const resp_301_old = 'HTTP/1.1 301 Moved Permanently\r\nLocation: /new\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
@@ -141,18 +141,18 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 
 fn main() {
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         handle
 	})!
 	println('Redirect demo on http://localhost:3000/  (/old -> 301, /login POST -> 303, /api/v1 -> 308)')
-	server.run()
+	srv.run()
 }

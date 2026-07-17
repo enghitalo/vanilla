@@ -100,8 +100,8 @@ curl -s http://localhost:3000/webcam | head -c 80
 Zero-copy `sendfile(2)` for the file path **now exists** in the epoll core: a
 handler hands a file off via `core.queue_file(fd, off, len)` and the worker
 streams it straight to the socket (EPOLLOUT-driven, no userspace bounce). The
-`http_server.static_assets` module uses it for large files — see
-`examples/static_assets`. Serving a recorded clip can adopt it the same way; the
+`static_assets` module uses it for large files — see
+`examples/spa_static_assets`. Serving a recorded clip can adopt it the same way; the
 handler contract here is unchanged.
 
 For the **live** path, dropping a viewer that can't keep up is intentional and

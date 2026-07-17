@@ -23,9 +23,9 @@ module main
 //     straight into `out` via ws/wi — no `+`, no `${}`, no builders.
 //   - Routing and the Range header are read IN PLACE as offsets/views into
 //     the request buffer — no `.to_string()`, no substr, no split.
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
+import server
+import core
+import http1.request_parser
 import os
 import strconv
 
@@ -133,7 +133,7 @@ fn handle(req_buffer []u8, mut out []u8, client_fd int, _worker_state voidptr, m
 //
 // The body allocation (`read_range`) is DISK I/O, not a discipline violation:
 // reading a file range must materialize bytes somewhere. The core's zero-copy
-// alternative is core.queue_file (sendfile(2), used by http_server.static_assets)
+// alternative is core.queue_file (sendfile(2), used by server.static_assets)
 // — not adopted here because this example teaches bounded-memory Range reads.
 fn serve_video(req request_parser.HttpRequest, mut out []u8) {
 	if !os.is_file(sample_video) {
@@ -261,20 +261,20 @@ fn main() {
 
 	mut viewers := &Viewers{}
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         fn [mut viewers] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 			return handle(req_buffer, mut out, client_fd, worker_state, mut event_loop, mut viewers)
 		}
-		limits:          http_server.Limits{
+		limits:          server.Limits{
 			max_header_bytes: 16 * 1024
 			read_timeout_ms:  10_000
 			// NOTE: no write_timeout_ms — the webcam stream is intentionally
@@ -282,5 +282,5 @@ fn main() {
 		}
 	})!
 	println('video stream on http://localhost:3000/  (/, /video, /webcam)')
-	server.run()
+	srv.run()
 }

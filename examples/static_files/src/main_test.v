@@ -8,7 +8,7 @@ module main
 // ./public/index.html fixture in a temp dir and chdirs into it (web_root is
 // a relative const), testsuite_end removes it. `${}` here is test scaffolding,
 // not program code.
-import http_server.core
+import core
 import os
 
 const fixture_body = '<h1>hello</h1>' // 14 bytes

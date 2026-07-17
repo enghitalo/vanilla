@@ -1,6 +1,6 @@
 module main
 
-import http_server.core
+import core
 
 // Handler-level conformance tests: feed raw request bytes to handle_request and
 // assert the status line, mirroring the checks an external probe (h1spec) makes.

@@ -76,7 +76,7 @@ Reach for the bytes you already have before allocating new ones.
 - Defer `.clone()` / `.to_string()` until the byte data must outlive the buffer.
 - Build a map lookup key as a non-owning view — `unsafe { tos(ptr, len) }` —
   when the map never retains it (it only hashes the key bytes). The
-  [static_assets module](../http_server/static_assets/static_assets.v#L273-L281)
+  [static_assets module](../static_assets/static_assets.v#L273-L281)
   is the canonical example: `key := tos(&buf[rs], rel_len)`, a view straight into
   the request buffer, so routing costs no allocation.
 - **Whenever a view suffices, use a view.** `unsafe { (&buf[start]).vbytes(len) }`
@@ -116,7 +116,7 @@ build responses.
 
 If a response never changes, build it **once at compile time** and send the
 bytes directly. This is exactly what the core does
-([response.c.v](../http_server/http1_1/response/response.c.v)):
+([response.c.v](../http1/response/response.c.v)):
 
 ```v
 const status_413_response = 'HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()

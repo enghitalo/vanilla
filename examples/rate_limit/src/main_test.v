@@ -11,7 +11,7 @@ module main
 // deterministic; refill-over-time is covered by the injected-clock unit tests.
 // (`${}` here is TEST scaffolding — the example code itself never
 // concatenates; see main.v.)
-import http_server.core
+import core
 
 const sec = i64(1_000_000_000) // 1s in nanoseconds
 

@@ -15,8 +15,8 @@ module main
 //
 // The same append-flush-suspend loop is how a chat feed, a progress stream, or a
 // log tail would push to many clients from one thread. See core.Handler.
-import http_server
-import http_server.core
+import server
+import core
 
 #include <sys/timerfd.h>
 #include <unistd.h>
@@ -87,10 +87,10 @@ fn sse_tick(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidp
 }
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            8092
 		io_multiplexing: .epoll
 		handler:         handle
 	})!
-	server.run()
+	srv.run()
 }

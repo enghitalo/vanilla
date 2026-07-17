@@ -65,10 +65,10 @@ pub:
 
 // One-shot: new_server(port:0) → spawn run() → reactor at readiness → all scripts
 // terminal → shutdown(grace) → Outcome.
-pub fn drive(config http_server.ServerConfig, scripts []Script) !Outcome
+pub fn drive(config server.ServerConfig, scripts []Script) !Outcome
 
 // Session form, for cross-connection choreography (SSE, shutdown-while-in-flight):
-pub fn start(config http_server.ServerConfig) !&Harness
+pub fn start(config server.ServerConfig) !&Harness
 pub fn (mut h Harness) fire(scripts []Script) !Outcome   // returns when THESE scripts' last round completed; conns stay open in the reactor
 pub fn (mut h Harness) wait(group GroupId, until fn (acc []u8) bool) !Outcome // block until predicate holds on every conn of the group (or EOF)
 pub fn (mut h Harness) stop()                             // close client fds, shutdown server, join reactor
@@ -143,14 +143,14 @@ Server-side change in `new_server` (cold path only):
 
 ## Where things live (module cycles decide this)
 
-- `vtest/` is a **top-level module** (`import vtest`). It imports `http_server`,
+- `vtest/` is a **top-level module** (`import vtest`). It imports `server`,
   so it can never be imported from files compiled *as part of* module
-  `http_server` — including that module's own `_test.v` files.
+  `server` — including that module's own `_test.v` files.
 - Therefore socket e2e tests for the server live in **`tests/`** (repo root),
-  standalone `_test.v` files importing `http_server` + `vtest`. They only ever
+  standalone `_test.v` files importing `server` + `vtest`. They only ever
   used public API; they never needed module-internal access.
 - Example tests are `module main` and import `vtest` directly, in place.
-- `http_server/testkit` (deadline-bounded readers) stays for the hand-rolled
+- `testkit` (deadline-bounded readers) stays for the hand-rolled
   escape-hatch tests; vtest does not import it.
 
 ## What stays hand-rolled (deliberately)
@@ -178,7 +178,7 @@ Server-side change in `new_server` (cold path only):
    with a test.
 3. `vtest/` module: reactor + predicates + `drive`/`start`/`fire`/`wait`/`stop` +
    its own smoke tests in `tests/`.
-4. Prova de fogo: migrate `http_server/backend_behaviors_test.v` →
+4. Prova de fogo: migrate `tests/backend_behaviors_test.v` →
    `tests/backend_behaviors_test.v` on vtest (all 19 checks, same coverage,
    storms where they add value).
 5. Migrate `server_test.v` (keep hook-contract test hand-rolled),

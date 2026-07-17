@@ -14,8 +14,8 @@ module main
 // epoll only watches pollable fds (pipes/sockets), NOT regular files — a file
 // reads as "always ready", so streaming one needs no async at all. The pipe here
 // is the realistic case: the bytes genuinely arrive over time.
-import http_server
-import http_server.core
+import server
+import core
 
 #include <stdio.h>
 #include <fcntl.h>
@@ -79,10 +79,10 @@ fn on_chunk(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidp
 }
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            8093
 		io_multiplexing: .epoll
 		handler:         handle
 	})!
-	server.run()
+	srv.run()
 }

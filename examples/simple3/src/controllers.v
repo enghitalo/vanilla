@@ -1,7 +1,7 @@
 module main
 
 import strings
-import http_server.http1_1.request_parser
+import http1.request_parser
 
 const http_ok_response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 

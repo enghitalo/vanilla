@@ -36,10 +36,10 @@ module main
 //
 // WORKS TODAY. The one core dependency for perfect timing is a request-start
 // timestamp; we stamp it at handler entry, which is close enough.
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
-import http_server.http1_1.response
+import server
+import core
+import http1.request_parser
+import http1.response
 import strconv
 import sync
 import time
@@ -295,18 +295,18 @@ fn main() {
 		app(req_buffer, mut m, mut out)!
 	}, mut m)
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         handler
 	})!
 	println('Observability demo on http://localhost:3000/  (/healthz, /readyz, /metrics)')
-	server.run()
+	srv.run()
 }

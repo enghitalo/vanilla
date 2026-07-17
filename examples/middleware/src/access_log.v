@@ -21,7 +21,7 @@ module main
 // (per-worker buffers via thread-local storage, flushed independently) is noted
 // in the README as the next optimization — it needs a thread-local slot, which
 // this server doesn't expose to the handler.
-import http_server.core
+import core
 
 // Buffered, thread-safe (glibc locks the stream), append-mode C stdio.
 fn C.fopen(path &char, mode &char) voidptr

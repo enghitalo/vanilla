@@ -15,14 +15,14 @@
 // where io_uring_setup is sandboxed, e.g. GitHub's hosted runners), iocp under
 // $if windows. On other platforms every test is a no-op.
 //
-// Standalone on purpose: vtest imports http_server, so this file lives outside
+// Standalone on purpose: vtest imports server, so this file lives outside
 // that module (no import cycle) and uses only public API.
 import strconv
 import time
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
-import http_server.http1_1.response
+import server
+import core
+import http1.request_parser
+import http1.response
 import vtest
 
 const bb_req = 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
@@ -111,8 +111,8 @@ fn bb_concat(a []u8, b []u8) []u8 {
 //     head, so round 2's tail bytes arrive to a connection that must resume a
 //     buffered partial request (the old file forced this split with a sleep;
 //     the pipelined barrier does it with completion, no clock).
-fn check_pipelining_and_framing(backend http_server.IOBackend) ! {
-	out := vtest.drive(http_server.ServerConfig{
+fn check_pipelining_and_framing(backend server.IOBackend) ! {
+	out := vtest.drive(server.ServerConfig{
 		io_multiplexing: backend
 		handler:         bb_ok_handler
 	}, [
@@ -155,11 +155,11 @@ fn check_pipelining_and_framing(backend http_server.IOBackend) ! {
 // max_connections=4 — must be refused at accept (close with no response). The
 // two fire() groups are the cross-connection ordering: the first returns only
 // after all 4 responses arrived, so the count is exactly 4 when the 5th lands.
-fn check_max_connections(backend http_server.IOBackend) ! {
-	mut h := vtest.start(http_server.ServerConfig{
+fn check_max_connections(backend server.IOBackend) ! {
+	mut h := vtest.start(server.ServerConfig{
 		io_multiplexing: backend
 		handler:         bb_ok_handler
-		limits:          http_server.Limits{
+		limits:          server.Limits{
 			max_connections: 4
 		}
 	})!
@@ -199,11 +199,11 @@ fn check_max_connections(backend http_server.IOBackend) ! {
 // io_uring) — never served a 200. then_eof means completion can ONLY come from
 // the server's clock; the stopwatch MEASURES how long that took after the
 // fact (the old file's <1500ms promptness assert), it is not a deadline.
-fn check_read_timeout(backend http_server.IOBackend) ! {
-	mut h := vtest.start(http_server.ServerConfig{
+fn check_read_timeout(backend server.IOBackend) ! {
+	mut h := vtest.start(server.ServerConfig{
 		io_multiplexing: backend
 		handler:         bb_ok_handler
-		limits:          http_server.Limits{
+		limits:          server.Limits{
 			read_timeout_ms: 400
 		}
 	})!
@@ -246,16 +246,16 @@ fn check_read_timeout(backend http_server.IOBackend) ! {
 // drain silence probe ("no bytes for 500ms after the first chunk") is a
 // negative timing assertion that needs a client-side clock — inexpressible
 // under the vtest contract, deliberately dropped.
-fn check_large_upload_drain(backend http_server.IOBackend) ! {
+fn check_large_upload_drain(backend server.IOBackend) ! {
 	head :=
 		'POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: ${bb_upload_body_len}\r\n\r\n'.bytes()
 	first_chunk := []u8{len: bb_upload_chunk_len, init: u8(0x61)}
 	rest := []u8{len: bb_upload_body_len - bb_upload_chunk_len, init: u8(0x61)}
 	full_body := []u8{len: bb_upload_body_len, init: u8(0x61)}
-	out := vtest.drive(http_server.ServerConfig{
+	out := vtest.drive(server.ServerConfig{
 		io_multiplexing: backend
 		handler:         bb_upload_handler
-		limits:          http_server.Limits{
+		limits:          server.Limits{
 			max_request_bytes: 8 * 1024 * 1024 // headroom for the 2 MiB bodies
 		}
 	}, [
@@ -299,14 +299,14 @@ fn check_large_upload_drain(backend http_server.IOBackend) ! {
 // answered 200. The 413 bytes themselves are asserted only when they arrived:
 // the server closes with the body unread, so the kernel may RST and discard
 // the response in flight — the hard contract is "no 200, connection ended".
-fn check_streamed_body_over_max_body_bytes(backend http_server.IOBackend) ! {
+fn check_streamed_body_over_max_body_bytes(backend server.IOBackend) ! {
 	head :=
 		'POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: ${bb_upload_body_len}\r\n\r\n'.bytes()
 	first_chunk := []u8{len: bb_upload_chunk_len, init: u8(0x61)}
-	out := vtest.drive(http_server.ServerConfig{
+	out := vtest.drive(server.ServerConfig{
 		io_multiplexing: backend
 		handler:         bb_upload_handler
-		limits:          http_server.Limits{
+		limits:          server.Limits{
 			max_body_bytes:    64 * 1024 // far below the 2 MiB declared body
 			max_request_bytes: 8 * 1024 * 1024
 		}
@@ -336,8 +336,8 @@ fn check_streamed_body_over_max_body_bytes(backend http_server.IOBackend) ! {
 // receive the full response on the still-open read side (RFC 9112 §9.6).
 // Regression test for issue #103, where the recv→0 (EOF) tore the connection
 // down before the already-computed response was flushed.
-fn check_half_close_after_request(backend http_server.IOBackend) ! {
-	out := vtest.drive(http_server.ServerConfig{
+fn check_half_close_after_request(backend server.IOBackend) ! {
+	out := vtest.drive(server.ServerConfig{
 		io_multiplexing: backend
 		handler:         bb_ok_handler
 	}, [
@@ -365,8 +365,8 @@ fn check_half_close_after_request(backend http_server.IOBackend) ! {
 // cumulative target 2 frames — 100 first, final 200 second. Without the
 // prompt the server would wait for a body the client is deliberately
 // withholding, and this test would hang (the correct liveness signal).
-fn check_expect_100_continue(backend http_server.IOBackend) ! {
-	out := vtest.drive(http_server.ServerConfig{
+fn check_expect_100_continue(backend server.IOBackend) ! {
+	out := vtest.drive(server.ServerConfig{
 		io_multiplexing: backend
 		handler:         bb_ok_handler
 	}, [
@@ -392,15 +392,15 @@ fn check_expect_100_continue(backend http_server.IOBackend) ! {
 }
 
 // check_graceful_shutdown (hybrid — lifecycle owned by the test, VTEST.md):
-// serve one request, then call server.shutdown(2000) from the test thread. The
+// serve one request, then call server_ref().shutdown(2000) from the test thread. The
 // stopwatch MEASURES the idle drain's promptness after it returned (the old
 // file's <1000ms assert) — shutdown's precise drain returns the moment the
 // in-flight counters hit zero, not after the grace. Every listener is then
 // stopped, so 10 fresh connects must all be refused (connect error, or an
 // immediate close with no response). The deferred stop() calls shutdown again;
 // both are idempotent.
-fn check_graceful_shutdown(backend http_server.IOBackend) ! {
-	mut h := vtest.start(http_server.ServerConfig{
+fn check_graceful_shutdown(backend server.IOBackend) ! {
+	mut h := vtest.start(server.ServerConfig{
 		io_multiplexing: backend
 		handler:         bb_ok_handler
 	})!
@@ -450,7 +450,7 @@ fn check_graceful_shutdown(backend http_server.IOBackend) ! {
 
 fn test_iouring_large_upload_drain() ! {
 	$if linux {
-		if !http_server.iou_backend_available() {
+		if !server.iou_backend_available() {
 			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
 			return
 		}
@@ -460,7 +460,7 @@ fn test_iouring_large_upload_drain() ! {
 
 fn test_iouring_streamed_body_over_max_body_bytes() ! {
 	$if linux {
-		if !http_server.iou_backend_available() {
+		if !server.iou_backend_available() {
 			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
 			return
 		}
@@ -470,7 +470,7 @@ fn test_iouring_streamed_body_over_max_body_bytes() ! {
 
 fn test_iouring_pipelining_and_framing() ! {
 	$if linux {
-		if !http_server.iou_backend_available() {
+		if !server.iou_backend_available() {
 			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
 			return
 		}
@@ -480,7 +480,7 @@ fn test_iouring_pipelining_and_framing() ! {
 
 fn test_iouring_max_connections() ! {
 	$if linux {
-		if !http_server.iou_backend_available() {
+		if !server.iou_backend_available() {
 			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
 			return
 		}
@@ -490,7 +490,7 @@ fn test_iouring_max_connections() ! {
 
 fn test_iouring_read_timeout() ! {
 	$if linux {
-		if !http_server.iou_backend_available() {
+		if !server.iou_backend_available() {
 			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
 			return
 		}
@@ -500,7 +500,7 @@ fn test_iouring_read_timeout() ! {
 
 fn test_iouring_graceful_shutdown() ! {
 	$if linux {
-		if !http_server.iou_backend_available() {
+		if !server.iou_backend_available() {
 			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
 			return
 		}
@@ -510,7 +510,7 @@ fn test_iouring_graceful_shutdown() ! {
 
 fn test_iouring_half_close_after_request() ! {
 	$if linux {
-		if !http_server.iou_backend_available() {
+		if !server.iou_backend_available() {
 			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
 			return
 		}
@@ -526,43 +526,43 @@ fn test_iouring_half_close_after_request() ! {
 
 fn test_iocp_large_upload_drain() ! {
 	$if windows {
-		check_large_upload_drain(unsafe { http_server.IOBackend(0) })!
+		check_large_upload_drain(unsafe { server.IOBackend(0) })!
 	}
 }
 
 fn test_iocp_streamed_body_over_max_body_bytes() ! {
 	$if windows {
-		check_streamed_body_over_max_body_bytes(unsafe { http_server.IOBackend(0) })!
+		check_streamed_body_over_max_body_bytes(unsafe { server.IOBackend(0) })!
 	}
 }
 
 fn test_iocp_pipelining_and_framing() ! {
 	$if windows {
-		check_pipelining_and_framing(unsafe { http_server.IOBackend(0) })!
+		check_pipelining_and_framing(unsafe { server.IOBackend(0) })!
 	}
 }
 
 fn test_iocp_max_connections() ! {
 	$if windows {
-		check_max_connections(unsafe { http_server.IOBackend(0) })!
+		check_max_connections(unsafe { server.IOBackend(0) })!
 	}
 }
 
 fn test_iocp_read_timeout() ! {
 	$if windows {
-		check_read_timeout(unsafe { http_server.IOBackend(0) })!
+		check_read_timeout(unsafe { server.IOBackend(0) })!
 	}
 }
 
 fn test_iocp_graceful_shutdown() ! {
 	$if windows {
-		check_graceful_shutdown(unsafe { http_server.IOBackend(0) })!
+		check_graceful_shutdown(unsafe { server.IOBackend(0) })!
 	}
 }
 
 fn test_iocp_half_close_after_request() ! {
 	$if windows {
-		check_half_close_after_request(unsafe { http_server.IOBackend(0) })!
+		check_half_close_after_request(unsafe { server.IOBackend(0) })!
 	}
 }
 

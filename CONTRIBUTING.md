@@ -6,6 +6,14 @@
 - Always try to keep abstraction to a minimum
 - Don't complicate it
 
+## Module imports
+
+Use **fully-qualified imports** from the repo root (`import server.backend_epoll`,
+`import http1.response`) — never sibling-relative paths — so any future directory
+move stays a pure import-line change. The one-direction dependency rule between
+modules is documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
+enforced by CI.
+
 ## Sending Raw HTTP Requests for Testing
 
 You can test your server by sending raw HTTP requests directly using tools like `nc` (netcat), `telnet`, or `socat`. This is useful for debugging, learning, or end-to-end testing.
