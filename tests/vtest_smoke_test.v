@@ -1,13 +1,13 @@
 // Smoke tests for the vtest module itself (docs/VTEST.md), against the
-// platform-default backend. Standalone on purpose: vtest imports http_server,
-// so these tests live outside the http_server module (no import cycle) and use
+// platform-default backend. Standalone on purpose: vtest imports server,
+// so these tests live outside the server module (no import cycle) and use
 // only public API. No ports (always ephemeral), no timeouts (the only clock in
 // this file is the server's own Limits, in the stall test), no readiness
 // plumbing (drive/start own the lifecycle).
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
-import http_server.http1_1.response
+import server
+import core
+import http1.request_parser
+import http1.response
 import vtest
 
 const get_root = 'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
@@ -44,7 +44,7 @@ fn pipeline(req []u8, n int) []u8 {
 // responses, spread across every worker. Position = identity, order per conn
 // guaranteed by HTTP/1.1.
 fn test_pipelined_storm() ! {
-	out := vtest.drive(http_server.ServerConfig{ handler: smoke_handler }, vtest.repeat(64, vtest.Script{
+	out := vtest.drive(server.ServerConfig{ handler: smoke_handler }, vtest.repeat(64, vtest.Script{
 		rounds: [vtest.Round{
 			send: pipeline(get_root, 8)
 			want: 8
@@ -65,7 +65,7 @@ fn test_pipelined_storm() ! {
 // malformed request the router answers 400 + close. All concurrent; each
 // asserted by its script index.
 fn test_mixed_traffic() ! {
-	out := vtest.drive(http_server.ServerConfig{ handler: smoke_handler }, [
+	out := vtest.drive(server.ServerConfig{ handler: smoke_handler }, [
 		vtest.Script{
 			rounds: [vtest.Round{
 				send: get_root
@@ -100,7 +100,7 @@ fn test_mixed_traffic() ! {
 // Rounds sequence WITHIN a connection: the second request goes out only after
 // the first response arrived (the keep-alive reuse contract, kqueue-safe).
 fn test_keep_alive_rounds() ! {
-	out := vtest.drive(http_server.ServerConfig{ handler: smoke_handler }, [
+	out := vtest.drive(server.ServerConfig{ handler: smoke_handler }, [
 		vtest.Script{
 			rounds: [
 				vtest.Round{
@@ -120,7 +120,7 @@ fn test_keep_alive_rounds() ! {
 // Half-close (RFC 9112 §9.6): client sends the request then SHUT_WR; the
 // response must still arrive.
 fn test_half_close_still_answered() ! {
-	out := vtest.drive(http_server.ServerConfig{ handler: smoke_handler }, [
+	out := vtest.drive(server.ServerConfig{ handler: smoke_handler }, [
 		vtest.Script{
 			rounds:  [vtest.Round{
 				send: get_root
@@ -136,9 +136,9 @@ fn test_half_close_still_answered() ! {
 // completion can ONLY come from the server's own read_timeout reaper — the one
 // and only clock in this test, per the design contract.
 fn test_stalled_conns_reaped_by_server_clock() ! {
-	out := vtest.drive(http_server.ServerConfig{
+	out := vtest.drive(server.ServerConfig{
 		handler: smoke_handler
-		limits:  http_server.Limits{
+		limits:  server.Limits{
 			read_timeout_ms: 400
 		}
 	}, vtest.repeat(16, vtest.Script{
@@ -158,7 +158,7 @@ fn test_stalled_conns_reaped_by_server_clock() ! {
 // late expectation on still-open connections. The second fire only starts after
 // the first group finished — no sleeps anywhere.
 fn test_session_fire_then_wait() ! {
-	mut h := vtest.start(http_server.ServerConfig{ handler: smoke_handler })!
+	mut h := vtest.start(server.ServerConfig{ handler: smoke_handler })!
 	defer { h.stop() }
 
 	first := h.fire(vtest.repeat(4, vtest.Script{

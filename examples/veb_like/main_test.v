@@ -1,6 +1,6 @@
 module main
 
-import http_server.core
+import core
 
 // Exhaustive coverage of every route TYPE the router supports. Each case drives
 // the real router() through the same closure shape as ServerConfig.handler

@@ -3,7 +3,7 @@ module main
 // Graceful shutdown — now WORKING via Server.shutdown().
 //
 // On SIGTERM/SIGINT (what `docker stop` / k8s send) the server must not drop
-// in-flight requests. The signal handler calls `server.shutdown(grace_ms)`,
+// in-flight requests. The signal handler calls `srv.shutdown(grace_ms)`,
 // which:
 //   1. closes the listening socket -> the kernel refuses NEW connections;
 //   2. waits grace_ms for in-flight request handling to finish;
@@ -15,8 +15,8 @@ module main
 // the instant the last request finishes (so an idle server exits in ~ms, not the
 // full 2s grace; the grace is just the cap). The counters are per-worker and
 // cache-line-padded, so the per-request increment is free on the hot path.
-import http_server
-import http_server.core
+import server
+import core
 import os
 
 fn handle(_req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
@@ -26,14 +26,14 @@ fn handle(_req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr,
 
 fn main() {
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         handle
@@ -41,17 +41,17 @@ fn main() {
 
 	// Stop accepting, drain briefly, exit cleanly. (Captures `server` by value —
 	// shutdown only needs the listener fd.)
-	os.signal_opt(.term, fn [server] (_ os.Signal) {
+	os.signal_opt(.term, fn [srv] (_ os.Signal) {
 		eprintln('SIGTERM: stop accepting, draining (2s), exiting...')
-		server.shutdown(2000)
+		srv.shutdown(2000)
 		exit(0)
 	}) or {}
-	os.signal_opt(.int, fn [server] (_ os.Signal) {
+	os.signal_opt(.int, fn [srv] (_ os.Signal) {
 		eprintln('SIGINT: stop accepting, draining (2s), exiting...')
-		server.shutdown(2000)
+		srv.shutdown(2000)
 		exit(0)
 	}) or {}
 
 	println('Graceful-shutdown demo on http://localhost:3000/  (send SIGTERM to drain & exit)')
-	server.run()
+	srv.run()
 }

@@ -20,9 +20,9 @@ module main
 //     getpeername syscall per connection.
 //   - The most efficient block is at CONNECTION time (drop on accept). That
 //     needs a core accept-hook; here we answer 403 per request at handler level.
-import http_server
-import http_server.core
-import http_server.socket
+import server
+import core
+import socket
 import sync
 
 // Blocklist is the only shared state: a set of denied IPs, read-mostly.
@@ -72,14 +72,14 @@ fn main() {
 	blocklist.block('192.168.1.100')
 
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         fn [mut blocklist] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
@@ -88,5 +88,5 @@ fn main() {
 		}
 	})!
 	println('IP-block demo on http://localhost:3000/  (denied IPs get 403)')
-	server.run()
+	srv.run()
 }

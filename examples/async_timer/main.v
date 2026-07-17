@@ -14,8 +14,8 @@ module main
 // The same `event_loop.watch_fd(...)` primitive drives an async DB query (watch the DB
 // socket), a reverse proxy (watch the upstream socket), or SSE/WebSocket
 // backpressure (watch the client for EPOLLOUT). See core.Handler.
-import http_server
-import http_server.core
+import server
+import core
 
 #include <sys/timerfd.h>
 #include <time.h>
@@ -58,10 +58,10 @@ fn timer_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voi
 }
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            8091
 		io_multiplexing: .epoll
 		handler:         handle
 	})!
-	server.run()
+	srv.run()
 }

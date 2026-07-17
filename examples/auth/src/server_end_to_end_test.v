@@ -17,8 +17,8 @@
 // (machine-independent) plus a floor/ceiling.
 module main
 
-import http_server
-import http_server.core
+import server
+import core
 import vtest
 import strings
 import time
@@ -59,7 +59,7 @@ fn hol_protected_req() []u8 {
 // measure_protected_tail: with a login in flight, measure how long /protected
 // takes to complete. Returns the elapsed milliseconds. Asserts /protected was
 // actually served 200 (never dropped).
-fn measure_protected_tail(cfg http_server.ServerConfig, protected_req []u8) !i64 {
+fn measure_protected_tail(cfg server.ServerConfig, protected_req []u8) !i64 {
 	mut h := vtest.start(cfg)!
 	defer {
 		h.stop()
@@ -90,7 +90,7 @@ fn test_offload_prevents_head_of_line_blocking() ! {
 
 	// Naive synchronous verify: the single worker is stuck in argon2, so
 	// /protected waits the whole login.
-	sync_ms := measure_protected_tail(http_server.ServerConfig{
+	sync_ms := measure_protected_tail(server.ServerConfig{
 		io_multiplexing: .epoll
 		workers:         1
 		handler:         hol_sync_handler
@@ -98,7 +98,7 @@ fn test_offload_prevents_head_of_line_blocking() ! {
 
 	// The shipped handler + offload pool: the worker parks the login and serves
 	// /protected immediately.
-	offload_ms := measure_protected_tail(http_server.ServerConfig{
+	offload_ms := measure_protected_tail(server.ServerConfig{
 		io_multiplexing: .epoll
 		workers:         1
 		handler:         handle

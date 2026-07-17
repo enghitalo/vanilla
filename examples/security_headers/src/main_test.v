@@ -4,7 +4,7 @@ module main
 // Demonstrates testing the COMPOSITION pattern: assert the wrapper injects the
 // hardening headers into whatever the inner handler returned, in the right
 // place (after the status line, before the body).
-import http_server.core
+import core
 
 fn test_wrapper_injects_all_headers() {
 	out := serve('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()).bytestr()

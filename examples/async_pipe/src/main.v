@@ -9,8 +9,8 @@
 // Try:  curl http://localhost:8094/async   -> "async-ok"
 module main
 
-import http_server
-import http_server.core
+import server
+import core
 
 #include <unistd.h>
 
@@ -54,9 +54,9 @@ fn pipe_done(mut out []u8, ready_fd int, _ready_fd_error bool, _watch_payload vo
 }
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:    8094
 		handler: handle
 	})!
-	server.run()
+	srv.run()
 }

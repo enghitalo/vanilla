@@ -1,8 +1,8 @@
 module main
 
 import os
-import http_server
-import http_server.core
+import server
+import core
 import pg_async
 
 // End-to-end demo of the native async Postgres driver (pg_async) on the epoll
@@ -124,7 +124,7 @@ fn on_db_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload vo
 }
 
 fn main() {
-	mut s := http_server.new_server(http_server.ServerConfig{
+	mut s := server.new_server(server.ServerConfig{
 		port:       8099
 		handler:    handler
 		make_state: build_pool

@@ -12,8 +12,8 @@ module main
 // The field's meaning is uniform across backends (count of worker threads); the
 // topology differs — epoll runs one central acceptor + `workers` epoll loops,
 // io_uring runs `workers` shared-nothing rings (one SO_REUSEPORT listener each).
-import http_server
-import http_server.core
+import server
+import core
 import runtime
 
 fn api_handler(_req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
@@ -28,9 +28,9 @@ fn admin_handler(_req_buffer []u8, mut out []u8, _client_fd int, _worker_state v
 
 fn main() {
 	// Backend chosen per-OS; this example targets the Linux epoll backend.
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	} $else {
 		eprintln('per_server_workers: this example targets the Linux epoll backend')
 		return
@@ -43,7 +43,7 @@ fn main() {
 	main_workers := if cpus - admin_workers >= 1 { cpus - admin_workers } else { 1 }
 
 	// Secondary (admin) server on :8081 with a small pool, in its own thread.
-	mut admin := http_server.new_server(http_server.ServerConfig{
+	mut admin := server.new_server(server.ServerConfig{
 		port:            8081
 		io_multiplexing: backend
 		workers:         admin_workers
@@ -55,7 +55,7 @@ fn main() {
 	}()
 
 	// Main API server on :8080 with the remaining cores.
-	mut api := http_server.new_server(http_server.ServerConfig{
+	mut api := server.new_server(server.ServerConfig{
 		port:            8080
 		io_multiplexing: backend
 		workers:         main_workers

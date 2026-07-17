@@ -15,8 +15,8 @@ module main
 // (no CPU spin) and serves normally:
 //   v run examples/async_watch_hangup/
 //   curl http://localhost:8098/        # -> ok
-import http_server
-import http_server.core
+import server
+import core
 
 #include <unistd.h>
 
@@ -57,11 +57,11 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
 }
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            8098
 		io_multiplexing: .epoll
 		handler:         handle
 		on_worker_start: on_start
 	})!
-	server.run()
+	srv.run()
 }

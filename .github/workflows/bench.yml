@@ -21,7 +21,20 @@ on:
   push:
     branches: [ main ]
     paths:
-      - 'http_server/**'
+      - 'server/**'
+      - 'core/**'
+      - 'http1/**'
+      - 'http2/**'
+      - 'socket/**'
+      - 'epoll/**'
+      - 'io_uring/**'
+      - 'kqueue/**'
+      - 'iocp/**'
+      - 'tls/**'
+      - 'static_assets/**'
+      - 'testkit/**'
+      - 'vtest/**'
+      - 'tests/**'
       - 'bench/**'
       - '.github/workflows/bench.yml'
   workflow_dispatch:

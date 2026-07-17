@@ -1,6 +1,6 @@
 module main
 
-import http_server.core
+import core
 
 // Size limits are now enforced by the CORE (the read loop), not the handler —
 // so the handler stays trivial and the limit behavior is tested where it lives:

@@ -10,7 +10,7 @@ module main
 // THE PERF SHAPE
 //   This demo's body is STATIC, so everything is done ONCE at init: the body is
 //   compressed with each encoder and four COMPLETE responses (headers + body)
-//   are cached as consts — the same idea as http_server.static_assets serving
+//   are cached as consts — the same idea as server.static_assets serving
 //   precompressed `.br`/`.gz` siblings from disk. The per-request work is:
 //   parse → case-insensitive scan of the Accept-Encoding bytes IN PLACE in the
 //   request buffer (by offsets — not even a `buf[a..b]` slice, see has_token)
@@ -34,10 +34,10 @@ module main
 //     shows the selection shape; those all safely fall back to identity here.
 //   - If an encoder fails, fall back to identity and OMIT `Content-Encoding` —
 //     never label uncompressed bytes as compressed.
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
-import http_server.http1_1.response
+import server
+import core
+import http1.request_parser
+import http1.response
 import compress.brotli
 import compress.gzip
 import compress.zstd
@@ -153,14 +153,14 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 
 fn main() {
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         handle
@@ -169,5 +169,5 @@ fn main() {
 	if resp_br.len == 0 {
 		println('note: system libbrotli not found — `br` disabled, negotiating zstd/gzip instead')
 	}
-	server.run()
+	srv.run()
 }

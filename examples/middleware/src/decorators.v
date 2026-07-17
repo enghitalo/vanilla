@@ -3,7 +3,7 @@ module main
 // Global response decorators — `fn (next) fn` wrappers applied to every response.
 // (Access logging lives in access_log.v — it has enough machinery to warrant its
 // own file.)
-import http_server.core
+import core
 
 const security_headers = ('X-Content-Type-Options: nosniff\r\n' + 'X-Frame-Options: DENY\r\n' +
 	"Content-Security-Policy: default-src 'self'\r\n").bytes()

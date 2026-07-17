@@ -64,7 +64,7 @@ and
 ## Known limitations (tracked as core-vanilla issues)
 
 A handler can only decide a request the framer has already accepted as a complete
-message, so a few conformance gaps live in `http_server` core, not this example.
+message, so a few conformance gaps live in the `server` core, not this example.
 They are tracked as issues:
 
 - **`Content-Length` + `Transfer-Encoding` sent together**

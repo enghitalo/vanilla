@@ -1,9 +1,9 @@
 module main
 
-import http_server
-import http_server.core
-import http_server.http1_1.response
-import http_server.http1_1.request_parser
+import server
+import core
+import http1.response
+import http1.request_parser
 import pool
 import db.sqlite
 import time
@@ -68,13 +68,13 @@ fn main() {
 		db_pool: *db_pool
 	}
 
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		handler:         fn [app] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 			return app.handle_request(req_buffer, mut out, -1, unsafe { nil }, mut event_loop)
 		}
-		io_multiplexing: unsafe { http_server.IOBackend(0) }
+		io_multiplexing: unsafe { server.IOBackend(0) }
 	})!
 
-	server.run()
+	srv.run()
 }

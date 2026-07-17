@@ -1,8 +1,8 @@
 module main
 
 import strings
-import http_server.http1_1.response
-import http_server.http1_1.request_parser
+import http1.response
+import http1.request_parser
 import hash as wyhash
 
 const not_modified_response = 'HTTP/1.1 304 Not Modified\r\n\r\n'.bytes()
@@ -14,7 +14,7 @@ const http_created_response = 'HTTP/1.1 201 Created\r\nContent-Type: application
 const hex_digits = '0123456789abcdef'
 
 // ETag = 64-bit wyhash of the content, hex-encoded on the STACK — a cheap,
-// strong opaque validator, the same choice as http_server.static_assets.
+// strong opaque validator, the same choice as server.static_assets.
 // Cache validators need collision resistance for correctness, not
 // cryptographic strength: a crypto digest here (md5 previously) is pure
 // cost — slower, allocating, and md5 is broken anyway.

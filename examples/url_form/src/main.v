@@ -33,10 +33,10 @@ module main
 //     example exists to demonstrate; everything around it stays zero-copy.
 //   - The response is framed with a const prefix + `wi`/`ws` appends; the JSON
 //     body is genuinely dynamic (map echo), so it gets ONE strings.Builder.
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
-import http_server.http1_1.response
+import server
+import core
+import http1.request_parser
+import http1.response
 import strconv
 import strings
 
@@ -264,18 +264,18 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 
 fn main() {
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         handle
 	})!
 	println('URL/form decoding demo on http://localhost:3000/  (try /x?q=hello%20world&tag=c%2B%2B)')
-	server.run()
+	srv.run()
 }

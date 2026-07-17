@@ -19,13 +19,39 @@ on:
     branches: [ main ]
     paths:
       - 'examples/conformance/**'
-      - 'http_server/**'
+      - 'server/**'
+      - 'core/**'
+      - 'http1/**'
+      - 'http2/**'
+      - 'socket/**'
+      - 'epoll/**'
+      - 'io_uring/**'
+      - 'kqueue/**'
+      - 'iocp/**'
+      - 'tls/**'
+      - 'static_assets/**'
+      - 'testkit/**'
+      - 'vtest/**'
+      - 'tests/**'
       - '.github/workflows/conformance_h1spec.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'examples/conformance/**'
-      - 'http_server/**'
+      - 'server/**'
+      - 'core/**'
+      - 'http1/**'
+      - 'http2/**'
+      - 'socket/**'
+      - 'epoll/**'
+      - 'io_uring/**'
+      - 'kqueue/**'
+      - 'iocp/**'
+      - 'tls/**'
+      - 'static_assets/**'
+      - 'testkit/**'
+      - 'vtest/**'
+      - 'tests/**'
       - '.github/workflows/conformance_h1spec.yml'
 
 permissions:
@@ -57,7 +83,7 @@ jobs:
       #     `undefined reference` at link. It is a codegen bug, so it is NOT
       #     C-compiler-dependent; only -no-parallel eliminates it.
       #   * -cc gcc avoids the separate tcc<->gcc fallback race on liburing's
-      #     <stdatomic.h> (which every http_server build pulls in).
+      #     <stdatomic.h> (which every server build pulls in).
       # Matches the example matrix workflows. -prod is not immune to #27749, so
       # keep -no-parallel here even though these are debug builds.
       - name: Build examples/conformance
@@ -66,11 +92,11 @@ jobs:
       - name: Unit tests (hard gate)
         shell: bash
         run: v -cc gcc -no-parallel test examples/conformance/src
-      - name: http_server package tests (hard gate)
+      - name: module package tests (hard gate)
         shell: bash
-        # Runs the WHOLE http_server package test tree (recursive) — the example
-        # matrices don't cover http_server/ tests, so they run here on Linux:
-        #   • http1_1/request_parser/ — split-point framing incl. CL+TE (#104),
+        # Runs EVERY library module test tree (recursive) — the example
+        # matrices do not cover module tests, so they run here on Linux:
+        #   • http1/request_parser/ — split-point framing incl. CL+TE (#104),
         #     missing-chunk-terminator (#109) and chunk-size / Content-Length
         #     overflow regressions (guards against a hostile request re-crashing a
         #     worker or smuggling). Needs glibc memmem, so it is Linux-only.
@@ -88,7 +114,7 @@ jobs:
         #     pass trivially.
         env:
           VANILLA_NO_IOURING: 1
-        run: v -cc gcc -no-parallel test http_server/ tests/
+        run: v -cc gcc -no-parallel test server/ core/ http1/ http2/ socket/ epoll/ io_uring/ kqueue/ iocp/ tls/ static_assets/ testkit/ tests/
 
       # --- Report: live-server probe with h1spec --------------------------------
       - name: Install h1spec (uv)

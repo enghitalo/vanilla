@@ -25,7 +25,7 @@ module main
 // The pool is PER WORKER (built in make_state): shared-nothing, so verifier
 // threads never contend across workers, and the resume always lands on the
 // worker that parked the request (the pipe is registered in that worker's epoll).
-import http_server.core
+import core
 
 #include <unistd.h>
 

@@ -1,7 +1,7 @@
 module main
 
-import http_server
-import http_server.core
+import server
+import core
 import vtest
 
 // SSE fan-out end to end, on vtest (docs/VTEST.md) — the test main_test.v could
@@ -19,7 +19,7 @@ fn test_sse_fanout_end_to_end() ! {
 	// Same wiring as main(): one shared &Clients registry captured by the
 	// adapter closure (the reference field is shared across closure copies).
 	mut clients := &Clients{}
-	mut h := vtest.start(http_server.ServerConfig{
+	mut h := vtest.start(server.ServerConfig{
 		handler: fn [mut clients] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 			return handle(req_buffer, client_fd, mut out, mut clients)
 		}

@@ -12,9 +12,9 @@ module pg_async
 // pg_async deliberately does NOT import V's `net`: `net` declares `C.socket`
 // with TYPED enum params on some V versions, and V merges C declarations
 // globally — so importing `net` clashes with the plain-`int` `C.socket` that
-// http_server's socket module declares and breaks the build (e.g. on the V 0.5.1
+// the socket module declares and breaks the build (e.g. on the V 0.5.1
 // tag). The connection is opened with libc directly, using the same signatures
-// http_server.socket uses. C.recv/C.send/C.fcntl live in conn_async.v.
+// server.socket uses. C.recv/C.send/C.fcntl live in conn_async.v.
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>

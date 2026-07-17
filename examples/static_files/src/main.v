@@ -24,7 +24,7 @@ module main
 //   - The ETag is a 64-bit wyhash hex-encoded into a STACK scratch (`hex16`) —
 //     no `.hex()` string per request. Hashing the whole file per request is
 //     O(filesize) BY DESIGN — it is the conditional-GET pedagogy; for
-//     precomputed validators use `http_server.static_assets`.
+//     precomputed validators use `server.static_assets`.
 //   - The URL path reaches `safe_path` as a zero-copy `tos` VIEW; the os path
 //     APIs (norm_path/join_path/abs_path) are string-typed and make their own
 //     copies internally — the documented teaching trade-off (rule 3: don't
@@ -34,13 +34,13 @@ module main
 // userspace []u8. The epoll core can stream a file straight to the socket with
 // `sendfile(2)` (EPOLLOUT-driven, so a 4 GB file never sits in RAM) — a handler
 // hands the file off via `core.queue_file(fd, off, len)`. The reusable
-// `http_server.static_assets` module does exactly this for files past a size
-// threshold; see `examples/static_assets`. This example keeps the explicit
+// `server.static_assets` module does exactly this for files past a size
+// threshold; see `examples/spa_static_assets`. This example keeps the explicit
 // read-into-RAM path for teaching.
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
-import http_server.http1_1.response
+import server
+import core
+import http1.request_parser
+import http1.response
 import os
 import strconv
 import hash as wyhash
@@ -314,7 +314,7 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 	}
 	ctype := mime_type(fs_path)
 	// ETag = 64-bit wyhash of the content, hex-encoded into a stack scratch —
-	// a cheap, strong opaque validator (same as http_server.static_assets);
+	// a cheap, strong opaque validator (same as server.static_assets);
 	// a crypto digest here is pure cost, and md5 is broken anyway.
 	etag := hex16(wyhash.wyhash_c(content.data, u64(content.len), 0))
 
@@ -372,20 +372,20 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 
 fn main() {
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         handle
 	})!
 	// One-time init prints — `${}` is fine here, nothing below runs per request.
 	println('Static server on http://localhost:3000/  (root: ${web_root})')
-	println('For zero-copy large-file serving (sendfile(2)), use http_server.static_assets — see examples/static_assets.')
-	server.run()
+	println('For zero-copy large-file serving (sendfile(2)), use the static_assets module — see examples/spa_static_assets.')
+	srv.run()
 }

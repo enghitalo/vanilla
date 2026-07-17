@@ -21,7 +21,20 @@ on:
     branches: [ main ]
     paths:
       - 'examples/conformance/**'
-      - 'http_server/**'
+      - 'server/**'
+      - 'core/**'
+      - 'http1/**'
+      - 'http2/**'
+      - 'socket/**'
+      - 'epoll/**'
+      - 'io_uring/**'
+      - 'kqueue/**'
+      - 'iocp/**'
+      - 'tls/**'
+      - 'static_assets/**'
+      - 'testkit/**'
+      - 'vtest/**'
+      - 'tests/**'
       - '.github/workflows/conformance_http11probe.yml'
   workflow_dispatch:
     inputs:

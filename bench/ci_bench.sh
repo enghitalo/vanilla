@@ -41,7 +41,7 @@ BENCHES=(
 	"request_parser|bench/request_parser/request_parser_bench.v"
 	"middleware|bench/middleware/middleware_bench.v"
 	"etag_hash|bench/etag_hash/etag_hash.v"
-	"static_assets|bench/static_assets/static_assets_bench.v"
+	"static_assets|bench/static_assets_bench/static_assets_bench.v"
 )
 # Standardize the loop count for the A/B: the benches read BENCH_ITERS. 2M keeps
 # even the cheapest bench (request_parser, ~0.3s) comfortably above the runner's

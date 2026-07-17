@@ -1,14 +1,14 @@
 // End-to-end behavior tests for the platform-default backend (epoll on Linux,
 // kqueue on macOS, iocp on Windows — IOBackend(0)), migrated from
-// http_server/server_test.v onto vtest (docs/VTEST.md). Standalone on purpose:
-// vtest imports http_server, so this file lives outside that module and uses
+// server/server_test.v onto vtest (docs/VTEST.md). Standalone on purpose:
+// vtest imports server, so this file lives outside that module and uses
 // only public API. No ports (always ephemeral), no timeouts, no readiness
 // plumbing — drive() owns the lifecycle, and every test asserts leak-freedom
 // via the post-drain inflight counter.
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
-import http_server.http1_1.response
+import server
+import core
+import http1.request_parser
+import http1.response
 import vtest
 
 const get_root = 'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
@@ -45,7 +45,7 @@ fn closing_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, 
 // within the connection, so the second request goes out only after the first
 // response arrived (kqueue-safe).
 fn test_server_get_and_notfound() ! {
-	out := vtest.drive(http_server.ServerConfig{ handler: routing_handler }, [
+	out := vtest.drive(server.ServerConfig{ handler: routing_handler }, [
 		vtest.Script{
 			rounds: [
 				vtest.Round{
@@ -67,7 +67,7 @@ fn test_server_get_and_notfound() ! {
 // The body must be delivered through the real send path: the single framed
 // response carries the head AND the "OK" body.
 fn test_server_body_delivery() ! {
-	out := vtest.drive(http_server.ServerConfig{ handler: routing_handler }, [
+	out := vtest.drive(server.ServerConfig{ handler: routing_handler }, [
 		vtest.Script{
 			rounds: [vtest.Round{
 				send: get_root
@@ -85,7 +85,7 @@ fn test_server_body_delivery() ! {
 // (.close path exercised end to end): then_eof requires the SERVER to close,
 // and exactly one response must have arrived before it did.
 fn test_server_malformed_request_closes() ! {
-	out := vtest.drive(http_server.ServerConfig{ handler: closing_handler }, [
+	out := vtest.drive(server.ServerConfig{ handler: closing_handler }, [
 		vtest.Script{
 			rounds:   [vtest.Round{
 				send: malformed

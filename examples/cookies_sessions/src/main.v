@@ -27,10 +27,10 @@ module main
 //     with ws/wi straight into `out` — no `${}`, no `+`, no body string.
 //   - The only per-request-path allocations left are Store.create's owned
 //     strings, and those run per LOGIN, not per request (see new_token).
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
-import http_server.http1_1.response
+import server
+import core
+import http1.request_parser
+import http1.response
 import sync
 import crypto.rand
 import encoding.hex
@@ -64,7 +64,7 @@ fn (mut s Store) create(user_id string) string {
 
 // get looks a session up by id. The caller may pass a `tos` VIEW into the
 // request buffer: a map lookup only hashes/compares the key bytes and never
-// retains the key (http_server/static_assets uses the same pattern for
+// retains the key (static_assets uses the same pattern for
 // zero-alloc routing), so the view never escapes.
 fn (mut s Store) get(id string) ?Session {
 	s.mu.rlock()
@@ -232,14 +232,14 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 fn main() {
 	mut store := &Store{}
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         fn [mut store] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
@@ -247,5 +247,5 @@ fn main() {
 		}
 	})!
 	println('Cookies/sessions demo on http://localhost:3000/  (/login, /me, /logout)')
-	server.run()
+	srv.run()
 }

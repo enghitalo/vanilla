@@ -1,7 +1,7 @@
 module main
 
-import http_server
-import http_server.http1_1.response
+import server
+import http1.response
 import vtest
 
 // End-to-end cases against the example's real handler, on vtest (docs/VTEST.md):
@@ -36,7 +36,7 @@ fn test_server_end_to_end() ! {
 			}]
 		}
 	}
-	out := vtest.drive(http_server.ServerConfig{ handler: handle_request }, scripts)!
+	out := vtest.drive(server.ServerConfig{ handler: handle_request }, scripts)!
 
 	for i, c in cases {
 		assert out.conns[i].connect_err == '', '${c.name}: ${out.conns[i].connect_err}'

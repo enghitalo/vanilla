@@ -10,9 +10,9 @@
 // Probe: uvx --from git+https://github.com/dropseed/h1spec h1spec --strict localhost:3000
 module main
 
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
+import server
+import core
+import http1.request_parser
 
 // handle_request appends the complete raw HTTP response to `out` and returns a
 // Step: `.done` keeps the connection alive, `.close` flushes then closes it. It
@@ -128,17 +128,17 @@ fn token_list_has(val string, want string) bool {
 
 fn main() {
 	// Per-OS backend selection (parity with the other examples).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		handler:         handle_request
 		io_multiplexing: backend
 	})!
-	server.run()
+	srv.run()
 }

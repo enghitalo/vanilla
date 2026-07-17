@@ -45,10 +45,10 @@ module main
 // CONSTANT-TIME COMPARISON is the cross-cutting rule: any secret comparison
 // must not short-circuit, or timing leaks the secret. `hmac.equal()` for
 // every token/hash check; argon2's verifier uses it internally.
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
-import http_server.http1_1.response
+import server
+import core
+import http1.request_parser
+import http1.response
 import crypto.argon2
 import crypto.hmac
 import crypto.sha256
@@ -326,14 +326,14 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, m
 
 fn main() {
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         handle
@@ -347,5 +347,5 @@ fn main() {
 	println('  GET  /service    (X-API-Key: ..)             -> 200/401')
 	print('  demo password: ')
 	println(demo_password)
-	server.run()
+	srv.run()
 }

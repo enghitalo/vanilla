@@ -1,7 +1,7 @@
 module main
 
-import http_server.core
-import http_server.http1_1.response
+import core
+import http1.response
 import compress.brotli
 import compress.gzip
 import compress.zstd
