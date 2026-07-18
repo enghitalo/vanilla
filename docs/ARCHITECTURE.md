@@ -16,7 +16,7 @@ import and says nothing). Protocols are **siblings** over one engine:
 | `tls/` | mbedTLS split (`-d vanilla_tls` / stub) — server today, client transports later. |
 | `epoll/` `io_uring/` `kqueue/` `iocp/` | thin per-mechanism syscall wrappers, one dir-module each (`poll/` joins them as the portability floor). |
 | `server/` | **the engine** (was `http_server`) — one engine, N protocols via conn modes. OS facades (`server_linux.c.v`, …) select an `IOBackend`; `server/backend_*` are the reactors. |
-| `http1_1/` | HTTP/1.1 codecs: `request_parser/`, `response/`; a `client/` codec lands here later. |
+| `http1_1/` | HTTP/1.1 codecs: `request_parser/`, `response/`; `client/` is the client codec (request serializer + response parser). |
 | `http2/` | frame/hpack/types grow in place: stream mux, flow control, settings. |
 | `websocket/` `grpc/` | reserved siblings (RFC 6455 framing; length-prefixed messages over http2). Future protocols land as siblings here. |
 | `static_assets/` `testkit/` `vtest/` `pg_async/` | reusable handler-side and test-side modules. |
