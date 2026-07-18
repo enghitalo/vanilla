@@ -189,7 +189,7 @@ fn update_read_deadline(limits core.Limits, mut w WorkerState, mut cs PollConn) 
 // Windows/IOCP precedent. Returns false if the connection must close NOW
 // (framing error / .close / flood); the caller closes it after flushing.
 @[direct_array_access]
-fn drain_requests(h core.Handler, mut w WorkerState, mut cs PollConn, limits core.Limits, state voidptr) bool {
+fn drain_requests(h core.Handler, mut cs PollConn, limits core.Limits, state voidptr) bool {
 	mut pos := 0
 	mut event_loop := core.EventLoop{
 		client_fd: cs.fd
@@ -353,7 +353,7 @@ fn serve_readable(h core.Handler, mut w WorkerState, i int, limits core.Limits, 
 		unsafe {
 			cs.read_buf.len += n
 		}
-		if !drain_requests(h, mut w, mut cs, limits, state) {
+		if !drain_requests(h, mut cs, limits, state) {
 			must_close = true
 			break
 		}

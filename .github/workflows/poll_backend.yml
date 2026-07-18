@@ -50,13 +50,18 @@ jobs:
           sudo apt-get install -y liburing-dev linux-libc-dev
       # The whole behaviour suite (pipelining, split framing, max_connections,
       # read timeout, large-body drain, half-close, 100-continue, graceful
-      # shutdown) runs against .poll via the $if vanilla_poll ? test fns; the
-      # epoll checks run in the same binary as the control group (io_uring
-      # self-skips on hosted runners — io_uring_setup is sandboxed).
+      # shutdown) runs against .poll via the $if vanilla_poll ? test fns, with
+      # the epoll (and, where rings are available, io_uring) checks as the
+      # in-binary control group. ONE test file on purpose: parallel test
+      # BINARIES each spinning per-worker io_uring rings exhaust the runner's
+      # memlock ("io_uring_queue_init_params failed for all ring entry/flag
+      # combinations" — first run of this job); a single binary runs its
+      # servers sequentially and stays inside the limit. The wider module
+      # matrix already gates in conformance_h1spec.yml without the flag.
       - name: Behaviour suite with the poll reactor
         shell: bash
         run: |
-          v -cc gcc -no-parallel -d vanilla_poll test tests/backend_behaviors_test.v server/
+          v -cc gcc -no-parallel -d vanilla_poll test tests/backend_behaviors_test.v
       # A flag-on example build proves the -d wiring links outside tests too.
       - name: Build an example with -d vanilla_poll
         shell: bash
