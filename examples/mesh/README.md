@@ -8,9 +8,10 @@ The outbound call is the readiness path the #122 client study measured as
 the portable floor, composed from existing pieces — nothing new under
 `transport/`:
 
-1. `transport.dial_unix` once per worker (`make_state`) — a dial costs ~4×
-   a request, so the connection is **pooled** (depth-1 keep-alive, `busy`
-   guard; a real pool is the `pg_async` pattern).
+1. `transport.dial_unix`, pooled per worker (`make_state`): a FIXED pool of
+   4 keep-alive connections — a dial costs ~4× a request, so dialing
+   per request would dominate; when the whole pool is in flight the route
+   answers 503 (the pg_async idiom, sized small on purpose).
 2. `client.write_get` serializes into a reused scratch (zero-alloc).
 3. `send` → `event_loop.watch_fd(fd, .readable, ...)` → `.suspend` — the
    worker keeps serving while the backend answers.

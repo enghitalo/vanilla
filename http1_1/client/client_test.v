@@ -56,11 +56,60 @@ fn test_frame_bodyless_statuses() {
 }
 
 fn test_frame_error_codes() {
-	assert frame_response('HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n'.bytes()) == err_chunked
 	assert frame_response('HTTP/1.1 200 OK\r\nDate: x\r\n\r\n'.bytes()) == err_until_close
 	assert frame_response('ICY 200 OK\r\n\r\n'.bytes()) == err_malformed
 	assert frame_response('HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\n'.bytes()) == err_malformed
 	assert frame_response('HTTP/1.1 200 OK\r\nContent-Length: x\r\n\r\n'.bytes()) == err_malformed
+	// gzip cannot be decoded by a length-framing codec
+	assert frame_response('HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nx'.bytes()) == err_malformed
+}
+
+const chunked_head = 'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n'
+
+fn test_frame_chunked_complete_and_decoded() {
+	// two chunks + extension on the first size line
+	buf := '${chunked_head}5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\n\r\n'.bytes()
+	total := frame_response(buf)
+	assert total == buf.len
+	assert is_chunked(buf)
+	mut body := []u8{}
+	assert append_body(mut body, buf, total)
+	assert body.bytestr() == 'hello world'
+}
+
+fn test_frame_chunked_split_is_incomplete() {
+	full := '${chunked_head}5\r\nhello\r\n0\r\n\r\n'.bytes()
+	for cut in [chunked_head.len + 1, full.len - 6, full.len - 1] {
+		assert frame_response(full[..cut]) == incomplete, 'cut=${cut}'
+	}
+	assert frame_response(full) == full.len
+}
+
+fn test_frame_chunked_trailers_skipped() {
+	buf := '${chunked_head}2\r\nok\r\n0\r\nX-Trailer: done\r\n\r\n'.bytes()
+	total := frame_response(buf)
+	assert total == buf.len
+	mut body := []u8{}
+	assert append_body(mut body, buf, total)
+	assert body.bytestr() == 'ok'
+}
+
+fn test_frame_chunked_malformed() {
+	// non-hex chunk size
+	assert frame_response('${chunked_head}zz\r\nhi\r\n0\r\n\r\n'.bytes()) == err_malformed
+	// data not terminated by CRLF (the #109 desync shape)
+	assert frame_response('${chunked_head}5\r\nhello0\r\n\r\n'.bytes()) == err_malformed
+}
+
+fn test_header_value_lookup() {
+	buf :=
+		'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: "abc"\r\nContent-Length: 2\r\n\r\nok'.bytes()
+	s, l := header_value(buf, 'content-type')
+	assert buf[s..s + l].bytestr() == 'application/json'
+	e, el := header_value(buf, 'etag')
+	assert buf[e..e + el].bytestr() == '"abc"'
+	m, _ := header_value(buf, 'x-missing')
+	assert m == -1
 }
 
 fn test_case_insensitive_content_length() {

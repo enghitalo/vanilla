@@ -1,13 +1,12 @@
 module main
 
-// End-to-end: edge (TCP, ephemeral port) → backend (UDS) over the pooled
-// per-worker client conn, twice — the second request proves the depth-1
-// keep-alive pool reuses the connection. Linux-only invocation (the .epoll
-// enum value); the wiring mirrors main() with ephemeral everything.
+// End-to-end: edge (TCP, ephemeral port) → backend (UDS) over the per-worker
+// connection pool, twice — the second request proves the keep-alive pool
+// reuses a connection instead of redialing. Linux-only invocation (the
+// .epoll enum value); the wiring mirrors main() with ephemeral everything.
 import os
 import time
 import server
-import core
 import transport
 
 #include <poll.h>
@@ -73,11 +72,7 @@ fn test_mesh_end_to_end() {
 			port:               0
 			handler:            edge_handler
 			make_state:         fn [path] () voidptr {
-				return voidptr(&EdgeState{
-					socket_path: path
-					req_scratch: []u8{cap: 256}
-					resp_buf:    []u8{cap: 4096}
-				})
+				return new_edge_state(path)
 			}
 			after_server_start: fn [edge_ready] () {
 				edge_ready <- true

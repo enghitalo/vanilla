@@ -58,19 +58,29 @@ fn wi(mut out []u8, n i64) {
 	}
 }
 
-// EdgeState is THIS worker's private mesh client: one pooled UDS connection
-// (depth-1 keep-alive) plus reused buffers. Lock-free by construction —
-// make_state builds one per worker thread (the pg_async idiom). A real
-// service would hold a small pool here; `busy` is the honest depth-1 guard
-// (a second concurrent /mesh on the SAME worker answers 503 instead of
-// corrupting the in-flight exchange).
+// MeshConn is one pooled upstream connection: its fd, its in-flight flag and
+// its own response-accumulation buffer (each in-flight exchange needs a
+// private buffer — responses interleave across connections).
+struct MeshConn {
+mut:
+	fd       int = -1
+	busy     bool
+	resp_buf []u8
+}
+
+// EdgeState is THIS worker's private mesh client: a small FIXED pool of
+// keep-alive UDS connections plus a reused request scratch. Lock-free by
+// construction — make_state builds one per worker thread (the pg_async
+// idiom), so up to mesh_pool_size /mesh calls per worker fly concurrently;
+// beyond that the handler answers 503 instead of corrupting an in-flight
+// exchange. Connections are dialed lazily and redialed when they go stale.
+const mesh_pool_size = 4
+
 struct EdgeState {
 mut:
 	socket_path string
-	fd          int = -1
-	busy        bool
 	req_scratch []u8
-	resp_buf    []u8
+	conns       [mesh_pool_size]MeshConn
 }
 
 fn backend_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
@@ -78,22 +88,38 @@ fn backend_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, 
 	return .done
 }
 
-// ensure_conn returns the pooled backend connection, (re)dialing on demand.
-fn (mut st EdgeState) ensure_conn() bool {
-	if st.fd >= 0 {
-		return true
+// acquire returns the index of a free pooled connection ((re)dialing it on
+// demand), or -1 when the whole pool is in flight.
+fn (mut st EdgeState) acquire() int {
+	for i in 0 .. mesh_pool_size {
+		if st.conns[i].busy {
+			continue
+		}
+		if st.conns[i].fd < 0 {
+			st.conns[i].fd = transport.dial_unix(st.socket_path) or { continue }
+		}
+		return i
 	}
-	st.fd = transport.dial_unix(st.socket_path) or { return false }
-	return true
+	return -1
 }
 
-fn (mut st EdgeState) drop_conn() {
-	if st.fd >= 0 {
-		transport.close_fd(st.fd)
-		st.fd = -1
+// conn_by_fd maps a continuation's ready_fd back to its pool slot.
+fn (mut st EdgeState) conn_by_fd(fd int) int {
+	for i in 0 .. mesh_pool_size {
+		if st.conns[i].fd == fd {
+			return i
+		}
 	}
-	st.busy = false
-	st.resp_buf.clear()
+	return -1
+}
+
+fn (mut st EdgeState) drop_conn(i int) {
+	if st.conns[i].fd >= 0 {
+		transport.close_fd(st.conns[i].fd)
+		st.conns[i].fd = -1
+	}
+	st.conns[i].busy = false
+	st.conns[i].resp_buf.clear()
 }
 
 fn is_mesh_route(req []u8) bool {
@@ -114,14 +140,12 @@ fn edge_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut
 		return .done
 	}
 	mut st := unsafe { &EdgeState(worker_state) }
-	if st.busy {
-		res << edge_busy
+	ci := st.acquire()
+	if ci < 0 {
+		res << edge_busy // whole pool in flight on THIS worker
 		return .done
 	}
-	if !st.ensure_conn() {
-		res << edge_bad_gateway
-		return .done
-	}
+	fd := st.conns[ci].fd
 	// Serialize the upstream request into the reused scratch and send it.
 	// Small request + pooled idle connection ⇒ the socket buffer takes it in
 	// one send on any realistic setup; a production client would park on
@@ -130,17 +154,17 @@ fn edge_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut
 	client.write_get(mut st.req_scratch, '/hello', 'backend.local')
 	mut off := 0
 	for off < st.req_scratch.len {
-		n := C.send(st.fd, unsafe { &u8(st.req_scratch.data) + off },
-			usize(st.req_scratch.len - off), 0)
+		n :=
+			C.send(fd, unsafe { &u8(st.req_scratch.data) + off }, usize(st.req_scratch.len - off), 0)
 		if n <= 0 {
-			st.drop_conn() // stale pooled conn (backend restarted) — fail this one
+			st.drop_conn(ci) // stale pooled conn (backend restarted) — fail this one
 			res << edge_bad_gateway
 			return .done
 		}
 		off += n
 	}
-	st.busy = true
-	event_loop.watch_fd(st.fd, .readable, on_backend_reply, unsafe { nil })
+	st.conns[ci].busy = true
+	event_loop.watch_fd(fd, .readable, on_backend_reply, unsafe { nil })
 	return .suspend
 }
 
@@ -148,51 +172,78 @@ fn edge_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut
 // while the response is still incomplete — the multi-step chain contract).
 fn on_backend_reply(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut st := unsafe { &EdgeState(worker_state) }
+	ci := st.conn_by_fd(ready_fd)
+	if ci < 0 {
+		out << edge_bad_gateway // conn vanished from the pool (defensive)
+		return .done
+	}
 	if ready_fd_error {
-		st.drop_conn()
+		st.drop_conn(ci)
 		out << edge_bad_gateway
 		return .done
 	}
 	mut chunk := [4096]u8{}
 	n := C.recv(ready_fd, &chunk[0], usize(4096), 0)
 	if n <= 0 {
-		st.drop_conn() // EOF/reset mid-response
+		st.drop_conn(ci) // EOF/reset mid-response
 		out << edge_bad_gateway
 		return .done
 	}
-	unsafe { st.resp_buf.push_many(&chunk[0], n) }
-	total := client.frame_response(st.resp_buf)
+	unsafe { st.conns[ci].resp_buf.push_many(&chunk[0], n) }
+	total := client.frame_response(st.conns[ci].resp_buf)
 	if total == client.incomplete {
 		event_loop.watch_fd(ready_fd, .readable, on_backend_reply, unsafe { nil })
 		return .suspend
 	}
 	if total < 0 {
-		st.drop_conn() // unframeable upstream — drop the (desynced) conn too
+		st.drop_conn(ci) // unframeable upstream — drop the (desynced) conn too
 		out << edge_bad_gateway
 		return .done
 	}
-	if client.status_code(st.resp_buf) != 200 {
-		st.busy = false
-		st.resp_buf.clear()
+	if client.status_code(st.conns[ci].resp_buf) != 200 {
+		st.conns[ci].busy = false
+		st.conns[ci].resp_buf.clear()
 		out << edge_bad_gateway
 		return .done
 	}
-	body_start, body_len := client.body_bounds(st.resp_buf, total)
-	// Frame the edge reply around the backend body without `${}`/`+`.
+	// Frame the edge reply around the DECODED backend body without `${}`/`+`
+	// — append_body handles Content-Length and chunked upstreams alike, so a
+	// scratch assembly is needed to know the decoded length first.
+	st.req_scratch.clear()
+	if !client.append_body(mut st.req_scratch, st.conns[ci].resp_buf, total) {
+		st.drop_conn(ci)
+		out << edge_bad_gateway
+		return .done
+	}
 	wb(mut out, edge_mesh_head)
-	wi(mut out, i64(edge_mesh_pre.len + body_len + edge_mesh_post.len))
+	wi(mut out, i64(edge_mesh_pre.len + st.req_scratch.len + edge_mesh_post.len))
 	wb(mut out, edge_mesh_sep)
 	wb(mut out, edge_mesh_pre)
-	unsafe { out.push_many(&u8(st.resp_buf.data) + body_start, body_len) }
+	wb(mut out, st.req_scratch)
 	wb(mut out, edge_mesh_post)
-	// Depth-1 keep-alive: the exchange is complete, the pooled conn is free.
-	st.busy = false
-	st.resp_buf.clear()
+	// Exchange complete — the pooled keep-alive conn is free for the next call.
+	st.conns[ci].busy = false
+	st.conns[ci].resp_buf.clear()
 	return .done
 }
 
 fn mesh_socket_path() string {
 	return os.join_path(os.temp_dir(), 'vanilla_mesh_${os.getpid()}.sock')
+}
+
+// new_edge_state builds one worker's client state (make_state target). The
+// pool slots are explicitly reset — fixed-array elements don't run struct
+// field defaults, so fd must be forced to "not dialed yet".
+fn new_edge_state(path string) voidptr {
+	mut st := &EdgeState{
+		socket_path: path
+		req_scratch: []u8{cap: 4096}
+	}
+	for i in 0 .. mesh_pool_size {
+		st.conns[i].fd = -1
+		st.conns[i].resp_buf = []u8{cap: 4096}
+	}
+	return voidptr(st)
 }
 
 fn main() {
@@ -214,11 +265,7 @@ fn main() {
 		port:       edge_port
 		handler:    edge_handler
 		make_state: fn [path] () voidptr {
-			return voidptr(&EdgeState{
-				socket_path: path
-				req_scratch: []u8{cap: 256}
-				resp_buf:    []u8{cap: 4096}
-			})
+			return new_edge_state(path)
 		}
 	})!
 	println('mesh up: edge http://localhost:${edge_port}/mesh -> backend unix:${path}')

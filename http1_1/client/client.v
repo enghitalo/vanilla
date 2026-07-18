@@ -16,11 +16,9 @@ pub const no_body = []u8{}
 // frame_response return codes (mirrors request_parser's negative-int
 // convention: -1 incomplete, other negatives are hard errors).
 pub const incomplete = -1
-// status line unparseable / conflicting framing headers
+// status line unparseable / conflicting or invalid framing headers /
+// malformed chunked encoding
 pub const err_malformed = -2
-// Transfer-Encoding present — chunked responses are a follow-up; vanilla
-// servers always answer with Content-Length
-pub const err_chunked = -3
 // no Content-Length and a body-bearing status: the body is delimited by
 // connection close (RFC 9112 §6.3 fallback) — not frameable in advance
 pub const err_until_close = -4
@@ -130,12 +128,13 @@ fn header_value_start(buf []u8, i int, head_end int, name string) int {
 	return v
 }
 
-// frame_response returns the TOTAL byte length (head + body) of the first
-// complete response buffered in `buf`, or a negative code: `incomplete`
-// while more bytes are needed, `err_malformed` / `err_chunked` /
-// `err_until_close` for responses that cannot be framed. Keep-alive
-// pipelining works the same way as on the server: consume `total` bytes,
-// compact, frame again.
+// frame_response returns the TOTAL byte length (head + body, chunk framing
+// included) of the first complete response buffered in `buf`, or a negative
+// code: `incomplete` while more bytes are needed, `err_malformed` /
+// `err_until_close` for responses that cannot be framed. Both framings are
+// handled: Content-Length and Transfer-Encoding: chunked (trailer fields
+// after the terminating chunk are skipped). Keep-alive pipelining works the
+// same way as on the server: consume `total` bytes, compact, frame again.
 @[direct_array_access]
 pub fn frame_response(buf []u8) int {
 	hl := head_len(buf)
@@ -155,6 +154,7 @@ pub fn frame_response(buf []u8) int {
 	// Scan header lines for Content-Length / Transfer-Encoding. Lines start
 	// after the status line's CRLF.
 	mut content_length := i64(-1)
+	mut chunked := false
 	mut i := 0
 	for i + 1 < hl {
 		if buf[i] == `\r` && buf[i + 1] == `\n` {
@@ -162,8 +162,14 @@ pub fn frame_response(buf []u8) int {
 			if line >= hl - 2 {
 				break // reached the blank line
 			}
-			if header_value_start(buf, line, hl, 'transfer-encoding') > 0 {
-				return err_chunked
+			te := header_value_start(buf, line, hl, 'transfer-encoding')
+			if te > 0 {
+				// The only coding the codec decodes is a lone/final chunked
+				// (RFC 9112 §6.1); anything else cannot be framed.
+				if !value_has_chunked(buf, te, hl) {
+					return err_malformed
+				}
+				chunked = true
 			}
 			v := header_value_start(buf, line, hl, 'content-length')
 			if v > 0 {
@@ -187,6 +193,11 @@ pub fn frame_response(buf []u8) int {
 		}
 		i++
 	}
+	if chunked {
+		// TE wins over any (smuggling-suspect) Content-Length — same
+		// precedence the server enforces (RFC 9112 §6.3).
+		return frame_chunked_body(buf, hl)
+	}
 	if content_length < 0 {
 		return err_until_close
 	}
@@ -197,12 +208,218 @@ pub fn frame_response(buf []u8) int {
 	return int(total)
 }
 
-// body_bounds returns (start, len) of the body inside a response already
-// framed to `total` bytes (both 0 when there is no body).
+// value_has_chunked reports whether the header value at [v..head_end) says
+// (or ends in) 'chunked' — ASCII case-insensitive substring scan.
+@[direct_array_access]
+fn value_has_chunked(buf []u8, v int, head_end int) bool {
+	needle := 'chunked'
+	mut i := v
+	for i + needle.len <= head_end {
+		if buf[i] == `\r` {
+			return false
+		}
+		mut ok := true
+		for j in 0 .. needle.len {
+			mut c := buf[i + j]
+			if c >= `A` && c <= `Z` {
+				c += 32
+			}
+			if c != needle[j] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return true
+		}
+		i++
+	}
+	return false
+}
+
+@[inline]
+fn hex_digit(c u8) int {
+	if c >= `0` && c <= `9` {
+		return int(c - `0`)
+	}
+	if c >= `a` && c <= `f` {
+		return int(c - `a`) + 10
+	}
+	if c >= `A` && c <= `F` {
+		return int(c - `A`) + 10
+	}
+	return -1
+}
+
+// frame_chunked_body walks chunk-size lines from `body_start` and returns
+// the total message length once the terminating zero chunk (plus any
+// trailer fields — skipped, unlike the server-side framer, since real
+// upstreams do send them) and its final CRLF are buffered. The chunk-size
+// accumulator is i64 with a hard cap so a hostile size can neither wrap
+// negative nor hijack the zero-chunk branch (the request_parser #109
+// lessons, applied here too).
+@[direct_array_access]
+fn frame_chunked_body(buf []u8, body_start int) int {
+	mut pos := body_start
+	for {
+		// chunk-size line: HEXDIG+ [;extensions] CRLF
+		mut size := i64(0)
+		mut j := pos
+		mut digits := 0
+		for j < buf.len && buf[j] != `\r` && buf[j] != `;` {
+			d := hex_digit(buf[j])
+			if d < 0 {
+				return err_malformed
+			}
+			size = size * 16 + i64(d)
+			if size > 0x7fff_0000 {
+				return err_malformed
+			}
+			j++
+			digits++
+		}
+		if j >= buf.len {
+			return if digits > 16 { err_malformed } else { incomplete }
+		}
+		if digits == 0 {
+			return err_malformed // empty size line
+		}
+		// skip extensions to the CRLF
+		for j < buf.len && buf[j] != `\r` {
+			j++
+		}
+		if j + 1 >= buf.len {
+			return incomplete
+		}
+		if buf[j + 1] != `\n` {
+			return err_malformed
+		}
+		data_start := j + 2
+		if size == 0 {
+			// Trailer section: zero or more header lines, then a blank CRLF.
+			mut t := data_start
+			for {
+				if t + 1 >= buf.len {
+					return incomplete
+				}
+				if buf[t] == `\r` && buf[t + 1] == `\n` {
+					return t + 2 // the final CRLF — message complete
+				}
+				// skip one trailer line
+				for t < buf.len && buf[t] != `\n` {
+					t++
+				}
+				if t >= buf.len {
+					return incomplete
+				}
+				t++ // past the LF
+			}
+		}
+		// chunk-data + REQUIRED CRLF (RFC 9112 §7.1) — verified, not assumed.
+		crlf_at := i64(data_start) + size
+		if crlf_at + 1 >= i64(buf.len) {
+			return incomplete
+		}
+		if buf[int(crlf_at)] != `\r` || buf[int(crlf_at) + 1] != `\n` {
+			return err_malformed
+		}
+		pos = int(crlf_at) + 2
+	}
+	return incomplete
+}
+
+// body_bounds returns (start, len) of the RAW body region inside a response
+// already framed to `total` bytes (both 0 when there is no body). For a
+// chunked response the region still carries the chunk framing — use
+// append_body for the decoded bytes.
 pub fn body_bounds(buf []u8, total int) (int, int) {
 	hl := head_len(buf)
 	if hl < 0 || total <= hl {
 		return 0, 0
 	}
 	return hl, total - hl
+}
+
+// is_chunked reports whether the (complete-headed) response declares
+// Transfer-Encoding — i.e. whether the body region is chunk-framed.
+@[direct_array_access]
+pub fn is_chunked(buf []u8) bool {
+	hl := head_len(buf)
+	if hl < 0 {
+		return false
+	}
+	s, _ := header_value(buf, 'transfer-encoding')
+	return s >= 0
+}
+
+// header_value returns (start, len) of the first `name` header's value in
+// the response head, or (-1, 0) when absent. `name` must be lowercase; the
+// match is ASCII case-insensitive. The bounds are a zero-copy view into buf.
+@[direct_array_access]
+pub fn header_value(buf []u8, name string) (int, int) {
+	hl := head_len(buf)
+	if hl < 0 {
+		return -1, 0
+	}
+	mut i := 0
+	for i + 1 < hl {
+		if buf[i] == `\r` && buf[i + 1] == `\n` {
+			line := i + 2
+			if line >= hl - 2 {
+				break
+			}
+			v := header_value_start(buf, line, hl, name)
+			if v > 0 {
+				mut e := v
+				for e < hl && buf[e] != `\r` {
+					e++
+				}
+				return v, e - v
+			}
+		}
+		i++
+	}
+	return -1, 0
+}
+
+// append_body appends the DECODED body of a framed response into `out`: the
+// raw bytes for a Content-Length body, the de-chunked data for a chunked
+// one — a single call that works against any upstream. Returns false only
+// if the (already-framed) chunk structure fails to re-parse.
+@[direct_array_access]
+pub fn append_body(mut out []u8, buf []u8, total int) bool {
+	start, raw_len := body_bounds(buf, total)
+	if raw_len <= 0 {
+		return true
+	}
+	if !is_chunked(buf) {
+		unsafe { out.push_many(&u8(buf.data) + start, raw_len) }
+		return true
+	}
+	mut pos := start
+	for pos < total {
+		mut size := i64(0)
+		mut j := pos
+		for j < total && buf[j] != `\r` && buf[j] != `;` {
+			d := hex_digit(buf[j])
+			if d < 0 {
+				return false
+			}
+			size = size * 16 + i64(d)
+			j++
+		}
+		for j < total && buf[j] != `\r` {
+			j++
+		}
+		data := j + 2
+		if size == 0 {
+			return true // trailers (if any) carry no body data
+		}
+		if i64(data) + size > i64(total) {
+			return false
+		}
+		unsafe { out.push_many(&u8(buf.data) + data, int(size)) }
+		pos = data + int(size) + 2 // past data + CRLF
+	}
+	return true
 }
