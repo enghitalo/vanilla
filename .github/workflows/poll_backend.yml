@@ -1,0 +1,64 @@
+name: Poll Backend (portability floor)
+
+# Exercises the pure-POSIX poll(2) reactor (server/backend_poll/, issue #122
+# step 4) on Linux CI: the same behaviour suite the other backends pass, with
+# `-d vanilla_poll` swapping the reactor in. Zero hosted RTOS hardware needed
+# — this is the QNX/VxWorks floor running under a Linux kernel. Normal builds
+# never compile backend_poll (the import lives in a _d_vanilla_poll file), so
+# this job is the only place the flag is on.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'server/**'
+      - 'poll/**'
+      - 'core/**'
+      - 'http1_1/**'
+      - 'socket/**'
+      - 'vtest/**'
+      - 'tests/**'
+      - '.github/workflows/poll_backend.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'server/**'
+      - 'poll/**'
+      - 'core/**'
+      - 'http1_1/**'
+      - 'socket/**'
+      - 'vtest/**'
+      - 'tests/**'
+      - '.github/workflows/poll_backend.yml'
+
+jobs:
+  poll-reactor-tests:
+    runs-on: ubuntu-latest
+    name: behaviour suite under -d vanilla_poll
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up V
+        uses: vlang/setup-v@v1.7
+      - name: Remove Vlang folder to avoid conflicts
+        shell: bash
+        run: |
+          rm -rf -v ./vlang || true
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev linux-libc-dev
+      # The whole behaviour suite (pipelining, split framing, max_connections,
+      # read timeout, large-body drain, half-close, 100-continue, graceful
+      # shutdown) runs against .poll via the $if vanilla_poll ? test fns; the
+      # epoll checks run in the same binary as the control group (io_uring
+      # self-skips on hosted runners — io_uring_setup is sandboxed).
+      - name: Behaviour suite with the poll reactor
+        shell: bash
+        run: |
+          v -cc gcc -no-parallel -d vanilla_poll test tests/backend_behaviors_test.v server/
+      # A flag-on example build proves the -d wiring links outside tests too.
+      - name: Build an example with -d vanilla_poll
+        shell: bash
+        run: |
+          v -cc gcc -no-parallel -d vanilla_poll -o /tmp/simple_poll examples/simple/src
