@@ -154,7 +154,15 @@ fn jwt_verify(token []u8) bool {
 	signing := unsafe { (&token[0]).vbytes(last) } // view: "header.payload"
 	expected := hmac.new(jwt_secret, signing, sha256.sum, sha256.block_size)
 	sig_b64 := unsafe { tos(&token[last + 1], token.len - last - 1) } // view string
-	if !hmac.equal(expected, base64.url_decode(sig_b64)) {
+	// Compare in the ENCODED domain (constant-time): re-encode the expected
+	// MAC and match the presented base64url bytes exactly. Comparing DECODED
+	// bytes silently accepts non-canonical encodings — a 32-byte MAC leaves 2
+	// free padding bits in the 43rd base64url char, so every token would have
+	// 4 accepted spellings (RFC 8725 token-malleability; it also made the
+	// tamper test flake whenever the flipped bit landed in the padding).
+	expected_b64 := base64.url_encode(expected)
+	if !hmac.equal(unsafe { expected_b64.str.vbytes(expected_b64.len) },
+		unsafe { sig_b64.str.vbytes(sig_b64.len) }) {
 		return false
 	}
 	payload_b64 := unsafe { tos(&token[first + 1], last - first - 1) } // view string

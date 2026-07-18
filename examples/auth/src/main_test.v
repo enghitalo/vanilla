@@ -24,8 +24,28 @@ fn test_jwt_roundtrip() {
 
 fn test_jwt_tamper_is_rejected() {
 	mut token := jwt_sign('{"sub":"user-42","exp":${future_exp()}}'.bytes())
-	// flip the last signature byte
-	token[token.len - 1] = if token[token.len - 1] == `A` { `B` } else { `A` }
+	// Flip a MIDDLE signature char — every one of its 6 bits is MAC material.
+	// (The old version flipped the LAST char between A and B, which differ
+	// only in base64url padding bits for a 43-char signature — the decoded
+	// MAC was unchanged and the test flaked whenever the char landed on A.)
+	i := token.len - 2
+	token[i] = if token[i] == `A` { `B` } else { `A` }
+	assert !jwt_verify(token)
+}
+
+const b64url_alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+
+fn test_jwt_noncanonical_signature_rejected() {
+	// A 32-byte MAC encodes to 43 base64url chars: the last char carries 4
+	// MAC bits + 2 padding bits. XOR-ing its lowest bit changes ONLY padding
+	// — the decoded bytes stay identical — yet the canonical verifier must
+	// reject it (RFC 8725: one token, one spelling; blocklists and replay
+	// caches keyed by token bytes depend on it).
+	mut token := jwt_sign('{"sub":"user-42","exp":${future_exp()}}'.bytes())
+	last := token[token.len - 1]
+	idx := b64url_alphabet.index_u8(last)
+	assert idx >= 0, 'signature must end in a base64url char'
+	token[token.len - 1] = b64url_alphabet[idx ^ 1]
 	assert !jwt_verify(token)
 }
 
