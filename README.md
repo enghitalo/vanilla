@@ -211,6 +211,7 @@ fn main() {
 | `examples/hexagonal/` | Hexagonal architecture |
 | `examples/ip_block/` | IP allowlist / blocklist |
 | `examples/json_api/` | JSON API with multipart upload |
+| `examples/mesh/` | Local mesh: edge on TCP calling a backend on UDS via `http1_1.client` + a pooled per-worker connection + watch/suspend |
 | `examples/middleware/` | Middleware chain (auth, RBAC, 404) |
 | `examples/observability/` | `/healthz`, `/readyz`, `/metrics` |
 | `examples/proxy_aware/` | `X-Forwarded-For` / real-IP extraction |
