@@ -151,47 +151,41 @@ pub fn frame_response(buf []u8) int {
 	if st < 200 || st == 204 || st == 304 {
 		return hl
 	}
-	// Scan header lines for Content-Length / Transfer-Encoding. Lines start
-	// after the status line's CRLF.
+	// Scan header lines for Content-Length / Transfer-Encoding, jumping line
+	// to line (LF to LF) instead of testing every byte for CRLF.
 	mut content_length := i64(-1)
 	mut chunked := false
-	mut i := 0
-	for i + 1 < hl {
-		if buf[i] == `\r` && buf[i + 1] == `\n` {
-			line := i + 2
-			if line >= hl - 2 {
-				break // reached the blank line
+	mut line := next_line(buf, 0, hl) // first header line, past the status line
+	for line > 0 && line < hl - 2 {
+		te := header_value_start(buf, line, hl, 'transfer-encoding')
+		if te > 0 {
+			// The only coding the codec decodes is a lone/final chunked
+			// (RFC 9112 §6.1); anything else cannot be framed.
+			if !value_has_chunked(buf, te, hl) {
+				return err_malformed
 			}
-			te := header_value_start(buf, line, hl, 'transfer-encoding')
-			if te > 0 {
-				// The only coding the codec decodes is a lone/final chunked
-				// (RFC 9112 §6.1); anything else cannot be framed.
-				if !value_has_chunked(buf, te, hl) {
+			chunked = true
+		}
+		v := header_value_start(buf, line, hl, 'content-length')
+		if v > 0 {
+			mut n := i64(0)
+			mut d := v
+			for d < hl && buf[d] >= `0` && buf[d] <= `9` {
+				n = n * 10 + i64(buf[d] - `0`)
+				if n > 0x7fff_0000 {
 					return err_malformed
 				}
-				chunked = true
+				d++
 			}
-			v := header_value_start(buf, line, hl, 'content-length')
-			if v > 0 {
-				mut n := i64(0)
-				mut d := v
-				for d < hl && buf[d] >= `0` && buf[d] <= `9` {
-					n = n * 10 + i64(buf[d] - `0`)
-					if n > 0x7fff_0000 {
-						return err_malformed
-					}
-					d++
-				}
-				if d == v || (d < hl && buf[d] != `\r`) {
-					return err_malformed // empty or non-numeric value
-				}
-				if content_length >= 0 && content_length != n {
-					return err_malformed // conflicting duplicates
-				}
-				content_length = n
+			if d == v || (d < hl && buf[d] != `\r`) {
+				return err_malformed // empty or non-numeric value
 			}
+			if content_length >= 0 && content_length != n {
+				return err_malformed // conflicting duplicates
+			}
+			content_length = n
 		}
-		i++
+		line = next_line(buf, line, hl)
 	}
 	if chunked {
 		// TE wins over any (smuggling-suspect) Content-Length — same
@@ -206,6 +200,21 @@ pub fn frame_response(buf []u8) int {
 		return incomplete
 	}
 	return int(total)
+}
+
+// next_line returns the offset just past the next LF at/after `i` (i.e. the
+// start of the following line), or -1 when no further line starts before
+// `head_end`.
+@[direct_array_access; inline]
+fn next_line(buf []u8, i int, head_end int) int {
+	mut j := i
+	for j < head_end && buf[j] != `\n` {
+		j++
+	}
+	if j + 1 >= head_end {
+		return -1
+	}
+	return j + 1
 }
 
 // value_has_chunked reports whether the header value at [v..head_end) says
@@ -348,36 +357,36 @@ pub fn is_chunked(buf []u8) bool {
 	if hl < 0 {
 		return false
 	}
-	s, _ := header_value(buf, 'transfer-encoding')
+	s, _ := header_value_from(buf, hl, 'transfer-encoding')
 	return s >= 0
 }
 
 // header_value returns (start, len) of the first `name` header's value in
 // the response head, or (-1, 0) when absent. `name` must be lowercase; the
 // match is ASCII case-insensitive. The bounds are a zero-copy view into buf.
-@[direct_array_access]
 pub fn header_value(buf []u8, name string) (int, int) {
 	hl := head_len(buf)
 	if hl < 0 {
 		return -1, 0
 	}
-	mut i := 0
-	for i + 1 < hl {
-		if buf[i] == `\r` && buf[i + 1] == `\n` {
-			line := i + 2
-			if line >= hl - 2 {
-				break
+	return header_value_from(buf, hl, name)
+}
+
+// header_value_from is header_value with the head walk already paid — every
+// path that has `hl` in hand goes through here so the head is scanned once.
+@[direct_array_access]
+fn header_value_from(buf []u8, hl int, name string) (int, int) {
+	mut line := next_line(buf, 0, hl)
+	for line > 0 && line < hl - 2 {
+		v := header_value_start(buf, line, hl, name)
+		if v > 0 {
+			mut e := v
+			for e < hl && buf[e] != `\r` {
+				e++
 			}
-			v := header_value_start(buf, line, hl, name)
-			if v > 0 {
-				mut e := v
-				for e < hl && buf[e] != `\r` {
-					e++
-				}
-				return v, e - v
-			}
+			return v, e - v
 		}
-		i++
+		line = next_line(buf, line, hl)
 	}
 	return -1, 0
 }
@@ -388,11 +397,15 @@ pub fn header_value(buf []u8, name string) (int, int) {
 // if the (already-framed) chunk structure fails to re-parse.
 @[direct_array_access]
 pub fn append_body(mut out []u8, buf []u8, total int) bool {
-	start, raw_len := body_bounds(buf, total)
-	if raw_len <= 0 {
-		return true
+	// One head walk serves the bounds AND the framing question.
+	hl := head_len(buf)
+	if hl < 0 || total <= hl {
+		return true // no body
 	}
-	if !is_chunked(buf) {
+	start := hl
+	raw_len := total - hl
+	te, _ := header_value_from(buf, hl, 'transfer-encoding')
+	if te < 0 {
 		unsafe { out.push_many(&u8(buf.data) + start, raw_len) }
 		return true
 	}
