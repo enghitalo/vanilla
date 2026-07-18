@@ -51,15 +51,18 @@ jobs:
       # The whole behaviour suite (pipelining, split framing, max_connections,
       # read timeout, large-body drain, half-close, 100-continue, graceful
       # shutdown) runs against .poll via the $if vanilla_poll ? test fns, with
-      # the epoll (and, where rings are available, io_uring) checks as the
-      # in-binary control group. ONE test file on purpose: parallel test
-      # BINARIES each spinning per-worker io_uring rings exhaust the runner's
-      # memlock ("io_uring_queue_init_params failed for all ring entry/flag
-      # combinations" — first run of this job); a single binary runs its
-      # servers sequentially and stays inside the limit. The wider module
-      # matrix already gates in conformance_h1spec.yml without the flag.
+      # the epoll checks as the in-binary control group. VANILLA_NO_IOURING is
+      # the repo's own kill-switch for exactly this host class (see
+      # iou_backend_available): hosted runners cap io_uring so a probe that
+      # passes at time T still sees worker N's ring init fail a moment later
+      # ("io_uring_queue_init_params failed for all ring entry/flag
+      # combinations" — runs 1 and 2 of this job, in both the parallel-binary
+      # and single-binary shapes). io_uring is not this job's subject; its
+      # coverage gates in conformance_h1spec.yml.
       - name: Behaviour suite with the poll reactor
         shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
         run: |
           v -cc gcc -no-parallel -d vanilla_poll test tests/backend_behaviors_test.v
       # A flag-on example build proves the -d wiring links outside tests too.
