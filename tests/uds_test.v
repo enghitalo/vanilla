@@ -10,6 +10,7 @@ import os
 import time
 import server
 import core
+import socket
 import transport
 
 #include <poll.h>
@@ -171,5 +172,100 @@ fn test_dial_tcp() {
 		got := read_until_deadline(fd, 'HTTP/1.1 200', 3000)
 		assert got.starts_with('HTTP/1.1 200'), 'dial_tcp request failed, got: ${got}'
 		srv.shutdown(2000)
+	}
+}
+
+// --- peer credentials (LOCAL_IPC §6) ---------------------------------------
+
+const cred_ok = 'HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ncred-ok'.bytes()
+const cred_forbidden = 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
+
+// cred_handler authorizes by kernel-verified identity instead of anything in
+// the request: the caller must be THIS uid and THIS pid (the test client
+// lives in the same process). That is the §6 trust model end-to-end — the
+// gates who may connect, peer_cred says who each connection is.
+fn cred_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	cred := socket.peer_cred(client_fd) or {
+		res << cred_forbidden
+		return .close
+	}
+	if cred.uid == os.getuid() && cred.gid >= 0 && cred.pid == os.getpid() {
+		// Same-process client (this test) ⇒ pid must be OUR pid — the
+		// strictest assertion available without spawning a child.
+		res << cred_ok
+		return .close
+	}
+	res << cred_forbidden
+	return .close
+}
+
+fn test_uds_peer_cred() {
+	$if linux {
+		path := uds_socket_path('cred')
+		ready := chan bool{cap: 1}
+		mut srv := server.new_server(server.ServerConfig{
+			unix_socket_path:   path
+			io_multiplexing:    .epoll
+			handler:            cred_handler
+			after_server_start: fn [ready] () {
+				ready <- true
+			}
+		}) or {
+			assert false, err.msg()
+			return
+		}
+		spawn fn [mut srv] () {
+			srv.run()
+		}()
+		_ := <-ready
+		fd := transport.dial_unix(path) or {
+			assert false, err.msg()
+			return
+		}
+		defer {
+			transport.close_fd(fd)
+		}
+		assert C.write(fd, voidptr(&uds_req[0]), usize(uds_req.len)) == uds_req.len
+		got := read_until_deadline(fd, 'cred-ok', 3000)
+		assert got.contains('cred-ok'), 'peer_cred must identify this process over UDS, got: ${got}'
+		// A TCP connection has no unix peer: peer_cred must answer none.
+		srv.shutdown(500)
+	}
+}
+
+fn test_peer_cred_none_on_tcp() {
+	$if linux {
+		ready := chan bool{cap: 1}
+		mut srv := server.new_server(server.ServerConfig{
+			port:               0
+			io_multiplexing:    .epoll
+			handler:            cred_handler
+			after_server_start: fn [ready] () {
+				ready <- true
+			}
+		}) or {
+			assert false, err.msg()
+			return
+		}
+		spawn fn [mut srv] () {
+			srv.run()
+		}()
+		_ := <-ready
+		fd := transport.dial_tcp('127.0.0.1', srv.port) or {
+			assert false, err.msg()
+			return
+		}
+		defer {
+			transport.close_fd(fd)
+		}
+		mut pfd := C.pollfd{
+			fd:     fd
+			events: i16(C.POLLOUT)
+		}
+		assert C.poll(&pfd, 1, 2000) == 1
+		assert C.write(fd, voidptr(&uds_req[0]), usize(uds_req.len)) == uds_req.len
+		got := read_until_deadline(fd, 'HTTP/1.1 403', 3000)
+		assert got.starts_with('HTTP/1.1 403'), 'peer_cred over TCP must be none (403 here), got: ${got}'
+		srv.shutdown(500)
 	}
 }

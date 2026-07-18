@@ -12,7 +12,7 @@ import and says nothing). Protocols are **siblings** over one engine:
 | module | role |
 |---|---|
 | `core/` | protocol-neutral contract: `Handler`, `Step`, `Counter`, `Limits`, hand-off slots. `Handler` is bytes-in/bytes-out — nothing HTTP about it. |
-| `socket/` | listen side: TCP listeners, Windows sockets; UDS listeners, peer credentials and fd passing land here (docs/LOCAL_IPC.md §5–§7). |
+| `socket/` | listen side: TCP listeners, Windows sockets; UDS listeners and `peer_cred` (kernel-verified pid/uid/gid, §6); fd passing lands here (§7). |
 | `tls/` | mbedTLS split (`-d vanilla_tls` / stub) — server today, client transports later. |
 | `epoll/` `io_uring/` `kqueue/` `iocp/` | thin per-mechanism syscall wrappers, one dir-module each (`poll/` joins them as the portability floor). |
 | `server/` | **the engine** (was `http_server`) — one engine, N protocols via conn modes. OS facades (`server_linux.c.v`, …) select an `IOBackend`; `server/backend_*` are the reactors. |
