@@ -27,6 +27,7 @@ per-request allocation.
 | Linux | `.io_uring` | per-worker `SO_REUSEPORT` listener + multishot accept (kernel 5.19+) | `.suspend` watches (oneshot `IORING_OP_POLL_ADD`), `make_state` |
 | macOS | kqueue | per-worker | `.suspend` watches, `make_state` |
 | Windows | IOCP | one central acceptor → round-robins fds to per-worker IOCP ports | `.done`/`.close` only (`.suspend` closes), `make_state`, limits + timeouts |
+| any POSIX | `.poll` *(`-d vanilla_poll`)* | every worker polls the ONE shared listener (no SO_REUSEPORT assumed) | the QNX/VxWorks portability floor (`backend_poll/`): same request semantics, O(nfds), `.done`/`.close` only, never a default |
 
 ## The handler contract
 

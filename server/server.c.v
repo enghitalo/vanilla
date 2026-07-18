@@ -246,8 +246,20 @@ pub fn new_server(config ServerConfig) !Server {
 			return error('TLS is not yet supported on the Windows/IOCP backend')
 		}
 	} $else $if linux {
-		if io_multiplexing != .epoll && io_multiplexing != .io_uring {
-			return error('Linux only supports epoll and io_uring backends')
+		$if vanilla_poll ? {
+			if io_multiplexing !in [.epoll, .io_uring, .poll] {
+				return error('Linux only supports the epoll, io_uring and poll backends')
+			}
+			if io_multiplexing == .poll && config.tls_config != unsafe { nil } {
+				return error('TLS is not supported on the poll backend')
+			}
+		} $else {
+			if io_multiplexing == .poll {
+				return error('the poll backend requires building with `-d vanilla_poll`')
+			}
+			if io_multiplexing != .epoll && io_multiplexing != .io_uring {
+				return error('Linux only supports epoll and io_uring backends')
+			}
 		}
 	} $else $if darwin {
 		if io_multiplexing != .kqueue {

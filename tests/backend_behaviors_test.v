@@ -615,3 +615,72 @@ fn test_epoll_expect_100_continue() ! {
 		check_expect_100_continue(.epoll)!
 	}
 }
+
+// --- poll backend (the pure-POSIX portability floor, issue #122 step 4) ---
+// Compiled only under `-d vanilla_poll`, so the SAME behaviour suite
+// exercises the RTOS reactor on Linux CI at zero cost to normal builds
+// (without the flag these are empty no-ops).
+
+fn test_poll_large_upload_drain() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_large_upload_drain(.poll)!
+		}
+	}
+}
+
+fn test_poll_streamed_body_over_max_body_bytes() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_streamed_body_over_max_body_bytes(.poll)!
+		}
+	}
+}
+
+fn test_poll_pipelining_and_framing() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_pipelining_and_framing(.poll)!
+		}
+	}
+}
+
+fn test_poll_max_connections() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_max_connections(.poll)!
+		}
+	}
+}
+
+fn test_poll_read_timeout() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_read_timeout(.poll)!
+		}
+	}
+}
+
+fn test_poll_graceful_shutdown() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_graceful_shutdown(.poll)!
+		}
+	}
+}
+
+fn test_poll_half_close_after_request() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_half_close_after_request(.poll)!
+		}
+	}
+}
+
+fn test_poll_expect_100_continue() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_expect_100_continue(.poll)!
+		}
+	}
+}
