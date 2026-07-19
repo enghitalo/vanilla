@@ -10,7 +10,7 @@ A minimalist, high-performance HTTP server written in [V](https://vlang.io).
 - **Modular**: Easy to extend with custom controllers and handlers.
 - **Memory Safety**: No race conditions.
 - **No Magic**: Transparent and straightforward.
-- **E2E Testing**: Test handlers in-process by passing raw requests directly to `handle_request()`, or drive a running server over a real socket with `net.dial_tcp` and a read deadline (see [`tests/backend_behaviors_test.v`](tests/backend_behaviors_test.v)).
+- **E2E Testing**: Test handlers in-process by passing raw requests directly to `handle_request()`, or drive a running server — TCP or unix socket — with the `vtest` scripted client (raw fds via `transport.dial_tcp`/`dial_unix`; see [`tests/backend_behaviors_test.v`](tests/backend_behaviors_test.v)).
 - **SSE Friendly**: Built-in Server-Sent Events support (sync and async).
 - **ETag Friendly**: Conditional GETs with `ETag` and `If-None-Match` headers.
 - **Database Friendly**: Example with PostgreSQL connection pool.
@@ -72,9 +72,10 @@ fn test_handle_request() {
 }
 ```
 
-Or drive a running server over a real client socket — spawn `srv.run()` on a
-thread, then send raw requests with `net.dial_tcp` and read the responses under a
-deadline. This exercises the full framing / keep-alive / suspend-resume path and
+Or drive a running server over a real client socket — the `vtest` module owns
+the whole lifecycle (ephemeral bind or unix socket, readiness, shutdown) and
+dials raw non-blocking fds through `transport`, with scripts as data. This
+exercises the full framing / keep-alive / suspend-resume path and
 never hangs on a stalled stream. See
 [`tests/backend_behaviors_test.v`](tests/backend_behaviors_test.v)
 for the pattern (pipelining, framing across TCP segments, timeouts, graceful
@@ -239,9 +240,11 @@ Two layers, no bespoke test mode on the server:
 - **In-process** — call the handler directly (`handle_request(req, mut out, ...)`)
   and assert on the bytes it appends. Deterministic, no sockets, no threads; ideal
   for routing and response-shape assertions.
-- **Over a real socket** — spawn `srv.run()` on a thread, connect with
-  `net.dial_tcp`, and read responses under a per-read deadline (so a broken stream
-  fails fast instead of hanging). This drives the real backend end to end —
+- **Over a real socket** — drive the server with `vtest` (scripts as data,
+  lifecycle owned by the harness) or dial raw fds yourself with
+  `transport.dial_tcp`/`dial_unix` + `testkit`'s deadline-bounded `fd_*`
+  readers (so a broken stream fails fast instead of hanging). Either way this
+  drives the real backend end to end —
   epoll / io_uring / kqueue — including pipelining, request framing across TCP
   segments, keep-alive, `Expect: 100-continue`, half-close, read timeouts, and the
   async suspend/resume path. See

@@ -5,26 +5,18 @@
 // idle shutdown (the io_uring path exercises the dummy-connect wake poke —
 // shutdown(2) on an AF_UNIX listener yields NO CQE), assert the socket file
 // is unlinked on shutdown, and prove the path is immediately rebindable.
+// Client plumbing is transport.dial_* + testkit's fd_* deadline loops; the
+// scripted protocol behaviour over UDS is vtest's job (test_uds_vtest_scripts
+// below — a UDS e2e is a TCP e2e plus one config line).
 // Linux-only invocations: the .epoll/.io_uring enum values exist only there.
 import os
 import time
 import server
 import core
 import socket
+import testkit
 import transport
-
-#include <poll.h>
-
-struct C.pollfd {
-mut:
-	fd      int
-	events  i16
-	revents i16
-}
-
-fn C.poll(fds &C.pollfd, nfds u64, timeout int) int
-fn C.read(fd int, buf voidptr, count usize) int
-fn C.write(fd int, buf voidptr, count usize) int
+import vtest
 
 const uds_req = 'GET / HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n'.bytes()
 const uds_ok = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok'.bytes()
@@ -32,35 +24,6 @@ const uds_ok = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\
 fn uds_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	res << uds_ok
 	return .close
-}
-
-// read_until_deadline reads from a (possibly non-blocking) fd until `needle`
-// appears in the accumulated bytes or `timeout_ms` elapses — poll(2)-paced,
-// so a stalled stream fails the assert instead of hanging the test binary.
-fn read_until_deadline(fd int, needle string, timeout_ms int) string {
-	mut acc := []u8{cap: 512}
-	mut buf := [512]u8{}
-	sw := time.new_stopwatch()
-	for sw.elapsed().milliseconds() < timeout_ms {
-		mut pfd := C.pollfd{
-			fd:     fd
-			events: i16(C.POLLIN)
-		}
-		if C.poll(&pfd, 1, 50) <= 0 {
-			continue
-		}
-		n := C.read(fd, voidptr(&buf[0]), usize(512))
-		if n == 0 {
-			break // EOF
-		}
-		if n > 0 {
-			unsafe { acc.push_many(&buf[0], n) }
-			if acc.bytestr().contains(needle) {
-				break
-			}
-		}
-	}
-	return acc.bytestr()
 }
 
 fn uds_socket_path(tag string) string {
@@ -91,8 +54,8 @@ fn serve_once_over_uds(backend server.IOBackend, tag string) !(server.Server, st
 	defer {
 		transport.close_fd(fd)
 	}
-	assert C.write(fd, voidptr(&uds_req[0]), usize(uds_req.len)) == uds_req.len
-	got := read_until_deadline(fd, 'HTTP/1.1 200', 3000)
+	assert testkit.fd_write_all(fd, uds_req, 2000)
+	got := testkit.fd_read_until(fd, 'HTTP/1.1 200', 3000)
 	assert got.starts_with('HTTP/1.1 200'), '${backend}: expected a 200 over unix:${path}, got: ${got}'
 	return srv, path
 }
@@ -163,15 +126,76 @@ fn test_dial_tcp() {
 			transport.close_fd(fd)
 		}
 		// Non-blocking connect: wait for writability = connected (loopback).
-		mut pfd := C.pollfd{
-			fd:     fd
-			events: i16(C.POLLOUT)
-		}
-		assert C.poll(&pfd, 1, 2000) == 1, 'dial_tcp connect did not complete'
-		assert C.write(fd, voidptr(&uds_req[0]), usize(uds_req.len)) == uds_req.len
-		got := read_until_deadline(fd, 'HTTP/1.1 200', 3000)
+		assert testkit.fd_wait_writable(fd, 2000), 'dial_tcp connect did not complete'
+		assert testkit.fd_write_all(fd, uds_req, 2000)
+		got := testkit.fd_read_until(fd, 'HTTP/1.1 200', 3000)
 		assert got.starts_with('HTTP/1.1 200'), 'dial_tcp request failed, got: ${got}'
 		srv.shutdown(2000)
+	}
+}
+
+// --- scripted protocol behaviour over UDS (vtest) --------------------------
+
+const uds_keep_ok = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
+
+fn uds_keep_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	res << uds_keep_ok
+	return .done
+}
+
+// The issue-#122 step-2 promise made concrete: vtest drives UDS exactly like
+// TCP — the ONLY difference from a TCP script test is the unix_socket_path
+// config line (fire() dials through transport.dial_unix instead of dial_tcp).
+// Two concurrent connections against the single shared UDS listener: one
+// pipelines 4 requests in one write then keeps the connection alive for a
+// 5th, the other is a plain request — and drive()'s shutdown must leave
+// nothing in flight and unlink the socket file.
+fn test_uds_vtest_scripts() {
+	$if linux {
+		path := uds_socket_path('vtest')
+		mut pipelined := []u8{cap: uds_req.len * 4}
+		for _ in 0 .. 4 {
+			pipelined << 'GET / HTTP/1.1\r\nHost: local\r\n\r\n'.bytes()
+		}
+		out := vtest.drive(server.ServerConfig{
+			unix_socket_path: path
+			io_multiplexing:  .epoll
+			handler:          uds_keep_handler
+		}, [
+			vtest.Script{
+				rounds: [
+					vtest.Round{
+						send: pipelined
+						want: 4
+					},
+					vtest.Round{
+						send: 'GET / HTTP/1.1\r\nHost: local\r\n\r\n'.bytes()
+						want: 1
+					},
+				]
+			},
+			vtest.Script{
+				rounds: [
+					vtest.Round{
+						send: 'GET / HTTP/1.1\r\nHost: local\r\n\r\n'.bytes()
+					},
+				]
+			},
+		]) or {
+			assert false, err.msg()
+			return
+		}
+		pipe := out.conns[0]
+		assert pipe.connect_err == '', pipe.connect_err
+		assert pipe.frames.len == 5, 'UDS pipelining + keep-alive expected 5 responses, got ${pipe.frames.len}'
+		for f in pipe.frames {
+			assert f == uds_keep_ok
+		}
+		single := out.conns[1]
+		assert single.connect_err == '', single.connect_err
+		assert single.frames.len == 1
+		assert out.inflight_after == 0
+		assert !os.exists(path), 'drive() shutdown must unlink the socket file'
 	}
 }
 
@@ -183,7 +207,7 @@ const cred_forbidden = 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnectio
 // cred_handler authorizes by kernel-verified identity instead of anything in
 // the request: the caller must be THIS uid and THIS pid (the test client
 // lives in the same process). That is the §6 trust model end-to-end — the
-// gates who may connect, peer_cred says who each connection is.
+// path gates who may connect, peer_cred says who each connection is.
 fn cred_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	cred := socket.peer_cred(client_fd) or {
 		res << cred_forbidden
@@ -225,10 +249,9 @@ fn test_uds_peer_cred() {
 		defer {
 			transport.close_fd(fd)
 		}
-		assert C.write(fd, voidptr(&uds_req[0]), usize(uds_req.len)) == uds_req.len
-		got := read_until_deadline(fd, 'cred-ok', 3000)
+		assert testkit.fd_write_all(fd, uds_req, 2000)
+		got := testkit.fd_read_until(fd, 'cred-ok', 3000)
 		assert got.contains('cred-ok'), 'peer_cred must identify this process over UDS, got: ${got}'
-		// A TCP connection has no unix peer: peer_cred must answer none.
 		srv.shutdown(500)
 	}
 }
@@ -258,13 +281,10 @@ fn test_peer_cred_none_on_tcp() {
 		defer {
 			transport.close_fd(fd)
 		}
-		mut pfd := C.pollfd{
-			fd:     fd
-			events: i16(C.POLLOUT)
-		}
-		assert C.poll(&pfd, 1, 2000) == 1
-		assert C.write(fd, voidptr(&uds_req[0]), usize(uds_req.len)) == uds_req.len
-		got := read_until_deadline(fd, 'HTTP/1.1 403', 3000)
+		assert testkit.fd_wait_writable(fd, 2000)
+		assert testkit.fd_write_all(fd, uds_req, 2000)
+		// A TCP connection has no unix peer: peer_cred must answer none (403).
+		got := testkit.fd_read_until(fd, 'HTTP/1.1 403', 3000)
 		assert got.starts_with('HTTP/1.1 403'), 'peer_cred over TCP must be none (403 here), got: ${got}'
 		srv.shutdown(500)
 	}

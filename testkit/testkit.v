@@ -15,7 +15,9 @@
 // EOF) — none reads "until a marker / a byte count / a full Content-Length-framed
 // message, bounded by a deadline". Connecting is just `net.dial_tcp` and counting
 // occurrences is `string.count`, so those are used inline at the call sites rather
-// than wrapped here.
+// than wrapped here. Tests that dial raw fds through `transport` instead of
+// TcpConn use the fd_* family in fd_nix.c.v (same deadline discipline, raw
+// poll(2) — still no vanilla imports).
 module testkit
 
 import net
