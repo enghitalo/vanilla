@@ -10,8 +10,9 @@ module transport
 // Protocol clients (request serializers / response parsers) live inside
 // their protocol module (http1_1/client later), not here.
 //
-// `_nix` suffix: every Unix, never Windows (dial_windows lands with a
-// consumer, per docs/ARCHITECTURE.md).
+// `_nix` suffix: every Unix. The Windows side lives in
+// transport_windows.c.v (landed with its consumer, vtest — per
+// docs/ARCHITECTURE.md's "lands with a consumer" rule).
 
 #include <sys/socket.h>
 #include <sys/un.h>

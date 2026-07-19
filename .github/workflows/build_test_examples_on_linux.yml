@@ -20,9 +20,12 @@ jobs:
           - examples/conformance/src
           - examples/database/src
           - examples/etag/src
+          - examples/graceful_shutdown/src
           - examples/hexagonal/src
           - examples/io_uring_demo/src
+          - examples/mesh/src
           - examples/per_server_workers/src
+          - examples/request_limits/src
           - examples/simple/src
           - examples/simple2/src
           - examples/sse/src
@@ -71,3 +74,31 @@ jobs:
         shell: bash
         run: |
           v -cc gcc -no-parallel test $(pwd)/${{ matrix.folder }}
+
+  # The repo-root e2e suites (tests/): backend behaviours, UDS listeners +
+  # transport dials + peer_cred, vtest smoke. io_uring self-skips where
+  # io_uring_setup is sandboxed; VANILLA_NO_IOURING is the repo's kill-switch
+  # for hosted runners whose per-worker ring init fails after a passing probe
+  # (see poll_backend.yml for the full story).
+  repo-tests:
+    runs-on: ubuntu-latest
+    name: tests/ (behaviours, UDS, vtest)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up V
+        uses: vlang/setup-v@v1.7
+      - name: Remove Vlang folder to avoid conflicts
+        shell: bash
+        run: |
+          rm -rf -v ./vlang || true
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev linux-libc-dev
+      - name: Run tests/
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+        run: |
+          v -cc gcc -no-parallel test tests/

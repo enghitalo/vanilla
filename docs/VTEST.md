@@ -103,9 +103,18 @@ pub fn repeat(n int, s Script) []Script
   the first connect happens at the readiness instant (listeners are bound+listening
   even earlier — `new_server` is synchronous — so the backlog would absorb earlier
   connects anyway; the hook is the honest signal).
-- Per connection: blocking `connect()` on loopback (instant), then `O_NONBLOCK`
-  for all I/O. State: bytes sent (partial-send loop), accumulated `acc []u8`
-  (noscan, sized 8 KiB, grows), current round index, terminal flag.
+- Per connection: `transport.dial_tcp` / `dial_unix` (raw non-blocking fd — no
+  vlib TcpConn). A TCP connect may still be in flight when the fd enters the
+  reactor (EINPROGRESS); the first round's unsent bytes arm `POLLOUT`, which
+  resolves it, and a refused connect surfaces as `POLLERR`/`POLLHUP` ⇒ `eof`
+  with the script unmet (the refusal asserts accept both shapes). When the
+  server config sets `unix_socket_path`, `fire()` dials the socket file — a
+  UDS e2e is a TCP e2e plus that one config line. State: bytes sent
+  (partial-send loop), accumulated `acc []u8` (noscan, sized 8 KiB, grows),
+  current round index, terminal flag.
+- Sends use `MSG_NOSIGNAL` on Linux and `SO_NOSIGPIPE` (per socket, at dial)
+  on darwin: a peer the server already closed must report an error, not raise
+  SIGPIPE (vlib `net` used to SIG_IGN that process-wide; raw fds do not).
 - Loop: build pollfd set of live conns (`POLLIN`, plus `POLLOUT` while the current
   round's send is unfinished) + the self-pipe (`fire`/`wait`/`stop` wake the loop
   the same way the server's own reactor is woken from outside) → `poll(-1)` →
@@ -116,14 +125,19 @@ pub fn repeat(n int, s Script) []Script
   recorded, never fatal to the run.
 - Frame counting = the Content-Length predicate `testkit` uses today, generalized
   to N and kept as a pure `fn (acc []u8) bool`.
-- Windows: `WSAPoll` behind `$if windows` (same struct; POLLERR-on-connect quirk
-  fixed in Win10 2004+, current runners fine). Winsock init comes free via the
-  socket module.
+- Windows: `WSAPoll` behind `$if windows` (same struct). The WSAPoll
+  POLLERR-on-connect quirk never applies: `transport`'s Windows side connects
+  synchronously (then switches the fd non-blocking), so refusal surfaces as a
+  dial error. Winsock init happens inside `transport.dial_tcp` (WSAStartup is
+  refcounted).
 
 ## The enabler: `port: 0` = kernel-assigned ephemeral port
 
 `drive()` defaults to `port: 0` so parallel test binaries never coordinate ports
-(the old hand-maintained registry 8121–8162/18181–18184 dies).
+(the old hand-maintained registry 8121–8162/18181–18184 dies). A config with
+`unix_socket_path` set sidesteps ports entirely: the server listens on the
+socket file and the harness dials it (`tests/uds_test.v`,
+`test_uds_vtest_scripts`).
 
 Server-side change in `new_server` (cold path only):
 
@@ -143,7 +157,8 @@ Server-side change in `new_server` (cold path only):
 
 ## Where things live (module cycles decide this)
 
-- `vtest/` is a **top-level module** (`import vtest`). It imports `server`,
+- `vtest/` is a **top-level module** (`import vtest`). It imports `server`
+  (plus `transport` for dialing and `socket` for `shutdown_write`/nosigpipe),
   so it can never be imported from files compiled *as part of* module
   `server` — including that module's own `_test.v` files.
 - Therefore socket e2e tests for the server live in **`tests/`** (repo root),

@@ -2,51 +2,16 @@ module main
 
 // End-to-end: edge (TCP, ephemeral port) → backend (UDS) over the per-worker
 // connection pool, twice — the second request proves the keep-alive pool
-// reuses a connection instead of redialing. Linux-only invocation (the
+// reuses a connection instead of redialing. Client plumbing is
+// transport.dial_tcp + testkit's fd_* deadline loops (the raw-fd pattern
+// every transport e2e in the tree shares). Linux-only invocation (the
 // .epoll enum value); the wiring mirrors main() with ephemeral everything.
 import os
-import time
 import server
+import testkit
 import transport
 
-#include <poll.h>
-
-struct C.pollfd {
-mut:
-	fd      int
-	events  i16
-	revents i16
-}
-
-fn C.poll(fds &C.pollfd, nfds u64, timeout int) int
-fn C.read(fd int, buf voidptr, count usize) int
-fn C.write(fd int, buf voidptr, count usize) int
-
 const e2e_req = 'GET /mesh HTTP/1.1\r\nHost: e\r\nConnection: keep-alive\r\n\r\n'.bytes()
-
-fn e2e_read_until(fd int, needle string, timeout_ms int) string {
-	mut acc := []u8{cap: 1024}
-	mut buf := [1024]u8{}
-	sw := time.new_stopwatch()
-	for sw.elapsed().milliseconds() < timeout_ms {
-		mut pfd := C.pollfd{
-			fd:     fd
-			events: i16(C.POLLIN)
-		}
-		if C.poll(&pfd, 1, 50) <= 0 {
-			continue
-		}
-		n := C.read(fd, voidptr(&buf[0]), usize(1024))
-		if n <= 0 {
-			break
-		}
-		unsafe { acc.push_many(&buf[0], n) }
-		if acc.bytestr().contains(needle) {
-			break
-		}
-	}
-	return acc.bytestr()
-}
 
 fn test_mesh_end_to_end() {
 	$if linux {
@@ -86,15 +51,20 @@ fn test_mesh_end_to_end() {
 		}()
 		_ := <-edge_ready
 
-		fd := socket_connect_loopback(edge.port) or {
+		fd := transport.dial_tcp('127.0.0.1', edge.port) or {
 			assert false, err.msg()
 			return
 		}
+		defer {
+			transport.close_fd(fd)
+		}
+		// Non-blocking connect: writable == connected (loopback).
+		assert testkit.fd_wait_writable(fd, 2000), 'connect to edge did not complete'
 		// Two mesh calls on one client conn: the second reuses the pooled
 		// worker→backend connection (and the edge's own keep-alive).
 		for round in 0 .. 2 {
-			assert C.write(fd, voidptr(&e2e_req[0]), usize(e2e_req.len)) == e2e_req.len
-			got := e2e_read_until(fd, 'hello from the mesh', 3000)
+			assert testkit.fd_write_all(fd, e2e_req, 2000)
+			got := testkit.fd_read_until(fd, 'hello from the mesh', 3000)
 			assert got.starts_with('HTTP/1.1 200'), 'round ${round}: ${got}'
 			assert got.contains('"via":"edge"'), 'round ${round}: ${got}'
 			assert got.contains('"svc":"backend"'), 'round ${round}: ${got}'
@@ -102,19 +72,4 @@ fn test_mesh_end_to_end() {
 		edge.shutdown(500)
 		backend.shutdown(500)
 	}
-}
-
-// socket_connect_loopback dials 127.0.0.1:port non-blocking and waits for
-// the connect to complete (writability — the readiness path).
-fn socket_connect_loopback(port int) !int {
-	fd := transport.dial_tcp('127.0.0.1', port)!
-	mut pfd := C.pollfd{
-		fd:     fd
-		events: i16(C.POLLOUT)
-	}
-	if C.poll(&pfd, 1, 2000) != 1 {
-		transport.close_fd(fd)
-		return error('connect to edge did not complete')
-	}
-	return fd
 }

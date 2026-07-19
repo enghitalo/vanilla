@@ -6,11 +6,18 @@
 #ifndef VANILLA_TRANSPORT_SHIM_H
 #define VANILLA_TRANSPORT_SHIM_H
 
+#ifdef _WIN32
+#include <winsock2.h>
+
+typedef struct in_addr transport_in_addr;
+typedef struct sockaddr_in transport_sockaddr_in;
+#else
 #include <netinet/in.h>
 #include <sys/un.h>
 
 typedef struct in_addr transport_in_addr;
 typedef struct sockaddr_in transport_sockaddr_in;
 typedef struct sockaddr_un transport_sockaddr_un;
+#endif
 
 #endif
