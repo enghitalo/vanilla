@@ -135,6 +135,9 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 	// This worker can stream file bodies with sendfile(2): let handlers hand a
 	// file off via core.queue_file instead of copying it through write_buf.
 	core.enable_sendfile()
+	// ...and it can hand a connection over to another protocol's state machine
+	// (the conn-mode seam, issue #136): handlers upgrade via core.queue_takeover.
+	core.enable_takeover()
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut st := new_plain_state()
 	// Arm clientless background watches (timerfd refresh, signalfd, ...) on THIS

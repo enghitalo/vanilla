@@ -127,6 +127,16 @@ mut:
 	// connection (a keep-alive connection may carry several Expect requests, but
 	// only one is ever mid-read at a time, and close_conn clears it).
 	sent_100 bool
+	// The conn-mode seam (issue #136): nil (the default) means the HTTP/1.1
+	// state machine drives this connection — the hot path pays exactly one
+	// predictable nil-check in handle_readable. Set (via core.queue_takeover
+	// from an upgrade handler, e.g. RFC 6455 `Upgrade: websocket`) it is the
+	// ConnHandler every subsequent readable burst is fed to instead; the read
+	// buffer, batched flush, EPOLLOUT backpressure and timeout machinery are
+	// all reused unchanged. takeover_state is the caller's per-connection
+	// protocol state, handed back on every call, never inspected here.
+	takeover       core.ConnHandler = unsafe { nil }
+	takeover_state voidptr
 }
 
 // PlainState is the per-worker connection table. `parked` counts connections
@@ -398,7 +408,11 @@ fn sweep_timeouts(epoll_fd int, active_conns &core.Counter, mut st PlainState) {
 			continue
 		}
 		if cs.read_deadline > 0 && now > cs.read_deadline {
-			response.send_status_408_response(fd) // couldn't finish the request in time
+			// A taken-over connection no longer speaks HTTP — the 408 bytes
+			// would be protocol garbage to its peer; just close.
+			if cs.takeover == unsafe { nil } {
+				response.send_status_408_response(fd) // couldn't finish the request in time
+			}
 			close_conn(epoll_fd, fd, active_conns, mut st)
 		} else if cs.write_deadline > 0 && now > cs.write_deadline {
 			close_conn(epoll_fd, fd, active_conns, mut st)
@@ -444,6 +458,8 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			cs.awaiting_fd = -1
 			cs.close_after_flush = false
 			cs.sent_100 = false
+			cs.takeover = unsafe { nil }
+			cs.takeover_state = unsafe { nil }
 			st.conns[fd] = unsafe { nil }
 			st.free_conns << cs
 		}
