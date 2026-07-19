@@ -15,10 +15,11 @@ import and says nothing). Protocols are **siblings** over one engine:
 | `socket/` | listen side: TCP listeners, Windows sockets; UDS listeners and `peer_cred` (kernel-verified pid/uid/gid, §6); fd passing lands here (§7). |
 | `tls/` | mbedTLS split (`-d vanilla_tls` / stub) — server today, client transports later. |
 | `epoll/` `io_uring/` `kqueue/` `iocp/` | thin per-mechanism syscall wrappers, one dir-module each (`poll/` joins them as the portability floor). |
-| `server/` | **the engine** (was `http_server`) — one engine, N protocols via conn modes. OS facades (`server_linux.c.v`, …) select an `IOBackend`; `server/backend_*` are the reactors. |
+| `server/` | **the engine** (was `http_server`) — one engine, N protocols via conn modes: the takeover seam (issue #136) lets a handler hand a connection to a `core.ConnHandler` (`core.queue_takeover`, epoll-first), so upgrades change the framing authority without changing buffers or backpressure. OS facades (`server_linux.c.v`, …) select an `IOBackend`; `server/backend_*` are the reactors. |
 | `http1_1/` | HTTP/1.1 codecs: `request_parser/`, `response/`; `client/` is the client codec (request serializer + response parser). |
 | `http2/` | frame/hpack/types grow in place: stream mux, flow control, settings. |
-| `websocket/` `grpc/` | reserved siblings (RFC 6455 framing; length-prefixed messages over http2). Future protocols land as siblings here. |
+| `websocket/` | RFC 6455 codec (accept-key, frame head parse, unmask, server frame writers) — pure bytes, zero vanilla imports; an app's `ConnHandler` composes it over the takeover seam (`examples/websocket_echo`). |
+| `grpc/` | reserved sibling (length-prefixed messages over http2). Future protocols land as siblings here. |
 | `static_assets/` `testkit/` `vtest/` `pg_async/` | reusable handler-side and test-side modules. |
 | `transport/` | client-side dialing (`dial_tcp`, `dial_unix`) — bytes + non-blocking fds ONLY; protocol clients compose it (handler → `dial_*` → `event_loop.watch_fd` → `.suspend`), they don't live in it. |
 

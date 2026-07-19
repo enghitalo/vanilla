@@ -225,6 +225,7 @@ fn main() {
 | `examples/static_files/` | Static file serving (MIME, Range, ETag, traversal safety) |
 | `examples/url_form/` | Query-string and URL-encoded form parsing |
 | `examples/veb_like/` | veb-style declarative routing |
+| `examples/websocket_echo/` | RFC 6455 WebSocket echo over the connection-takeover seam (`core.queue_takeover` — one engine, two protocols on one connection) |
 | `examples/video_stream/` | HTTP video streaming |
 | `examples/async_sse/` | SSE via async handler (suspend/resume on fd) |
 | `examples/async_db_pg/` | PostgreSQL queries via async handler |
