@@ -1,0 +1,117 @@
+name: (Linux) HTTP/2 Conformance (h2spec)
+
+# Runs the h2spec RFC 9113/7541 conformance suite against the
+# examples/http2_cleartext server (cleartext, prior knowledge) on the epoll
+# backend — the http2 counterpart of conformance_h1spec.yml. Two layers:
+#
+#   1. `v test http2/` (state machine / HPACK / frame codec): every
+#      conformance decision asserted deterministically without a socket —
+#      the primary source of truth (runs in the repo-tests job and here).
+#   2. h2spec LIVE probe over TCP: the reference conformance tool driving
+#      real frames through the takeover seam. Hard gate — h2spec exits
+#      non-zero on any failed check.
+#
+# h2spec: https://github.com/summerwind/h2spec (Go, single binary).
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'http2/**'
+      - 'examples/http2_cleartext/**'
+      - 'server/**'
+      - 'core/**'
+      - 'http1_1/**'
+      - 'socket/**'
+      - 'epoll/**'
+      - 'io_uring/**'
+      - 'tls/**'
+      - '.github/workflows/conformance_h2spec.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'http2/**'
+      - 'examples/http2_cleartext/**'
+      - 'server/**'
+      - 'core/**'
+      - 'http1_1/**'
+      - 'socket/**'
+      - 'epoll/**'
+      - 'io_uring/**'
+      - 'tls/**'
+      - '.github/workflows/conformance_h2spec.yml'
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up V
+        uses: vlang/setup-v@v1.7
+      - name: Remove Vlang folder to avoid conflicts
+        shell: bash
+        run: |
+          rm -rf -v ./vlang || true
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev linux-libc-dev
+      # -cc gcc -no-parallel: same V-toolchain flake avoidance as the other
+      # workflows (tcc/stdatomic fallback race + vlang/v#27749 parallel-codegen
+      # link race).
+      - name: Build examples/http2_cleartext
+        shell: bash
+        run: v -cc gcc -no-parallel examples/http2_cleartext/src
+      - name: Unit tests (hard gate)
+        shell: bash
+        run: |
+          v -cc gcc -no-parallel test http2/
+          v -cc gcc -no-parallel test examples/http2_cleartext/src
+      - name: Install h2spec
+        shell: bash
+        run: |
+          curl -sSL -o /tmp/h2spec.tar.gz \
+            https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz
+          tar -xzf /tmp/h2spec.tar.gz -C /tmp
+          /tmp/h2spec --version
+      - name: Start the server
+        shell: bash
+        run: |
+          ./examples/http2_cleartext/src/src > /tmp/http2_server.log 2>&1 &
+          echo $! > /tmp/http2_server.pid
+          # Wait for the listener to come up (max ~10s).
+          for i in $(seq 1 40); do
+            if python3 -c "import socket;socket.create_connection(('127.0.0.1',3000),0.3)" 2>/dev/null; then
+              echo "server up after $((i))*0.25s"; break
+            fi
+            sleep 0.25
+          done
+          head -2 /tmp/http2_server.log || true
+      - name: Run h2spec (hard gate)
+        shell: bash
+        run: |
+          set +e
+          /tmp/h2spec -h 127.0.0.1 -p 3000 -o 5 > /tmp/h2spec.txt 2>&1
+          code=$?
+          # The tail carries the pass/fail tally; the Failures section (when
+          # present) carries every failed check with expected/actual.
+          tail -6 /tmp/h2spec.txt
+          {
+            echo '## h2spec'
+            echo '```'
+            tail -6 /tmp/h2spec.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" -ne 0 ]; then
+            echo "::error::h2spec reported conformance failures — details below."
+            sed -n '/^Failures:/,$p' /tmp/h2spec.txt
+            exit 1
+          fi
+          echo "h2spec: all checks passed."
+      - name: Stop the server
+        if: always()
+        shell: bash
+        run: |
+          [ -f /tmp/http2_server.pid ] && kill "$(cat /tmp/http2_server.pid)" 2>/dev/null || true
+          tail -20 /tmp/http2_server.log || true

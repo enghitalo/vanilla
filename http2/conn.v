@@ -47,12 +47,20 @@ const max_body_bytes = 8 * 1024 * 1024
 @[heap]
 struct StreamState {
 mut:
-	headers     []HeaderField
-	body        []u8
-	remote_done bool // END_STREAM received — the request is complete
-	recv_window i64
-	send_window i64
-	pending     []u8 // response DATA parked until the peer opens its window
+	headers []HeaderField
+	body    []u8
+	// END_STREAM received — the request side is complete
+	remote_done bool
+	// refused or malformed (§8.3): the RST already went out; keep draining the
+	// stream's frames quietly, never surface it as a request
+	rejected bool
+	// content-length asserted by the header block, -1 = none (§8.1.1: it must
+	// equal the DATA total, checked when the request side completes)
+	declared_len i64 = -1
+	recv_window  i64
+	send_window  i64
+	// response DATA parked until the peer opens its window
+	pending     []u8
 	pending_off int
 	pending_end bool
 }
@@ -73,6 +81,7 @@ mut:
 	hdr_end_stream bool
 	hdr_refused    bool
 	hdr_trailers   bool
+	hdr_malformed  bool
 	hdr_block      []u8
 	// peer-declared limits and both directions' flow-control windows
 	peer_max_frame   int = default_max_frame_size
@@ -151,6 +160,12 @@ pub fn (mut c ServerConn) consume(buf []u8, mut out []u8, mut reqs []Http2Reques
 			[]u8{}
 		}
 		if u8(fh.type_) > u8(FrameType.continuation) {
+			if c.hdr_expecting {
+				// A header block must be a contiguous frame sequence — even
+				// unknown frame types cannot interleave (§4.3).
+				write_goaway(mut out, c.last_stream, .protocol_error)
+				return consumed, true
+			}
 			consumed += total // unknown frame types MUST be ignored (§4.1)
 			continue
 		}
@@ -187,11 +202,17 @@ fn (mut c ServerConn) frame(fh FrameHeader, payload []u8, mut out []u8, mut reqs
 			if payload.len != 5 {
 				return .frame_size_error
 			}
-			return .no_error // deprecated scheme — parsed, ignored (§6.3)
+			dep := read_u32(payload, 0) & 0x7fffffff
+			if dep == fh.stream_id {
+				// A stream cannot depend on itself — stream error (§5.3.1).
+				write_rst_stream(mut out, fh.stream_id, .protocol_error)
+				c.streams.delete(fh.stream_id)
+			}
+			return .no_error // deprecated scheme — parsed, otherwise ignored (§6.3)
 		}
 		.rst_stream {
-			if fh.stream_id == 0 {
-				return .protocol_error
+			if fh.stream_id == 0 || fh.stream_id > c.last_stream {
+				return .protocol_error // includes RST on an idle stream (§6.4)
 			}
 			if payload.len != 4 {
 				return .frame_size_error
@@ -263,19 +284,27 @@ fn (mut c ServerConn) on_headers(fh FrameHeader, payload []u8, mut out []u8, mut
 		}
 		end = payload.len - pad
 	}
+	c.hdr_trailers = false
+	c.hdr_refused = false
+	c.hdr_malformed = false
 	if fh.flags & flag_priority != 0 {
 		if off + 5 > end {
 			return .protocol_error
 		}
+		dep := read_u32(payload, off) & 0x7fffffff
+		if dep == fh.stream_id {
+			c.hdr_malformed = true // self-dependency — stream error (§5.3.1)
+		}
 		off += 5
 	}
-	c.hdr_trailers = false
-	c.hdr_refused = false
 	if fh.stream_id in c.streams {
 		s := c.streams[fh.stream_id] or { return .internal_error }
-		// A second HEADERS on an open stream: trailers — only valid while the
-		// request side is open and only when it closes it (§8.1).
-		if s.remote_done || fh.flags & flag_end_stream == 0 {
+		if s.remote_done {
+			return .stream_closed // HEADERS on half-closed (remote) (§5.1)
+		}
+		// A second HEADERS on an open stream: trailers — only valid when the
+		// block also closes the request side (§8.1).
+		if fh.flags & flag_end_stream == 0 {
 			return .protocol_error
 		}
 		c.hdr_trailers = true
@@ -313,36 +342,180 @@ fn (mut c ServerConn) finish_header_block(mut out []u8, mut reqs []Http2Request)
 	}
 	stream_id := c.hdr_stream
 	if c.hdr_trailers {
+		if !valid_trailer_fields(fields) {
+			// Pseudo-headers or connection-specific fields in trailers make
+			// the request malformed (§8.1, §8.3) — stream error.
+			write_rst_stream(mut out, stream_id, .protocol_error)
+			c.streams.delete(stream_id)
+			return .no_error
+		}
 		// Trailers kept the HPACK state consistent; their fields are not
 		// surfaced (v1) — they complete the request as END_STREAM does.
-		mut s := c.streams[stream_id] or { return .internal_error }
-		s.remote_done = true
-		reqs << Http2Request{
-			stream_id: stream_id
-			headers:   s.headers
-			body:      s.body
-		}
+		c.complete_stream(stream_id, mut out, mut reqs)
 		return .no_error
 	}
 	if c.hdr_refused {
 		write_rst_stream(mut out, stream_id, .refused_stream)
 		return .no_error
 	}
+	ok, declared := validate_request_fields(fields)
+	malformed := c.hdr_malformed || !ok
 	mut s := &StreamState{
-		headers:     fields
-		recv_window: i64(default_window_size)
-		send_window: c.init_send_window
+		headers:      fields
+		rejected:     malformed
+		declared_len: declared
+		recv_window:  i64(default_window_size)
+		send_window:  c.init_send_window
 	}
 	c.streams[stream_id] = s
+	if malformed {
+		// Malformed request (§8.3): a stream error, never surfaced. The
+		// rejected stream state stays so the client's in-flight frames for it
+		// drain quietly instead of escalating to a connection error.
+		write_rst_stream(mut out, stream_id, .protocol_error)
+	}
 	if c.hdr_end_stream {
-		s.remote_done = true
-		reqs << Http2Request{
-			stream_id: stream_id
-			headers:   s.headers
-			body:      s.body
-		}
+		c.complete_stream(stream_id, mut out, mut reqs)
 	}
 	return .no_error
+}
+
+// complete_stream ends a stream's request side: rejected streams and
+// content-length violations are dropped, everything else surfaces as a
+// complete request (the stream stays for the response to be written).
+fn (mut c ServerConn) complete_stream(stream_id u32, mut out []u8, mut reqs []Http2Request) {
+	mut s := c.streams[stream_id] or { return }
+	s.remote_done = true
+	if s.rejected {
+		c.streams.delete(stream_id)
+		return
+	}
+	if s.declared_len >= 0 && s.declared_len != i64(s.body.len) {
+		// content-length must equal the DATA total (§8.1.1) — malformed.
+		write_rst_stream(mut out, stream_id, .protocol_error)
+		c.streams.delete(stream_id)
+		return
+	}
+	reqs << Http2Request{
+		stream_id: stream_id
+		headers:   s.headers
+		body:      s.body
+	}
+}
+
+// validate_request_fields enforces the malformed-request rules of RFC 9113
+// §8.2/§8.3 on a decoded request header list. Returns validity plus the
+// declared content-length (-1 when absent).
+fn validate_request_fields(fields []HeaderField) (bool, i64) {
+	mut seen_regular := false
+	mut method := ''
+	mut n_method := 0
+	mut n_scheme := 0
+	mut n_path := 0
+	mut n_authority := 0
+	mut declared := i64(-1)
+	for f in fields {
+		if f.name.len == 0 {
+			return false, -1
+		}
+		if f.name[0] == `:` {
+			if seen_regular {
+				return false, -1 // pseudo-header after a regular field (§8.3)
+			}
+			match f.name {
+				':method' {
+					n_method++
+					method = f.value
+				}
+				':scheme' {
+					n_scheme++
+				}
+				':path' {
+					n_path++
+					if f.value.len == 0 {
+						return false, -1 // empty :path (§8.3.1)
+					}
+				}
+				':authority' {
+					n_authority++
+				}
+				else {
+					return false, -1 // unknown or response pseudo-header (§8.3)
+				}
+			}
+			continue
+		}
+		seen_regular = true
+		if !valid_regular_field_name(f.name) {
+			return false, -1
+		}
+		if f.name == 'te' && f.value != 'trailers' {
+			return false, -1 // te may only carry 'trailers' (§8.2.2)
+		}
+		if f.name == 'content-length' {
+			n := parse_content_length(f.value)
+			if n < 0 {
+				return false, -1
+			}
+			if declared >= 0 && declared != n {
+				return false, -1 // differing duplicates (§8.1.1)
+			}
+			declared = n
+		}
+	}
+	if n_method != 1 || n_authority > 1 {
+		return false, -1
+	}
+	if method == 'CONNECT' {
+		// CONNECT omits :scheme and :path and requires :authority (§8.5).
+		if n_scheme != 0 || n_path != 0 || n_authority != 1 {
+			return false, -1
+		}
+	} else if n_scheme != 1 || n_path != 1 {
+		return false, -1 // exactly one of each (§8.3.1)
+	}
+	return true, declared
+}
+
+// valid_regular_field_name rejects uppercase (http2 field names are
+// lowercase on the wire, §8.2) and the connection-specific fields that must
+// not exist in http2 framing (§8.2.2).
+fn valid_regular_field_name(name string) bool {
+	for ch in name {
+		if (ch >= `A` && ch <= `Z`) || ch == ` ` || ch == 0 {
+			return false
+		}
+	}
+	return match name {
+		'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade' { false }
+		else { true }
+	}
+}
+
+// valid_trailer_fields: trailers carry only regular fields (§8.1).
+fn valid_trailer_fields(fields []HeaderField) bool {
+	for f in fields {
+		if f.name.len == 0 || f.name[0] == `:` || !valid_regular_field_name(f.name) {
+			return false
+		}
+	}
+	return true
+}
+
+// parse_content_length parses a strictly-decimal content-length; -1 on
+// anything else (signs, blanks, non-digits, absurd width).
+fn parse_content_length(s string) i64 {
+	if s.len == 0 || s.len > 18 {
+		return -1
+	}
+	mut n := i64(0)
+	for ch in s {
+		if ch < `0` || ch > `9` {
+			return -1
+		}
+		n = n * 10 + i64(ch - `0`)
+	}
+	return n
 }
 
 fn (mut c ServerConn) on_data(fh FrameHeader, payload []u8, mut out []u8, mut reqs []Http2Request) ErrorCode {
@@ -350,7 +523,10 @@ fn (mut c ServerConn) on_data(fh FrameHeader, payload []u8, mut out []u8, mut re
 		return .protocol_error
 	}
 	if fh.stream_id !in c.streams {
-		return .stream_closed // DATA on an idle/closed stream (§6.1)
+		if fh.stream_id > c.last_stream {
+			return .protocol_error // DATA on an idle stream (§5.1, §6.1)
+		}
+		return .stream_closed // DATA on a fully closed stream (§5.1)
 	}
 	mut s := c.streams[fh.stream_id] or { return .internal_error }
 	if s.remote_done {
@@ -375,11 +551,13 @@ fn (mut c ServerConn) on_data(fh FrameHeader, payload []u8, mut out []u8, mut re
 		}
 		end = payload.len - pad
 	}
-	if s.body.len + (end - off) > max_body_bytes {
-		return .enhance_your_calm // mirrors the h1 request-size ceiling
-	}
-	if end > off {
-		unsafe { s.body.push_many(&payload[off], end - off) }
+	if !s.rejected {
+		if s.body.len + (end - off) > max_body_bytes {
+			return .enhance_your_calm // mirrors the h1 request-size ceiling
+		}
+		if end > off {
+			unsafe { s.body.push_many(&payload[off], end - off) }
+		}
 	}
 	// Replenish eagerly: bodies are consumed on arrival (handlers see whole
 	// requests), so the peer's view of both windows snaps back to full.
@@ -392,12 +570,7 @@ fn (mut c ServerConn) on_data(fh FrameHeader, payload []u8, mut out []u8, mut re
 		}
 	}
 	if fh.flags & flag_end_stream != 0 {
-		s.remote_done = true
-		reqs << Http2Request{
-			stream_id: fh.stream_id
-			headers:   s.headers
-			body:      s.body
-		}
+		c.complete_stream(fh.stream_id, mut out, mut reqs)
 	}
 	return .no_error
 }
@@ -449,6 +622,12 @@ fn (mut c ServerConn) on_window_update(fh FrameHeader, payload []u8, mut out []u
 		return .frame_size_error
 	}
 	inc := read_u32(payload, 0) & 0x7fffffff
+	if fh.stream_id != 0 && inc == 0 {
+		// Zero increment on a stream is a STREAM error (§6.9).
+		write_rst_stream(mut out, fh.stream_id, .protocol_error)
+		c.streams.delete(fh.stream_id)
+		return .no_error
+	}
 	if inc == 0 {
 		return .protocol_error
 	}

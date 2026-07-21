@@ -331,6 +331,189 @@ fn test_new_stream_ids_must_ascend() {
 	assert frames[frames.len - 1].fh.type_ == .goaway
 }
 
+fn test_validate_request_fields_rules() {
+	ok0, cl0 := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'),
+		hf(':path', '/'), hf(':authority', 'x')])
+	assert ok0
+	assert cl0 == -1
+	ok1, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http')])
+	assert !ok1 // missing :path
+	ok2, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'),
+		hf('x', 'y'), hf(':path', '/')])
+	assert !ok2 // pseudo-header after a regular field
+	ok3, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'),
+		hf(':path', '/'), hf(':status', '200')])
+	assert !ok3 // response pseudo-header in a request
+	ok4, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'),
+		hf(':path', '')])
+	assert !ok4 // empty :path
+	ok5, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'),
+		hf(':path', '/'), hf('connection', 'close')])
+	assert !ok5 // connection-specific field
+	ok6, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'),
+		hf(':path', '/'), hf('te', 'gzip')])
+	assert !ok6 // te may only carry 'trailers'
+	ok7, cl7 := validate_request_fields([hf(':method', 'POST'), hf(':scheme', 'http'),
+		hf(':path', '/'), hf('content-length', '42')])
+	assert ok7
+	assert cl7 == 42
+	ok8, _ := validate_request_fields([hf(':method', 'POST'), hf(':scheme', 'http'),
+		hf(':path', '/'), hf('content-length', '4'), hf('content-length', '5')])
+	assert !ok8 // differing duplicate content-length
+	ok9, _ := validate_request_fields([hf(':method', 'CONNECT'), hf(':scheme', 'http'),
+		hf(':path', '/'), hf(':authority', 'x')])
+	assert !ok9 // CONNECT must omit :scheme and :path
+	ok10, _ := validate_request_fields([hf(':method', 'CONNECT'), hf(':authority', 'x:443')])
+	assert ok10
+	ok11, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'),
+		hf(':path', '/'), hf('X-Bad', 'v')])
+	assert !ok11 // uppercase field name
+}
+
+fn test_malformed_request_is_rst_not_fatal() {
+	mut c := new_server_conn()
+	handshake(mut c)
+	mut block := []u8{}
+	encode_indexed(mut block, 2)
+	encode_indexed(mut block, 6)
+	encode_indexed(mut block, 4)
+	encode_literal_name_idx(mut block, 1, 'x.test')
+	encode_literal(mut block, 'X-Bad', 'v') // uppercase name — malformed (§8.2)
+	mut input := []u8{}
+	write_frame_header(mut input, .headers, flag_end_headers | flag_end_stream, 1, block.len)
+	input << block
+	mut out := []u8{}
+	mut reqs := []Http2Request{}
+	consumed, closing := c.consume(input, mut out, mut reqs)
+	assert consumed == input.len
+	assert !closing
+	assert reqs.len == 0
+	frames := frames_of(out)
+	assert frames.len == 1
+	assert frames[0].fh.type_ == .rst_stream
+	assert read_u32(frames[0].payload, 0) == u32(ErrorCode.protocol_error)
+	// The connection lives on: a valid request on the next stream works.
+	block2 := get_request_block()
+	mut input2 := []u8{}
+	write_frame_header(mut input2, .headers, flag_end_headers | flag_end_stream, 3, block2.len)
+	input2 << block2
+	out.clear()
+	_, closing2 := c.consume(input2, mut out, mut reqs)
+	assert !closing2
+	assert reqs.len == 1
+	assert reqs[0].stream_id == 3
+}
+
+fn test_content_length_mismatch_is_malformed() {
+	mut c := new_server_conn()
+	handshake(mut c)
+	mut block := []u8{}
+	encode_indexed(mut block, 3) // :method POST
+	encode_indexed(mut block, 6)
+	encode_indexed(mut block, 4)
+	encode_literal(mut block, 'content-length', '5')
+	mut input := []u8{}
+	write_frame_header(mut input, .headers, flag_end_headers, 1, block.len)
+	input << block
+	write_data_header(mut input, 1, 2, true)
+	input << 'hi'.bytes()
+	mut out := []u8{}
+	mut reqs := []Http2Request{}
+	consumed, closing := c.consume(input, mut out, mut reqs)
+	assert consumed == input.len
+	assert !closing
+	assert reqs.len == 0 // 2 != 5 — malformed, never surfaced (§8.1.1)
+	frames := frames_of(out)
+	assert frames[frames.len - 1].fh.type_ == .rst_stream
+	assert c.streams.len == 0
+}
+
+fn test_window_update_zero_on_stream_is_stream_error() {
+	mut c := new_server_conn()
+	handshake(mut c)
+	block := get_request_block()
+	mut input := []u8{}
+	write_frame_header(mut input, .headers, flag_end_headers | flag_end_stream, 1, block.len)
+	input << block
+	mut out := []u8{}
+	mut reqs := []Http2Request{}
+	c1, cl1 := c.consume(input, mut out, mut reqs)
+	assert c1 == input.len
+	assert !cl1
+	out.clear()
+	mut wu := []u8{}
+	write_window_update(mut wu, 1, 0)
+	_, closing := c.consume(wu, mut out, mut reqs)
+	assert !closing // stream error, not a connection error (§6.9)
+	frames := frames_of(out)
+	assert frames.len == 1
+	assert frames[0].fh.type_ == .rst_stream
+}
+
+fn test_rst_on_idle_stream_is_fatal() {
+	mut c := new_server_conn()
+	handshake(mut c)
+	mut input := []u8{}
+	write_rst_stream(mut input, 5, .cancel) // stream 5 was never opened
+	mut out := []u8{}
+	mut reqs := []Http2Request{}
+	_, closing := c.consume(input, mut out, mut reqs)
+	assert closing
+	frames := frames_of(out)
+	assert frames[frames.len - 1].fh.type_ == .goaway
+}
+
+fn test_data_on_idle_stream_is_fatal() {
+	mut c := new_server_conn()
+	handshake(mut c)
+	mut input := []u8{}
+	write_data_header(mut input, 5, 2, true)
+	input << 'hi'.bytes()
+	mut out := []u8{}
+	mut reqs := []Http2Request{}
+	_, closing := c.consume(input, mut out, mut reqs)
+	assert closing
+	frames := frames_of(out)
+	assert frames[frames.len - 1].fh.type_ == .goaway
+}
+
+fn test_extension_frame_inside_header_block_is_fatal() {
+	mut c := new_server_conn()
+	handshake(mut c)
+	block := get_request_block()
+	mut input := []u8{}
+	// HEADERS without END_HEADERS opens a block...
+	write_frame_header(mut input, .headers, flag_end_stream, 1, block.len)
+	input << block
+	// ...an unknown frame type interleaves — must kill the connection (§4.3).
+	input << [u8(0), 0, 0, 0x0b, 0, 0, 0, 0, 1]
+	mut out := []u8{}
+	mut reqs := []Http2Request{}
+	_, closing := c.consume(input, mut out, mut reqs)
+	assert closing
+	frames := frames_of(out)
+	assert frames[frames.len - 1].fh.type_ == .goaway
+}
+
+fn test_headers_self_dependency_is_stream_error() {
+	mut c := new_server_conn()
+	handshake(mut c)
+	block := get_request_block()
+	mut input := []u8{}
+	// HEADERS with the PRIORITY flag whose dependency is the stream itself.
+	write_frame_header(mut input, .headers, flag_end_headers | flag_end_stream | flag_priority, 1,
+		block.len + 5)
+	input << [u8(0), 0, 0, 1, 16] // depend on stream 1 (self), weight 16
+	input << block
+	mut out := []u8{}
+	mut reqs := []Http2Request{}
+	_, closing := c.consume(input, mut out, mut reqs)
+	assert !closing
+	assert reqs.len == 0
+	frames := frames_of(out)
+	assert frames[0].fh.type_ == .rst_stream
+}
+
 fn test_rst_stream_drops_state() {
 	mut c := new_server_conn()
 	handshake(mut c)

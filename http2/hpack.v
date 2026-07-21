@@ -236,6 +236,7 @@ pub fn (mut d HpackDecoder) decode(block []u8) ![]HeaderField {
 	mut out := []HeaderField{cap: 16}
 	mut pos := 0
 	mut decoded := 0
+	mut fields_seen := false
 	for pos < block.len {
 		b := block[pos]
 		if b & 0x80 != 0 {
@@ -247,6 +248,7 @@ pub fn (mut d HpackDecoder) decode(block []u8) ![]HeaderField {
 			if decoded > max_decoded_block {
 				return error('hpack: header block too large decoded')
 			}
+			fields_seen = true
 			out << HeaderField{
 				name:  name
 				value: value
@@ -268,12 +270,17 @@ pub fn (mut d HpackDecoder) decode(block []u8) ![]HeaderField {
 				return error('hpack: header block too large decoded')
 			}
 			d.add(name, value)
+			fields_seen = true
 			out << HeaderField{
 				name:  name
 				value: value
 			}
 		} else if b & 0xe0 == 0x20 {
-			// Dynamic table size update (§6.3).
+			// Dynamic table size update (§6.3) — only valid BEFORE the first
+			// field of a block (RFC 7541 §4.2).
+			if fields_seen {
+				return error('hpack: table size update after a header field')
+			}
 			size, p := decode_int(block, pos, 5)!
 			pos = p
 			if int(size) > d.max_size {
@@ -299,6 +306,7 @@ pub fn (mut d HpackDecoder) decode(block []u8) ![]HeaderField {
 			if decoded > max_decoded_block {
 				return error('hpack: header block too large decoded')
 			}
+			fields_seen = true
 			out << HeaderField{
 				name:  name
 				value: value
@@ -532,6 +540,11 @@ fn huffman_decode(src []u8, mut out []u8) ! {
 				break
 			}
 		}
+	}
+	if nbits > 7 {
+		// More than 7 unconsumed bits is an incomplete symbol, not padding —
+		// a decoding error even when the bits are all ones (RFC 7541 §5.2).
+		return error('hpack: huffman padding longer than 7 bits')
 	}
 	if cur != (u64(1) << nbits) - 1 {
 		return error('hpack: invalid huffman padding')

@@ -170,6 +170,23 @@ fn test_response_blocks_with_eviction() ! {
 	assert d.dynamic_size() <= 256
 }
 
+fn test_huffman_rejects_padding_longer_than_7_bits() {
+	// 16 all-one bits decode to no symbol: more than 7 bits of "padding" is
+	// an incomplete symbol and must be rejected (RFC 7541 §5.2).
+	mut out := []u8{}
+	if _ := huffman_decode([u8(0xff), 0xff], mut out) {
+		assert false
+	}
+}
+
+fn test_table_size_update_after_a_field_rejected() {
+	// Indexed field, then a size update — updates only lead a block (§4.2).
+	mut d := new_decoder(hpack_default_table_size)
+	if _ := d.decode(hx('823fe101')) {
+		assert false
+	}
+}
+
 fn test_table_size_update_above_settings_limit_rejected() {
 	mut d := new_decoder(128)
 	// Update to 256 when the advertised limit is 128 — connection error.
