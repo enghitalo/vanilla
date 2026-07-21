@@ -217,6 +217,10 @@ mut:
 	dyn_size int           // sum of entry sizes (name + value + 32, RFC 7541 §4.1)
 	max_size int           // protocol ceiling (our SETTINGS_HEADER_TABLE_SIZE)
 	cur_max  int           // current limit, lowered/raised by table-size updates
+	// Reused Huffman-decode scratch: one buffer, cleared per Huffman string,
+	// so a Huffman-coded literal costs no per-string allocation (bytestr()
+	// copies the result out). RSS stays flat under `-gc none`.
+	huff_scratch []u8
 }
 
 // new_decoder returns a decoder whose dynamic table is capped at `max_size`
@@ -234,6 +238,17 @@ pub fn new_decoder(max_size int) HpackDecoder {
 // COMPRESSION_ERROR) — the table state is unrecoverable after a bad block.
 pub fn (mut d HpackDecoder) decode(block []u8) ![]HeaderField {
 	mut out := []HeaderField{cap: 16}
+	d.decode_into(block, mut out)!
+	return out
+}
+
+// decode_into is decode's zero-allocation form: it clears `out` and refills it,
+// reusing the caller's slice (a per-connection buffer) across header blocks
+// instead of returning a fresh one per request. Steady-state allocation is
+// zero — the churn that leaks under `-gc none`. Same fatal-error contract as
+// decode.
+pub fn (mut d HpackDecoder) decode_into(block []u8, mut out []HeaderField) ! {
+	out.clear()
 	mut pos := 0
 	mut decoded := 0
 	mut fields_seen := false
@@ -313,7 +328,6 @@ pub fn (mut d HpackDecoder) decode(block []u8) ![]HeaderField {
 			}
 		}
 	}
-	return out
 }
 
 // dynamic_size reports the dynamic table's current byte size (tests/metrics).
@@ -375,10 +389,13 @@ fn (mut d HpackDecoder) decode_str(block []u8, pos int) !(string, int) {
 	if !huff {
 		return src.bytestr(), p + n
 	}
-	// Huffman output is at most 8/5 of the input (shortest code is 5 bits).
-	mut tmp := []u8{cap: n * 8 / 5 + 1}
-	huffman_decode(src, mut tmp)!
-	return tmp.bytestr(), p + n
+	// Huffman decode into the decoder's reused scratch (cleared, capacity
+	// retained) instead of a fresh []u8 per string — the per-header allocation
+	// churn that leaks under `-gc none`. bytestr() copies out, so the scratch
+	// is free to be reused by the next string immediately.
+	d.huff_scratch.clear()
+	huffman_decode(src, mut d.huff_scratch)!
+	return d.huff_scratch.bytestr(), p + n
 }
 
 // decode_int reads an N-bit-prefix integer (§5.1). Accumulates in u64 so no

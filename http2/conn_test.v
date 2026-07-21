@@ -617,6 +617,59 @@ fn test_headers_self_dependency_is_stream_error() {
 	assert frames[0].fh.type_ == .rst_stream
 }
 
+// Leak-regression guard: under `-gc none` a dropped &StreamState is never
+// reclaimed, so 50 requests must REUSE one StreamState via the free-list, not
+// leak 50. Asserts the map drains AND the free-list stays at one entry.
+fn test_stream_state_reused_across_requests() {
+	mut c := new_server_conn()
+	handshake(mut c)
+	block := get_request_block()
+	mut sid := u32(1)
+	for _ in 0 .. 50 {
+		mut input := []u8{}
+		write_frame_header(mut input, .headers, flag_end_headers | flag_end_stream, sid, block.len)
+		input << block
+		mut out := []u8{}
+		mut reqs := []Http2Request{}
+		_, closing := c.consume(input, mut out, mut reqs)
+		assert !closing
+		assert reqs.len == 1
+		mut rb := []u8{}
+		encode_status(mut rb, 200)
+		c.write_response_headers(mut out, sid, rb, false)
+		c.write_response_data(mut out, sid, 'ok'.bytes())
+		assert sid !in c.streams // released back to the free-list
+		sid += 2
+	}
+	assert c.streams.len == 0
+	assert c.free_streams.len == 1 // ONE reused state, not 50 leaked
+}
+
+// A response that fits the send window is emitted directly to `out`; nothing
+// is copied into the stream's pending buffer and the stream is released.
+fn test_response_data_within_window_does_not_buffer() {
+	mut c := new_server_conn()
+	handshake(mut c)
+	block := get_request_block()
+	mut input := []u8{}
+	write_frame_header(mut input, .headers, flag_end_headers | flag_end_stream, 1, block.len)
+	input << block
+	mut out := []u8{}
+	mut reqs := []Http2Request{}
+	_, _ := c.consume(input, mut out, mut reqs)
+	out.clear()
+	mut rb := []u8{}
+	encode_status(mut rb, 200)
+	c.write_response_headers(mut out, 1, rb, false)
+	c.write_response_data(mut out, 1, 'hello over http2'.bytes())
+	assert 1 !in c.streams // fit the window → emitted + released, none parked
+	frames := frames_of(out)
+	assert frames.len == 2
+	assert frames[1].fh.type_ == .data
+	assert frames[1].fh.flags & flag_end_stream != 0
+	assert frames[1].payload.bytestr() == 'hello over http2'
+}
+
 fn test_rst_stream_drops_state() {
 	mut c := new_server_conn()
 	handshake(mut c)

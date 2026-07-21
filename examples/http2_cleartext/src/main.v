@@ -163,6 +163,10 @@ struct BridgeState {
 mut:
 	conn   &http2.ServerConn
 	parked bool
+	// Reused across bursts: consume() appends completed requests here, and we
+	// clear it each call instead of allocating a fresh slice per readable
+	// burst (which would leak under `-gc none`).
+	reqs []http2.Http2Request
 }
 
 // WatchCapture records the ONE watch an app handler arms while served over
@@ -211,10 +215,14 @@ mut:
 fn http2_takeover_conn(buf []u8, mut out []u8, client_fd int, takeover_state voidptr, worker_state voidptr, mut event_loop core.EventLoop) (int, core.Step) {
 	mut bridge := unsafe { &BridgeState(takeover_state) }
 	mut conn := bridge.conn
-	mut reqs := []http2.Http2Request{}
-	consumed, closing := conn.consume(buf, mut out, mut reqs)
+	bridge.reqs.clear()
+	consumed, closing := conn.consume(buf, mut out, mut bridge.reqs)
 	mut must_close := closing
-	for req in reqs {
+	// Index, not `for x in bridge.reqs`: serve_http2_request takes `mut bridge`,
+	// and V forbids passing a container as mut while ranging over it. consume
+	// already finished appending, so the length is fixed here.
+	for i in 0 .. bridge.reqs.len {
+		req := bridge.reqs[i]
 		if !serve_http2_request(mut bridge, req, mut out, client_fd, worker_state, mut event_loop) {
 			must_close = true
 		}
