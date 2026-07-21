@@ -50,6 +50,8 @@ const echo_path = '/echo'.bytes()
 const star_target = '*'.bytes()
 
 const h1_line_suffix = ' HTTP/1.1\r\n'.bytes()
+const http11_version = 'HTTP/1.1'.bytes()
+const http10_version = 'HTTP/1.0'.bytes()
 const h1_host_prefix = 'host: '.bytes()
 const h1_content_length_prefix = 'content-length: '.bytes()
 const h1_header_sep = ': '.bytes()
@@ -100,6 +102,15 @@ fn handle(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event
 		// connection's state once the mode flips (the takeover_state slot).
 		conn.write_server_preface(mut res)
 		return .done
+	}
+	if !slice_eq(hr.buffer, hr.version, http11_version)
+		&& !slice_eq(hr.buffer, hr.version, http10_version) {
+		// Not an HTTP/1.x request — e.g. a garbled http2 connection preface.
+		// Answer 400 and drop the connection (RFC 9113 §3.5 requires the TCP
+		// connection terminated on an invalid preface; a keep-alive 404 would
+		// leave the peer hanging).
+		res << response.tiny_bad_request_response
+		return .close
 	}
 	return app_route(hr, mut res)
 }

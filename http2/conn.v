@@ -175,11 +175,11 @@ pub fn (mut c ServerConn) consume(buf []u8, mut out []u8, mut reqs []Http2Reques
 			write_goaway(mut out, c.last_stream, code)
 			return consumed, true
 		}
-		if c.saw_goaway {
-			return consumed, true
-		}
 	}
-	return consumed, false
+	// A peer GOAWAY closes the connection — but only after the whole burst
+	// is processed, so frames sent alongside it (e.g. a PING) still get
+	// their answers flushed before the FIN instead of dying in an RST.
+	return consumed, c.saw_goaway
 }
 
 // frame dispatches one complete frame. Any code but .no_error is
@@ -622,16 +622,10 @@ fn (mut c ServerConn) on_window_update(fh FrameHeader, payload []u8, mut out []u
 		return .frame_size_error
 	}
 	inc := read_u32(payload, 0) & 0x7fffffff
-	if fh.stream_id != 0 && inc == 0 {
-		// Zero increment on a stream is a STREAM error (§6.9).
-		write_rst_stream(mut out, fh.stream_id, .protocol_error)
-		c.streams.delete(fh.stream_id)
-		return .no_error
-	}
-	if inc == 0 {
-		return .protocol_error
-	}
 	if fh.stream_id == 0 {
+		if inc == 0 {
+			return .protocol_error
+		}
 		c.conn_send_window += i64(inc)
 		if c.conn_send_window > i64(max_window) {
 			return .flow_control_error
@@ -639,6 +633,15 @@ fn (mut c ServerConn) on_window_update(fh FrameHeader, payload []u8, mut out []u
 		for id in c.streams.keys() {
 			c.flush_pending(mut out, id)
 		}
+		return .no_error
+	}
+	if fh.stream_id > c.last_stream {
+		return .protocol_error // WINDOW_UPDATE on an idle stream (§5.1)
+	}
+	if inc == 0 {
+		// Zero increment on a stream is a STREAM error (§6.9).
+		write_rst_stream(mut out, fh.stream_id, .protocol_error)
+		c.streams.delete(fh.stream_id)
 		return .no_error
 	}
 	if fh.stream_id !in c.streams {

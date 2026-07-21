@@ -452,6 +452,43 @@ fn test_window_update_zero_on_stream_is_stream_error() {
 	assert frames[0].fh.type_ == .rst_stream
 }
 
+fn test_frames_after_goaway_still_answered_before_close() {
+	mut c := new_server_conn()
+	handshake(mut c)
+	// GOAWAY and a PING in ONE burst: the PING must still get its ack before
+	// the close (dying with unread bytes in the socket turns the FIN into an
+	// RST and loses the flush).
+	mut input := []u8{}
+	write_goaway(mut input, 0, .no_error)
+	opaque := [u8(1), 2, 3, 4, 5, 6, 7, 8]
+	write_frame_header(mut input, .ping, 0, 0, 8)
+	input << opaque
+	mut out := []u8{}
+	mut reqs := []Http2Request{}
+	consumed, closing := c.consume(input, mut out, mut reqs)
+	assert consumed == input.len
+	assert closing
+	frames := frames_of(out)
+	assert frames.len == 1
+	assert frames[0].fh.type_ == .ping
+	assert frames[0].fh.flags & flag_ack != 0
+	assert frames[0].payload == opaque
+}
+
+fn test_window_update_on_idle_stream_is_fatal() {
+	mut c := new_server_conn()
+	handshake(mut c)
+	mut input := []u8{}
+	write_window_update(mut input, 5, 1) // stream 5 was never opened
+	mut out := []u8{}
+	mut reqs := []Http2Request{}
+	_, closing := c.consume(input, mut out, mut reqs)
+	assert closing
+	frames := frames_of(out)
+	assert frames[frames.len - 1].fh.type_ == .goaway
+	assert read_u32(frames[frames.len - 1].payload, 4) == u32(ErrorCode.protocol_error)
+}
+
 fn test_rst_on_idle_stream_is_fatal() {
 	mut c := new_server_conn()
 	handshake(mut c)

@@ -26,6 +26,15 @@ fn test_h1_routes() {
 	assert missing.starts_with('HTTP/1.1 404')
 }
 
+fn test_non_http1x_version_is_400_close() {
+	// A garbled http2 preface parses as an h1 request with a non-HTTP/1.x
+	// version — it must 400 and DROP the connection (RFC 9113 §3.5), not get
+	// a keep-alive 404 that leaves the peer hanging.
+	step, res := serve_h1('INVALID CONNECTION PREFACE\r\n\r\n')
+	assert step == .close
+	assert res.starts_with('HTTP/1.1 400')
+}
+
 fn test_preface_without_capable_worker_is_501() {
 	// This test binary never calls core.enable_takeover(), so queue_takeover
 	// reports false and the preface must be answered with the visible 501.
