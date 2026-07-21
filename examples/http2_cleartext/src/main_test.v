@@ -214,11 +214,11 @@ fn test_bridge_parks_and_resumes_async_stream() ! {
 		slow_block := get_block_path('/slow')
 		home_block := get_block(4)
 		mut input := []u8{}
-		http2.write_frame_header(mut input, .headers, http2.flag_end_headers | http2.flag_end_stream,
-			1, slow_block.len)
+		http2.write_frame_header(mut input, .headers,
+			http2.flag_end_headers | http2.flag_end_stream, 1, slow_block.len)
 		input << slow_block
-		http2.write_frame_header(mut input, .headers, http2.flag_end_headers | http2.flag_end_stream,
-			3, home_block.len)
+		http2.write_frame_header(mut input, .headers,
+			http2.flag_end_headers | http2.flag_end_stream, 3, home_block.len)
 		input << home_block
 		// Engine-loop stand-in: capture what the bridge arms for the park.
 		mut engine_capture := WatchCapture{}
@@ -228,8 +228,8 @@ fn test_bridge_parks_and_resumes_async_stream() ! {
 			register:  capture_register
 		}
 		mut out := []u8{}
-		consumed, step := http2_takeover_conn(input, mut out, -1, voidptr(bridge), unsafe { nil }, mut
-			el)
+		consumed, step :=
+			http2_takeover_conn(input, mut out, -1, voidptr(bridge), unsafe { nil }, mut el)
 		assert consumed == input.len
 		assert step == .suspend
 		assert bridge.parked
@@ -287,11 +287,11 @@ fn test_second_parker_is_refused_with_rst() {
 		slow1 := get_block_path('/slow')
 		slow3 := get_block_path('/slow')
 		mut input := []u8{}
-		http2.write_frame_header(mut input, .headers, http2.flag_end_headers | http2.flag_end_stream,
-			1, slow1.len)
+		http2.write_frame_header(mut input, .headers,
+			http2.flag_end_headers | http2.flag_end_stream, 1, slow1.len)
 		input << slow1
-		http2.write_frame_header(mut input, .headers, http2.flag_end_headers | http2.flag_end_stream,
-			3, slow3.len)
+		http2.write_frame_header(mut input, .headers,
+			http2.flag_end_headers | http2.flag_end_stream, 3, slow3.len)
 		input << slow3
 		mut engine_capture := WatchCapture{}
 		mut el := core.EventLoop{
@@ -300,8 +300,8 @@ fn test_second_parker_is_refused_with_rst() {
 			register:  capture_register
 		}
 		mut out := []u8{}
-		consumed, step := http2_takeover_conn(input, mut out, -1, voidptr(bridge), unsafe { nil }, mut
-			el)
+		consumed, step :=
+			http2_takeover_conn(input, mut out, -1, voidptr(bridge), unsafe { nil }, mut el)
 		assert consumed == input.len
 		assert step == .suspend
 		frames := split_frames(out)

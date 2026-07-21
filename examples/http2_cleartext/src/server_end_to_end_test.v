@@ -82,16 +82,16 @@ fn e2e_async_opening() []u8 {
 	http2.encode_indexed(mut slow_block, 6)
 	http2.encode_literal_name_idx(mut slow_block, 4, '/slow')
 	http2.encode_literal_name_idx(mut slow_block, 1, 'x.test')
-	http2.write_frame_header(mut b, .headers, http2.flag_end_headers | http2.flag_end_stream,
-		1, slow_block.len)
+	http2.write_frame_header(mut b, .headers, http2.flag_end_headers | http2.flag_end_stream, 1,
+		slow_block.len)
 	b << slow_block
 	mut home_block := []u8{}
 	http2.encode_indexed(mut home_block, 2)
 	http2.encode_indexed(mut home_block, 6)
 	http2.encode_indexed(mut home_block, 4)
 	http2.encode_literal_name_idx(mut home_block, 1, 'x.test')
-	http2.write_frame_header(mut b, .headers, http2.flag_end_headers | http2.flag_end_stream,
-		3, home_block.len)
+	http2.write_frame_header(mut b, .headers, http2.flag_end_headers | http2.flag_end_stream, 3,
+		home_block.len)
 	b << home_block
 	return b
 }
