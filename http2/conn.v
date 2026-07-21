@@ -74,6 +74,19 @@ mut:
 	preface_seen bool
 	last_stream  u32
 	streams      map[u32]&StreamState
+	// Per-connection free-list of retired StreamStates, each retaining its
+	// body + pending buffers. release_stream resets and pushes here instead of
+	// dropping the pointer; new_stream pops from here instead of allocating.
+	// Under `-gc none` a dropped &StreamState is never reclaimed, so allocating
+	// one per request (load generators drive millions) is an unbounded leak —
+	// reuse keeps steady-state allocation at zero and RSS flat. Bounded by the
+	// peak concurrent stream count (≤ max_concurrent_streams).
+	free_streams []&StreamState
+	// Reused decode target for one header block: HPACK must decode every block
+	// (dynamic-table state), but a refused/trailers block is discarded and a
+	// real request's fields are copied into its own StreamState.headers. One
+	// buffer, cleared per block — never a fresh slice per request.
+	scratch_fields []HeaderField
 	// header-block assembly: HEADERS..CONTINUATION must be contiguous (§4.3)
 	hdr_expecting  bool
 	hdr_stream     u32
@@ -202,7 +215,7 @@ fn (mut c ServerConn) frame(fh FrameHeader, payload []u8, mut out []u8, mut reqs
 			if dep == fh.stream_id {
 				// A stream cannot depend on itself — stream error (§5.3.1).
 				write_rst_stream(mut out, fh.stream_id, .protocol_error)
-				c.streams.delete(fh.stream_id)
+				c.release_stream(fh.stream_id)
 			}
 			return .no_error // deprecated scheme — parsed, otherwise ignored (§6.3)
 		}
@@ -213,7 +226,7 @@ fn (mut c ServerConn) frame(fh FrameHeader, payload []u8, mut out []u8, mut reqs
 			if payload.len != 4 {
 				return .frame_size_error
 			}
-			c.streams.delete(fh.stream_id)
+			c.release_stream(fh.stream_id)
 			return .no_error
 		}
 		.settings {
@@ -338,18 +351,57 @@ fn (mut c ServerConn) on_headers(fh FrameHeader, payload []u8, mut out []u8, mut
 // finish_header_block runs once END_HEADERS arrives: decompress, then either
 // surface trailers-completion, refuse, or open the stream (and complete the
 // request when END_STREAM rode the HEADERS).
+// new_stream returns a StreamState for `stream_id`, reusing one from the
+// free-list (its body/pending buffers retained, capacity intact) or allocating
+// only when the free-list is empty. All fields are reset to the fresh-stream
+// defaults; the caller fills headers/rejected/declared_len.
+fn (mut c ServerConn) new_stream(stream_id u32) &StreamState {
+	mut s := if c.free_streams.len > 0 {
+		c.free_streams.pop()
+	} else {
+		&StreamState{}
+	}
+	s.remote_done = false
+	s.rejected = false
+	s.declared_len = -1
+	s.recv_window = i64(default_window_size)
+	s.send_window = c.init_send_window
+	s.pending_off = 0
+	s.pending_end = false
+	s.headers.clear()
+	s.body.clear()
+	s.pending.clear()
+	c.streams[stream_id] = s
+	return s
+}
+
+// release_stream retires a stream: its StreamState is reset and pushed to the
+// free-list for reuse (NOT dropped — that leaks under `-gc none`), and the map
+// entry removed. Any Http2Request still referencing the stream's headers/body
+// must already have been served (the handler writes the response, which
+// releases the stream — the request is done being read by then).
+fn (mut c ServerConn) release_stream(stream_id u32) {
+	if mut s := c.streams[stream_id] {
+		s.headers.clear()
+		s.body.clear()
+		s.pending.clear()
+		c.free_streams << s
+	}
+	c.streams.delete(stream_id)
+}
+
 fn (mut c ServerConn) finish_header_block(mut out []u8, mut reqs []Http2Request) ErrorCode {
 	c.hdr_expecting = false
-	fields := c.dec.decode(c.hdr_block) or {
+	c.dec.decode_into(c.hdr_block, mut c.scratch_fields) or {
 		return .compression_error // table state is unrecoverable (RFC 7541 §5.3)
 	}
 	stream_id := c.hdr_stream
 	if c.hdr_trailers {
-		if !valid_trailer_fields(fields) {
+		if !valid_trailer_fields(c.scratch_fields) {
 			// Pseudo-headers or connection-specific fields in trailers make
 			// the request malformed (§8.1, §8.3) — stream error.
 			write_rst_stream(mut out, stream_id, .protocol_error)
-			c.streams.delete(stream_id)
+			c.release_stream(stream_id)
 			return .no_error
 		}
 		// Trailers kept the HPACK state consistent; their fields are not
@@ -361,16 +413,15 @@ fn (mut c ServerConn) finish_header_block(mut out []u8, mut reqs []Http2Request)
 		write_rst_stream(mut out, stream_id, .refused_stream)
 		return .no_error
 	}
-	ok, declared := validate_request_fields(fields)
+	ok, declared := validate_request_fields(c.scratch_fields)
 	malformed := c.hdr_malformed || !ok
-	mut s := &StreamState{
-		headers:      fields
-		rejected:     malformed
-		declared_len: declared
-		recv_window:  i64(default_window_size)
-		send_window:  c.init_send_window
-	}
-	c.streams[stream_id] = s
+	mut s := c.new_stream(stream_id)
+	// Copy the decoded fields into the stream's own retained storage: the
+	// scratch is overwritten by the next block, but a request's headers must
+	// survive until it is served (and other streams may decode meanwhile).
+	s.headers << c.scratch_fields
+	s.rejected = malformed
+	s.declared_len = declared
 	if malformed {
 		// Malformed request (§8.3): a stream error, never surfaced. The
 		// rejected stream state stays so the client's in-flight frames for it
@@ -390,13 +441,13 @@ fn (mut c ServerConn) complete_stream(stream_id u32, mut out []u8, mut reqs []Ht
 	mut s := c.streams[stream_id] or { return }
 	s.remote_done = true
 	if s.rejected {
-		c.streams.delete(stream_id)
+		c.release_stream(stream_id)
 		return
 	}
 	if s.declared_len >= 0 && s.declared_len != i64(s.body.len) {
 		// content-length must equal the DATA total (§8.1.1) — malformed.
 		write_rst_stream(mut out, stream_id, .protocol_error)
-		c.streams.delete(stream_id)
+		c.release_stream(stream_id)
 		return
 	}
 	reqs << Http2Request{
@@ -652,7 +703,7 @@ fn (mut c ServerConn) on_window_update(fh FrameHeader, payload []u8, mut out []u
 	if inc == 0 {
 		// Zero increment on a stream is a STREAM error (§6.9).
 		write_rst_stream(mut out, fh.stream_id, .protocol_error)
-		c.streams.delete(fh.stream_id)
+		c.release_stream(fh.stream_id)
 		return .no_error
 	}
 	if fh.stream_id !in c.streams {
@@ -662,7 +713,7 @@ fn (mut c ServerConn) on_window_update(fh FrameHeader, payload []u8, mut out []u
 	s.send_window += i64(inc)
 	if s.send_window > i64(max_window) {
 		write_rst_stream(mut out, fh.stream_id, .flow_control_error)
-		c.streams.delete(fh.stream_id)
+		c.release_stream(fh.stream_id)
 		return .no_error // stream-level error (§6.9.1), connection lives on
 	}
 	c.flush_pending(mut out, fh.stream_id)
@@ -675,7 +726,7 @@ fn (mut c ServerConn) on_window_update(fh FrameHeader, payload []u8, mut out []u
 // violations are RSTed internally, this is the application-level escape.
 pub fn (mut c ServerConn) abort_stream(mut out []u8, stream_id u32, code ErrorCode) {
 	write_rst_stream(mut out, stream_id, code)
-	c.streams.delete(stream_id)
+	c.release_stream(stream_id)
 }
 
 // write_response_headers appends the response HEADERS frame for `block` (an
@@ -704,7 +755,7 @@ pub fn (mut c ServerConn) write_response_headers(mut out []u8, stream_id u32, bl
 		}
 	}
 	if end_stream {
-		c.streams.delete(stream_id)
+		c.release_stream(stream_id)
 	}
 }
 
@@ -717,12 +768,43 @@ pub fn (mut c ServerConn) write_response_data(mut out []u8, stream_id u32, body 
 	mut s := c.streams[stream_id] or { return }
 	if body.len == 0 {
 		write_data_header(mut out, stream_id, 0, true)
-		c.streams.delete(stream_id)
+		c.release_stream(stream_id)
 		return
 	}
-	s.pending << body
-	s.pending_end = true
-	c.flush_pending(mut out, stream_id)
+	// Emit directly from `body` as far as the connection + stream send windows
+	// and the peer's max frame size allow; only the UNSENT tail is copied into
+	// `pending` (flushed on later WINDOW_UPDATEs). The common case — the whole
+	// response fits the window — copies nothing (was: a full-body copy per
+	// request, an unbounded churn source under `-gc none`).
+	mut off := 0
+	for off < body.len {
+		mut allow := c.conn_send_window
+		if s.send_window < allow {
+			allow = s.send_window
+		}
+		if allow <= 0 {
+			break
+		}
+		mut chunk := body.len - off
+		if i64(chunk) > allow {
+			chunk = int(allow)
+		}
+		if chunk > c.peer_max_frame {
+			chunk = c.peer_max_frame
+		}
+		last := off + chunk == body.len
+		write_data_header(mut out, stream_id, chunk, last)
+		unsafe { out.push_many(&body[off], chunk) }
+		off += chunk
+		c.conn_send_window -= i64(chunk)
+		s.send_window -= i64(chunk)
+	}
+	if off < body.len {
+		unsafe { s.pending.push_many(&body[off], body.len - off) }
+		s.pending_end = true
+	} else {
+		c.release_stream(stream_id)
+	}
 }
 
 fn (mut c ServerConn) flush_pending(mut out []u8, stream_id u32) {
@@ -751,6 +833,6 @@ fn (mut c ServerConn) flush_pending(mut out []u8, stream_id u32) {
 		s.send_window -= i64(chunk)
 	}
 	if s.pending_off == s.pending.len && s.pending_end {
-		c.streams.delete(stream_id)
+		c.release_stream(stream_id)
 	}
 }
