@@ -50,6 +50,9 @@ jobs:
           # websocket_echo: the takeover seam is epoll-only, but the example must
           # degrade cleanly elsewhere — the 501-fallback + codec tests run here.
           - examples/websocket_echo/src
+          # http2_cleartext: same story — the 501-fallback + the pure-bytes
+          # bridge tests run here; the socket e2e is Linux-guarded.
+          - examples/http2_cleartext/src
     steps:
       - uses: actions/checkout@v4
       - name: Set up V

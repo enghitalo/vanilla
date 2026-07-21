@@ -22,3 +22,11 @@ jobs:
         shell: bash
         run: |
           v fmt -verify .
+      # On failure, print the exact reformatting vfmt wants, so a contributor
+      # (or a bot) can fix files from the log alone — `-verify` only names
+      # the offending files.
+      - name: Show vfmt diff for the offending files
+        if: failure()
+        shell: bash
+        run: |
+          v fmt -diff . || true
