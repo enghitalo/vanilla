@@ -332,8 +332,8 @@ fn test_new_stream_ids_must_ascend() {
 }
 
 fn test_validate_request_fields_rules() {
-	ok0, cl0 := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'),
-		hf(':path', '/'), hf(':authority', 'x')])
+	ok0, cl0 := validate_request_fields([hf(':method', 'GET'),
+		hf(':scheme', 'http'), hf(':path', '/'), hf(':authority', 'x')])
 	assert ok0
 	assert cl0 == -1
 	ok1, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http')])
@@ -353,20 +353,22 @@ fn test_validate_request_fields_rules() {
 	ok6, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'),
 		hf(':path', '/'), hf('te', 'gzip')])
 	assert !ok6 // te may only carry 'trailers'
-	ok7, cl7 := validate_request_fields([hf(':method', 'POST'), hf(':scheme', 'http'),
-		hf(':path', '/'), hf('content-length', '42')])
+	ok7, cl7 := validate_request_fields([hf(':method', 'POST'),
+		hf(':scheme', 'http'), hf(':path', '/'), hf('content-length', '42')])
 	assert ok7
 	assert cl7 == 42
-	ok8, _ := validate_request_fields([hf(':method', 'POST'), hf(':scheme', 'http'),
-		hf(':path', '/'), hf('content-length', '4'), hf('content-length', '5')])
+	ok8, _ := validate_request_fields([hf(':method', 'POST'),
+		hf(':scheme', 'http'), hf(':path', '/'), hf('content-length', '4'),
+		hf('content-length', '5')])
 	assert !ok8 // differing duplicate content-length
-	ok9, _ := validate_request_fields([hf(':method', 'CONNECT'), hf(':scheme', 'http'),
-		hf(':path', '/'), hf(':authority', 'x')])
+	ok9, _ := validate_request_fields([hf(':method', 'CONNECT'),
+		hf(':scheme', 'http'), hf(':path', '/'), hf(':authority', 'x')])
 	assert !ok9 // CONNECT must omit :scheme and :path
-	ok10, _ := validate_request_fields([hf(':method', 'CONNECT'), hf(':authority', 'x:443')])
+	ok10, _ := validate_request_fields([hf(':method', 'CONNECT'),
+		hf(':authority', 'x:443')])
 	assert ok10
-	ok11, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'),
-		hf(':path', '/'), hf('X-Bad', 'v')])
+	ok11, _ := validate_request_fields([hf(':method', 'GET'),
+		hf(':scheme', 'http'), hf(':path', '/'), hf('X-Bad', 'v')])
 	assert !ok11 // uppercase field name
 }
 
@@ -501,8 +503,8 @@ fn test_headers_self_dependency_is_stream_error() {
 	block := get_request_block()
 	mut input := []u8{}
 	// HEADERS with the PRIORITY flag whose dependency is the stream itself.
-	write_frame_header(mut input, .headers, flag_end_headers | flag_end_stream | flag_priority, 1,
-		block.len + 5)
+	flags := flag_end_headers | flag_end_stream | flag_priority
+	write_frame_header(mut input, .headers, flags, 1, block.len + 5)
 	input << [u8(0), 0, 0, 1, 16] // depend on stream 1 (self), weight 16
 	input << block
 	mut out := []u8{}
