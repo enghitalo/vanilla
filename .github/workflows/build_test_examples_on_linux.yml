@@ -22,6 +22,7 @@ jobs:
           - examples/etag/src
           - examples/graceful_shutdown/src
           - examples/hexagonal/src
+          - examples/http2_cleartext/src
           - examples/io_uring_demo/src
           - examples/mesh/src
           - examples/per_server_workers/src
@@ -103,3 +104,10 @@ jobs:
           VANILLA_NO_IOURING: '1'
         run: |
           v -cc gcc -no-parallel test tests/
+      # The http2 module's unit tests (HPACK against the RFC 7541 Appendix C
+      # vectors, frame codec, ServerConn state machine) — pure-bytes tests
+      # with no sockets, so they run here rather than in an example lane.
+      - name: Run http2 module tests
+        shell: bash
+        run: |
+          v -cc gcc -no-parallel test http2/

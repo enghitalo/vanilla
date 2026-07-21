@@ -226,6 +226,7 @@ fn main() {
 | `examples/url_form/` | Query-string and URL-encoded form parsing |
 | `examples/veb_like/` | veb-style declarative routing |
 | `examples/websocket_echo/` | RFC 6455 WebSocket echo over the connection-takeover seam (`core.queue_takeover` — one engine, two protocols on one connection) |
+| `examples/http2_cleartext/` | HTTP/2 (cleartext, prior-knowledge, RFC 9113) over the same seam — the `PRI *` preface flips the connection, then the SAME handler serves h1 and http2 requests |
 | `examples/video_stream/` | HTTP video streaming |
 | `examples/async_sse/` | SSE via async handler (suspend/resume on fd) |
 | `examples/async_db_pg/` | PostgreSQL queries via async handler |
@@ -423,8 +424,8 @@ See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark 
 - [ ] Flush a queued response before tearing down a half-closed connection ([#103](https://github.com/enghitalo/vanilla/issues/103)) — unblocks the live h1spec/Http11Probe gate
 - [x] Request timeouts — `Limits.read_timeout_ms` (408) / `write_timeout_ms`, enforced by the per-worker deadline sweep
 - [x] Chunked transfer-encoding in the request parser (`frame_chunked_total`)
-- [ ] HTTP/2 support (multiplexing, HPACK, server push)
-- [ ] WebSocket upgrade (framing, ping/pong, close handshake)
+- [x] HTTP/2 — cleartext prior-knowledge via the takeover seam: HPACK (RFC 7541, Appendix C-verified), multiplexed streams, send-side flow control (`http2/` + `examples/http2_cleartext/`); TLS/ALPN and the HTTP/1.1 Upgrade handshake still open
+- [x] WebSocket upgrade (framing, ping/pong, close handshake) — `websocket/` codec + `examples/websocket_echo/` over the takeover seam
 - [x] TLS/HTTPS — epoll backend via `ServerConfig.tls_config` (e.g. `tls.new_self_signed()`); other backends are plaintext
 - [ ] HTTPS example (`examples/https/`)
 - [x] Body-size cap + max-connections via `Limits` (`max_body_bytes` → 413, `max_request_bytes`, `max_connections`); a per-connection request-count limit is still open
