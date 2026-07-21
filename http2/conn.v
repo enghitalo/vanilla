@@ -531,7 +531,8 @@ fn (mut c ServerConn) flush_pending(mut out []u8, stream_id u32) {
 			allow = s.send_window
 		}
 		if allow <= 0 {
-			return // parked until a WINDOW_UPDATE reopens a window
+			// parked until a WINDOW_UPDATE reopens a window
+			return
 		}
 		mut chunk := s.pending.len - s.pending_off
 		if i64(chunk) > allow {

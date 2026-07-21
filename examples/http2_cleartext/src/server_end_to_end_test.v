@@ -50,8 +50,8 @@ fn e2e_get_opening() []u8 {
 	http2.encode_indexed(mut block, 6) // :scheme http
 	http2.encode_indexed(mut block, 4) // :path /
 	http2.encode_literal_name_idx(mut block, 1, 'x.test')
-	http2.write_frame_header(mut b, .headers, http2.flag_end_headers | http2.flag_end_stream,
-		1, block.len)
+	http2.write_frame_header(mut b, .headers, http2.flag_end_headers | http2.flag_end_stream, 1,
+		block.len)
 	b << block
 	return b
 }

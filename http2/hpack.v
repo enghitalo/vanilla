@@ -459,13 +459,27 @@ pub fn encode_literal(mut out []u8, name string, value string) {
 // static-table form for the seven pre-indexed codes, a literal otherwise.
 pub fn encode_status(mut out []u8, status int) {
 	match status {
-		200 { encode_indexed(mut out, 8) }
-		204 { encode_indexed(mut out, 9) }
-		206 { encode_indexed(mut out, 10) }
-		304 { encode_indexed(mut out, 11) }
-		400 { encode_indexed(mut out, 12) }
-		404 { encode_indexed(mut out, 13) }
-		500 { encode_indexed(mut out, 14) }
+		200 {
+			encode_indexed(mut out, 8)
+		}
+		204 {
+			encode_indexed(mut out, 9)
+		}
+		206 {
+			encode_indexed(mut out, 10)
+		}
+		304 {
+			encode_indexed(mut out, 11)
+		}
+		400 {
+			encode_indexed(mut out, 12)
+		}
+		404 {
+			encode_indexed(mut out, 13)
+		}
+		500 {
+			encode_indexed(mut out, 14)
+		}
 		else {
 			mut digits := [u8(0), 0, 0]
 			digits[0] = u8(`0` + (status / 100) % 10)

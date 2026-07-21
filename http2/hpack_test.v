@@ -150,22 +150,22 @@ fn test_rfc7541_c4_requests_huffman() ! {
 // block, and the third block's inserts evict earlier entries.
 fn test_response_blocks_with_eviction() ! {
 	mut d := new_decoder(hpack_default_table_size)
-	first := d.decode(hx('3fe101488264025885aec3771a4b6196d07abe941054d444a8200595040b8166e082a62d1bff6e919d29ad171863c78f0b97c8e9ae82ae43d3'))!
+	first :=
+		d.decode(hx('3fe101488264025885aec3771a4b6196d07abe941054d444a8200595040b8166e082a62d1bff6e919d29ad171863c78f0b97c8e9ae82ae43d3'))!
 	assert first == [field(':status', '302'), field('cache-control', 'private'),
-		field('date', 'Mon, 21 Oct 2013 20:13:21 GMT'),
-		field('location', 'https://www.example.com')]
+		field('date', 'Mon, 21 Oct 2013 20:13:21 GMT'), field('location', 'https://www.example.com')]
 	assert d.dynamic_size() == 222
 	second := d.decode(hx('4883640effc1c0bf'))!
 	assert second == [field(':status', '307'), field('cache-control', 'private'),
-		field('date', 'Mon, 21 Oct 2013 20:13:21 GMT'),
-		field('location', 'https://www.example.com')]
+		field('date', 'Mon, 21 Oct 2013 20:13:21 GMT'), field('location', 'https://www.example.com')]
 	assert d.dynamic_size() == 222
-	third := d.decode(hx('88c16196d07abe941054d444a8200595040b8166e084a62d1bffc05a839bd9ab77ad94e7821dd7f2e6c7b335dfdfcd5b3960d5af27087f3672c1ab270fb5291f9587316065c003ed4ee5b1063d5007'))!
+	third :=
+		d.decode(hx('88c16196d07abe941054d444a8200595040b8166e084a62d1bffc05a839bd9ab77ad94e7821dd7f2e6c7b335dfdfcd5b3960d5af27087f3672c1ab270fb5291f9587316065c003ed4ee5b1063d5007'))!
 	assert third == [field(':status', '200'), field('cache-control', 'private'),
-		field('date', 'Mon, 21 Oct 2013 20:13:22 GMT'),
-		field('location', 'https://www.example.com'),
+		field('date', 'Mon, 21 Oct 2013 20:13:22 GMT'), field('location', 'https://www.example.com'),
 		field('content-encoding', 'gzip'),
-		field('set-cookie', 'foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1')]
+		field('set-cookie',
+			'foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1')]
 	assert d.dynamic_size() == 215
 	assert d.dynamic_size() <= 256
 }
