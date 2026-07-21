@@ -669,6 +669,15 @@ fn (mut c ServerConn) on_window_update(fh FrameHeader, payload []u8, mut out []u
 	return .no_error
 }
 
+// abort_stream refuses or aborts a stream the server cannot serve: RST_STREAM
+// with `code`, and the stream's state released. For composition layers that
+// must shed a stream (e.g. a bridge over a saturated resource) — protocol
+// violations are RSTed internally, this is the application-level escape.
+pub fn (mut c ServerConn) abort_stream(mut out []u8, stream_id u32, code ErrorCode) {
+	write_rst_stream(mut out, stream_id, code)
+	c.streams.delete(stream_id)
+}
+
 // write_response_headers appends the response HEADERS frame for `block` (an
 // HPACK block built with the encode_* helpers — :status first, RFC 9113
 // §8.3). A block wider than the peer's max frame size splits into

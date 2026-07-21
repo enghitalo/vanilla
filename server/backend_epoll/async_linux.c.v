@@ -627,10 +627,12 @@ fn serve_takeover_conn(mut reactor Reactor, epoll_fd int, fd int, limits core.Li
 }
 
 // drain_takeover feeds the buffered bytes to the connection's ConnHandler until
-// it stops consuming (partial frame) or the buffer empties. Mirrors
-// drain_requests' shape: consumed bytes are compacted away, responses batch in
-// write_buf, and the pending-write cap bounds a peer that floods frames without
-// reading. Returns false if the connection was closed.
+// it stops consuming (partial frame), parks on a watch (.suspend), or the
+// buffer empties. Mirrors drain_requests' shape: consumed bytes are compacted
+// away, responses batch in write_buf, and the pending-write cap bounds a peer
+// that floods frames without reading. Returns false when the caller must stop
+// touching the connection — closed, OR parked on a watch (resumed later by
+// on_watch_ready, exactly like a parked h1 request).
 @[direct_array_access; manualfree]
 fn drain_takeover(mut reactor Reactor, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) bool {
 	mut event_loop := core.EventLoop{
@@ -643,10 +645,10 @@ fn drain_takeover(mut reactor Reactor, epoll_fd int, fd int, limits core.Limits,
 		event_loop.last_watched = -1
 		mut consumed, step := cs.takeover(buf_view(cs.read_buf, 0, cs.read_buf.len), mut
 			cs.write_buf, fd, cs.takeover_state, state, mut event_loop)
-		if event_loop.last_watched >= 0 {
-			// v1: takeover connections cannot park (.suspend unsupported, issue
-			// #136) — any watch a ConnHandler armed is a contract violation; tear
-			// it down before it can fire against a reused client_fd.
+		if step != .suspend && event_loop.last_watched >= 0 {
+			// Watched but did not park (.done/.close after watch_fd — a contract
+			// violation): tear the stray watch down before it can fire against a
+			// reused client_fd.
 			detach_rejected_watch(mut reactor, epoll_fd, event_loop.last_watched, fd)
 		}
 		if consumed > cs.read_buf.len {
@@ -662,9 +664,31 @@ fn drain_takeover(mut reactor Reactor, epoll_fd int, fd int, limits core.Limits,
 				}
 				// consumed > 0: more complete frames may still be buffered — loop.
 			}
-			else {
-				// .close — and .suspend (unsupported in v1) degrades to it: flush
-				// what the handler appended (e.g. its close frame), then close.
+			.suspend {
+				// The ConnHandler parked on a watch (the issue #136 follow-up):
+				// the registered continuation resumes the connection when the fd
+				// fires — the same park/resume machinery h1 requests use. Until
+				// then the connection reads nothing (handle_readable's awaiting_fd
+				// gate); unprocessed bytes wait in read_buf and the socket. The
+				// contract allows at most ONE armed watch per parked connection —
+				// the close-path teardown (close_client) tracks exactly one fd.
+				if event_loop.last_watched < 0 {
+					// Suspended without arming a watch: nothing would ever resume
+					// this connection — flush what was appended, then close.
+					if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
+						close_conn(epoll_fd, fd, active_conns, mut st)
+					}
+					return false
+				}
+				cs.awaiting_fd = event_loop.last_watched
+				update_read_deadline(limits, mut st, mut cs) // parked ⇒ clears any armed deadline
+				if cs.write_buf.len > cs.write_off {
+					flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs)
+				}
+				return false // parked — not closed; on_watch_ready resumes it
+			}
+			.close {
+				// Flush what the handler appended (e.g. its close frame), then close.
 				if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
 					close_conn(epoll_fd, fd, active_conns, mut st)
 				}
@@ -986,6 +1010,21 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 					cs, state)
 				return
 			}
+			if cs.takeover != unsafe { nil } {
+				// A resumed TAKEN-OVER connection (a ConnHandler parked via
+				// watch_fd — the issue #136 follow-up): the continuation just
+				// appended protocol bytes; flush them, then hand the socket back
+				// to the takeover drain, which also consumes anything that
+				// arrived while parked.
+				if cs.write_buf.len > cs.write_off {
+					if !flush_batch(epoll_fd, client_fd, limits, active_conns, mut st, mut cs) {
+						return
+					}
+				}
+				serve_takeover_conn(mut reactor, epoll_fd, client_fd, limits, active_conns, mut st, mut
+					cs, state)
+				return
+			}
 			// Send this response and drain any requests that were pipelined behind it
 			// (and read anything that arrived while parked) — one batched flush.
 			serve_conn(h, mut reactor, epoll_fd, client_fd, limits, active_conns, mut st, mut cs,
@@ -1088,6 +1127,19 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 				if qt.cont != unsafe { nil } {
 					cs.takeover = qt.cont
 					cs.takeover_state = qt.state
+					if cs.write_buf.len > cs.write_off {
+						if !flush_batch(epoll_fd, client_fd, limits, active_conns, mut st, mut cs) {
+							continue
+						}
+					}
+					serve_takeover_conn(mut reactor, epoll_fd, client_fd, limits, active_conns, mut
+						st, mut cs, state)
+					continue
+				}
+				if cs.takeover != unsafe { nil } {
+					// Resumed takeover connection parked on this shared fd: flush
+					// the continuation's output and return the socket to the
+					// takeover drain (same routing as on_watch_ready).
 					if cs.write_buf.len > cs.write_off {
 						if !flush_batch(epoll_fd, client_fd, limits, active_conns, mut st, mut cs) {
 							continue

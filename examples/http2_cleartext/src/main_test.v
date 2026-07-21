@@ -77,11 +77,11 @@ fn hf(name string, value string) http2.HeaderField {
 	}
 }
 
-// bridge_step feeds one burst to the takeover ConnHandler over `conn`.
-fn bridge_step(mut conn http2.ServerConn, input []u8) (int, core.Step, []u8) {
+// bridge_step feeds one burst to the takeover ConnHandler over `bridge`.
+fn bridge_step(mut bridge BridgeState, input []u8) (int, core.Step, []u8) {
 	mut out := []u8{}
 	mut event_loop := core.EventLoop{}
-	consumed, step := http2_takeover_conn(input, mut out, -1, voidptr(conn), unsafe { nil }, mut
+	consumed, step := http2_takeover_conn(input, mut out, -1, voidptr(&bridge), unsafe { nil }, mut
 		event_loop)
 	return consumed, step, out
 }
@@ -96,7 +96,9 @@ fn get_block(path_idx int) []u8 {
 }
 
 fn test_http2_get_bridges_to_the_h1_handler() ! {
-	mut conn := http2.new_server_conn()
+	mut bridge := &BridgeState{
+		conn: http2.new_server_conn()
+	}
 	mut input := []u8{}
 	input << http2.preface_tail
 	http2.write_settings(mut input, [])
@@ -104,7 +106,7 @@ fn test_http2_get_bridges_to_the_h1_handler() ! {
 	http2.write_frame_header(mut input, .headers, http2.flag_end_headers | http2.flag_end_stream,
 		1, block.len)
 	input << block
-	consumed, step, out := bridge_step(mut conn, input)
+	consumed, step, out := bridge_step(mut bridge, input)
 	assert consumed == input.len
 	assert step == .done
 	frames := split_frames(out)
@@ -130,11 +132,13 @@ fn test_http2_get_bridges_to_the_h1_handler() ! {
 }
 
 fn test_http2_post_echo_with_body() ! {
-	mut conn := http2.new_server_conn()
+	mut bridge := &BridgeState{
+		conn: http2.new_server_conn()
+	}
 	mut handshake := []u8{}
 	handshake << http2.preface_tail
 	http2.write_settings(mut handshake, [])
-	_, step0, _ := bridge_step(mut conn, handshake)
+	_, step0, _ := bridge_step(mut bridge, handshake)
 	assert step0 == .done
 	mut block := []u8{}
 	http2.encode_indexed(mut block, 3) // :method POST
@@ -146,7 +150,7 @@ fn test_http2_post_echo_with_body() ! {
 	input << block
 	http2.write_data_header(mut input, 1, 4, true)
 	input << 'ping'.bytes()
-	consumed, step, out := bridge_step(mut conn, input)
+	consumed, step, out := bridge_step(mut bridge, input)
 	assert consumed == input.len
 	assert step == .done
 	frames := split_frames(out)
@@ -164,11 +168,13 @@ fn test_http2_post_echo_with_body() ! {
 }
 
 fn test_http2_goaway_keeps_the_connection_serving() {
-	mut conn := http2.new_server_conn()
+	mut bridge := &BridgeState{
+		conn: http2.new_server_conn()
+	}
 	mut handshake := []u8{}
 	handshake << http2.preface_tail
 	http2.write_settings(mut handshake, [])
-	_, step0, _ := bridge_step(mut conn, handshake)
+	_, step0, _ := bridge_step(mut bridge, handshake)
 	assert step0 == .done
 	// A peer GOAWAY does not close the connection — the peer does. The
 	// bridge keeps serving (a PING after it still gets an ack).
@@ -176,7 +182,7 @@ fn test_http2_goaway_keeps_the_connection_serving() {
 	http2.write_goaway(mut input, 0, .no_error)
 	http2.write_frame_header(mut input, .ping, 0, 0, 8)
 	input << [u8(1), 2, 3, 4, 5, 6, 7, 8]
-	consumed, step, out := bridge_step(mut conn, input)
+	consumed, step, out := bridge_step(mut bridge, input)
 	assert consumed == input.len
 	assert step == .done
 	frames := split_frames(out)
@@ -185,12 +191,153 @@ fn test_http2_goaway_keeps_the_connection_serving() {
 	assert frames[0].fh.flags & http2.flag_ack != 0
 }
 
+fn get_block_path(path string) []u8 {
+	mut block := []u8{}
+	http2.encode_indexed(mut block, 2) // :method GET
+	http2.encode_indexed(mut block, 6) // :scheme http
+	http2.encode_literal_name_idx(mut block, 4, path)
+	http2.encode_literal_name_idx(mut block, 1, 'x.test')
+	return block
+}
+
+fn test_bridge_parks_and_resumes_async_stream() ! {
+	$if linux {
+		mut bridge := &BridgeState{
+			conn: http2.new_server_conn()
+		}
+		mut handshake := []u8{}
+		handshake << http2.preface_tail
+		http2.write_settings(mut handshake, [])
+		_, s0, _ := bridge_step(mut bridge, handshake)
+		assert s0 == .done
+		// One burst, two streams: /slow parks on a timerfd, / answers now.
+		slow_block := get_block_path('/slow')
+		home_block := get_block(4)
+		mut input := []u8{}
+		http2.write_frame_header(mut input, .headers,
+			http2.flag_end_headers | http2.flag_end_stream, 1, slow_block.len)
+		input << slow_block
+		http2.write_frame_header(mut input, .headers,
+			http2.flag_end_headers | http2.flag_end_stream, 3, home_block.len)
+		input << home_block
+		// Engine-loop stand-in: capture what the bridge arms for the park.
+		mut engine_capture := WatchCapture{}
+		mut el := core.EventLoop{
+			client_fd: -1
+			reactor:   unsafe { voidptr(&engine_capture) }
+			register:  capture_register
+		}
+		mut out := []u8{}
+		consumed, step :=
+			http2_takeover_conn(input, mut out, -1, voidptr(bridge), unsafe { nil }, mut el)
+		assert consumed == input.len
+		assert step == .suspend
+		assert bridge.parked
+		assert engine_capture.fd >= 0 // the app's real timerfd, re-armed by the bridge
+		assert el.last_watched == engine_capture.fd
+		// Stream 3 answered immediately; stream 1 has nothing yet.
+		frames := split_frames(out)
+		mut saw_home := false
+		for f in frames {
+			assert f.fh.stream_id != 1
+			if f.fh.type_ == .data && f.fh.stream_id == 3 {
+				assert f.payload.bytestr() == 'hello over one handler\n'
+				saw_home = true
+			}
+		}
+		assert saw_home
+		// The timer "fires": run the continuation the engine would run.
+		mut resume_capture := WatchCapture{}
+		mut el2 := core.EventLoop{
+			client_fd: -1
+			reactor:   unsafe { voidptr(&resume_capture) }
+			register:  capture_register
+		}
+		mut out2 := []u8{}
+		rstep := engine_capture.cont(mut out2, engine_capture.fd, false, engine_capture.udata,
+			unsafe { nil }, mut el2)
+		assert rstep == .done
+		assert !bridge.parked
+		frames2 := split_frames(out2)
+		assert frames2.len == 2
+		assert frames2[0].fh.type_ == .headers
+		assert frames2[0].fh.stream_id == 1
+		mut dec := http2.new_decoder(http2.hpack_default_table_size)
+		fields := dec.decode(frames2[0].payload)!
+		assert fields[0] == hf(':status', '200')
+		assert frames2[1].fh.type_ == .data
+		assert frames2[1].fh.stream_id == 1
+		assert frames2[1].fh.flags & http2.flag_end_stream != 0
+		assert frames2[1].payload.bytestr() == 'slow done\n'
+	}
+}
+
+fn test_second_parker_is_refused_with_rst() {
+	$if linux {
+		mut bridge := &BridgeState{
+			conn: http2.new_server_conn()
+		}
+		mut handshake := []u8{}
+		handshake << http2.preface_tail
+		http2.write_settings(mut handshake, [])
+		_, s0, _ := bridge_step(mut bridge, handshake)
+		assert s0 == .done
+		// TWO /slow streams in one burst: the first parks, the second is
+		// refused (one armed watch per parked connection — engine contract).
+		slow1 := get_block_path('/slow')
+		slow3 := get_block_path('/slow')
+		mut input := []u8{}
+		http2.write_frame_header(mut input, .headers,
+			http2.flag_end_headers | http2.flag_end_stream, 1, slow1.len)
+		input << slow1
+		http2.write_frame_header(mut input, .headers,
+			http2.flag_end_headers | http2.flag_end_stream, 3, slow3.len)
+		input << slow3
+		mut engine_capture := WatchCapture{}
+		mut el := core.EventLoop{
+			client_fd: -1
+			reactor:   unsafe { voidptr(&engine_capture) }
+			register:  capture_register
+		}
+		mut out := []u8{}
+		consumed, step :=
+			http2_takeover_conn(input, mut out, -1, voidptr(bridge), unsafe { nil }, mut el)
+		assert consumed == input.len
+		assert step == .suspend
+		frames := split_frames(out)
+		mut saw_rst := false
+		for f in frames {
+			if f.fh.type_ == .rst_stream && f.fh.stream_id == 3 {
+				assert f.payload == [u8(0), 0, 0, 7] // REFUSED_STREAM
+				saw_rst = true
+			}
+		}
+		assert saw_rst
+		// The parked stream still completes.
+		mut resume_capture := WatchCapture{}
+		mut el2 := core.EventLoop{
+			client_fd: -1
+			reactor:   unsafe { voidptr(&resume_capture) }
+			register:  capture_register
+		}
+		mut out2 := []u8{}
+		rstep := engine_capture.cont(mut out2, engine_capture.fd, false, engine_capture.udata,
+			unsafe { nil }, mut el2)
+		assert rstep == .done
+		frames2 := split_frames(out2)
+		assert frames2.len == 2
+		assert frames2[1].payload.bytestr() == 'slow done\n'
+	}
+}
+
 fn test_http2_partial_frame_consumes_nothing() {
-	mut conn := http2.new_server_conn()
+	mut bridge := &BridgeState{
+		conn: http2.new_server_conn()
+	}
 	mut handshake := []u8{}
 	handshake << http2.preface_tail
 	http2.write_settings(mut handshake, [])
-	c0, s0, _ := bridge_step(mut conn, handshake)
+	c0, s0, _ := bridge_step(mut bridge, handshake)
 	assert c0 == handshake.len
 	assert s0 == .done
 	block := get_block(4)
@@ -198,11 +345,11 @@ fn test_http2_partial_frame_consumes_nothing() {
 	http2.write_frame_header(mut whole, .headers, http2.flag_end_headers | http2.flag_end_stream,
 		1, block.len)
 	whole << block
-	consumed, step, out := bridge_step(mut conn, whole[..whole.len - 2])
+	consumed, step, out := bridge_step(mut bridge, whole[..whole.len - 2])
 	assert consumed == 0
 	assert step == .done
 	assert out.len == 0
-	consumed2, step2, out2 := bridge_step(mut conn, whole)
+	consumed2, step2, out2 := bridge_step(mut bridge, whole)
 	assert consumed2 == whole.len
 	assert step2 == .done
 	assert split_frames(out2).len == 2 // HEADERS + DATA
