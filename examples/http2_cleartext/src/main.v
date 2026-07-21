@@ -167,6 +167,15 @@ mut:
 	// clear it each call instead of allocating a fresh slice per readable
 	// burst (which would leak under `-gc none`).
 	reqs []http2.Http2Request
+	// Per-connection scratch reused for EVERY request (cleared, capacity kept):
+	// the h1-translation request, the handler's response, the HPACK response
+	// block, and the lowercase header-name buffer. Allocating these per request
+	// was the dominant `-gc none` leak — a full h1 round-trip's worth of bytes
+	// per request, never reclaimed.
+	h1_req       []u8
+	h1_res       []u8
+	resp_block   []u8
+	name_scratch []u8
 }
 
 // WatchCapture records the ONE watch an app handler arms while served over
@@ -260,23 +269,24 @@ fn serve_http2_request(mut bridge BridgeState, req http2.Http2Request, mut out [
 	if method == '' || path == '' {
 		// Malformed request (§8.3.1) — answer 400 on the stream, keep the
 		// connection.
-		mut block := []u8{cap: 4}
-		http2.encode_status(mut block, 400)
-		conn.write_response_headers(mut out, req.stream_id, block, true)
+		bridge.resp_block.clear()
+		http2.encode_status(mut bridge.resp_block, 400)
+		blk := bridge.resp_block
+		conn.write_response_headers(mut out, req.stream_id, blk, true)
 		return true
 	}
 	if authority == '' {
 		authority = 'localhost'
 	}
-	// Translate to h1 request bytes.
-	mut h1_req := []u8{cap: 256 + req.body.len}
-	unsafe { h1_req.push_many(method.str, method.len) }
-	h1_req << u8(` `)
-	unsafe { h1_req.push_many(path.str, path.len) }
-	h1_req << h1_line_suffix
-	h1_req << h1_host_prefix
-	unsafe { h1_req.push_many(authority.str, authority.len) }
-	h1_req << crlf
+	// Translate to h1 request bytes in the reused per-connection buffer.
+	bridge.h1_req.clear()
+	unsafe { bridge.h1_req.push_many(method.str, method.len) }
+	bridge.h1_req << u8(` `)
+	unsafe { bridge.h1_req.push_many(path.str, path.len) }
+	bridge.h1_req << h1_line_suffix
+	bridge.h1_req << h1_host_prefix
+	unsafe { bridge.h1_req.push_many(authority.str, authority.len) }
+	bridge.h1_req << crlf
 	for f in req.headers {
 		if f.name.len == 0 || f.name[0] == `:` {
 			continue
@@ -286,35 +296,38 @@ fn serve_http2_request(mut bridge BridgeState, req http2.Http2Request, mut out [
 		if f.name == 'host' || f.name == 'te' || is_connection_specific(f.name) {
 			continue
 		}
-		unsafe { h1_req.push_many(f.name.str, f.name.len) }
-		h1_req << h1_header_sep
-		unsafe { h1_req.push_many(f.value.str, f.value.len) }
-		h1_req << crlf
+		unsafe { bridge.h1_req.push_many(f.name.str, f.name.len) }
+		bridge.h1_req << h1_header_sep
+		unsafe { bridge.h1_req.push_many(f.value.str, f.value.len) }
+		bridge.h1_req << crlf
 	}
 	if req.body.len > 0 {
-		h1_req << h1_content_length_prefix
-		write_int(mut h1_req, i64(req.body.len))
-		h1_req << crlf
+		bridge.h1_req << h1_content_length_prefix
+		write_int(mut bridge.h1_req, i64(req.body.len))
+		bridge.h1_req << crlf
 	}
-	h1_req << crlf
+	bridge.h1_req << crlf
 	if req.body.len > 0 {
-		unsafe { h1_req.push_many(&req.body[0], req.body.len) }
+		unsafe { bridge.h1_req.push_many(&req.body[0], req.body.len) }
 	}
 	// The same pure handler serves the translated request — against a CAPTURE
 	// event loop, so an async route's watch is recorded (not armed) and the
-	// bridge can re-frame its resumed output for this stream.
-	mut h1_res := []u8{cap: 512}
+	// bridge can re-frame its resumed output for this stream. A local view of
+	// h1_req avoids passing a bridge field alongside `mut bridge.h1_res`.
+	req_bytes := bridge.h1_req
+	bridge.h1_res.clear()
 	mut capture := WatchCapture{}
 	mut probe_loop := core.EventLoop{
 		client_fd: client_fd
 		reactor:   unsafe { voidptr(&capture) }
 		register:  capture_register
 	}
-	step := handle(h1_req, mut h1_res, client_fd, worker_state, mut probe_loop)
+	step := handle(req_bytes, mut bridge.h1_res, client_fd, worker_state, mut probe_loop)
 	if step == .suspend {
-		return bridge_park(mut bridge, req.stream_id, capture, h1_res, mut out, mut event_loop)
+		return bridge_park(mut bridge, req.stream_id, capture, mut out, mut event_loop)
 	}
-	if !frame_h1_response(mut conn, req.stream_id, h1_res, mut out) {
+	res := bridge.h1_res
+	if !frame_h1_response(mut bridge, req.stream_id, res, mut out) {
 		return false
 	}
 	return step == .done
@@ -326,7 +339,7 @@ fn serve_http2_request(mut bridge BridgeState, req http2.Http2Request, mut out [
 // connection — the engine's close-path teardown tracks exactly one watch —
 // so a second parker is refused (RST_STREAM) and the client retries.
 // Returns false when the connection must close.
-fn bridge_park(mut bridge BridgeState, stream_id u32, capture WatchCapture, h1_partial []u8, mut out []u8, mut event_loop core.EventLoop) bool {
+fn bridge_park(mut bridge BridgeState, stream_id u32, capture WatchCapture, mut out []u8, mut event_loop core.EventLoop) bool {
 	if capture.fd < 0 || capture.cont == unsafe { nil } {
 		// Suspended without arming a watch — nothing would resume the stream.
 		http2.write_goaway(mut out, stream_id, .internal_error)
@@ -343,13 +356,16 @@ fn bridge_park(mut bridge BridgeState, stream_id u32, capture WatchCapture, h1_p
 		conn.abort_stream(mut out, stream_id, .refused_stream)
 		return true
 	}
-	wait := &StreamWait{
+	mut wait := &StreamWait{
 		bridge:    unsafe { &BridgeState(voidptr(&bridge)) }
 		stream_id: stream_id
 		app_cont:  capture.cont
 		app_udata: capture.udata
-		h1_res:    h1_partial
 	}
+	// The parked stream owns its partial response: bridge.h1_res is reused by
+	// the next request on this connection, so copy (not alias) it. Parks are
+	// the rare async case — this is the one allocation the async path keeps.
+	wait.h1_res << bridge.h1_res
 	bridge.parked = true
 	event_loop.watch_fd(capture.fd, capture.interest, bridge_wake, voidptr(wait))
 	return true
@@ -383,8 +399,7 @@ fn bridge_wake(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload vo
 		return .suspend
 	}
 	bridge.parked = false
-	mut conn := bridge.conn
-	if !frame_h1_response(mut conn, wait.stream_id, wait.h1_res, mut out) {
+	if !frame_h1_response(mut bridge, wait.stream_id, wait.h1_res, mut out) {
 		return .close
 	}
 	if step == .close {
@@ -399,7 +414,7 @@ fn bridge_wake(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload vo
 // frame_h1_response re-frames a complete h1 response as HEADERS + DATA for
 // `stream_id`. Returns false (after a GOAWAY) when the response is unusable —
 // connection-fatal, since the stream would otherwise hang forever.
-fn frame_h1_response(mut conn http2.ServerConn, stream_id u32, h1_res []u8, mut out []u8) bool {
+fn frame_h1_response(mut bridge BridgeState, stream_id u32, h1_res []u8, mut out []u8) bool {
 	total := client.frame_response(h1_res)
 	status := client.status_code(h1_res)
 	if total <= 0 || status < 0 {
@@ -408,9 +423,11 @@ fn frame_h1_response(mut conn http2.ServerConn, stream_id u32, h1_res []u8, mut 
 	}
 	head := client.head_len(h1_res)
 	bstart, blen := client.body_bounds(h1_res, total)
-	mut block := []u8{cap: 64}
-	http2.encode_status(mut block, status)
-	append_response_fields(mut block, h1_res, head)
+	bridge.resp_block.clear()
+	http2.encode_status(mut bridge.resp_block, status)
+	append_response_fields(mut bridge, h1_res, head)
+	mut conn := bridge.conn
+	block := bridge.resp_block
 	conn.write_response_headers(mut out, stream_id, block, blen == 0)
 	if blen > 0 {
 		body := unsafe { (&h1_res[bstart]).vbytes(blen) }
@@ -432,8 +449,10 @@ fn slow_route(mut res []u8, mut event_loop core.EventLoop) core.Step {
 }
 
 // append_response_fields HPACK-encodes the h1 response head's fields (after
-// the status line, names lowercased, connection-specific fields dropped).
-fn append_response_fields(mut block []u8, res []u8, head int) {
+// the status line, names lowercased, connection-specific fields dropped) into
+// bridge.resp_block, lowercasing names through the reused bridge.name_scratch
+// (a VIEW is passed to encode_literal — no per-header string allocation).
+fn append_response_fields(mut bridge BridgeState, res []u8, head int) {
 	mut pos := 0
 	for pos + 1 < head && !(res[pos] == `\r` && res[pos + 1] == `\n`) {
 		pos++
@@ -452,15 +471,19 @@ fn append_response_fields(mut block []u8, res []u8, head int) {
 			colon++
 		}
 		if colon > pos && colon < eol {
-			mut lower := []u8{cap: colon - pos}
+			bridge.name_scratch.clear()
 			for i in pos .. colon {
 				mut ch := res[i]
 				if ch >= `A` && ch <= `Z` {
 					ch += 32
 				}
-				lower << ch
+				bridge.name_scratch << ch
 			}
-			name := lower.bytestr()
+			name := if bridge.name_scratch.len > 0 {
+				unsafe { tos(&bridge.name_scratch[0], bridge.name_scratch.len) }
+			} else {
+				''
+			}
 			if !is_connection_specific(name) {
 				mut vstart := colon + 1
 				for vstart < eol && res[vstart] == u8(` `) {
@@ -471,7 +494,7 @@ fn append_response_fields(mut block []u8, res []u8, head int) {
 				} else {
 					''
 				}
-				http2.encode_literal(mut block, name, value)
+				http2.encode_literal(mut bridge.resp_block, name, value)
 			}
 		}
 		pos = eol + 2
