@@ -25,16 +25,24 @@ fn C.vanilla_to_take(out_cont &voidptr, out_state &voidptr) bool
 // bytes to `out` (the same persistent, batch-flushed write buffer handlers
 // use). It returns how many bytes of `buf` it consumed plus the next Step:
 //
-//   .done  — keep the connection open and wait for more bytes
-//   .close — flush whatever is in `out`, then close the connection
+//   .done    — keep the connection open and wait for more bytes
+//   .suspend — park the connection on the fd just armed via
+//              event_loop.watch_fd(...): the registered continuation (a
+//              core.WakeFn, same contract as an h1 park) resumes it when the
+//              fd fires — appending protocol bytes to the SAME write buffer —
+//              and its .done hands the socket back to the takeover drain.
+//              While parked the engine reads nothing from the client (bytes
+//              wait in the socket, mirroring a parked h1 request) and at most
+//              ONE watch may be armed per connection (the close-path teardown
+//              tracks exactly one fd). Suspending WITHOUT arming a watch
+//              closes the connection — nothing would ever resume it.
+//   .close   — flush whatever is in `out`, then close the connection
 //
 // A partial frame is expressed by consuming fewer bytes than `buf.len` (or 0):
 // the engine keeps the tail buffered, compacts it to the front, and calls
 // again when more bytes arrive. Consuming nothing while returning .done on a
 // full buffer would spin the connection — the engine closes it if the buffer
-// can no longer grow. `.suspend` is not supported for takeover connections in
-// v1 (treated as .close); push/backpressure choreography composes with the
-// watch primitive as a follow-up (issue #136).
+// can no longer grow.
 //
 //   takeover_state — the value passed to queue_takeover (per-connection
 //                    protocol state, e.g. fragmentation reassembly); the

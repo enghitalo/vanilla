@@ -11,6 +11,7 @@ import server
 import vtest
 
 const e2e_home_body = 'hello over one handler\n'.bytes()
+const e2e_slow_body = 'slow done\n'.bytes()
 
 fn e2e_index_bytes(acc []u8, needle []u8) int {
 	if needle.len == 0 || acc.len < needle.len {
@@ -70,6 +71,31 @@ fn e2e_post_echo(stream_id u32, payload string) []u8 {
 	return b
 }
 
+// e2e_async_opening: preface + SETTINGS + GET /slow (stream 1, parks on a
+// timerfd) + GET / (stream 3, answers immediately) — all in ONE write.
+fn e2e_async_opening() []u8 {
+	mut b := []u8{}
+	b << http2.preface
+	http2.write_settings(mut b, [])
+	mut slow_block := []u8{}
+	http2.encode_indexed(mut slow_block, 2)
+	http2.encode_indexed(mut slow_block, 6)
+	http2.encode_literal_name_idx(mut slow_block, 4, '/slow')
+	http2.encode_literal_name_idx(mut slow_block, 1, 'x.test')
+	http2.write_frame_header(mut b, .headers, http2.flag_end_headers | http2.flag_end_stream,
+		1, slow_block.len)
+	b << slow_block
+	mut home_block := []u8{}
+	http2.encode_indexed(mut home_block, 2)
+	http2.encode_indexed(mut home_block, 6)
+	http2.encode_indexed(mut home_block, 4)
+	http2.encode_literal_name_idx(mut home_block, 1, 'x.test')
+	http2.write_frame_header(mut b, .headers, http2.flag_end_headers | http2.flag_end_stream,
+		3, home_block.len)
+	b << home_block
+	return b
+}
+
 fn e2e_ping() []u8 {
 	mut b := []u8{}
 	http2.write_frame_header(mut b, .ping, 0, 0, 8)
@@ -122,6 +148,28 @@ fn test_http2_cleartext_end_to_end() {
 					},
 				]
 			},
+			// Conn 2 — ASYNC over http2 (the .suspend-over-the-seam follow-up
+			// of issue #136): /slow parks stream 1 on a timerfd while / on
+			// stream 3 answers immediately; the parked stream completes when
+			// the timer fires and resumes the connection.
+			vtest.Script{
+				rounds: [
+					vtest.Round{
+						send:  e2e_async_opening()
+						until: e2e_until_bytes(e2e_slow_body)
+					},
+				]
+			},
+			// Conn 3 — the SAME async route over plain h1: the engine parks
+			// the request (pre-existing machinery, proven undisturbed).
+			vtest.Script{
+				rounds: [
+					vtest.Round{
+						send:  'GET /slow HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+						until: e2e_until_bytes(e2e_slow_body)
+					},
+				]
+			},
 		]) or {
 			assert false, err.msg()
 			return
@@ -138,5 +186,19 @@ fn test_http2_cleartext_end_to_end() {
 		assert h1.connect_err == '', h1.connect_err
 		assert !h1.unmet
 		assert e2e_index_bytes(h1.raw, 'HTTP/1.1 200 OK'.bytes()) >= 0
+
+		async := out.conns[2]
+		assert async.connect_err == '', async.connect_err
+		assert !async.unmet, 'async choreography ended early: ${async.raw.bytestr()}'
+		home_at := e2e_index_bytes(async.raw, e2e_home_body)
+		slow_at := e2e_index_bytes(async.raw, e2e_slow_body)
+		assert home_at >= 0
+		// The ready stream must not wait behind the parked one: / answers in
+		// microseconds, the timer holds /slow for 30 ms.
+		assert slow_at > home_at, 'the parked stream blocked the ready one'
+
+		h1slow := out.conns[3]
+		assert h1slow.connect_err == '', h1slow.connect_err
+		assert !h1slow.unmet, 'h1 /slow never resumed: ${h1slow.raw.bytestr()}'
 	}
 }
