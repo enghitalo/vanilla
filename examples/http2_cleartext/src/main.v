@@ -105,11 +105,11 @@ fn handle(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event
 	}
 	if !slice_eq(hr.buffer, hr.version, http11_version)
 		&& !slice_eq(hr.buffer, hr.version, http10_version) {
-		// Not an HTTP/1.x request — e.g. a garbled http2 connection preface.
-		// Answer 400 and drop the connection (RFC 9113 §3.5 requires the TCP
-		// connection terminated on an invalid preface; a keep-alive 404 would
-		// leave the peer hanging).
-		res << response.tiny_bad_request_response
+		// Not an HTTP/1.x request — a garbled http2 connection preface. Speak
+		// the language the peer attempted: a GOAWAY(PROTOCOL_ERROR) frame,
+		// then drop the connection (RFC 9113 §3.5). h1 error bytes here would
+		// only feed a confused http2 frame parser on the other side.
+		http2.write_goaway(mut res, 0, .protocol_error)
 		return .close
 	}
 	return app_route(hr, mut res)

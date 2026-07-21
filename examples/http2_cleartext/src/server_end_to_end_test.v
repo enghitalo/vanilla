@@ -86,12 +86,6 @@ fn e2e_ping_ack() []u8 {
 	return b
 }
 
-fn e2e_goaway() []u8 {
-	mut b := []u8{}
-	http2.write_goaway(mut b, 0, .no_error)
-	return b
-}
-
 fn test_http2_cleartext_end_to_end() {
 	$if linux {
 		out := vtest.drive(server.ServerConfig{
@@ -99,10 +93,11 @@ fn test_http2_cleartext_end_to_end() {
 			handler:         handle
 		}, [
 			// Conn 0 — the full choreography on one connection: opening burst
-			// (preface + SETTINGS + GET pipelined), a second request, a PING,
-			// then a clean GOAWAY from the client.
+			// (preface + SETTINGS + GET pipelined), a second request, then a
+			// PING. The client closes the connection at script end (a peer
+			// GOAWAY would not close it — §6.8 — the engine reaps our EOF).
 			vtest.Script{
-				rounds:   [
+				rounds: [
 					vtest.Round{
 						send:  e2e_get_opening()
 						until: e2e_until_bytes(e2e_home_body)
@@ -115,14 +110,7 @@ fn test_http2_cleartext_end_to_end() {
 						send:  e2e_ping()
 						until: e2e_until_bytes(e2e_ping_ack())
 					},
-					vtest.Round{
-						send:  e2e_goaway()
-						until: fn (acc []u8) bool {
-							return true // no reply expected — just the close below
-						}
-					},
 				]
-				then_eof: true
 			},
 			// Conn 1 — plain HTTP/1.1 on the same port, same handler: the
 			// protocols coexist per connection, not per server.
@@ -141,7 +129,6 @@ fn test_http2_cleartext_end_to_end() {
 		full := out.conns[0]
 		assert full.connect_err == '', full.connect_err
 		assert !full.unmet, 'choreography ended early: ${full.raw.bytestr()}'
-		assert full.eof, 'server must close after the client GOAWAY'
 		// The server preface (a SETTINGS frame) must be the very first bytes.
 		assert full.raw.len >= 9
 		assert full.raw[3] == u8(0x04), 'first frame must be SETTINGS'

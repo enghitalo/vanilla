@@ -452,12 +452,12 @@ fn test_window_update_zero_on_stream_is_stream_error() {
 	assert frames[0].fh.type_ == .rst_stream
 }
 
-fn test_frames_after_goaway_still_answered_before_close() {
+fn test_ping_after_goaway_still_answered() {
 	mut c := new_server_conn()
 	handshake(mut c)
-	// GOAWAY and a PING in ONE burst: the PING must still get its ack before
-	// the close (dying with unread bytes in the socket turns the FIN into an
-	// RST and loses the flush).
+	// A peer GOAWAY does not close the connection (it only forbids new
+	// streams; the peer closes the TCP connection itself) — a PING after it
+	// must still get its ack (§6.8).
 	mut input := []u8{}
 	write_goaway(mut input, 0, .no_error)
 	opaque := [u8(1), 2, 3, 4, 5, 6, 7, 8]
@@ -467,12 +467,59 @@ fn test_frames_after_goaway_still_answered_before_close() {
 	mut reqs := []Http2Request{}
 	consumed, closing := c.consume(input, mut out, mut reqs)
 	assert consumed == input.len
-	assert closing
+	assert !closing
 	frames := frames_of(out)
 	assert frames.len == 1
 	assert frames[0].fh.type_ == .ping
 	assert frames[0].fh.flags & flag_ack != 0
 	assert frames[0].payload == opaque
+}
+
+fn test_settings_window_growth_flushes_parked_data() {
+	mut c := new_server_conn()
+	// Handshake with an initial stream window of ZERO: every response byte
+	// parks.
+	mut input := []u8{}
+	input << preface_tail
+	write_settings(mut input, [
+		Setting{
+			id:  setting_initial_window_size
+			val: 0
+		},
+	])
+	block := get_request_block()
+	write_frame_header(mut input, .headers, flag_end_headers | flag_end_stream, 1, block.len)
+	input << block
+	mut out := []u8{}
+	mut reqs := []Http2Request{}
+	_, closing := c.consume(input, mut out, mut reqs)
+	assert !closing
+	assert reqs.len == 1
+	out.clear()
+	mut resp_block := []u8{}
+	encode_status(mut resp_block, 200)
+	c.write_response_headers(mut out, 1, resp_block, false)
+	c.write_response_data(mut out, 1, 'parked'.bytes())
+	mut frames := frames_of(out)
+	assert frames.len == 1 // HEADERS only — all DATA parked behind window 0
+	// SETTINGS raising the initial window must unpark it (§6.9.2).
+	out.clear()
+	mut grow := []u8{}
+	write_settings(mut grow, [
+		Setting{
+			id:  setting_initial_window_size
+			val: 1
+		},
+	])
+	_, closing2 := c.consume(grow, mut out, mut reqs)
+	assert !closing2
+	frames = frames_of(out)
+	assert frames.len == 2
+	assert frames[0].fh.type_ == .settings
+	assert frames[0].fh.flags & flag_ack != 0
+	assert frames[1].fh.type_ == .data
+	assert int(frames[1].fh.length) == 1
+	assert frames[1].payload.bytestr() == 'p'
 }
 
 fn test_window_update_on_idle_stream_is_fatal() {

@@ -26,13 +26,18 @@ fn test_h1_routes() {
 	assert missing.starts_with('HTTP/1.1 404')
 }
 
-fn test_non_http1x_version_is_400_close() {
+fn test_non_http1x_version_gets_goaway_and_close() {
 	// A garbled http2 preface parses as an h1 request with a non-HTTP/1.x
-	// version — it must 400 and DROP the connection (RFC 9113 §3.5), not get
-	// a keep-alive 404 that leaves the peer hanging.
-	step, res := serve_h1('INVALID CONNECTION PREFACE\r\n\r\n')
+	// version — answer in the protocol the peer attempted: a
+	// GOAWAY(PROTOCOL_ERROR) frame, then drop the connection (RFC 9113 §3.5).
+	mut res := []u8{}
+	mut event_loop := core.EventLoop{}
+	step := handle('INVALID CONNECTION PREFACE\r\n\r\n'.bytes(), mut res, -1, unsafe { nil }, mut
+		event_loop)
 	assert step == .close
-	assert res.starts_with('HTTP/1.1 400')
+	frames := split_frames(res)
+	assert frames.len == 1
+	assert frames[0].fh.type_ == .goaway
 }
 
 fn test_preface_without_capable_worker_is_501() {
@@ -158,18 +163,26 @@ fn test_http2_post_echo_with_body() ! {
 	assert frames[2].fh.flags & http2.flag_end_stream != 0
 }
 
-fn test_http2_goaway_closes_the_connection() {
+fn test_http2_goaway_keeps_the_connection_serving() {
 	mut conn := http2.new_server_conn()
 	mut handshake := []u8{}
 	handshake << http2.preface_tail
 	http2.write_settings(mut handshake, [])
 	_, step0, _ := bridge_step(mut conn, handshake)
 	assert step0 == .done
+	// A peer GOAWAY does not close the connection — the peer does. The
+	// bridge keeps serving (a PING after it still gets an ack).
 	mut input := []u8{}
 	http2.write_goaway(mut input, 0, .no_error)
-	consumed, step, _ := bridge_step(mut conn, input)
+	http2.write_frame_header(mut input, .ping, 0, 0, 8)
+	input << [u8(1), 2, 3, 4, 5, 6, 7, 8]
+	consumed, step, out := bridge_step(mut conn, input)
 	assert consumed == input.len
-	assert step == .close
+	assert step == .done
+	frames := split_frames(out)
+	assert frames.len == 1
+	assert frames[0].fh.type_ == .ping
+	assert frames[0].fh.flags & http2.flag_ack != 0
 }
 
 fn test_http2_partial_frame_consumes_nothing() {

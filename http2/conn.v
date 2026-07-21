@@ -72,7 +72,6 @@ pub struct ServerConn {
 mut:
 	dec          HpackDecoder
 	preface_seen bool
-	saw_goaway   bool
 	last_stream  u32
 	streams      map[u32]&StreamState
 	// header-block assembly: HEADERS..CONTINUATION must be contiguous (§4.3)
@@ -176,10 +175,7 @@ pub fn (mut c ServerConn) consume(buf []u8, mut out []u8, mut reqs []Http2Reques
 			return consumed, true
 		}
 	}
-	// A peer GOAWAY closes the connection — but only after the whole burst
-	// is processed, so frames sent alongside it (e.g. a PING) still get
-	// their answers flushed before the FIN instead of dying in an RST.
-	return consumed, c.saw_goaway
+	return consumed, false
 }
 
 // frame dispatches one complete frame. Any code but .no_error is
@@ -242,7 +238,11 @@ fn (mut c ServerConn) frame(fh FrameHeader, payload []u8, mut out []u8, mut reqs
 			if payload.len < 8 {
 				return .frame_size_error
 			}
-			c.saw_goaway = true
+			// A peer GOAWAY only forbids NEW streams from our side (we open
+			// none — no push). Keep serving: in-flight streams finish, pings
+			// still get acks, and the peer closes the TCP connection when it
+			// is done (the engine reaps the EOF). Closing eagerly here turned
+			// the peer's follow-up frames into TCP resets (§6.8).
 			return .no_error
 		}
 		.window_update {
@@ -586,6 +586,7 @@ fn (mut c ServerConn) on_settings(fh FrameHeader, payload []u8, mut out []u8) Er
 		return .no_error
 	}
 	settings := parse_settings(payload) or { return .frame_size_error }
+	mut window_changed := false
 	for st in settings {
 		if st.id == setting_initial_window_size {
 			if st.val > max_window {
@@ -599,6 +600,7 @@ fn (mut c ServerConn) on_settings(fh FrameHeader, payload []u8, mut out []u8) Er
 				mut s := c.streams[id] or { continue }
 				s.send_window += delta
 			}
+			window_changed = true
 		} else if st.id == setting_max_frame_size {
 			if st.val < u32(default_max_frame_size) || st.val > 16777215 {
 				return .protocol_error
@@ -614,6 +616,12 @@ fn (mut c ServerConn) on_settings(fh FrameHeader, payload []u8, mut out []u8) Er
 		// identifiers are ignored (§6.5.2).
 	}
 	write_settings_ack(mut out)
+	if window_changed {
+		// A grown initial window may have unparked response DATA (§6.9.2).
+		for id in c.streams.keys() {
+			c.flush_pending(mut out, id)
+		}
+	}
 	return .no_error
 }
 
