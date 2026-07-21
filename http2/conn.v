@@ -235,6 +235,9 @@ fn (mut c ServerConn) frame(fh FrameHeader, payload []u8, mut out []u8, mut reqs
 			return .no_error
 		}
 		.goaway {
+			if fh.stream_id != 0 {
+				return .protocol_error // GOAWAY is connection-level only (§6.8)
+			}
 			if payload.len < 8 {
 				return .frame_size_error
 			}

@@ -475,6 +475,23 @@ fn test_ping_after_goaway_still_answered() {
 	assert frames[0].payload == opaque
 }
 
+fn test_goaway_on_a_stream_is_fatal() {
+	mut c := new_server_conn()
+	handshake(mut c)
+	// GOAWAY is connection-level only — a non-zero stream id is a
+	// connection error of type PROTOCOL_ERROR (§6.8).
+	mut input := []u8{}
+	write_frame_header(mut input, .goaway, 0, 1, 8)
+	input << [u8(0), 0, 0, 0, 0, 0, 0, 0]
+	mut out := []u8{}
+	mut reqs := []Http2Request{}
+	_, closing := c.consume(input, mut out, mut reqs)
+	assert closing
+	frames := frames_of(out)
+	assert frames[frames.len - 1].fh.type_ == .goaway
+	assert read_u32(frames[frames.len - 1].payload, 4) == u32(ErrorCode.protocol_error)
+}
+
 fn test_settings_window_growth_flushes_parked_data() {
 	mut c := new_server_conn()
 	// Handshake with an initial stream window of ZERO: every response byte
