@@ -10,6 +10,8 @@
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/pem.h>
+#include <mbedtls/oid.h>
+#include <mbedtls/asn1.h>
 #include <psa/crypto.h>
 #include <psa/crypto_values.h>
 #include <stdlib.h>
@@ -21,6 +23,7 @@
 #include <linux/tls.h>
 #include <netinet/tcp.h> /* TCP_ULP, SOL_TCP */
 #include <sys/socket.h>  /* setsockopt, SOL_TLS (via bits/socket.h) */
+#include <arpa/inet.h>   /* inet_pton for IP: SAN entries */
 #ifndef SOL_TLS
 #define SOL_TLS 282
 #endif
@@ -32,6 +35,10 @@ struct vtls_ctx {
     mbedtls_svc_key_id_t key_id;
     char cert_pem[4096];
     size_t cert_pem_len;
+    // Private key as PEM, filled by vtls_use_self_signed so the caller can
+    // persist the pair and reload it through vtls_use_pem. Never logged.
+    char key_pem[2048];
+    size_t key_pem_len;
     // ALPN: mbedtls_ssl_conf_alpn_protocols stores the POINTER, so the backing
     // strings and the NULL-terminated pointer list must outlive the config —
     // hence they live here in the ctx, not on the stack.
@@ -106,13 +113,61 @@ void vtls_ctx_free(vtls_ctx *c) {
     free(c);
 }
 
+// Parse one "DNS:<host>" / "IP:<v4|v6>" entry into a SAN list node. IP bytes are
+// written to `ipbuf` (>= 16 bytes), which must outlive the node.
+static int vtls_parse_san(const char *s, mbedtls_x509_san_list *node, unsigned char *ipbuf) {
+    memset(node, 0, sizeof *node);
+    if (strncmp(s, "DNS:", 4) == 0) {
+        size_t len = strlen(s + 4);
+        if (len == 0) return -1;
+        node->node.type = MBEDTLS_X509_SAN_DNS_NAME;
+        node->node.san.unstructured_name.p = (unsigned char *)(s + 4);
+        node->node.san.unstructured_name.len = len;
+        return 0;
+    }
+    if (strncmp(s, "IP:", 3) == 0) {
+        node->node.type = MBEDTLS_X509_SAN_IP_ADDRESS;
+        node->node.san.unstructured_name.p = ipbuf;
+        if (inet_pton(AF_INET, s + 3, ipbuf) == 1) { node->node.san.unstructured_name.len = 4; return 0; }
+        if (inet_pton(AF_INET6, s + 3, ipbuf) == 1) { node->node.san.unstructured_name.len = 16; return 0; }
+        return -1;
+    }
+    return -1;
+}
+
 // Generate an EC P-256 key (PSA) + a self-signed X.509v3 cert into the context.
-int vtls_use_self_signed(vtls_ctx *c) {
+// `sans` are "DNS:<host>" / "IP:<v4|v6>" entries (1..16); the first one's value
+// doubles as the subject CN. The cert carries subjectAltName, basicConstraints
+// CA:FALSE, keyUsage and extendedKeyUsage=serverAuth: browsers, Android, Java,
+// Go and curl all match the connection target against the SANs and ignore the
+// CN, so a SAN-less cert is rejected by everything but curl's CN fallback.
+// The private key is also exported to c->key_pem (see vtls_key_pem) so the pair
+// can be persisted and reloaded with vtls_use_pem.
+int vtls_use_self_signed(vtls_ctx *c, char *const *sans, size_t nsans) {
     mbedtls_x509write_cert wc;
     unsigned char der[4096];
     int ret;
+    enum { VTLS_MAX_SANS = 16 };
+    mbedtls_x509_san_list nodes[VTLS_MAX_SANS];
+    unsigned char ipbufs[VTLS_MAX_SANS][16];
+    char cn[160];
 
+    if (sans == NULL || nsans == 0 || nsans > VTLS_MAX_SANS) return -1;
     mbedtls_x509write_crt_init(&wc);
+
+    for (size_t i = 0; i < nsans; i++) {
+        if ((ret = vtls_parse_san(sans[i], &nodes[i], ipbufs[i])) != 0) goto done;
+        nodes[i].next = (i + 1 < nsans) ? &nodes[i + 1] : NULL;
+    }
+    // Subject CN = first SAN value (the part after "DNS:"/"IP:"). Informational
+    // only - validation goes through the SANs - but it makes `openssl s_client`
+    // and browser dialogs show something meaningful.
+    {
+        const char *colon = strchr(sans[0], ':');
+        const char *value = colon ? colon + 1 : sans[0];
+        if (strlen(value) > 64) { ret = -1; goto done; }
+        snprintf(cn, sizeof cn, "CN=%s,O=vanilla", value);
+    }
 
     psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
     psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_SIGN_HASH | PSA_KEY_USAGE_EXPORT);
@@ -124,8 +179,8 @@ int vtls_use_self_signed(vtls_ctx *c) {
 
     mbedtls_x509write_crt_set_subject_key(&wc, &c->pkey);
     mbedtls_x509write_crt_set_issuer_key(&wc, &c->pkey);
-    if ((ret = mbedtls_x509write_crt_set_subject_name(&wc, "CN=localhost,O=vanilla,C=US")) != 0) goto done;
-    if ((ret = mbedtls_x509write_crt_set_issuer_name(&wc, "CN=localhost,O=vanilla,C=US")) != 0) goto done;
+    if ((ret = mbedtls_x509write_crt_set_subject_name(&wc, cn)) != 0) goto done;
+    if ((ret = mbedtls_x509write_crt_set_issuer_name(&wc, cn)) != 0) goto done;
     mbedtls_x509write_crt_set_version(&wc, MBEDTLS_X509_CRT_VERSION_3);
     mbedtls_x509write_crt_set_md_alg(&wc, MBEDTLS_MD_SHA256);
 
@@ -134,25 +189,58 @@ int vtls_use_self_signed(vtls_ctx *c) {
     if ((ret = mbedtls_x509write_crt_set_serial_raw(&wc, serial, sizeof(serial))) != 0) goto done;
     mbedtls_x509write_crt_set_validity(&wc, "20250101000000", "20351231235959");
 
+    if ((ret = mbedtls_x509write_crt_set_subject_alternative_name(&wc, nodes)) != 0) goto done;
+    if ((ret = mbedtls_x509write_crt_set_basic_constraints(&wc, 0, -1)) != 0) goto done;
+    if ((ret = mbedtls_x509write_crt_set_key_usage(&wc,
+            MBEDTLS_X509_KU_DIGITAL_SIGNATURE | MBEDTLS_X509_KU_KEY_AGREEMENT)) != 0) goto done;
+    {
+        mbedtls_asn1_sequence eku = {
+            { MBEDTLS_ASN1_OID, MBEDTLS_OID_SIZE(MBEDTLS_OID_SERVER_AUTH), (unsigned char *)MBEDTLS_OID_SERVER_AUTH },
+            NULL
+        };
+        if ((ret = mbedtls_x509write_crt_set_ext_key_usage(&wc, &eku)) != 0) goto done;
+    }
+
     ret = mbedtls_x509write_crt_der(&wc, der, sizeof(der));
     if (ret < 0) goto done;
     size_t der_len = (size_t)ret;
     unsigned char *der_start = der + sizeof(der) - der_len;
 
     if ((ret = mbedtls_x509_crt_parse_der(&c->srvcert, der_start, der_len)) != 0) goto done;
-    ret = mbedtls_pem_write_buffer("-----BEGIN CERTIFICATE-----\n", "-----END CERTIFICATE-----\n",
-                                   der_start, der_len, (unsigned char *)c->cert_pem,
-                                   sizeof(c->cert_pem), &c->cert_pem_len);
+    if ((ret = mbedtls_pem_write_buffer("-----BEGIN CERTIFICATE-----\n", "-----END CERTIFICATE-----\n",
+                                        der_start, der_len, (unsigned char *)c->cert_pem,
+                                        sizeof(c->cert_pem), &c->cert_pem_len)) != 0) goto done;
+    // PSA key created with PSA_KEY_USAGE_EXPORT, so the opaque key can be written
+    // out as a standard PEM that mbedtls_pk_parse_key (vtls_use_pem) reads back.
+    if ((ret = mbedtls_pk_write_key_pem(&c->pkey, (unsigned char *)c->key_pem, sizeof(c->key_pem))) != 0) goto done;
+    c->key_pem_len = strlen(c->key_pem);
 done:
     mbedtls_x509write_crt_free(&wc);
     return ret;
+}
+
+// Keep a copy of a loaded PEM in the ctx so vtls_cert_pem/vtls_key_pem work for
+// loaded identities too (persist_dir reloads go through here). `len` includes
+// the trailing NUL the V side guarantees; oversized input (a long chain) just
+// leaves the copy empty - the parsed cert/key are unaffected.
+static void vtls_keep_pem(const unsigned char *src, size_t len, char *dst, size_t cap, size_t *out_len) {
+    size_t n = len;
+    while (n > 0 && src[n - 1] == '\0') n--;
+    if (n == 0 || n >= cap) { *out_len = 0; return; }
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+    *out_len = n;
 }
 
 int vtls_use_pem(vtls_ctx *c, const unsigned char *cert, size_t clen,
                  const unsigned char *key, size_t klen) {
     int ret = mbedtls_x509_crt_parse(&c->srvcert, cert, clen);
     if (ret != 0) return ret;
-    return mbedtls_pk_parse_key(&c->pkey, key, klen, NULL, 0); // Mbed TLS 4: no RNG args
+    ret = mbedtls_pk_parse_key(&c->pkey, key, klen, NULL, 0); // Mbed TLS 4: no RNG args
+    if (ret != 0) return ret;
+    vtls_keep_pem(cert, clen, c->cert_pem, sizeof(c->cert_pem), &c->cert_pem_len);
+    vtls_keep_pem(key, klen, c->key_pem, sizeof(c->key_pem), &c->key_pem_len);
+    return 0;
 }
 
 int vtls_setup(vtls_ctx *c) {
@@ -171,6 +259,10 @@ int vtls_setup(vtls_ctx *c) {
     mbedtls_ssl_conf_new_session_tickets(&c->conf, 0);
 #endif
     return mbedtls_ssl_conf_own_cert(&c->conf, &c->srvcert, &c->pkey);
+}
+
+const char *vtls_key_pem(vtls_ctx *c) {
+    return (c && c->key_pem_len > 0) ? c->key_pem : NULL;
 }
 
 const char *vtls_cert_pem(vtls_ctx *c) {

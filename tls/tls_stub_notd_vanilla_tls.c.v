@@ -12,7 +12,7 @@ pub fn initialize() ! {
 	return error(not_built)
 }
 
-pub fn new_self_signed() !&Config {
+pub fn new_self_signed(opts SelfSignedOpts) !&Config {
 	return error(not_built)
 }
 
@@ -25,6 +25,10 @@ pub fn (c &Config) set_alpn(protos string) ! {
 }
 
 pub fn (c &Config) cert_pem() string {
+	return ''
+}
+
+pub fn (c &Config) key_pem() string {
 	return ''
 }
 

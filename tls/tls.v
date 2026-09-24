@@ -32,6 +32,27 @@ pub struct Config {
 	ctx voidptr
 }
 
+// SelfSignedOpts configures new_self_signed. Every field is optional:
+// `tls.new_self_signed()` gives a localhost/loopback certificate that lives
+// only as long as the process.
+@[params]
+pub struct SelfSignedOpts {
+pub:
+	// Subject Alternative Names the certificate is valid for, as `DNS:<host>`
+	// or `IP:<v4-or-v6>`. Clients match the connection target against these
+	// and ignore the CN (browsers, Android, Java, Go, Python; only curl still
+	// falls back to the CN), so list every host or IP you will connect with.
+	// The first entry's value doubles as the subject CN.
+	sans []string = ['DNS:localhost', 'IP:127.0.0.1', 'IP:::1']
+	// Directory to keep the identity in. On first use the generated
+	// `cert.pem` and `key.pem` (mode 0600, dir 0700) are written there; later
+	// runs load them instead of generating anew, so the certificate - and
+	// anything pinned to it (`curl --cacert`, an Android trust anchor) -
+	// survives restarts. Empty: in-memory only, a fresh certificate every
+	// start. When the files exist, `sans` is ignored: delete them to re-issue.
+	persist_dir string
+}
+
 // Session is a per-connection TLS session bound to an accepted, non-blocking fd.
 pub struct Session {
 	sess voidptr
