@@ -49,7 +49,10 @@ static inline bool vanilla_qb_queue(const void* ptr, int64_t len) {
 	return false;
 }
 
-static inline bool vanilla_qb_take(const void** out_ptr, int64_t* out_len) {
+// out_ptr is `void**`, not `const void**`: the V caller passes `&voidptr`
+// (a plain void**), and modern gcc rejects the implicit void** -> const void**
+// conversion. The pointee stays borrowed/read-only by contract.
+static inline bool vanilla_qb_take(void** out_ptr, int64_t* out_len) {
 	(void)out_ptr;
 	(void)out_len;
 	return false;
@@ -93,11 +96,11 @@ static inline bool vanilla_qb_queue(const void* ptr, int64_t len) {
 // Reads and clears a queued buffer. Returns false (outputs untouched) when none
 // is queued. Always clears `queued`, so the slot holds at most one request's
 // hand-off and never leaks into the next request.
-static inline bool vanilla_qb_take(const void** out_ptr, int64_t* out_len) {
+static inline bool vanilla_qb_take(void** out_ptr, int64_t* out_len) {
 	if (!vanilla_qb.queued) {
 		return false;
 	}
-	*out_ptr = vanilla_qb.ptr;
+	*out_ptr = (void*)vanilla_qb.ptr;
 	*out_len = vanilla_qb.len;
 	vanilla_qb.queued = false;
 	return true;

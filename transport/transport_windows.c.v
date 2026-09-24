@@ -34,8 +34,9 @@ mut:
 }
 
 // Empty decl names the C struct tag (defined by winsock2.h) so WSAStartup has
-// real storage — same form as socket/socket_windows.c.v.
-struct C.WSAData {}
+// real storage — same form (pub, program-wide C decl registry) as
+// socket/socket_windows.c.v.
+pub struct C.WSAData {}
 
 // Signatures match socket/'s decls exactly (V registers C fn signatures
 // program-wide, vlang/v#27791).

@@ -9,8 +9,9 @@ module socket
 
 // struct WSAData is fully defined by the included winsock2.h; the empty V
 // decl just names the C struct tag (same form as vlib/net) so WSAStartup has
-// real storage to write into.
-struct C.WSAData {}
+// real storage to write into. pub, like vlib/net's decl: V registers C decls
+// program-wide, and a private one poisons every other module's use of the tag.
+pub struct C.WSAData {}
 
 pub fn init_winsock() ! {
 	mut wsa_data := C.WSAData{}
@@ -72,7 +73,7 @@ pub fn connect_to_server_on_windows(port int) !int {
 	mut addr := C.sockaddr_in{
 		sin_family: u16(C.AF_INET)
 		sin_port:   C.htons(u16(port))
-		sin_addr:   C.in_addr{C.htonl(u32(0x7f000001))} // 127.0.0.1
+		sin_addr:   C.htonl(u32(0x7f000001)) // 127.0.0.1
 	}
 
 	println('[client] Connecting to server on port ${port} (127.0.0.1)...')
@@ -114,7 +115,7 @@ pub fn create_server_socket_on_windows(port int) int {
 	server_addr := C.sockaddr_in{
 		sin_family: u16(C.AF_INET)
 		sin_port:   C.htons(u16(port))
-		sin_addr:   C.in_addr{u32(C.INADDR_ANY)}
+		sin_addr:   u32(C.INADDR_ANY)
 	}
 
 	if C.bind(server_fd, voidptr(&server_addr), sizeof(server_addr)) == socket_error {

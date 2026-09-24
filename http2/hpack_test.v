@@ -112,18 +112,16 @@ fn test_index_errors() {
 fn test_rfc7541_c3_requests_plain() ! {
 	mut d := new_decoder(hpack_default_table_size)
 	first := d.decode(hx('828684410f7777772e6578616d706c652e636f6d'))!
-	assert first == [field(':method', 'GET'), field(':scheme', 'http'),
-		field(':path', '/'), field(':authority', 'www.example.com')]
+	assert first == [field(':method', 'GET'), field(':scheme', 'http'), field(':path', '/'),
+		field(':authority', 'www.example.com')]
 	assert d.dynamic_size() == 57
 	second := d.decode(hx('828684be58086e6f2d6361636865'))!
-	assert second == [field(':method', 'GET'), field(':scheme', 'http'),
-		field(':path', '/'), field(':authority', 'www.example.com'),
-		field('cache-control', 'no-cache')]
+	assert second == [field(':method', 'GET'), field(':scheme', 'http'), field(':path', '/'),
+		field(':authority', 'www.example.com'), field('cache-control', 'no-cache')]
 	assert d.dynamic_size() == 110
 	third := d.decode(hx('828785bf400a637573746f6d2d6b65790c637573746f6d2d76616c7565'))!
-	assert third == [field(':method', 'GET'), field(':scheme', 'https'),
-		field(':path', '/index.html'), field(':authority', 'www.example.com'),
-		field('custom-key', 'custom-value')]
+	assert third == [field(':method', 'GET'), field(':scheme', 'https'), field(':path', '/index.html'),
+		field(':authority', 'www.example.com'), field('custom-key', 'custom-value')]
 	assert d.dynamic_size() == 164
 }
 
@@ -131,18 +129,16 @@ fn test_rfc7541_c3_requests_plain() ! {
 fn test_rfc7541_c4_requests_huffman() ! {
 	mut d := new_decoder(hpack_default_table_size)
 	first := d.decode(hx('828684418cf1e3c2e5f23a6ba0ab90f4ff'))!
-	assert first == [field(':method', 'GET'), field(':scheme', 'http'),
-		field(':path', '/'), field(':authority', 'www.example.com')]
+	assert first == [field(':method', 'GET'), field(':scheme', 'http'), field(':path', '/'),
+		field(':authority', 'www.example.com')]
 	assert d.dynamic_size() == 57
 	second := d.decode(hx('828684be5886a8eb10649cbf'))!
-	assert second == [field(':method', 'GET'), field(':scheme', 'http'),
-		field(':path', '/'), field(':authority', 'www.example.com'),
-		field('cache-control', 'no-cache')]
+	assert second == [field(':method', 'GET'), field(':scheme', 'http'), field(':path', '/'),
+		field(':authority', 'www.example.com'), field('cache-control', 'no-cache')]
 	assert d.dynamic_size() == 110
 	third := d.decode(hx('828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf'))!
-	assert third == [field(':method', 'GET'), field(':scheme', 'https'),
-		field(':path', '/index.html'), field(':authority', 'www.example.com'),
-		field('custom-key', 'custom-value')]
+	assert third == [field(':method', 'GET'), field(':scheme', 'https'), field(':path', '/index.html'),
+		field(':authority', 'www.example.com'), field('custom-key', 'custom-value')]
 	assert d.dynamic_size() == 164
 }
 
@@ -163,8 +159,7 @@ fn test_response_blocks_with_eviction() ! {
 		d.decode(hx('88c16196d07abe941054d444a8200595040b8166e084a62d1bffc05a839bd9ab77ad94e7821dd7f2e6c7b335dfdfcd5b3960d5af27087f3672c1ab270fb5291f9587316065c003ed4ee5b1063d5007'))!
 	assert third == [field(':status', '200'), field('cache-control', 'private'),
 		field('date', 'Mon, 21 Oct 2013 20:13:22 GMT'), field('location', 'https://www.example.com'),
-		field('content-encoding', 'gzip'),
-		field('set-cookie',
+		field('content-encoding', 'gzip'), field('set-cookie',
 			'foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1')]
 	assert d.dynamic_size() == 215
 	assert d.dynamic_size() <= 256
@@ -205,8 +200,8 @@ fn test_encoder_helpers_roundtrip() ! {
 	encode_literal(mut out, 'x-custom', 'yes')
 	encode_literal(mut out, 'x-empty', '')
 	got := d.decode(out)!
-	assert got == [field(':status', '200'), field(':status', '302'),
-		field('age', '120'), field('x-custom', 'yes'), field('x-empty', '')]
+	assert got == [field(':status', '200'), field(':status', '302'), field('age', '120'),
+		field('x-custom', 'yes'), field('x-empty', '')]
 	// Stateless encoding must leave the peer's dynamic table untouched.
 	assert d.dynamic_size() == 0
 }

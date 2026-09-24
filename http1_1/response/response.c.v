@@ -3,7 +3,7 @@ module response
 #include <errno.h>
 
 fn C.send(__fd int, __buf voidptr, __n usize, __flags int) int
-fn C.perror(s &u8)
+fn C.perror(s &char)
 
 pub const tiny_bad_request_response = 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 const status_444_response = 'HTTP/1.1 444 No Response\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()

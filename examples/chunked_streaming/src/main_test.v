@@ -102,7 +102,7 @@ fn test_smuggling_guard_via_validate_http1() {
 	// The handler appends the canned 400 and closes the connection.
 	req :=
 		'POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n' +
-		'5\r\nhello\r\n0\r\n\r\n'
+			'5\r\nhello\r\n0\r\n\r\n'
 	mut out := []u8{}
 	mut event_loop := core.EventLoop{}
 	assert handle(req.bytes(), mut out, -1, unsafe { nil }, mut event_loop) == .close

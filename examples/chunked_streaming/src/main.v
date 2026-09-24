@@ -158,8 +158,7 @@ const resp_head_chunked = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransf
 const last_chunk = '0\r\n\r\n'.bytes()
 
 // The no-body demo pieces — three separate frames on the wire.
-const demo_pieces = ['first piece\n'.bytes(), 'second piece\n'.bytes(),
-	'third piece\n'.bytes()]
+const demo_pieces = ['first piece\n'.bytes(), 'second piece\n'.bytes(), 'third piece\n'.bytes()]
 
 // is_chunked reports whether Transfer-Encoding is `chunked` — compared in
 // place over the header bytes (case-insensitive), no to_string/to_lower.

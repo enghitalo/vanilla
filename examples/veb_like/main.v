@@ -208,7 +208,7 @@ fn main() {
 		}
 		// Production limits: bound resource use so a single client can't exhaust
 		// the server. All default to 0 (unlimited) — set explicitly here.
-		limits: server.Limits{
+		limits:          server.Limits{
 			max_header_bytes: 16 * 1024   // 16 KiB headers  -> 431
 			max_body_bytes:   1024 * 1024 // 1 MiB body     -> 413 (from Content-Length)
 			max_connections:  100_000     // refuse past this many concurrent

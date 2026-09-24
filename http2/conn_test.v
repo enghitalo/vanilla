@@ -47,8 +47,7 @@ fn get_request_block() []u8 {
 }
 
 fn get_request_fields() []HeaderField {
-	return [hf(':method', 'GET'), hf(':scheme', 'http'), hf(':path', '/'),
-		hf(':authority', 'x.test')]
+	return [hf(':method', 'GET'), hf(':scheme', 'http'), hf(':path', '/'), hf(':authority', 'x.test')]
 }
 
 fn test_server_preface_parses() ! {
@@ -332,43 +331,40 @@ fn test_new_stream_ids_must_ascend() {
 }
 
 fn test_validate_request_fields_rules() {
-	ok0, cl0 := validate_request_fields([hf(':method', 'GET'),
-		hf(':scheme', 'http'), hf(':path', '/'), hf(':authority', 'x')])
+	ok0, cl0 := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'), hf(':path', '/'),
+		hf(':authority', 'x')])
 	assert ok0
 	assert cl0 == -1
 	ok1, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http')])
 	assert !ok1 // missing :path
-	ok2, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'),
-		hf('x', 'y'), hf(':path', '/')])
+	ok2, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'), hf('x', 'y'),
+		hf(':path', '/')])
 	assert !ok2 // pseudo-header after a regular field
-	ok3, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'),
-		hf(':path', '/'), hf(':status', '200')])
+	ok3, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'), hf(':path', '/'),
+		hf(':status', '200')])
 	assert !ok3 // response pseudo-header in a request
-	ok4, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'),
-		hf(':path', '')])
+	ok4, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'), hf(':path', '')])
 	assert !ok4 // empty :path
-	ok5, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'),
-		hf(':path', '/'), hf('connection', 'close')])
+	ok5, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'), hf(':path', '/'),
+		hf('connection', 'close')])
 	assert !ok5 // connection-specific field
-	ok6, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'),
-		hf(':path', '/'), hf('te', 'gzip')])
+	ok6, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'), hf(':path', '/'),
+		hf('te', 'gzip')])
 	assert !ok6 // te may only carry 'trailers'
-	ok7, cl7 := validate_request_fields([hf(':method', 'POST'),
-		hf(':scheme', 'http'), hf(':path', '/'), hf('content-length', '42')])
+	ok7, cl7 := validate_request_fields([hf(':method', 'POST'), hf(':scheme', 'http'),
+		hf(':path', '/'), hf('content-length', '42')])
 	assert ok7
 	assert cl7 == 42
-	ok8, _ := validate_request_fields([hf(':method', 'POST'),
-		hf(':scheme', 'http'), hf(':path', '/'), hf('content-length', '4'),
-		hf('content-length', '5')])
+	ok8, _ := validate_request_fields([hf(':method', 'POST'), hf(':scheme', 'http'), hf(':path', '/'),
+		hf('content-length', '4'), hf('content-length', '5')])
 	assert !ok8 // differing duplicate content-length
-	ok9, _ := validate_request_fields([hf(':method', 'CONNECT'),
-		hf(':scheme', 'http'), hf(':path', '/'), hf(':authority', 'x')])
+	ok9, _ := validate_request_fields([hf(':method', 'CONNECT'), hf(':scheme', 'http'),
+		hf(':path', '/'), hf(':authority', 'x')])
 	assert !ok9 // CONNECT must omit :scheme and :path
-	ok10, _ := validate_request_fields([hf(':method', 'CONNECT'),
-		hf(':authority', 'x:443')])
+	ok10, _ := validate_request_fields([hf(':method', 'CONNECT'), hf(':authority', 'x:443')])
 	assert ok10
-	ok11, _ := validate_request_fields([hf(':method', 'GET'),
-		hf(':scheme', 'http'), hf(':path', '/'), hf('X-Bad', 'v')])
+	ok11, _ := validate_request_fields([hf(':method', 'GET'), hf(':scheme', 'http'), hf(':path', '/'),
+		hf('X-Bad', 'v')])
 	assert !ok11 // uppercase field name
 }
 

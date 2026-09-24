@@ -44,10 +44,15 @@ pub const infinite = u32(0xFFFFFFFF)
 // and will complete through the port — the NON-error "error" every post gets.
 pub const wsa_io_pending = 997
 
+// INVALID_HANDLE_VALUE spelled as a typed V constant — current V types the
+// bare `C.INVALID_HANDLE_VALUE` ident as `int`, which no longer coerces to
+// the declared `voidptr` parameter (same spelling vlib/os uses).
+const invalid_handle_value = voidptr(-1)
+
 // create_iocp creates a completion port that wakes at most
 // `max_concurrent_threads` threads at once (1 for a single-worker port).
 pub fn create_iocp(max_concurrent_threads u32) !voidptr {
-	handle := C.CreateIoCompletionPort(C.INVALID_HANDLE_VALUE, unsafe { nil }, 0,
+	handle := C.CreateIoCompletionPort(invalid_handle_value, unsafe { nil }, 0,
 		max_concurrent_threads)
 	if handle == unsafe { nil } {
 		return error('CreateIoCompletionPort failed: WSA ${C.WSAGetLastError()}')

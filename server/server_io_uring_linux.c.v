@@ -14,12 +14,15 @@ import time
 #include <sched.h>
 #include <sys/socket.h>
 
-fn C.perror(s &u8)
+fn C.perror(s &char)
 fn C.sleep(seconds u32) u32
 fn C.close(fd int) int
 fn C.shutdown(sockfd int, how int) int
 fn C.memmove(dest voidptr, src voidptr, n usize) voidptr
-fn C.sched_setaffinity(pid int, cpusetsize usize, mask &u64) int
+// mask is a cpu_set_t* in <sched.h>; we hand it a raw u64 word array, so keep
+// the binding untyped rather than model cpu_set_t (whose header typedef would
+// clash with any V-side struct declaration).
+fn C.sched_setaffinity(pid int, cpusetsize usize, mask voidptr) int
 
 // iou_backend_available reports whether the io_uring backend can actually run in
 // THIS process (kernel supports io_uring_setup AND it is not blocked by a
@@ -163,7 +166,7 @@ fn maybe_pin_worker(cpu int) {
 	}
 	mut set := [16]u64{} // CPU_SETSIZE/64 words → up to 1024 CPUs
 	set[cpu / 64] |= u64(1) << u32(cpu % 64)
-	C.sched_setaffinity(0, usize(sizeof(set)), &set[0])
+	C.sched_setaffinity(0, usize(sizeof(set)), voidptr(&set[0]))
 }
 
 // --- io_uring CQE handlers -------------------------------------------------

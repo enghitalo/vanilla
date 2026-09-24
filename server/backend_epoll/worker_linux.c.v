@@ -11,10 +11,13 @@ import os
 #include <sys/epoll.h>
 #include <sched.h>
 
-fn C.perror(s &u8)
+fn C.perror(s &char)
 fn C.sleep(seconds u32) u32
 fn C.close(fd int) int
-fn C.sched_setaffinity(pid int, cpusetsize usize, mask &u64) int
+// mask is a cpu_set_t* in <sched.h>; we hand it a raw u64 word array, so keep
+// the binding untyped rather than model cpu_set_t (whose header typedef would
+// clash with any V-side struct declaration).
+fn C.sched_setaffinity(pid int, cpusetsize usize, mask voidptr) int
 
 // maybe_pin_worker pins the calling worker thread to `cpu` when VANILLA_PIN_CPUS
 // is set. Opt-in: pinning warms caches and stops migration on dedicated
@@ -27,7 +30,7 @@ fn maybe_pin_worker(cpu int) {
 	}
 	mut set := [16]u64{} // CPU_SETSIZE/64 words → up to 1024 CPUs
 	set[cpu / 64] |= u64(1) << u32(cpu % 64)
-	C.sched_setaffinity(0, usize(sizeof(set)), &set[0])
+	C.sched_setaffinity(0, usize(sizeof(set)), voidptr(&set[0]))
 }
 
 // release_conn closes a connection: removes it from epoll (which closes the fd)
