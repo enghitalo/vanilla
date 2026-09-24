@@ -9,8 +9,9 @@ module socket
 
 // struct WSAData is fully defined by the included winsock2.h; the empty V
 // decl just names the C struct tag (same form as vlib/net) so WSAStartup has
-// real storage to write into.
-struct C.WSAData {}
+// real storage to write into. pub, like vlib/net's decl: V registers C decls
+// program-wide, and a private one poisons every other module's use of the tag.
+pub struct C.WSAData {}
 
 pub fn init_winsock() ! {
 	mut wsa_data := C.WSAData{}
