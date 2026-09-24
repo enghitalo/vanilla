@@ -90,8 +90,8 @@ fn test_async_db_workload() {
 	// The real async-db query shape: price range + limit, all nine columns.
 	res := c.query(r'select id, name, category, price, quantity, active, tags, rating_score, rating_count
 		from pg_async_test_items where price between $1 and $2 limit $3', [
-		?[]u8('10'.bytes()),
-		?[]u8('60'.bytes()),
+		?[]u8('10'.bytes())
+		?[]u8('60'.bytes())
 		?[]u8('50'.bytes()),
 	])!
 	mut it := res.rows()
@@ -129,7 +129,7 @@ fn test_async_db_workload() {
 
 	// Empty range (the async-db anti-cheat): zero matching rows, clean iteration.
 	empty := c.query(r'select id from pg_async_test_items where price between $1 and $2', [
-		?[]u8('900000'.bytes()),
+		?[]u8('900000'.bytes())
 		?[]u8('999999'.bytes()),
 	])!
 	mut eit := empty.rows()

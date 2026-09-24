@@ -73,7 +73,7 @@ fn main() {
 		port:            3000
 		io_multiplexing: backend
 		// The whole point: one wrap, every response hardened.
-		handler: with_security_headers(app)
+		handler:         with_security_headers(app)
 	})!
 	println('Security-headers demo on http://localhost:3000/  (every response hardened via wrapper)')
 	srv.run()

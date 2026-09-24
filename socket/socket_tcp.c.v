@@ -36,6 +36,7 @@ $if linux {
 } $else {
 	fn C.bind(sockfd int, addr voidptr, addrlen u32) int // Use voidptr for generic sockaddr
 }
+
 fn C.setsockopt(__fd int, __level int, __optname int, __optval voidptr, __optlen u32) int
 fn C.listen(__fd int, __n int) int
 fn C.perror(s &char)
@@ -47,6 +48,7 @@ $if linux {
 } $else {
 	fn C.accept(sockfd int, address voidptr, addrlen &u32) int // Use voidptr here too
 }
+
 fn C.htons(__hostshort u16) u16
 fn C.ntohs(__netshort u16) u16
 fn C.getsockname(fd int, addr voidptr, addrlen &u32) int

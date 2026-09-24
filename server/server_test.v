@@ -40,7 +40,8 @@ fn test_after_server_start_fires_when_ready() ! {
 	}()
 
 	select {
-		_ := <-ready {}
+		_ := <-ready {
+		}
 		2000 * time.millisecond {
 			assert false, 'after_server_start did not fire within 2s'
 		}

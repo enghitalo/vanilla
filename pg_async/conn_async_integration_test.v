@@ -34,7 +34,7 @@ fn test_async_query_pump_against_live_pg() {
 	for round in 0 .. 2 {
 		expect := round + 7
 		assert c.async_submit(r'select $1::int4, $2::text', [
-			?[]u8('${expect}'.bytes()),
+			?[]u8('${expect}'.bytes())
 			?[]u8('round'.bytes()),
 		])
 		assert c.is_busy()

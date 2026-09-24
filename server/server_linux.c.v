@@ -9,7 +9,7 @@ pub enum IOBackend {
 	// The pure-POSIX poll(2) portability floor (QNX/VxWorks tier). Compiled
 	// on Linux ONLY under `-d vanilla_poll` (new_server rejects it otherwise)
 	// so CI can exercise the RTOS reactor at zero cost to normal builds.
-	poll = 2
+	poll     = 2
 }
 
 // run_selected_backend dispatches to the configured Linux backend. Defined per

@@ -106,7 +106,8 @@ fn try_offload(worker_state voidptr, password []u8, mut event_loop core.EventLoo
 		st.jobs <- job {
 			queued = true
 		}
-		else {}
+		else {
+		}
 	}
 	if !queued {
 		C.close(fds[0])

@@ -347,7 +347,7 @@ fn main() {
 		handler:         handle
 		// Per-worker argon2 offload pool (real on epoll/kqueue; a nil-returning
 		// stub on Windows, where handle falls back to a synchronous verify).
-		make_state: make_auth_state
+		make_state:      make_auth_state
 	})!
 	println('Auth demo on http://localhost:3000/')
 	println('  POST /token      (body = password)           -> JWT')

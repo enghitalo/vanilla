@@ -318,8 +318,10 @@ fn serve_readable(h core.Handler, mut w WorkerState, i int, limits core.Limits, 
 				match start_body_drain(h, mut cs, limits, state, target) {
 					1 { continue } // draining started; keep consuming the body
 					2 { must_close = true }
-					else {} // head incomplete — fall through to grow
+					else {}
 				}
+
+				// head incomplete — fall through to grow
 
 				if must_close {
 					break

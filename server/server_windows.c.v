@@ -454,8 +454,9 @@ fn win_arm_recv(h core.Handler, mut st WinState, mut cs WinConn, limits core.Lim
 					win_advance(h, mut st, mut cs, limits, active_conns, state) // flush the 400, then close
 					return
 				}
-				else {} // head not complete yet → grow below
+				else {}
 			}
+			// head not complete yet → grow below
 		}
 		if cs.body_drain == 0 && cs.read_buf.len == cs.read_buf.cap {
 			if target > cs.read_buf.cap && target <= req_cap {

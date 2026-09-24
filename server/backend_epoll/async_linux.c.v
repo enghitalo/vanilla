@@ -437,8 +437,9 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 					cs, state, target) {
 					1 { continue } // draining started; keep reading the body
 					2 { return } // connection closed
-					else {} // head not complete yet → fall through to grow
+					else {}
 				}
+				// head not complete yet → fall through to grow
 			}
 			if target > cs.read_buf.cap && target <= req_cap {
 				unsafe { cs.read_buf.grow_cap(target - cs.read_buf.cap) }
