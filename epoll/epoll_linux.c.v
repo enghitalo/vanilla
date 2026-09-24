@@ -8,7 +8,7 @@ module epoll
 fn C.epoll_create1(__flags int) int
 fn C.epoll_ctl(__epfd int, __op int, __fd int, __event &C.epoll_event) int
 fn C.epoll_wait(__epfd int, __events &C.epoll_event, __maxevents int, __timeout int) int
-fn C.perror(s &u8)
+fn C.perror(s &char)
 fn C.close(fd int) int
 
 // fd get/set go through C shims (epoll_shim.h) so V never models the

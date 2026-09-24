@@ -155,10 +155,6 @@ pub struct C.io_uring_params {
 	features       u32
 }
 
-pub struct C.cpu_set_t {
-	val [16]u64
-}
-
 // C function bindings
 fn C.io_uring_queue_init_params(entries u32, ring &C.io_uring, p &C.io_uring_params) int
 fn C.io_uring_queue_exit(ring &C.io_uring)
@@ -202,14 +198,6 @@ fn C.htonl(hostlong u32) u32
 @[typedef]
 pub struct C.pthread_t {
 	data u64
-}
-
-@[typedef]
-pub struct C.sigaction {
-	sa_handler  voidptr
-	sa_mask     u64
-	sa_flags    int
-	sa_restorer voidptr
 }
 
 // ==================== Connection Structure ====================

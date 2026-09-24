@@ -17,10 +17,15 @@ pub type DbConn = pg.DB | sqlite.DB
 // 	// reset returns the connection to initial state for reuse
 // 	reset() !
 // }
+// Statement-form matches: `return match ...` needs every arm to yield a
+// value, and `close() !` yields none - the current checker rejects both
+// shapes (older V let them through).
 fn (c DbConn) validate() !bool {
-	return match c {
+	match c {
 		pg.DB {
-			// return c.ping() !
+			// db.pg has no cheap liveness probe (a ping is a full round-trip),
+			// so a pooled pg connection is assumed live until a query fails.
+			return true
 		}
 		sqlite.DB {
 			// For SQLite, we can assume the connection is always valid
@@ -30,12 +35,12 @@ fn (c DbConn) validate() !bool {
 }
 
 fn (mut c DbConn) close() ! {
-	return match mut c {
+	match mut c {
 		pg.DB {
-			return c.close()
+			c.close()!
 		}
 		sqlite.DB {
-			return c.close()
+			c.close()!
 		}
 	}
 }

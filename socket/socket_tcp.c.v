@@ -21,7 +21,7 @@ $if !windows {
 }
 
 fn C.getpeername(fd int, addr voidptr, addrlen &u32) int
-fn C.inet_ntop(af int, src voidptr, dst &char, size u32) &char
+fn C.inet_ntop(af int, src voidptr, dst &char, size int) &char
 
 $if linux {
 	// accept4 sets the client socket non-blocking atomically, saving the two
@@ -53,24 +53,24 @@ fn C.getsockname(fd int, addr voidptr, addrlen &u32) int
 fn C.fcntl(fd int, cmd int, arg int) int
 fn C.connect(sockfd int, addr &C.sockaddr_in, addrlen u32) int
 
-// Internet address
-struct C.in_addr {
-	// address in network byte order
-	s_addr u32
-}
-
 // An IP socket address is defined as a combination of an IP
 // interface address and a 16-bit port number.  The basic IP protocol
 // does not supply port numbers, they are implemented by higher level
 // protocols like udp(7) and tcp(7).  On raw sockets sin_port is set
 // to the IP protocol.
+//
+// sin_addr is the raw network-order u32, not a `C.in_addr` wrapper struct:
+// vlib/net declares `C.sockaddr_in.sin_addr u32`, and V unifies C struct
+// declarations by name across modules, so any program importing both this
+// module and `net` (the tests do) must agree on the field type. Same bytes
+// either way - in_addr is a one-member struct.
 struct C.sockaddr_in {
 	// address family: AF_INET
 	sin_family u16
 	// port in network byte order
 	sin_port u16
-	// internet address
-	sin_addr C.in_addr
+	// internet address, network byte order
+	sin_addr u32
 }
 
 // Helper for client connections (for testing)
@@ -90,7 +90,7 @@ pub fn connect_to_server(port int) !int {
 		mut addr := C.sockaddr_in{
 			sin_family: u16(C.AF_INET)
 			sin_port:   C.htons(u16(port))
-			sin_addr:   C.in_addr{u32(C.INADDR_ANY)} // 0.0.0.0
+			sin_addr:   u32(C.INADDR_ANY) // 0.0.0.0
 		}
 		println('[client] Connecting to server on port ${port} (0.0.0.0)...')
 		// Cast to voidptr for OS compatibility
@@ -284,7 +284,7 @@ pub fn create_server_socket(port int) int {
 		server_addr := C.sockaddr_in{
 			sin_family: u16(C.AF_INET)
 			sin_port:   C.htons(u16(port))
-			sin_addr:   C.in_addr{u32(C.INADDR_ANY)} // 0.0.0.0
+			sin_addr:   u32(C.INADDR_ANY) // 0.0.0.0
 		}
 
 		// Cast to voidptr to fix the type mismatch

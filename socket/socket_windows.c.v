@@ -72,7 +72,7 @@ pub fn connect_to_server_on_windows(port int) !int {
 	mut addr := C.sockaddr_in{
 		sin_family: u16(C.AF_INET)
 		sin_port:   C.htons(u16(port))
-		sin_addr:   C.in_addr{C.htonl(u32(0x7f000001))} // 127.0.0.1
+		sin_addr:   C.htonl(u32(0x7f000001)) // 127.0.0.1
 	}
 
 	println('[client] Connecting to server on port ${port} (127.0.0.1)...')
@@ -114,7 +114,7 @@ pub fn create_server_socket_on_windows(port int) int {
 	server_addr := C.sockaddr_in{
 		sin_family: u16(C.AF_INET)
 		sin_port:   C.htons(u16(port))
-		sin_addr:   C.in_addr{u32(C.INADDR_ANY)}
+		sin_addr:   u32(C.INADDR_ANY)
 	}
 
 	if C.bind(server_fd, voidptr(&server_addr), sizeof(server_addr)) == socket_error {
