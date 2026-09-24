@@ -24,8 +24,13 @@ vtls_ctx *vtls_ctx_new(void);
 void vtls_ctx_free(vtls_ctx *ctx);
 
 // Populate the context with a freshly generated self-signed certificate +
-// key (EC P-256, TLS 1.3). Returns 0 on success.
-int vtls_use_self_signed(vtls_ctx *ctx);
+// key (EC P-256, TLS 1.3). `sans` are 1..16 "DNS:<host>" / "IP:<v4|v6>" entries
+// the certificate will be valid for (clients validate against these, not the
+// CN). `char *const *` rather than `const char *const *` only because V emits
+// `char**` for `&&char` and gcc rejects the double-const conversion; the
+// strings are never modified. Returns 0 on success, non-zero on a bad entry or
+// generation failure.
+int vtls_use_self_signed(vtls_ctx *ctx, char *const *sans, size_t nsans);
 
 // Populate the context from PEM cert + key buffers. Returns 0 on success.
 int vtls_use_pem(vtls_ctx *ctx, const unsigned char *cert, size_t clen,
@@ -42,6 +47,12 @@ int vtls_set_alpn(vtls_ctx *ctx, const char *list);
 // The generated/loaded certificate as PEM (NUL-terminated), or NULL. Useful to
 // save so a client can trust it (curl --cacert). Valid until vtls_ctx_free.
 const char *vtls_cert_pem(vtls_ctx *ctx);
+
+// The private key as PEM (NUL-terminated), or NULL. Set by vtls_use_self_signed
+// (exported from the generated key) and by vtls_use_pem (a copy of the input,
+// when it fits). Lets the caller persist the pair and reload it with
+// vtls_use_pem, so the identity survives restarts. Valid until vtls_ctx_free.
+const char *vtls_key_pem(vtls_ctx *ctx);
 
 // The protocol negotiated via ALPN (e.g. "http/1.1"), or NULL if none. Valid
 // only once the handshake on this session has completed.

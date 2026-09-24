@@ -1,5 +1,7 @@
 module tls
 
+import os
+
 // Real TLS implementation backed by the vanilla_tls C shim (Mbed TLS 4,
 // TLS 1.3). Compiled only with `-d vanilla_tls`; otherwise the stubs in
 // tls_stub_notd_vanilla_tls.c.v are used and Mbed TLS is not a dependency.
@@ -16,11 +18,12 @@ module tls
 fn C.vtls_global_init() int
 fn C.vtls_ctx_new() voidptr
 fn C.vtls_ctx_free(ctx voidptr)
-fn C.vtls_use_self_signed(ctx voidptr) int
+fn C.vtls_use_self_signed(ctx voidptr, sans &&char, nsans usize) int
 fn C.vtls_use_pem(ctx voidptr, cert &u8, clen usize, key &u8, klen usize) int
 fn C.vtls_setup(ctx voidptr) int
 fn C.vtls_set_alpn(ctx voidptr, list &char) int
 fn C.vtls_cert_pem(ctx voidptr) &char
+fn C.vtls_key_pem(ctx voidptr) &char
 fn C.vtls_get_alpn(sess voidptr) &char
 fn C.vtls_session_new(ctx voidptr, fd int) voidptr
 fn C.vtls_session_free(sess voidptr)
@@ -38,17 +41,40 @@ pub fn initialize() ! {
 	}
 }
 
-// new_self_signed builds a config with a freshly generated self-signed cert
-// (EC P-256, TLS 1.3) — handy for dev/testing without a real certificate.
-pub fn new_self_signed() !&Config {
+// new_self_signed builds a config with a self-signed certificate (EC P-256,
+// TLS 1.3) - the zero-config way to get HTTPS without a CA. Defaults to
+// SANs for localhost and the loopback IPs; pass `sans:` for the real host/IP
+// and `persist_dir:` to keep the same identity across restarts (see
+// SelfSignedOpts). The certificate is self-signed, so clients must be told to
+// trust it: `curl --cacert`, an Android network-security-config trust anchor,
+// or a browser exception - export it with cert_pem().
+pub fn new_self_signed(opts SelfSignedOpts) !&Config {
 	initialize()! // psa_crypto_init is idempotent
+	if opts.persist_dir != '' {
+		cert_path := os.join_path(opts.persist_dir, 'cert.pem')
+		key_path := os.join_path(opts.persist_dir, 'key.pem')
+		if os.exists(cert_path) && os.exists(key_path) {
+			cert := os.read_bytes(cert_path) or {
+				return error('vtls: cannot read ${cert_path}: ${err}')
+			}
+			key := os.read_bytes(key_path) or { return error('vtls: cannot read ${key_path}: ${err}') }
+			return new_from_pem(cert, key)
+		}
+	}
+	if opts.sans.len == 0 {
+		return error('vtls: at least one SAN is required (e.g. "DNS:localhost" or "IP:203.0.113.5")')
+	}
 	ctx := C.vtls_ctx_new()
 	if ctx == unsafe { nil } {
 		return error('vtls: out of memory')
 	}
-	if C.vtls_use_self_signed(ctx) != 0 {
+	mut csans := []&char{cap: opts.sans.len}
+	for s in opts.sans {
+		csans << &char(s.str)
+	}
+	if C.vtls_use_self_signed(ctx, unsafe { &&char(csans.data) }, usize(csans.len)) != 0 {
 		C.vtls_ctx_free(ctx)
-		return error('vtls: self-signed certificate generation failed')
+		return error('vtls: self-signed certificate generation failed - each SAN must be "DNS:<host>" or "IP:<v4|v6>" (got ${opts.sans})')
 	}
 	if C.vtls_setup(ctx) != 0 {
 		C.vtls_ctx_free(ctx)
@@ -58,8 +84,35 @@ pub fn new_self_signed() !&Config {
 		C.vtls_ctx_free(ctx)
 		return error('vtls: failed to set ALPN')
 	}
-	return &Config{
+	cfg := &Config{
 		ctx: ctx
+	}
+	if opts.persist_dir != '' {
+		persist_identity(cfg, opts.persist_dir) or {
+			cfg.free()
+			return err
+		}
+	}
+	return cfg
+}
+
+// persist_identity writes key.pem (0600) then cert.pem into `dir` (created
+// 0700 if missing). Key first: a crash between the two writes must never leave
+// a cert on disk whose key is lost, or the next start would load a half pair.
+fn persist_identity(cfg &Config, dir string) ! {
+	if !os.exists(dir) {
+		os.mkdir_all(dir, mode: 0o700) or { return error('vtls: cannot create ${dir}: ${err}') }
+	}
+	key := cfg.key_pem()
+	if key == '' {
+		return error('vtls: private key export failed, nothing persisted')
+	}
+	key_path := os.join_path(dir, 'key.pem')
+	os.write_file(key_path, key) or { return error('vtls: cannot write ${key_path}: ${err}') }
+	os.chmod(key_path, 0o600) or { return error('vtls: cannot chmod ${key_path}: ${err}') }
+	cert_path := os.join_path(dir, 'cert.pem')
+	os.write_file(cert_path, cfg.cert_pem()) or {
+		return error('vtls: cannot write ${cert_path}: ${err}')
 	}
 }
 
@@ -106,10 +159,25 @@ pub fn (c &Config) set_alpn(protos string) ! {
 	}
 }
 
-// cert_pem returns the certificate as PEM (e.g. to save so a client can trust a
-// self-signed cert: `curl --cacert server.pem`).
+// cert_pem returns the certificate as PEM, to hand to clients that must trust
+// a self-signed server: `curl --cacert server.pem`, an Android
+// network-security-config trust anchor, a browser exception. Pair it with
+// `persist_dir` in new_self_signed, otherwise the PEM is only valid for the
+// current process - the next start generates a different certificate.
 pub fn (c &Config) cert_pem() string {
 	p := C.vtls_cert_pem(c.ctx)
+	if p == unsafe { nil } {
+		return ''
+	}
+	return unsafe { cstring_to_vstring(p) }
+}
+
+// key_pem returns the private key as PEM - exported for new_self_signed
+// configs, a copy of the input for new_from_pem ones. It is what
+// `persist_dir` writes to key.pem; treat it like any private key - never
+// log it. Empty only if the key did not fit the 2 KiB buffer.
+pub fn (c &Config) key_pem() string {
+	p := C.vtls_key_pem(c.ctx)
 	if p == unsafe { nil } {
 		return ''
 	}
