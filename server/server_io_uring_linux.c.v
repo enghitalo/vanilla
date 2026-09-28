@@ -579,10 +579,14 @@ fn io_uring_worker_loop(worker &io_uring.Worker, mut env IouEnv, limits Limits, 
 	// configured; otherwise the loop blocks indefinitely — no clock read, no wake
 	// (zero cost on the default path). When on, the sweep interval is the scan's
 	// rate limit (a busy worker does not walk its connection table after every
-	// batch), and the wait never blocks past the next due scan (an idle worker
-	// still wakes to reap), so a deadline is acted on at most one interval (plus
-	// the batch) late. Waiting a full interval after a batch that landed just
-	// before the scan was due would let it slip to almost two.
+	// batch), and while a connection is live the wait never blocks past the next
+	// due scan (a quiet worker still wakes to reap), so a deadline is acted on at
+	// most one interval (plus the batch) late. Waiting a full interval after a
+	// batch that landed just before the scan was due would let it slip to almost
+	// two. A worker with NO live connection has nothing to reap and blocks until
+	// a completion, like the default path: the accept that wakes it is followed
+	// by the check below, which scans if one is due and bounds the next wait, so
+	// the new connection's deadlines keep the one-interval bound.
 	sweep_ms := limits.sweep_interval_ms()
 	sweep_on := sweep_ms > 0
 	sweep_ns := u64(sweep_ms) * 1_000_000
@@ -597,9 +601,11 @@ fn io_uring_worker_loop(worker &io_uring.Worker, mut env IouEnv, limits Limits, 
 	for {
 		// ONE syscall per loop iteration: flush every SQE queued during the last
 		// drain and block until at least one completion is ready (or, when a
-		// timeout is set, until the sweep interval elapses → -ETIME).
+		// timeout is set and a connection is live, until the next scan is due →
+		// -ETIME). free_top counts free pool slots, so a full stack means none is
+		// live.
 		mut ret := 0
-		if sweep_on {
+		if sweep_on && worker.free_top < worker.conns.len {
 			mut first := &C.io_uring_cqe(unsafe { nil })
 			ts.tv_nsec = i64(wait_ns)
 			ret = C.io_uring_submit_and_wait_timeout(&worker.ring, &first, 1, &ts, unsafe { nil })
