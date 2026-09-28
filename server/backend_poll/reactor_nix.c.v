@@ -12,7 +12,8 @@ module backend_poll
 // assume it), so accept wake-order across workers is kernel-defined (herd
 // skew). Same request semantics as the epoll backend — pipelining, split
 // framing, limits (400/413/431), Expect: 100-continue, streamed large-body
-// drain, half-close, read/write timeouts, graceful shutdown drain — minus
+// drain, half-close, read/write/idle timeouts (deadlines start at accept, so
+// a silent connection is reaped too), graceful shutdown drain — minus
 // the extras: no watch reactor (`.suspend` drops the connection, like
 // Windows/IOCP), no sendfile/queue_buf hand-offs (never enabled, so
 // `core.queue_file` returns false and handlers append bytes instead), no TLS.
@@ -52,11 +53,12 @@ mut:
 	read_buf          []u8
 	write_buf         []u8
 	write_off         int
-	read_deadline     u64 // monotonic ns; >0 while a request is mid-read
+	read_deadline     u64 // monotonic ns; >0 while waiting on a request: from accept for the first, from its first byte for a later one, or an idle deadline (see idle)
 	write_deadline    u64 // monotonic ns; >0 while a batch is pending
 	body_drain        i64 // >0 while a streamed large body is being discarded
 	close_after_flush bool
 	sent_100          bool
+	idle              bool // read_deadline is an idle deadline (nothing of a request has arrived yet): the first byte clears it, expiry closes silently
 }
 
 struct WorkerState {
@@ -64,7 +66,10 @@ mut:
 	conns      []&PollConn        // live connections (dense — index is NOT the fd)
 	free_conns []&PollConn        // retired states, buffers kept (same pooling as epoll)
 	pfds       []C.vanilla_pollfd // rebuilt each iteration: [listener?] + conns
-	parked     int                // connections with an armed deadline (gates the sweep)
+	parked     int                // armed deadlines, read + write (gates the sweep)
+	idle_ns    u64                // Limits.idle_ms() in ns; 0 = no idle deadlines
+	now        u64                // monotonic ns, read once per wake (only when a timeout is set) and reused by every arm and the sweep
+	next_sweep u64                // monotonic ns; the sweep is rate-limited to one scan per sweep interval
 	accepting  bool = true
 }
 
@@ -84,6 +89,10 @@ fn (mut w WorkerState) conn_for(fd int) &PollConn {
 
 // close_conn_at closes w.conns[i] and recycles its state (swap-remove keeps
 // the table dense; iteration order is per-worker private, so it may change).
+//
+// The slot is released BEFORE the close: once the peer can observe the close,
+// its max_connections slot is already free, so a client that reconnects on
+// EOF is never refused by a count that has not caught up.
 fn (mut w WorkerState) close_conn_at(i int, active_conns &core.Counter) {
 	mut cs := w.conns[i]
 	if cs.read_deadline != 0 {
@@ -92,8 +101,8 @@ fn (mut w WorkerState) close_conn_at(i int, active_conns &core.Counter) {
 	if cs.write_deadline != 0 {
 		w.parked--
 	}
-	socket.close_socket(cs.fd)
 	stdatomic.add_i64(&active_conns.n, -1)
+	socket.close_socket(cs.fd)
 	unsafe {
 		cs.read_buf.len = 0
 		cs.write_buf.len = 0
@@ -105,6 +114,7 @@ fn (mut w WorkerState) close_conn_at(i int, active_conns &core.Counter) {
 	cs.body_drain = 0
 	cs.close_after_flush = false
 	cs.sent_100 = false
+	cs.idle = false
 	w.conns.delete(i)
 	w.free_conns << cs
 }
@@ -151,7 +161,7 @@ fn flush_pending(mut w WorkerState, mut cs PollConn, limits core.Limits) int {
 		}
 		if n < 0 && (C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK) {
 			if limits.write_timeout_ms > 0 && cs.write_deadline == 0 {
-				cs.write_deadline = time.sys_mono_now() + u64(limits.write_timeout_ms) * 1_000_000
+				cs.write_deadline = w.now + u64(limits.write_timeout_ms) * 1_000_000
 				w.parked++
 			}
 			return 0
@@ -168,18 +178,35 @@ fn flush_pending(mut w WorkerState, mut cs PollConn, limits core.Limits) int {
 }
 
 // update_read_deadline — armed once while a request is mid-read (partial
-// bytes buffered or a body mid-drain), cleared when idle. Same total-time
-// semantics as every other backend.
+// bytes buffered or a body mid-drain), cleared once the read side is empty
+// (the request completed). Never refreshed by progress: an accept-time or
+// mid-request deadline keeps its total-time budget, the same semantics as
+// every other backend. An idle deadline is left alone — only the first byte
+// of the next request clears it (serve_readable).
 @[inline]
 fn update_read_deadline(limits core.Limits, mut w WorkerState, mut cs PollConn) {
 	if cs.read_buf.len > 0 || cs.body_drain > 0 {
 		if limits.read_timeout_ms > 0 && cs.read_deadline == 0 {
-			cs.read_deadline = time.sys_mono_now() + u64(limits.read_timeout_ms) * 1_000_000
+			cs.read_deadline = w.now + u64(limits.read_timeout_ms) * 1_000_000
 			w.parked++
 		}
-	} else if cs.read_deadline != 0 {
+	} else if cs.read_deadline != 0 && !cs.idle {
 		cs.read_deadline = 0
 		w.parked--
+	}
+}
+
+// arm_idle starts the keep-alive idle clock at a request boundary: the
+// response is fully handed to the kernel (callers only reach it after a full
+// flush, or when nothing was owed) and nothing of the next request is
+// buffered or mid-drain, so no read deadline governs. An armed idle deadline
+// is never extended (read_deadline != 0). Closing connections never get here.
+@[inline]
+fn arm_idle(mut w WorkerState, mut cs PollConn) {
+	if w.idle_ns != 0 && cs.read_deadline == 0 && cs.read_buf.len == 0 && cs.body_drain == 0 {
+		cs.read_deadline = w.now + w.idle_ns
+		cs.idle = true
+		w.parked++
 	}
 }
 
@@ -355,6 +382,14 @@ fn serve_readable(h core.Handler, mut w WorkerState, i int, limits core.Limits, 
 		unsafe {
 			cs.read_buf.len += n
 		}
+		if cs.idle {
+			// First byte of the next request: drop the idle deadline;
+			// update_read_deadline below arms a fresh read deadline if the
+			// request is still incomplete.
+			cs.idle = false
+			cs.read_deadline = 0
+			w.parked--
+		}
 		if !drain_requests(h, mut cs, limits, state) {
 			must_close = true
 			break
@@ -400,6 +435,9 @@ fn serve_readable(h core.Handler, mut w WorkerState, i int, limits core.Limits, 
 		w.close_conn_at(i, active_conns)
 		return false
 	}
+	// Keep-alive: everything answered is flushed (a parked batch returned
+	// above), including an empty-response cycle — wait for the next request.
+	arm_idle(mut w, mut cs)
 	return true
 }
 
@@ -427,17 +465,24 @@ fn handle_writable(mut w WorkerState, i int, limits core.Limits, active_conns &c
 		w.close_conn_at(i, active_conns)
 		return false
 	}
+	// The parked batch drained: back to waiting for the next request.
+	arm_idle(mut w, mut cs)
 	return true
 }
 
+// sweep_timeouts reaps every connection whose deadline passed (w.now). A read
+// deadline sends 408 only when part of a request is buffered; an idle wait,
+// or a peer that never spoke, closes silently.
 @[direct_array_access]
 fn sweep_timeouts(mut w WorkerState, active_conns &core.Counter) {
-	now := time.sys_mono_now()
+	now := w.now
 	mut i := 0
 	for i < w.conns.len {
 		cs := w.conns[i]
 		if cs.read_deadline > 0 && now > cs.read_deadline {
-			response.send_status_408_response(cs.fd)
+			if cs.read_buf.len > 0 || cs.body_drain > 0 {
+				response.send_status_408_response(cs.fd)
+			}
 			w.close_conn_at(i, active_conns)
 			continue // swap-remove: re-check index i
 		}
@@ -458,7 +503,15 @@ fn poll_worker(listener int, handler core.Handler, make_state fn () voidptr, lim
 		state = make_state()
 	}
 	mut w := WorkerState{}
-	sweep_on := limits.read_timeout_ms > 0 || limits.write_timeout_ms > 0
+	idle_ms := limits.idle_ms()
+	if idle_ms > 0 {
+		w.idle_ns = u64(idle_ms) * 1_000_000
+	}
+	// sweep_ms > 0 iff any timeout (read, write, idle) is on. With none set
+	// there are no clock reads, no sweep and poll() blocks forever.
+	sweep_ms := limits.sweep_interval_ms()
+	sweep_on := sweep_ms > 0
+	sweep_ns := u64(sweep_ms) * 1_000_000
 	for {
 		// Rebuild the pollfd set from connection state — O(nfds), the floor's
 		// documented cost (poll(2) itself is O(nfds) anyway). Interest derives
@@ -485,7 +538,7 @@ fn poll_worker(listener int, handler core.Handler, make_state fn () voidptr, lim
 			// done — exiting beats spinning on an empty poll set.
 			return
 		}
-		wait_ms := if sweep_on && w.parked > 0 { 250 } else { -1 }
+		wait_ms := if sweep_on && w.parked > 0 { sweep_ms } else { -1 }
 		num := poll.wait(&w.pfds[0], u64(w.pfds.len), wait_ms)
 		if num < 0 {
 			if C.errno == C.EINTR {
@@ -493,6 +546,9 @@ fn poll_worker(listener int, handler core.Handler, make_state fn () voidptr, lim
 			}
 			C.perror(c'poll')
 			return
+		}
+		if sweep_on {
+			w.now = time.sys_mono_now()
 		}
 		mut idx := 0
 		if w.accepting {
@@ -517,8 +573,20 @@ fn poll_worker(listener int, handler core.Handler, make_state fn () voidptr, lim
 						continue
 					}
 					socket.set_tcp_nodelay(client_fd)
-					w.conn_for(client_fd)
+					mut cs := w.conn_for(client_fd)
 					stdatomic.add_i64(&active_conns.n, 1)
+					// Birth: the connection waits for its first request from now
+					// on. read_timeout_ms bounds that whole first request (not
+					// refreshed by its first bytes); with no read timeout, a
+					// connection that has sent nothing is idle.
+					if limits.read_timeout_ms > 0 {
+						cs.read_deadline = w.now + u64(limits.read_timeout_ms) * 1_000_000
+						w.parked++
+					} else if w.idle_ns != 0 {
+						cs.read_deadline = w.now + w.idle_ns
+						cs.idle = true
+						w.parked++
+					}
 				}
 			}
 			idx = 1
@@ -558,7 +626,11 @@ fn poll_worker(listener int, handler core.Handler, make_state fn () voidptr, lim
 				serve_readable(handler, mut w, ci, limits, counter, active_conns, state)
 			}
 		}
-		if sweep_on && w.parked > 0 {
+		// Rate-limited: a busy worker scans its table at most once per
+		// interval (a timeout wake always scans), so expiry is at most one
+		// interval (+ the batch) late.
+		if sweep_on && w.parked > 0 && (num == 0 || w.now >= w.next_sweep) {
+			w.next_sweep = w.now + sweep_ns
 			sweep_timeouts(mut w, active_conns)
 		}
 	}
