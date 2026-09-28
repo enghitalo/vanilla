@@ -11,6 +11,8 @@ module vtest
 //     poll(-1); progress comes from the server (bytes or close), so the only
 //     clocks in a test are the server's own configs (Limits). A server that
 //     loses liveness hangs the test — deliberately (CI step timeout backstops).
+//     (The one bounded wait: drive() gives the server up to its shutdown grace
+//     to finish closing bookkeeping before it samples the leak counters.)
 //   - A run terminates exactly when every connection reached a terminal state:
 //     its script's expectations met, or EOF from the server.
 //   - Scripts are data. The engine is this one file; read it once and every
@@ -30,6 +32,7 @@ module vtest
 // first round's unsent bytes arm POLLOUT, and a refused connect surfaces as
 // POLLERR/POLLHUP ⇒ eof with the script unmet.
 import sync.stdatomic
+import time
 import server
 import socket
 import transport
@@ -88,7 +91,7 @@ pub:
 	// Server internals, sampled when this Outcome was built (after shutdown for
 	// drive(); live for fire()/wait()). inflight_after == 0 proves the drain;
 	// active_after can lag EOF bookkeeping by a beat on a live server — assert
-	// it == 0 in drive() outcomes.
+	// it == 0 in drive() outcomes, which wait for that bookkeeping to settle.
 	inflight_after i64
 	active_after   i64
 }
@@ -249,11 +252,27 @@ pub fn drive(config server.ServerConfig, scripts []Script) !Outcome {
 	mut h := start(config)!
 	o := h.fire(scripts)!
 	h.stop()
+	h.settle()
 	return Outcome{
 		group:          o.group
 		conns:          o.conns
 		inflight_after: h.inflight_sum()
 		active_after:   stdatomic.load_i64(&h.server.active_conns.n)
+	}
+}
+
+// settle waits, for at most grace_ms, until the server has finished the
+// bookkeeping for the connections stop() just closed. Server.shutdown returns
+// as soon as nothing is in flight, which can be before a worker has even woken
+// for the clients' FINs — sampling then would read a connection that is about
+// to be released as leaked. A real leak never settles, and the counters are
+// then sampled as they are, so the asserts still catch it.
+fn (h &Harness) settle() {
+	for _ in 0 .. h.grace_ms {
+		if h.inflight_sum() == 0 && stdatomic.load_i64(&h.server.active_conns.n) == 0 {
+			return
+		}
+		time.sleep(time.millisecond)
 	}
 }
 
