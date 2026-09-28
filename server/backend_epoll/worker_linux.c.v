@@ -174,6 +174,10 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 		0
 	}
 	st.idle_ns = u64(limits.idle_ms()) * 1_000_000
+	// Accept registers new fds for EPOLLOUT too (accept_events) exactly when
+	// a timeout is on: every connection's state is then created by its birth
+	// event (conn_birth), handled first in the loop below.
+	births := st.read_ns != 0 || st.idle_ns != 0
 	// Adaptive epoll_wait timeout (busy-poll hybrid). After a wait that returned
 	// events, poll again with timeout 0: under sustained load the next batch is
 	// usually already queued, so we skip the block→wake scheduler round-trip that
@@ -217,13 +221,38 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 					active_conns, mut st, state)
 				continue
 			}
+			if births && (fd >= st.conns.len || unsafe { st.conns[fd] == nil }) {
+				// No state yet. A new socket is writable at ADD, so a
+				// connection's FIRST report always carries EPOLLOUT (even when
+				// the peer already reset or half-closed it), and active watch
+				// fds were routed above. So this is either that birth — and
+				// conn_birth's MOD succeeds only while the fd is in this epoll —
+				// or a stale event for an fd closed earlier in this batch (a
+				// client, or a watch fd close_client tore down). accept may
+				// already have reused that number, for a connection this worker
+				// does not own or for one whose own birth event is still queued
+				// here. Closing or serving a stale fd would release a slot that
+				// was already released, or build a zombie state whose deadline
+				// later closes someone else's socket: drop the event.
+				if ev & u32(C.EPOLLOUT) == 0 || !conn_birth(epoll_fd, fd, mut st) {
+					continue
+				}
+				// Born, with nothing to write: skip the EPOLLOUT half.
+				if ev & (u32(C.EPOLLHUP) | u32(C.EPOLLERR)) != 0 {
+					close_client(mut reactor, epoll_fd, fd, active_conns, mut st) // gone already
+				} else if ev & u32(C.EPOLLIN) != 0 {
+					// The request often arrives with the connection, and under
+					// EPOLLET a skipped edge is never reported again.
+					handle_readable(handler, mut reactor, epoll_fd, fd, limits, counter,
+						active_conns, mut st, state)
+				}
+				continue
+			}
 			if ev & (u32(C.EPOLLHUP) | u32(C.EPOLLERR)) != 0 {
 				close_client(mut reactor, epoll_fd, fd, active_conns, mut st) // tears any watch down first
 				continue
 			}
 			if ev & u32(C.EPOLLOUT) != 0 {
-				// Also the birth of a connection accept registered with EPOLLOUT:
-				// that returns true, so its EPOLLIN half below still runs.
 				if !handle_writable_plain(epoll_fd, fd, active_conns, mut st) {
 					continue // connection closed — skip the EPOLLIN half of this event
 				}

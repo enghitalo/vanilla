@@ -343,21 +343,16 @@ fn flush_batch(epoll_fd int, fd int, limits core.Limits, active_conns &core.Coun
 	return true
 }
 
-// conn_birth handles the first EPOLLOUT of a connection that has no state yet:
-// accept registered it with EPOLLOUT (accept_events) because a deadline must
-// start at accept. It creates the state, arms that deadline — READ when
-// read_timeout_ms is set (it bounds the silence and the whole first request),
-// otherwise IDLE (a connection that has sent nothing is idle) — and switches
-// the fd back to EPOLLIN|EPOLLET. Returns true so the worker still runs the
-// EPOLLIN half of the same event: the request often arrives with the
-// connection, and under EPOLLET a skipped edge is never reported again.
+// conn_birth handles the first report of a connection that has no state yet
+// (it carries EPOLLOUT): accept registered it with EPOLLOUT (accept_events)
+// because a deadline must start at accept. It creates the state, arms that
+// deadline — READ when read_timeout_ms is set (it bounds the silence and the
+// whole first request), otherwise IDLE (a connection that has sent nothing is
+// idle) — and switches the fd back to EPOLLIN|EPOLLET. Returns false, and
+// creates nothing, for a stale event (see process_events_plain). Called only
+// when accept-time births are on.
 @[inline]
 fn conn_birth(epoll_fd int, fd int, mut st PlainState) bool {
-	if st.read_ns == 0 && st.idle_ns == 0 {
-		// Accept never armed EPOLLOUT: nil means a close raced this event in
-		// the same batch.
-		return false
-	}
 	// MOD before reading (never after: a read that closes the fd lets accept
 	// reuse the number). A failed MOD means the fd is no longer in this epoll
 	// — a stale event for a connection closed earlier in the batch.
@@ -397,16 +392,21 @@ fn arm_idle_deadline(mut st PlainState, mut cs ConnState) {
 	st.parked++
 }
 
-// handle_writable_plain drains a parked batch when the socket is writable; on
-// an fd with no state yet it is the connection's birth (conn_birth). Returns
-// false if the connection was closed or the event is stale (the worker must
-// then skip any further events for this fd in the current batch).
+// handle_writable_plain drains a parked batch when the socket is writable.
+// Returns false if the connection was closed (the worker must then skip any
+// further events for this fd in the current batch).
 @[direct_array_access; manualfree]
 fn handle_writable_plain(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainState) bool {
-	if fd >= st.conns.len || unsafe { st.conns[fd] == nil } {
-		return conn_birth(epoll_fd, fd, mut st)
+	if fd >= st.conns.len {
+		return false
 	}
 	mut cs := st.conns[fd]
+	if unsafe { cs == nil } {
+		// EPOLLOUT is only armed after state exists (an accept-time birth is
+		// handled by the worker loop); nil means a close raced this event in
+		// the same batch.
+		return false
+	}
 	if cs.body_drain > 0 {
 		// A streamed upload's response is buffered in write_buf but MUST stay held
 		// until the body is fully drained (drain-then-respond). If an earlier batch
@@ -484,8 +484,12 @@ fn sweep_timeouts(epoll_fd int, active_conns &core.Counter, mut st PlainState) {
 			// 408 only when part of a request arrived — a peer that never spoke
 			// (the accept-time deadline) gets a silent close. A taken-over
 			// connection no longer speaks HTTP — the 408 bytes would be protocol
-			// garbage to its peer; just close.
-			if cs.takeover == unsafe { nil } && (cs.read_buf.len > 0 || cs.body_drain > 0) {
+			// garbage to its peer; just close. Nor while a response is still
+			// pending on the write side (parked mid-send, or held until a
+			// streamed body drains): the 408 would land inside it, or be read
+			// as the answer to a request that was in fact answered.
+			if cs.takeover == unsafe { nil } && (cs.read_buf.len > 0 || cs.body_drain > 0)
+				&& cs.write_off >= cs.write_buf.len && cs.file_remaining <= 0 {
 				response.send_status_408_response(fd) // couldn't finish the request in time
 			}
 			close_conn(epoll_fd, fd, active_conns, mut st)

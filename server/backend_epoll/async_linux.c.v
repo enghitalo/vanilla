@@ -189,8 +189,12 @@ fn (mut r Reactor) reactor_watch(ext_fd int, client_fd int, cont core.WakeFn, ud
 
 // reactor_clear marks ext_fd's slot free. The fd itself stays in epoll (a
 // pool-owned connection is re-armed by the next watch); only the parked-request
-// record is dropped, so a stale readiness edge finds `active == false` and is
-// ignored.
+// record is dropped. When on_watch_ready clears a slot, the edge that woke it
+// has spent the fd's one-shot registration (register_watch), so the fd reports
+// nothing more until re-armed; the teardown callers DEL the fd right after. An
+// edge for it that is already in this batch finds `active == false` and falls
+// through to the client paths, which drop an event for an fd with no state
+// unless it is a birth, when accept-time births are on (process_events_plain).
 @[direct_array_access; inline]
 fn (mut r Reactor) reactor_clear(ext_fd int) {
 	if ext_fd >= 0 && ext_fd < r.watches.len {
@@ -272,8 +276,19 @@ fn (mut r Reactor) reactor_orphan_single(ext_fd int, client_fd int) bool {
 
 // register_watch is installed into EventLoop.register; it is what `event_loop.watch_fd(...)`
 // ultimately calls. It records the watch and arms the external fd in this
-// worker's epoll (level-triggered: simplest correct default for arbitrary
-// consumer fds). Runs on the worker thread, so no synchronization is needed.
+// worker's epoll: level-triggered (simplest correct default for arbitrary
+// consumer fds) and EPOLLONESHOT, so each arm reports at most ONE readiness.
+// Every consumer already re-arms (watch_fd again) to keep waiting, so the
+// one-shot costs nothing: that re-arm is the MOD below either way. It matters
+// once a continuation stops watching an fd it keeps open (it moved on to a
+// different fd, or finished without closing a pooled one): the spent
+// registration stays silent instead of re-firing with no watch behind it,
+// which busy-spun the worker and fell through to the client paths. There an
+// EPOLLOUT looked like a connection's birth (conn_birth would adopt the app's
+// fd and later close it). The runtime cannot DEL such an fd itself: on the
+// client path the continuation owns the fd and may already have closed it,
+// and accept may have reused the number for a new connection in this epoll.
+// Runs on the worker thread, so no synchronization is needed.
 fn register_watch(mut w core.EventLoop, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
 	if ext_fd < 0 {
 		// A consumer handed us a failed fd (e.g. timerfd_create returned -1); never
@@ -285,12 +300,12 @@ fn register_watch(mut w core.EventLoop, ext_fd int, interest core.WatchInterest,
 	r.armed = true // sticky: the event loop starts probing the watch table
 	if r.rearming_dead {
 		// Tombstone re-arm (drain_pipelined dead branch): the queue slot stays
-		// exactly as it is — only the (already-armed, level-triggered) fd needs to
-		// remain in epoll. Do NOT touch the watch table: a dedup match would
-		// refresh the tombstone, and a dedup that skips dead slots would append a
-		// duplicate live entry for a dead client.
-		if epoll.mod_fd_in_epoll(w.loop_fd, ext_fd, u32(C.EPOLLIN)) != 0 {
-			epoll.add_fd_to_epoll(w.loop_fd, ext_fd, u32(C.EPOLLIN))
+		// exactly as it is — only the fd needs re-arming in epoll (this edge spent
+		// its one-shot registration). Do NOT touch the watch table: a dedup match
+		// would refresh the tombstone, and a dedup that skips dead slots would
+		// append a duplicate live entry for a dead client.
+		if epoll.mod_fd_in_epoll(w.loop_fd, ext_fd, u32(C.EPOLLIN) | u32(C.EPOLLONESHOT)) != 0 {
+			epoll.add_fd_to_epoll(w.loop_fd, ext_fd, u32(C.EPOLLIN) | u32(C.EPOLLONESHOT))
 		}
 		w.last_watched = ext_fd
 		return
@@ -302,9 +317,14 @@ fn register_watch(mut w core.EventLoop, ext_fd int, interest core.WatchInterest,
 		// this re-stamps it every park; promotion to a queue preserves it.
 		r.watches[ext_fd].persistent = true
 	}
-	events := if interest == .writable { u32(C.EPOLLOUT) } else { u32(C.EPOLLIN) }
+	events := if interest == .writable {
+		u32(C.EPOLLOUT) | u32(C.EPOLLONESHOT)
+	} else {
+		u32(C.EPOLLIN) | u32(C.EPOLLONESHOT)
+	}
 	// Re-arm if the fd is already in this worker's epoll (a pool-owned connection
-	// re-watched across queries), otherwise add it (a fresh request-owned fd).
+	// re-watched across queries, or a one-shot spent by the edge that ran this
+	// continuation), otherwise add it (a fresh request-owned fd).
 	// Trying MOD first avoids an EEXIST perror on every pool-fd reuse and needs no
 	// extra bookkeeping: a fresh fd's MOD fails with ENOENT and falls through to ADD.
 	if epoll.mod_fd_in_epoll(w.loop_fd, ext_fd, events) != 0 {
@@ -426,6 +446,9 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 				return
 			}
 			cs.body_drain -= dn
+			if cs.body_drain == 0 {
+				end_read_deadline(mut st, mut cs) // the streamed request is complete
+			}
 			continue
 		}
 		if cs.read_buf.len == cs.read_buf.cap {
@@ -557,7 +580,9 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 // the deadline is armed once and not refreshed on progress, so read_timeout_ms
 // — when set (default 0 = off) — bounds the TOTAL time to receive a request,
 // including a streamed body. Size it for the largest upload you accept. A
-// connection's first request keeps the deadline conn_birth armed at accept.
+// connection's first request keeps the deadline conn_birth armed at accept;
+// completing a request ends its deadline (end_read_deadline), so a pipelined
+// partial behind it is armed afresh here.
 @[inline]
 fn update_read_deadline(limits core.Limits, mut st PlainState, mut cs ConnState) {
 	if cs.awaiting_fd < 0 && (cs.read_buf.len > 0 || cs.body_drain > 0) {
@@ -896,7 +921,23 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 		}
 	}
 	compact_read_buf(mut cs, pos)
+	if pos > 0 {
+		end_read_deadline(mut st, mut cs)
+	}
 	return true
+}
+
+// end_read_deadline clears the read deadline of a request that just
+// completed (consumed by drain_requests, or a streamed body fully drained).
+// Anything still buffered is the NEXT request: update_read_deadline then arms
+// it a fresh deadline from this batch, so a pipelined request never inherits
+// the clock armed at accept or for the request before it.
+@[inline]
+fn end_read_deadline(mut st PlainState, mut cs ConnState) {
+	if cs.read_deadline != 0 {
+		cs.read_deadline = 0
+		st.parked--
+	}
 }
 
 // compact_read_buf drops the first `pos` consumed bytes, keeping the leftover
@@ -980,13 +1021,18 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 		return
 	}
 	client_fd := parked_client
-	if client_fd >= st.conns.len {
+	if client_fd >= st.conns.len || unsafe { st.conns[client_fd] == nil } {
+		// The client was closed by a path that is not close_client (a failed
+		// write, a write timeout while parked) and its watch was left armed.
+		// Nothing will ever run this continuation: close a request-owned fd,
+		// as close_client would have. This edge spent its one-shot
+		// registration, so it would never fire again and would leak.
+		if !reactor.watches[ext_fd].persistent {
+			epoll.remove_fd_from_epoll(epoll_fd, ext_fd) // DEL + close
+		}
 		return
 	}
 	mut cs := st.conns[client_fd]
-	if unsafe { cs == nil } {
-		return
-	}
 	cs.awaiting_fd = -1
 	mut event_loop := core.EventLoop{
 		client_fd: client_fd
@@ -1060,6 +1106,9 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 			}
 			if cs.write_buf.len > cs.write_off {
 				if !flush_batch(epoll_fd, client_fd, limits, active_conns, mut st, mut cs) {
+					// The peer is gone: tear down the watch just re-armed for it.
+					detach_rejected_watch(mut reactor, epoll_fd, event_loop.last_watched,
+						client_fd)
 					return
 				}
 			}
