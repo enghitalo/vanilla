@@ -538,7 +538,18 @@ fn poll_worker(listener int, handler core.Handler, make_state fn () voidptr, lim
 			// done — exiting beats spinning on an empty poll set.
 			return
 		}
-		wait_ms := if sweep_on && w.parked > 0 { sweep_ms } else { -1 }
+		// With a deadline armed, block only until the next scan is due (at most
+		// one interval): a traffic wake just before next_sweep skips the scan,
+		// and waiting a full interval after it would make expiry up to two
+		// intervals late. w.now is this iteration's cached clock (no extra
+		// read); rounding up lands the wake at/after next_sweep.
+		wait_ms := if !(sweep_on && w.parked > 0) {
+			-1
+		} else if w.now >= w.next_sweep {
+			0
+		} else {
+			int((w.next_sweep - w.now + 999_999) / 1_000_000)
+		}
 		num := poll.wait(&w.pfds[0], u64(w.pfds.len), wait_ms)
 		if num < 0 {
 			if C.errno == C.EINTR {
@@ -627,8 +638,9 @@ fn poll_worker(listener int, handler core.Handler, make_state fn () voidptr, lim
 			}
 		}
 		// Rate-limited: a busy worker scans its table at most once per
-		// interval (a timeout wake always scans), so expiry is at most one
-		// interval (+ the batch) late.
+		// interval (a timeout wake always scans). The wait above never sleeps
+		// past next_sweep, so consecutive scans are at most one interval
+		// (+ the batch) apart and so is expiry lateness.
 		if sweep_on && w.parked > 0 && (num == 0 || w.now >= w.next_sweep) {
 			w.next_sweep = w.now + sweep_ns
 			sweep_timeouts(mut w, active_conns)
