@@ -13,6 +13,8 @@
 // exactly once, timers included; a parked request closed by a write-side path
 // (write timeout, pending-write cap) has its watch torn down; and a spent
 // watch on an fd the app keeps open is never adopted as a connection.
+// The checks that need no watch reactor or takeover also run on the poll
+// backend (`-d vanilla_poll`), which shares the 408 / fresh-deadline rules.
 //
 // vtest contract (docs/VTEST.md): the only clocks are the server's Limits. A
 // "pause longer than idle" is produced by a WITNESS connection the server
@@ -1032,5 +1034,66 @@ fn test_epoll_connect_storm_served() ! {
 		check_connect_storm_served(.epoll, server.Limits{
 			idle_timeout_ms: 2000
 		})!
+	}
+}
+
+// --- poll (-d vanilla_poll): the checks that need no watch reactor ----------
+
+fn test_poll_pipelined_partial_fresh_deadline() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_pipelined_partial_fresh_deadline(.poll, 'GET / HTTP/1.1\r\nHost: x\r\n'.bytes(),
+				'\r\nGET / HTTP/1.1\r\nHo'.bytes(), 'st: x\r\n\r\n'.bytes())!
+			head := 'POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: ${et_upload_body_len}\r\n\r\n'.bytes()
+			chunk := []u8{len: et_upload_chunk_len, init: u8(0x61)}
+			rest := []u8{len: et_upload_body_len - et_upload_chunk_len, init: u8(0x61)}
+			check_pipelined_partial_fresh_deadline(.poll, et_concat(head, chunk), et_concat(rest,
+				'GET / HTTP/1.1\r\nHo'.bytes()), 'st: x\r\n\r\n'.bytes())!
+		}
+	}
+}
+
+fn test_poll_no_408_inside_pending_response() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_no_408_inside_pending_response(.poll)!
+		}
+	}
+}
+
+fn test_poll_stalled_upload_408() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_stalled_upload_408(.poll)!
+		}
+	}
+}
+
+fn test_poll_expect_100_under_timeouts() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_expect_100_under_timeouts(.poll)!
+		}
+	}
+}
+
+fn test_poll_streamed_upload_under_timeouts() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_streamed_upload_under_timeouts(.poll)!
+		}
+	}
+}
+
+fn test_poll_connect_storm_served() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_connect_storm_served(.poll, server.Limits{
+				read_timeout_ms: 2000
+			})!
+			check_connect_storm_served(.poll, server.Limits{
+				idle_timeout_ms: 2000
+			})!
+		}
 	}
 }
