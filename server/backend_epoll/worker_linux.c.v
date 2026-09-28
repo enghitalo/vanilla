@@ -163,21 +163,32 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 		}
 		on_worker_start(state, mut startup_loop)
 	}
-	// Only arm the timeout sweep if a deadline is actually configured.
-	sweep_on := limits.read_timeout_ms > 0 || limits.write_timeout_ms > 0
+	// Only run the clock and the timeout sweep if a deadline is actually
+	// configured (sweep_interval_ms is 0 when read, write and idle are all off).
+	sweep_ms := limits.sweep_interval_ms()
+	sweep_on := sweep_ms > 0
+	sweep_ns := u64(sweep_ms) * 1_000_000
+	st.read_ns = if limits.read_timeout_ms > 0 {
+		u64(limits.read_timeout_ms) * 1_000_000
+	} else {
+		0
+	}
+	st.idle_ns = u64(limits.idle_ms()) * 1_000_000
 	// Adaptive epoll_wait timeout (busy-poll hybrid). After a wait that returned
 	// events, poll again with timeout 0: under sustained load the next batch is
 	// usually already queued, so we skip the block→wake scheduler round-trip that
 	// a blocking epoll_wait pays per iteration. An EMPTY poll drops straight back
-	// to a blocking wait (250 ms when something is parked so the timeout sweep
-	// still fires, otherwise -1 = sleep until the next event), so an idle worker
-	// burns zero CPU — it only ever spins while there is work to do.
+	// to a blocking wait (until the next sweep is due — at most sweep_ms — while
+	// a deadline is armed, otherwise -1 = sleep until the next event), so an idle
+	// worker burns zero CPU — it only ever spins while there is work to do.
 	mut hot := false
 	for {
 		wait_ms := if hot {
 			0
 		} else if sweep_on && st.parked > 0 {
-			250
+			// The end-of-batch check below keeps next_sweep ahead of st.now
+			// whenever a deadline is armed; +1 rounds the ms up.
+			if st.next_sweep > st.now { int((st.next_sweep - st.now) / 1_000_000) + 1 } else { 0 }
 		} else {
 			-1
 		}
@@ -189,6 +200,9 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 			}
 			C.perror(c'epoll_wait')
 			break
+		}
+		if sweep_on {
+			st.tick() // the batch clock: one read per iteration, reused by every deadline
 		}
 		hot = num_events > 0
 		for i in 0 .. num_events {
@@ -208,6 +222,8 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 				continue
 			}
 			if ev & u32(C.EPOLLOUT) != 0 {
+				// Also the birth of a connection accept registered with EPOLLOUT:
+				// that returns true, so its EPOLLIN half below still runs.
 				if !handle_writable_plain(epoll_fd, fd, active_conns, mut st) {
 					continue // connection closed — skip the EPOLLIN half of this event
 				}
@@ -218,9 +234,12 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 			}
 		}
 		// After handling this batch (or a timeout wake with num_events == 0),
-		// reap any connection whose read/write deadline has passed.
-		if sweep_on && st.parked > 0 {
+		// reap any connection whose read/write/idle deadline has passed — at most
+		// once per sweep interval, so a busy worker does not walk its connection
+		// table after every batch.
+		if sweep_on && st.parked > 0 && st.now >= st.next_sweep {
 			sweep_timeouts(epoll_fd, active_conns, mut st)
+			st.next_sweep = st.now + sweep_ns
 		}
 	}
 }

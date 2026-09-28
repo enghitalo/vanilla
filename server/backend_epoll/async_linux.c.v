@@ -27,7 +27,6 @@ import epoll
 import http1_1.request_parser
 import http1_1.response
 import sync.stdatomic
-import time
 
 #include <errno.h>
 #include <sys/epoll.h>
@@ -472,6 +471,12 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 		unsafe {
 			cs.read_buf.len += n
 		}
+		// First byte of a request: the idle wait is over. If the request stays
+		// incomplete, update_read_deadline arms its read deadline below.
+		if cs.idle_deadline != 0 {
+			cs.idle_deadline = 0
+			st.parked--
+		}
 		if !drain_requests(h, mut reactor, epoll_fd, fd, limits, active_conns, mut st, mut cs,
 			state) {
 			return
@@ -536,7 +541,11 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 	// upgrade request and reads the socket to EAGAIN (edge-triggered contract).
 	if cs.takeover != unsafe { nil } {
 		serve_takeover_conn(mut reactor, epoll_fd, fd, limits, active_conns, mut st, mut cs, state)
+		return
 	}
+	// Every response of this burst is out: a request boundary (arm_idle_deadline
+	// declines if anything is still pending, buffered or parked).
+	arm_idle_deadline(mut st, mut cs)
 }
 
 // update_read_deadline arms the read deadline ONCE while a request is mid-read
@@ -547,12 +556,13 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 // requests, not a stalled read. Like every other read path (TLS, io_uring),
 // the deadline is armed once and not refreshed on progress, so read_timeout_ms
 // — when set (default 0 = off) — bounds the TOTAL time to receive a request,
-// including a streamed body. Size it for the largest upload you accept.
+// including a streamed body. Size it for the largest upload you accept. A
+// connection's first request keeps the deadline conn_birth armed at accept.
 @[inline]
 fn update_read_deadline(limits core.Limits, mut st PlainState, mut cs ConnState) {
 	if cs.awaiting_fd < 0 && (cs.read_buf.len > 0 || cs.body_drain > 0) {
 		if limits.read_timeout_ms > 0 && cs.read_deadline == 0 {
-			cs.read_deadline = time.sys_mono_now() + u64(limits.read_timeout_ms) * 1_000_000
+			cs.read_deadline = st.now + u64(limits.read_timeout_ms) * 1_000_000
 			st.parked++
 		}
 	} else if cs.read_deadline != 0 {
