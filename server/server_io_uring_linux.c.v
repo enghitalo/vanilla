@@ -61,9 +61,6 @@ const iou_stream_body_above = 1024 * 1024
 // Close a peer that pipelines requests but never drains responses, before its
 // response batch grows without bound.
 const iou_max_pending_write = 8 * 1024 * 1024
-// How often the worker wakes to sweep stale connections when a read timeout is
-// configured (ns). Zero cost when no timeout is set — the loop blocks instead.
-const iou_sweep_interval_ns = i64(250 * 1_000_000)
 
 // iou_release decrements the global connection count (only when max_connections
 // accounting is active) and returns the connection to its pool. pool_release is
@@ -78,20 +75,29 @@ fn iou_release(worker &io_uring.Worker, mut conn io_uring.Connection, active_con
 	io_uring.pool_release_from_ptr(worker, mut conn)
 }
 
-// iou_arm_recv posts the next recv and maintains the read deadline: armed while a
-// partial request is buffered (read_buf.len > 0), cleared on an idle keep-alive
-// wait (read_buf empty) so idle connections are never reaped mid-keep-alive.
-// All deadline logic is gated on read_timeout_ms > 0, so the default path pays
-// nothing (no clock read, no shared state). Returns false if the SQ is full.
+// iou_arm_recv posts the next recv and arms the read deadline. Every wait for
+// request bytes goes through here, so none is unbounded while a timeout is set:
+//   * a partial request is buffered: arm the read deadline (read_timeout_ms)
+//     unless one is already armed — the accept-time deadline or this request's
+//     own is kept, never refreshed by progress (slowloris bound);
+//   * nothing is buffered and no deadline is armed: a keep-alive wait (or a new
+//     connection without read_timeout_ms), so arm the IDLE deadline
+//     (worker.idle_ns); handle_io_uring_read drops it on the first byte.
+// An empty buffer WITH a deadline is a new connection's accept-time deadline,
+// which stays. Callers clear a spent deadline before arming (flush, park, the
+// no-output drain in handle_io_uring_read). Gated on read_timeout_ms / idle_ns,
+// so the default path pays two compares (no clock read, no shared state).
+// Returns false if the SQ is full.
 @[inline]
 fn iou_arm_recv(worker &io_uring.Worker, mut conn io_uring.Connection, limits Limits) bool {
-	if limits.read_timeout_ms > 0 {
+	if (limits.read_timeout_ms > 0 || worker.idle_ns > 0) && conn.read_deadline == 0 {
 		if conn.read_buf.len > 0 {
-			if conn.read_deadline == 0 {
+			if limits.read_timeout_ms > 0 {
 				conn.read_deadline = time.sys_mono_now() + u64(limits.read_timeout_ms) * 1_000_000
 			}
-		} else {
-			conn.read_deadline = 0
+		} else if worker.idle_ns > 0 {
+			conn.read_deadline = time.sys_mono_now() + worker.idle_ns
+			conn.idle = true
 		}
 	}
 	return io_uring.prepare_recv(&worker.ring, mut conn)
@@ -147,8 +153,9 @@ fn iou_flush_response(worker &io_uring.Worker, mut conn io_uring.Connection, lim
 	// is full (posted == false) no send CQE will ever arrive, so a pre-increment
 	// would leak into worker.inflight and make Server.shutdown() wait out its whole
 	// grace period. (A full SQ still leaves the connection without an in-flight op —
-	// a pre-existing limitation shared by every prepare_* call site, reachable only
-	// on a degraded ring; the counter, at least, now stays exact.)
+	// a pre-existing limitation of the send-side call sites, reachable only on a
+	// degraded ring; the counter, at least, now stays exact. The recv arms instead
+	// release the connection when their SQE cannot be queued.)
 	if posted && unsafe { worker.inflight != nil } {
 		stdatomic.add_i64(&worker.inflight.n, 1)
 	}
@@ -195,6 +202,13 @@ fn handle_io_uring_accept(worker &io_uring.Worker, cqe &C.io_uring_cqe, limits L
 				if track {
 					stdatomic.add_i64(&active_conns.n, 1)
 				}
+				// Birth: the first request must arrive COMPLETE within read_timeout_ms
+				// of accept, so a peer that connects and never sends is reaped.
+				// Without a read timeout, iou_arm_recv arms the idle deadline instead
+				// (a connection that has sent nothing is idle).
+				if limits.read_timeout_ms > 0 {
+					nc.read_deadline = time.sys_mono_now() + u64(limits.read_timeout_ms) * 1_000_000
+				}
 				if !iou_arm_recv(worker, mut *nc, limits) {
 					iou_release(worker, mut *nc, active_conns, track)
 				}
@@ -240,12 +254,23 @@ fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, mut env Io
 	if conn.body_drain > 0 {
 		conn.body_drain -= res
 		if conn.body_drain > 0 {
-			iou_arm_drain_recv(worker, mut *conn, limits) // more body to consume
+			// More body to consume. A recv that cannot be queued would leave the
+			// connection with no op in flight — nothing could ever complete (or
+			// reap) it — so drop it instead.
+			if !iou_arm_drain_recv(worker, mut *conn, limits) {
+				iou_release(worker, mut *conn, active_conns, track)
+			}
 		} else {
 			// Whole body drained — now send the response prepared from the head.
 			iou_flush_response(worker, mut *conn, limits)
 		}
 		return
+	}
+	// First byte of a request after an idle wait: drop the idle deadline. If the
+	// request stays partial, iou_arm_recv below arms a fresh read deadline.
+	if conn.idle {
+		conn.idle = false
+		conn.read_deadline = 0
 	}
 	unsafe {
 		conn.read_buf.len += res
@@ -299,8 +324,9 @@ fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, mut env Io
 				// Handler errored on the head (send the error, then close), or the
 				// whole body happened to be buffered already — either way send now.
 				iou_flush_response(worker, mut *conn, limits)
-			} else {
-				iou_arm_drain_recv(worker, mut *conn, limits) // start draining the body
+			} else if !iou_arm_drain_recv(worker, mut *conn, limits) {
+				// Could not start draining the body (SQ full): drop, as above.
+				iou_release(worker, mut *conn, active_conns, track)
 			}
 			return
 		}
@@ -313,7 +339,17 @@ fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, mut env Io
 	if conn.read_buf.len == conn.read_buf.cap && total > conn.read_buf.cap && total <= req_cap {
 		unsafe { conn.read_buf.grow_cap(total - conn.read_buf.cap) }
 	}
-	iou_arm_recv(worker, mut *conn, limits)
+	if conn.read_buf.len == 0 {
+		// Every buffered request was answered with nothing to send (a handler
+		// returned .done with no output): its read deadline is spent. Clear it so
+		// iou_arm_recv arms the idle deadline for this keep-alive wait.
+		conn.read_deadline = 0
+	}
+	// No op in flight if the recv cannot be queued (degraded ring): drop the
+	// connection rather than leave it unreachable by any completion or sweep.
+	if !iou_arm_recv(worker, mut *conn, limits) {
+		iou_release(worker, mut *conn, active_conns, track)
+	}
 }
 
 // buf_view returns a non-owning []u8 window into buf[start..start+length] with the
@@ -410,10 +446,12 @@ fn handle_io_uring_write(worker &io_uring.Worker, cqe &C.io_uring_cqe, mut env I
 			return
 		}
 	}
-	// Keep-alive: read the next request. read_buf still holds any pipelined
-	// leftover; iou_arm_recv re-arms the read deadline iff that leftover is a
-	// partial request, and leaves an idle keep-alive wait deadline-free.
-	iou_arm_recv(worker, mut *conn, limits)
+	// Keep-alive: read the next request. The flush cleared the read deadline;
+	// read_buf still holds any pipelined leftover, so iou_arm_recv arms a read
+	// deadline if that leftover is a partial request, else the idle deadline.
+	if !iou_arm_recv(worker, mut *conn, limits) {
+		iou_release(worker, mut *conn, active_conns, track)
+	}
 }
 
 fn dispatch_io_uring_cqe(worker &io_uring.Worker, cqe &C.io_uring_cqe, mut env IouEnv, limits Limits, active_conns &core.Counter) {
@@ -436,18 +474,20 @@ fn dispatch_io_uring_cqe(worker &io_uring.Worker, cqe &C.io_uring_cqe, mut env I
 	}
 }
 
-// iou_sweep_timeouts half-closes every connection whose read OR write deadline
-// has passed. It calls shutdown(2) (NOT close): the connection still has its
-// single recv/send in flight, so closing here would free the pool slot while a
-// completion is still pending — and a fresh accept could reuse that slot under
-// the stale CQE. shutdown makes the in-flight op complete with an error/EOF, and
+// iou_sweep_timeouts half-closes every connection whose read (including idle) OR
+// write deadline passed before `now` — silently: io_uring sends no 408. It calls
+// shutdown(2) (NOT close): the connection still has its single recv/send in
+// flight, so closing here would free the pool slot while a completion is still
+// pending — and a fresh accept could reuse that slot under the stale CQE.
+// shutdown makes the in-flight op complete with an error/EOF, and
 // handle_io_uring_read/write then frees the slot the normal way, after its CQE is
-// drained. Scanned only when a read or write timeout is configured.
+// drained. Run by the worker loop at most once per Limits.sweep_interval_ms(),
+// and only when a timeout is configured.
 @[direct_array_access]
-fn iou_sweep_timeouts(worker &io_uring.Worker) {
+fn iou_sweep_timeouts(worker &io_uring.Worker, now u64) {
 	mut w := unsafe { &io_uring.Worker(worker) }
-	now := time.sys_mono_now()
-	for i in 0 .. w.conns.len {
+	// Slots below used_lo have never been handed out (see pool_acquire).
+	for i in w.used_lo .. w.conns.len {
 		mut c := unsafe { &w.conns[i] }
 		if unsafe { c.owner == nil } {
 			continue // free slot
@@ -486,6 +526,8 @@ fn io_uring_worker_main(listener int, cpu_id int, handler core.Handler, make_sta
 	// freed on release — per-request memcpy + realloc churn at high conn counts).
 	core.enable_queue_buf()
 	io_uring.pool_init(mut worker)
+	// Resolve the keep-alive idle budget once (iou_arm_recv reads it per arm).
+	worker.idle_ns = u64(limits.idle_ms()) * 1_000_000
 
 	ring_entries := iou_init_ring(&worker.ring) or {
 		eprintln('Failed to initialize io_uring for worker ${cpu_id}: ${err.msg()}')
@@ -531,19 +573,25 @@ fn io_uring_worker_main(listener int, cpu_id int, handler core.Handler, make_sta
 fn io_uring_worker_loop(worker &io_uring.Worker, mut env IouEnv, limits Limits, active_conns &core.Counter) {
 	io_uring.prepare_accept(&worker.ring, worker.socket_fd, worker.use_multishot)
 
-	// Only arm the periodic timeout wake when a read or write timeout is
-	// configured; otherwise the loop blocks indefinitely (zero cost on the
-	// default path).
-	sweep_on := limits.read_timeout_ms > 0 || limits.write_timeout_ms > 0
+	// The deadline sweep runs only when a timeout (read, write or idle) is
+	// configured; otherwise the loop blocks indefinitely — no clock read, no wake
+	// (zero cost on the default path). When on, the sweep interval is both the
+	// wait timeout (an idle worker still wakes to reap) and the scan's rate limit
+	// (a busy worker does not walk its connection table after every batch), so a
+	// deadline is acted on at most about one interval late.
+	sweep_ms := limits.sweep_interval_ms()
+	sweep_on := sweep_ms > 0
+	sweep_ns := u64(sweep_ms) * 1_000_000
 	mut ts := C.__kernel_timespec{
 		tv_sec:  0
-		tv_nsec: iou_sweep_interval_ns
+		tv_nsec: i64(sweep_ns)
 	}
+	mut next_sweep := u64(0)
 
 	mut cqes := unsafe { [io_uring.drain_batch]&C.io_uring_cqe{} }
 	for {
 		// ONE syscall per loop iteration: flush every SQE queued during the last
-		// drain and block until at least one completion is ready (or, when a read
+		// drain and block until at least one completion is ready (or, when a
 		// timeout is set, until the sweep interval elapses → -ETIME).
 		mut ret := 0
 		if sweep_on {
@@ -587,7 +635,12 @@ fn io_uring_worker_loop(worker &io_uring.Worker, mut env IouEnv, limits Limits, 
 			iou_retry_pending_polls(mut env)
 		}
 		if sweep_on {
-			iou_sweep_timeouts(worker)
+			// One clock read per iteration, reused by the scan.
+			now := time.sys_mono_now()
+			if now >= next_sweep {
+				iou_sweep_timeouts(worker, now)
+				next_sweep = now + sweep_ns
+			}
 		}
 	}
 }
@@ -652,10 +705,12 @@ fn iou_release_supports_multishot(release string) bool {
 // its own ring + SO_REUSEPORT listener + connection pool.
 //
 // Limits parity with the epoll backend: max_request_bytes/header/body (413/431),
-// max_connections (refused at accept), read_timeout_ms (slowloris: a partial
-// request that stalls is half-closed by the per-worker sweep) and write_timeout_ms
-// (a peer that stops reading mid-response is half-closed the same way) are all
-// enforced.
+// max_connections (refused at accept), read_timeout_ms (from accept for the first
+// request, so a silent connect is reaped too; a later partial request that stalls
+// is reaped the same way), idle_timeout_ms (a keep-alive connection that sends no
+// byte of its next request) and write_timeout_ms (a peer that stops reading
+// mid-response) are all enforced by the per-worker sweep, which half-closes the
+// connection silently (no 408 on this backend).
 //
 // Graceful shutdown: Server.shutdown() sets the shared draining flag and
 // shutdown(2)s every listener in server.listener_fds (created up front in
