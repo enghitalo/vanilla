@@ -1097,3 +1097,58 @@ fn test_poll_connect_storm_served() ! {
 		}
 	}
 }
+
+// check_poll_stalled_expect_upload_408: the stalled-upload 408 when the head
+// also asks for 100-continue and comes in one write with body bytes. The first
+// read fills the read buffer, so the interim 100 is queued and the drain
+// starts in the same burst, before any flush. That unsent 100 belongs to the
+// upload itself, not to an earlier request: the 408 replaces it along with the
+// held reply. With a GET pipelined ahead, its reply is owed first: silent.
+fn check_poll_stalled_expect_upload_408(backend server.IOBackend) ! {
+	upload := et_concat('POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: ${et_upload_body_len}\r\nExpect: 100-continue\r\n\r\n'.bytes(),
+		[]u8{len: et_upload_chunk_len, init: u8(0x61)})
+	out := vtest.drive(server.ServerConfig{
+		io_multiplexing: backend
+		handler:         et_handler
+		limits:          server.Limits{
+			read_timeout_ms: 500
+		}
+	}, [
+		vtest.Script{
+			rounds:   [
+				vtest.Round{
+					send: upload
+					want: 0
+				},
+			]
+			then_eof: true
+		},
+		vtest.Script{
+			rounds:   [
+				vtest.Round{
+					send: et_concat(et_req, upload)
+					want: 0
+				},
+			]
+			then_eof: true
+		},
+	])!
+	c := out.conns[0]
+	assert c.connect_err == '', c.connect_err
+	assert c.eof, '${backend}: the stalled upload must be reaped'
+	assert c.raw.bytestr().starts_with('HTTP/1.1 408'), '${backend}: a stalled Expect: 100-continue upload must get its 408, got ${c.raw.len} bytes: ${c.raw.bytestr()}'
+	assert !c.raw.bytestr().contains('uploaded'), '${backend}: the held reply went out for an incomplete upload'
+	behind := out.conns[1]
+	assert behind.connect_err == '', behind.connect_err
+	assert behind.eof, '${backend}: the stalled upload must be reaped'
+	assert behind.raw.len == 0, '${backend}: a 408 ahead of the reply owed to the pipelined GET: ${behind.raw.bytestr()}'
+	assert out.active_after == 0
+}
+
+fn test_poll_stalled_expect_upload_408() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_poll_stalled_expect_upload_408(.poll)!
+		}
+	}
+}

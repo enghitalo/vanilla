@@ -56,7 +56,7 @@ mut:
 	read_deadline     u64 // monotonic ns; >0 while waiting on a request: from accept for the first, from its first byte for a later one, or an idle deadline (see idle)
 	write_deadline    u64 // monotonic ns; >0 while a batch is pending
 	body_drain        i64 // >0 while a streamed large body is being discarded
-	drain_off         int // while body_drain > 0: where the held response to the streamed request starts in write_buf
+	drain_off         int // while body_drain > 0: where the streamed request's own held output (its reply, after its interim 100 if that is still unsent) starts in write_buf
 	close_after_flush bool
 	sent_100          bool
 	idle              bool // read_deadline is an idle deadline (nothing of a request has arrived yet): the first byte clears it, expiry closes silently
@@ -288,7 +288,17 @@ fn start_body_drain(h core.Handler, mut cs PollConn, limits core.Limits, state v
 		client_fd: cs.fd
 		register:  core.reject_register
 	}
+	// The reply appended here is held until the body drains; while it is, the
+	// sweep may answer a stalled body with a 408 in its place (sweep_timeouts).
+	// When the head came in one burst with body bytes, this request's own
+	// interim 100 is still queued and unsent too — it is not an earlier
+	// response, so the boundary is where that 100 starts: the 408 replaces both.
 	cs.drain_off = cs.write_buf.len
+	cont := response.status_100_continue_response
+	if cs.sent_100 && cs.drain_off - cs.write_off == cont.len
+		&& unsafe { vmemcmp(&u8(cs.write_buf.data) + cs.write_off, cont.data, cont.len) } == 0 {
+		cs.drain_off = cs.write_off
+	}
 	if h(head, mut cs.write_buf, cs.fd, state, mut event_loop) != .done {
 		cs.write_buf << response.tiny_bad_request_response
 		return 2
@@ -503,9 +513,10 @@ fn sweep_timeouts(mut w WorkerState, active_conns &core.Counter) {
 			// The 408 goes straight to the socket, so it must not land inside or
 			// ahead of an earlier response still pending (a parked batch): only
 			// with nothing left to write, or — for a streamed body — when every
-			// earlier response is out and the one held for the timed-out
-			// request itself (which the 408 replaces) has not started (the
-			// flush is held for the whole drain).
+			// earlier response is out and what is held for the timed-out
+			// request itself (its reply, and its interim 100 if still unsent;
+			// the 408 replaces both) has not started (the flush is held for
+			// the whole drain).
 			at_boundary := if cs.body_drain > 0 {
 				cs.write_off == cs.drain_off
 			} else {
