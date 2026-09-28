@@ -1,3 +1,4 @@
+// vtest build: linux && vanilla_tls?
 // Connection reaping over HTTPS on the epoll TLS worker: a silent TCP connect,
 // a stalled handshake, an idle keep-alive connection (after a synchronous
 // send, and after a parked response drains), a partial request and a request
@@ -6,8 +7,11 @@
 // with idle reaping opted out, must keep working. These are the TLS twins of
 // the check_* reaping scenarios in backend_behaviors_test.v.
 //
-// Only built with `-d vanilla_tls` on Linux (the TLS worker is the epoll
-// backend's; Mbed TLS is opt-in): in a default build every test is a no-op.
+// Only runs with `-d vanilla_tls` on Linux (the TLS worker is the epoll
+// backend's; Mbed TLS is opt-in). The build constraint on line 1 makes a
+// default `v test tests/` skip the file, so it needs neither Mbed TLS nor the
+// OpenSSL headers the client below links; the $if gates keep a direct build
+// of it a no-op.
 //
 //   v -cc gcc -d vanilla_tls test tests/tls_timeouts_test.v
 //
@@ -94,6 +98,10 @@ fn tt_unbufferable_len() int {
 // tt_start serves tt_ok_handler over HTTPS on one epoll TLS worker. (`.epoll`
 // exists only on Linux, hence the gate.)
 fn tt_start(limits server.Limits) !&vtest.Harness {
+	// The openssl client writes without MSG_NOSIGNAL: a close_notify (or a
+	// request) written to a connection the server already reset must fail
+	// that call, not kill the test binary with SIGPIPE.
+	os.signal_ignore(.pipe)
 	$if linux {
 		return vtest.start(server.ServerConfig{
 			io_multiplexing: .epoll

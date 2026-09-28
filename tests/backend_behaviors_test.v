@@ -312,9 +312,12 @@ fn check_idle_keepalive_timeout(backend server.IOBackend, limits server.Limits) 
 // needs this). The witness is the server's own clock: connection B is silent,
 // so it is reaped by its accept-time read deadline, which fires at least
 // read_timeout_ms after A went idle — A must still serve a second request.
+// One worker, so A's deadline (if one were wrongly armed) is due no later
+// than B's in the same sweep.
 fn check_idle_opt_out(backend server.IOBackend) ! {
 	mut h := vtest.start(server.ServerConfig{
 		io_multiplexing: backend
+		workers:         1
 		handler:         bb_ok_handler
 		limits:          server.Limits{
 			read_timeout_ms: 400
@@ -404,10 +407,13 @@ fn check_idle_after_parked_write(backend server.IOBackend) ! {
 
 // check_reaped_slots_free_max_connections: the production lockout. Silent
 // connections fill max_connections; once their deadlines reap them, a new
-// connection must be SERVED, not refused at accept.
+// connection must be SERVED, not refused at accept. One worker: io_uring
+// releases a reaped slot only when that ring drains the recv completion, so
+// with several rings another ring's accept could still see the old count.
 fn check_reaped_slots_free_max_connections(backend server.IOBackend) ! {
 	mut h := vtest.start(server.ServerConfig{
 		io_multiplexing: backend
+		workers:         1
 		handler:         bb_ok_handler
 		limits:          server.Limits{
 			max_connections: 2
@@ -436,10 +442,64 @@ fn check_reaped_slots_free_max_connections(backend server.IOBackend) ! {
 	assert c.frames[0].bytestr().starts_with('HTTP/1.1 200')
 }
 
-// check_keepalive_under_timeouts: with read and idle deadlines armed,
-// keep-alive must keep working — the idle deadline armed after response 1 is
-// replaced when request 2 starts (split across two writes), and a pipelined
-// pair is served in one burst.
+// check_first_byte_clears_idle: the first byte of the next request ends the
+// idle wait (contract rule 3). A is served, then sends a partial head: from
+// then on only the 3 s read budget may apply. Witness W is served and then
+// idle-reaped 300 ms later — by then A has sat still longer than its idle
+// budget too, and (one worker) a wrongly surviving idle deadline on A would
+// have been due in the same sweep. A must still complete its request and
+// serve one more.
+fn check_first_byte_clears_idle(backend server.IOBackend) ! {
+	mut h := vtest.start(server.ServerConfig{
+		io_multiplexing: backend
+		workers:         1
+		handler:         bb_ok_handler
+		limits:          server.Limits{
+			read_timeout_ms: 3000
+			idle_timeout_ms: 300
+		}
+	})!
+	defer {
+		h.stop()
+	}
+	a := h.fire([
+		vtest.Script{
+			rounds: [
+				vtest.Round{
+					send: bb_req
+					want: 1
+				},
+				vtest.Round{
+					send: bb_partial_head
+					want: 0
+				},
+			]
+		},
+	])!
+	assert a.conns[0].frames.len == 1
+	w := h.fire([
+		vtest.Script{
+			rounds:   [
+				vtest.Round{
+					send: bb_req
+					want: 1
+				},
+			]
+			then_eof: true
+		},
+	])!
+	assert w.conns[0].eof, '${backend}: the idle witness must be reaped by idle_timeout_ms'
+	done := h.send(a.group, bb_split_tail, vtest.frames(2))!
+	assert !done.conns[0].eof, '${backend}: the first byte must clear the idle deadline — A was reaped mid-request'
+	assert done.conns[0].frames.len == 2
+	more := h.send(a.group, bb_req, vtest.frames(3))!
+	assert more.conns[0].frames.len == 3, '${backend}: keep-alive after the completed request broke'
+}
+
+// check_keepalive_under_timeouts: with read and idle deadlines armed (5 s,
+// far longer than the test), keep-alive must keep working: a request split
+// across two writes and a pipelined pair are served. That the first byte
+// really clears the idle deadline is check_first_byte_clears_idle's job.
 fn check_keepalive_under_timeouts(backend server.IOBackend) ! {
 	out := vtest.drive(server.ServerConfig{
 		io_multiplexing: backend
@@ -805,6 +865,16 @@ fn test_iouring_keepalive_under_timeouts() ! {
 	}
 }
 
+fn test_iouring_first_byte_clears_idle() ! {
+	$if linux {
+		if !server.iou_backend_available() {
+			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
+			return
+		}
+		check_first_byte_clears_idle(.io_uring)!
+	}
+}
+
 fn test_iouring_graceful_shutdown() ! {
 	$if linux {
 		if !server.iou_backend_available() {
@@ -901,6 +971,12 @@ fn test_iocp_keepalive_under_timeouts() ! {
 	}
 }
 
+fn test_iocp_first_byte_clears_idle() ! {
+	$if windows {
+		check_first_byte_clears_idle(unsafe { server.IOBackend(0) })!
+	}
+}
+
 fn test_iocp_graceful_shutdown() ! {
 	$if windows {
 		check_graceful_shutdown(unsafe { server.IOBackend(0) })!
@@ -982,6 +1058,12 @@ fn test_epoll_reaped_slots_free_max_connections() ! {
 fn test_epoll_keepalive_under_timeouts() ! {
 	$if linux {
 		check_keepalive_under_timeouts(.epoll)!
+	}
+}
+
+fn test_epoll_first_byte_clears_idle() ! {
+	$if linux {
+		check_first_byte_clears_idle(.epoll)!
 	}
 }
 
@@ -1100,6 +1182,14 @@ fn test_poll_keepalive_under_timeouts() ! {
 	$if linux {
 		$if vanilla_poll ? {
 			check_keepalive_under_timeouts(.poll)!
+		}
+	}
+}
+
+fn test_poll_first_byte_clears_idle() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_first_byte_clears_idle(.poll)!
 		}
 	}
 }
