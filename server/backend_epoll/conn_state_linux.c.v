@@ -115,9 +115,12 @@ mut:
 	// head was already answered, this many body bytes are still to be consumed
 	// off the socket before the connection is ready for its next request.
 	body_drain i64
+	// While body_drain > 0: where the reply held for the streamed request
+	// starts in write_buf. Everything before it answers earlier requests.
+	drain_off int
 	// The external fd this connection is parked on while awaiting a watch
-	// (-1 = not parked). Lets the worker tear the watch down if the client
-	// closes mid-await.
+	// (-1 = not parked). close_conn tears that watch down, whichever path
+	// closes the connection mid-await.
 	awaiting_fd int = -1
 	// Set when the client half-closed its write side (recv → 0 / EOF) while a
 	// response was still pending: the request half is done, but we still owe the
@@ -169,6 +172,9 @@ mut:
 	// uses it, so the request path never reads the clock itself.
 	now        u64
 	next_sweep u64 // monotonic ns; the sweep scans the table only once now >= this
+	// This worker's watch registry (set once by process_events_plain), so
+	// close_conn can tear down the watch of a connection closed mid-await.
+	reactor &Reactor = unsafe { nil }
 }
 
 // tick reads the batch clock (see PlainState.now).
@@ -343,21 +349,16 @@ fn flush_batch(epoll_fd int, fd int, limits core.Limits, active_conns &core.Coun
 	return true
 }
 
-// conn_birth handles the first EPOLLOUT of a connection that has no state yet:
-// accept registered it with EPOLLOUT (accept_events) because a deadline must
-// start at accept. It creates the state, arms that deadline — READ when
-// read_timeout_ms is set (it bounds the silence and the whole first request),
-// otherwise IDLE (a connection that has sent nothing is idle) — and switches
-// the fd back to EPOLLIN|EPOLLET. Returns true so the worker still runs the
-// EPOLLIN half of the same event: the request often arrives with the
-// connection, and under EPOLLET a skipped edge is never reported again.
+// conn_birth handles the first report of a connection that has no state yet
+// (it carries EPOLLOUT): accept registered it with EPOLLOUT (accept_events)
+// because a deadline must start at accept. It creates the state, arms that
+// deadline — READ when read_timeout_ms is set (it bounds the silence and the
+// whole first request), otherwise IDLE (a connection that has sent nothing is
+// idle) — and switches the fd back to EPOLLIN|EPOLLET. Returns false, and
+// creates nothing, for a stale event (see process_events_plain). Called only
+// when accept-time births are on.
 @[inline]
 fn conn_birth(epoll_fd int, fd int, mut st PlainState) bool {
-	if st.read_ns == 0 && st.idle_ns == 0 {
-		// Accept never armed EPOLLOUT: nil means a close raced this event in
-		// the same batch.
-		return false
-	}
 	// MOD before reading (never after: a read that closes the fd lets accept
 	// reuse the number). A failed MOD means the fd is no longer in this epoll
 	// — a stale event for a connection closed earlier in the batch.
@@ -377,36 +378,43 @@ fn conn_birth(epoll_fd int, fd int, mut st PlainState) bool {
 // arm_idle_deadline starts the keep-alive idle clock at a request boundary:
 // the response is fully handed to the kernel and the connection is back to
 // waiting for a new request. Anything else keeps its own clock or none —
-// bytes of the next request buffered (the read deadline governs), a streamed
-// body still draining, parked on a watch, taken over, closing, or a write
-// still pending (the write deadline governs). Arms only when unarmed, never
-// refreshes: a burst that read nothing cannot extend the idle wait, and a
-// served request always re-arms fresh because its first byte cleared it.
+// bytes of the next request buffered or a read deadline still armed (the read
+// deadline governs: the accept-time one of a connection that has sent nothing
+// yet, woken by an event that read nothing), a streamed body still draining,
+// parked on a watch, taken over, closing, or a write still pending (the write
+// deadline governs). Arms only when unarmed, never refreshes: a burst that
+// read nothing cannot extend the idle wait, and a served request always
+// re-arms fresh because its first byte cleared it.
 //
 // Called from the serve_conn tail and the handle_writable_plain drain, never
-// from flush_batch: the SSE flush in on_watch_ready runs flush_batch BEFORE it
-// re-parks the connection (awaiting_fd is still -1 there).
+// from flush_batch: most of its callers are not at a request boundary (a
+// streaming continuation's piece, a takeover's frames, a reply before a close).
 @[inline]
 fn arm_idle_deadline(mut st PlainState, mut cs ConnState) {
 	if st.idle_ns == 0 || cs.idle_deadline != 0 || cs.read_buf.len != 0 || cs.body_drain != 0
-		|| cs.awaiting_fd >= 0 || cs.takeover != unsafe { nil } || cs.close_after_flush
-		|| cs.write_off < cs.write_buf.len || cs.file_remaining > 0 {
+		|| cs.read_deadline != 0 || cs.awaiting_fd >= 0 || cs.takeover != unsafe { nil }
+		|| cs.close_after_flush || cs.write_off < cs.write_buf.len || cs.file_remaining > 0 {
 		return
 	}
 	cs.idle_deadline = st.now + st.idle_ns
 	st.parked++
 }
 
-// handle_writable_plain drains a parked batch when the socket is writable; on
-// an fd with no state yet it is the connection's birth (conn_birth). Returns
-// false if the connection was closed or the event is stale (the worker must
-// then skip any further events for this fd in the current batch).
+// handle_writable_plain drains a parked batch when the socket is writable.
+// Returns false if the connection was closed (the worker must then skip any
+// further events for this fd in the current batch).
 @[direct_array_access; manualfree]
 fn handle_writable_plain(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainState) bool {
-	if fd >= st.conns.len || unsafe { st.conns[fd] == nil } {
-		return conn_birth(epoll_fd, fd, mut st)
+	if fd >= st.conns.len {
+		return false
 	}
 	mut cs := st.conns[fd]
+	if unsafe { cs == nil } {
+		// EPOLLOUT is only armed after state exists (an accept-time birth is
+		// handled by the worker loop); nil means a close raced this event in
+		// the same batch.
+		return false
+	}
 	if cs.body_drain > 0 {
 		// A streamed upload's response is buffered in write_buf but MUST stay held
 		// until the body is fully drained (drain-then-respond). If an earlier batch
@@ -484,8 +492,20 @@ fn sweep_timeouts(epoll_fd int, active_conns &core.Counter, mut st PlainState) {
 			// 408 only when part of a request arrived — a peer that never spoke
 			// (the accept-time deadline) gets a silent close. A taken-over
 			// connection no longer speaks HTTP — the 408 bytes would be protocol
-			// garbage to its peer; just close.
-			if cs.takeover == unsafe { nil } && (cs.read_buf.len > 0 || cs.body_drain > 0) {
+			// garbage to its peer; just close. And only at a response boundary:
+			// the 408 goes straight to the socket, so it must not land inside a
+			// response still pending (parked mid-send), nor ahead of one owed to
+			// an earlier request. That is nothing left to write or, for a
+			// streamed body, every earlier response out and the reply held for
+			// the upload itself not started: that request was never answered,
+			// and the 408 replaces its reply.
+			at_boundary := if cs.body_drain > 0 {
+				cs.write_off == cs.drain_off
+			} else {
+				cs.write_off >= cs.write_buf.len
+			}
+			if cs.takeover == unsafe { nil } && (cs.read_buf.len > 0 || cs.body_drain > 0)
+				&& at_boundary && cs.file_remaining <= 0 {
 				response.send_status_408_response(fd) // couldn't finish the request in time
 			}
 			close_conn(epoll_fd, fd, active_conns, mut st)
@@ -499,14 +519,22 @@ fn sweep_timeouts(epoll_fd int, active_conns &core.Counter, mut st PlainState) {
 
 // close_conn resets the connection's state, returns it to the per-worker pool
 // (buffers kept, see PlainState.free_conns), clears its table slot and
-// releases the fd. NOT idempotent (release_conn always runs): every close
-// site must make sure it is the only one closing — the bool returns of
-// flush_batch / drain_requests / handle_writable_plain exist exactly for that.
+// releases the fd. A connection parked on a watch has that watch torn down
+// first, whatever closes it (a hangup, a failed write, the write timeout, the
+// pending-write cap): a request-owned fd is closed, a pooled one tombstoned
+// (detach_watch). Otherwise the watch would stay armed for a client that is
+// gone, and fire against whichever connection reuses its number. NOT
+// idempotent (release_conn always runs): every close site must make sure it
+// is the only one closing — the bool returns of flush_batch / drain_requests
+// / handle_writable_plain exist exactly for that.
 @[direct_array_access; manualfree]
 fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainState) {
 	if fd < st.conns.len {
 		mut cs := st.conns[fd]
 		if unsafe { cs != nil } {
+			if cs.awaiting_fd >= 0 {
+				detach_watch(mut st.reactor, epoll_fd, cs.awaiting_fd, fd)
+			}
 			if cs.read_deadline != 0 {
 				st.parked--
 			}
@@ -535,6 +563,7 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			cs.file_off = 0
 			cs.file_remaining = 0
 			cs.body_drain = 0
+			cs.drain_off = 0
 			cs.awaiting_fd = -1
 			cs.close_after_flush = false
 			cs.sent_100 = false
