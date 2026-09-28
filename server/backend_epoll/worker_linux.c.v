@@ -246,14 +246,18 @@ fn process_events_tls(worker_id int, epoll_fd int, handler core.Handler, make_st
 	sweep_on := sweep_ms > 0
 	sweep_ns := u64(sweep_ms) * 1_000_000
 	mut next_sweep := u64(0)
+	mut sweep_wait := sweep_ms // ms until next_sweep, as of the last sweep call
 	// Reused by every sweep (cleared, never reallocated past its high-water
 	// mark): the sweep allocates nothing, which -gc none requires.
 	mut expired := []int{cap: 64}
 	unsafe { expired.flags.set(.noslices) } // a growth frees the old block
 	for {
-		// Every session may carry a deadline (from accept on), so wake at the
-		// sweep cadence while any exists; otherwise sleep until the next event.
-		wait_ms := if sweep_on && sessions.len > 0 { sweep_ms } else { -1 }
+		// Every session may carry a deadline (from accept on), so while any
+		// exists wake no later than the next sweep is due; otherwise sleep
+		// until the next event. (sessions only changes in the batch or the
+		// sweep, and the sweep runs after any batch that leaves one, so
+		// sweep_wait is current whenever it is used.)
+		wait_ms := if sweep_on && sessions.len > 0 { sweep_wait } else { -1 }
 		num_events := C.epoll_wait(epoll_fd, &events[0], socket.max_connection_size, wait_ms)
 		if num_events < 0 {
 			if C.errno == C.EINTR {
@@ -286,8 +290,8 @@ fn process_events_tls(worker_id int, epoll_fd int, handler core.Handler, make_st
 		// most once per sweep interval: one clock read per busy batch, not a
 		// walk of every session.
 		if sweep_on && sessions.len > 0 {
-			next_sweep = sweep_timeouts_tls(epoll_fd, active_conns, next_sweep, sweep_ns, mut
-				expired, mut sessions)
+			next_sweep, sweep_wait = sweep_timeouts_tls(epoll_fd, active_conns, next_sweep,
+				sweep_ns, mut expired, mut sessions)
 		}
 	}
 }

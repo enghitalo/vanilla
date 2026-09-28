@@ -455,15 +455,17 @@ fn tls_park_write(mut conn TlsConn, resp []u8, sent int, write_timeout_ms int) {
 // response, keep-alive idle): no 408 is sent, since encrypting a reply onto a
 // stalled socket would itself block and a peer that never spoke has nothing
 // to parse; dropping the connection is the honest action. Rate-limited: it
-// reads the clock once and walks the table only when `next_sweep` has come
-// (the worker's epoll_wait timeout is the same interval, so an idle worker
-// wakes for it). `expired` is the worker's reusable scratch, so a sweep
-// allocates nothing. Returns the next sweep time.
+// reads the clock once and walks the table only when `next_sweep` has come.
+// `expired` is the worker's reusable scratch, so a sweep allocates nothing.
+// Returns the next sweep time and the epoll_wait timeout until it (1..interval
+// ms), so an idle worker wakes for it. Not a full interval after every batch:
+// a batch that lands just before `next_sweep` would then push the walk to
+// almost two intervals after the previous one.
 @[manualfree]
-fn sweep_timeouts_tls(epoll_fd int, active_conns &core.Counter, next_sweep u64, interval_ns u64, mut expired []int, mut sessions map[int]&TlsConn) u64 {
+fn sweep_timeouts_tls(epoll_fd int, active_conns &core.Counter, next_sweep u64, interval_ns u64, mut expired []int, mut sessions map[int]&TlsConn) (u64, int) {
 	now := time.sys_mono_now()
 	if now < next_sweep {
-		return next_sweep
+		return next_sweep, int((next_sweep - now + 999_999) / 1_000_000)
 	}
 	expired.clear()
 	for fd, conn in sessions {
@@ -476,7 +478,7 @@ fn sweep_timeouts_tls(epoll_fd int, active_conns &core.Counter, next_sweep u64, 
 	for fd in expired {
 		close_tls(epoll_fd, fd, active_conns, mut sessions)
 	}
-	return now + interval_ns
+	return now + interval_ns, int(interval_ns / 1_000_000)
 }
 
 @[manualfree]
