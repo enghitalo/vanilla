@@ -196,8 +196,13 @@ Server-side change in `new_server` (cold path only):
    idle deadline: with `read_timeout_ms` set, `idle_timeout_ms` inherits it, so a
    keep-alive connection that sits between groups gets EOF after `idle_ms()`.
    A test that parks connections (SSE subscribers, a later `send()`) needs
-   `idle_timeout_ms: -1` or no read timeout. A "backstop" `read_timeout_ms`
-   stays safe when the script sends all its bytes at once and never idles.
+   `idle_timeout_ms: -1` or no read timeout. `-1` only exempts a connection
+   that sits *between* requests: one whose first request is not complete yet
+   (silent, or a partial head continued later with `send()`) stays under
+   `read_timeout_ms` from accept, so such a test needs no read timeout at all
+   (nor a positive `idle_timeout_ms`, which is then armed at accept instead).
+   A "backstop" `read_timeout_ms` stays safe when the script sends all its
+   bytes at once and never idles.
 
 ## Migration plan (each step = one commit, `v test .` green)
 

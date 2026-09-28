@@ -17,6 +17,7 @@ on:
       - 'socket/**'
       - 'http1_1/**'
       - 'vtest/**'
+      - 'transport/**'
       - 'tests/tls_timeouts_test.v'
       - '.github/workflows/tls_backend.yml'
   pull_request:
@@ -29,6 +30,7 @@ on:
       - 'socket/**'
       - 'http1_1/**'
       - 'vtest/**'
+      - 'transport/**'
       - 'tests/tls_timeouts_test.v'
       - '.github/workflows/tls_backend.yml'
 
@@ -99,14 +101,16 @@ jobs:
       # other lane (tcc<->gcc fallback race on liburing's <stdatomic.h>, and the
       # vlang/v#27749 parallel-codegen link race).
       #
-      # `-ldflags -l...`: V emits `#flag @VMODROOT/tls/vanilla_tls.c` AFTER the
-      # `-lmbedtls -lmbedx509 -lmbedcrypto` flags, and Ubuntu's gcc links with
-      # --as-needed by default, so the libraries are dropped before the only
-      # object that uses them and the link fails with undefined mbedtls_* /
-      # psa_* references. -ldflags lands at the end of the command line, after
-      # vanilla_tls.c, which puts the libraries back where the linker wants
-      # them. Drop this once the #flag order in tls/tls_mbedtls_d_vanilla_tls.c.v
-      # lists vanilla_tls.c before the -l flags.
+      # No extra link flags: this lane builds exactly what a user's
+      # `v -d vanilla_tls` build does. Ubuntu's gcc links with --as-needed by
+      # default, so tls/tls_mbedtls_d_vanilla_tls.c.v must list
+      # `#flag @VMODROOT/tls/vanilla_tls.c` BEFORE
+      # `-lmbedtls -lmbedx509 -lmbedcrypto`; with the libraries first they are
+      # dropped before the only object that uses them and the link fails with
+      # undefined mbedtls_* / psa_* references (V then retries with its
+      # established compiler, which cannot build every program). Do not paper
+      # over such a failure with -ldflags here: Ubuntu/Debian user builds would
+      # still be broken.
       #
       # VANILLA_NO_IOURING: the repo's kill-switch for hosted runners whose
       # per-worker io_uring rings fail to init (see poll_backend.yml); the TLS
@@ -116,9 +120,7 @@ jobs:
         env:
           VANILLA_NO_IOURING: '1'
         run: |
-          v -cc gcc -no-parallel -d vanilla_tls \
-            -ldflags -lmbedtls -ldflags -lmbedx509 -ldflags -lmbedcrypto \
-            test tls/
+          v -cc gcc -no-parallel -d vanilla_tls test tls/
       # HTTPS connection reaping end to end (read deadline armed at accept,
       # bounding silent connects and the handshake; idle keep-alive; slots
       # freed for max_connections). This exercises userspace mbedTLS: kTLS
@@ -128,6 +130,4 @@ jobs:
         env:
           VANILLA_NO_IOURING: '1'
         run: |
-          v -cc gcc -no-parallel -d vanilla_tls \
-            -ldflags -lmbedtls -ldflags -lmbedx509 -ldflags -lmbedcrypto \
-            test tests/tls_timeouts_test.v
+          v -cc gcc -no-parallel -d vanilla_tls test tests/tls_timeouts_test.v

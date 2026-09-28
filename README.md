@@ -248,8 +248,9 @@ Two layers, no bespoke test mode on the server:
   readers (so a broken stream fails fast instead of hanging). Either way this
   drives the real backend end to end —
   epoll / io_uring / kqueue — including pipelining, request framing across TCP
-  segments, keep-alive, `Expect: 100-continue`, half-close, read/idle timeouts, and the
-  async suspend/resume path. See
+  segments, keep-alive, `Expect: 100-continue`, half-close, read/idle timeouts
+  (not on kqueue, which does not enforce them yet), and the async
+  suspend/resume path. See
   [`tests/backend_behaviors_test.v`](tests/backend_behaviors_test.v)
   and the `*_end_to_end_test.v` files under [`examples/`](examples/).
 
@@ -426,7 +427,7 @@ See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark 
 - [x] Chunked transfer-encoding in the request parser (`frame_chunked_total`)
 - [x] HTTP/2 — cleartext prior-knowledge via the takeover seam: HPACK (RFC 7541, Appendix C-verified), multiplexed streams, send-side flow control (`http2/` + `examples/http2_cleartext/`); TLS/ALPN and the HTTP/1.1 Upgrade handshake still open
 - [x] WebSocket upgrade (framing, ping/pong, close handshake) — `websocket/` codec + `examples/websocket_echo/` over the takeover seam
-- [x] TLS/HTTPS — epoll backend via `ServerConfig.tls_config`; `tls.new_self_signed()` issues a localhost/loopback certificate with proper SANs, `sans: ['IP:203.0.113.5']` targets a real host and `persist_dir:` keeps the identity across restarts (or `tls.new_from_pem` for CA-issued certs); the handshake is bounded by `read_timeout_ms` (its deadline starts at accept); other backends are plaintext
+- [x] TLS/HTTPS — epoll backend via `ServerConfig.tls_config`; `tls.new_self_signed()` issues a localhost/loopback certificate with proper SANs, `sans: ['IP:203.0.113.5']` targets a real host and `persist_dir:` keeps the identity across restarts (or `tls.new_from_pem` for CA-issued certs); the handshake is bounded from accept by `read_timeout_ms` (or, without one, `idle_timeout_ms`); other backends are plaintext
 - [ ] HTTPS example (`examples/https/`)
 - [x] Body-size cap + max-connections via `Limits` (`max_body_bytes` → 413, `max_request_bytes`, `max_connections`); pair `max_connections` with a read or idle timeout — reaping silent and idle connections is what frees their slots. A per-connection request-count limit is still open
 - [ ] Response caching layer (ETag + `Last-Modified` auto-generation)

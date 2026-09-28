@@ -586,12 +586,13 @@
   keeps per-connection deadlines and sweeps them at most once per
   `Limits.sweep_interval_ms()`, which is also its blocking-wait timeout while a
   deadline may be armed; with no timeout set there is no sweep and no wake.
-  The first request's read deadline is armed at **accept**, so a connection
-  that never sends a byte (or never finishes its TLS handshake) is reaped and
+  A deadline is armed at **accept** (the read deadline, or the idle one when
+  there is no read timeout), so a connection that never sends a byte (or
+  never finishes its TLS handshake) is reaped and
   frees its `max_connections` slot; idle keep-alive connections are closed
   silently after the idle budget. 408 only for a partial request. The
-  fixed-5-second `epoll_wait` plan below was not used: a rate-limited sweep
-  costs nothing when no timeout is configured.
+  original plan (a fixed 5-second `epoll_wait`/`kevent` timeout) was not used:
+  a rate-limited sweep costs nothing when no timeout is configured.
 - **Still open:** the kqueue (darwin) backend enforces none of these timeouts
   (nor `max_connections`).
 - **Testing:** `tests/backend_behaviors_test.v` — `check_silent_conn_timeout`,

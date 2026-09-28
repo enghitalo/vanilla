@@ -17,6 +17,7 @@ on:
       - 'http1_1/**'
       - 'socket/**'
       - 'vtest/**'
+      - 'transport/**'
       - 'tests/**'
       - '.github/workflows/poll_backend.yml'
   pull_request:
@@ -28,6 +29,7 @@ on:
       - 'http1_1/**'
       - 'socket/**'
       - 'vtest/**'
+      - 'transport/**'
       - 'tests/**'
       - '.github/workflows/poll_backend.yml'
 

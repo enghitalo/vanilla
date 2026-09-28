@@ -95,7 +95,7 @@ alone also reaps idle keep-alive connections. With both at 0 nothing is armed.
 | `max_connections` | refuse new connections past this many concurrent (checked at accept). Pair it with a read or idle timeout: without a deadline, connections that never send (or peers that vanish without a FIN) hold their slots forever and the server stops accepting |
 | `read_timeout_ms` | a request (head + body) must arrive complete within this long, else close. The **first** request's clock starts at **accept**, so it also bounds a connection that never sends a byte and the TLS handshake; a later request's clock starts at its first byte. Not refreshed on progress (the slowloris bound) — size it for your largest upload. **408** only if part of the request arrived (plaintext epoll / poll / iocp); a peer that sent nothing is closed silently, and TLS / io_uring always close silently |
 | `write_timeout_ms` | close a connection whose parked response can't drain in time |
-| `idle_timeout_ms` | keep-alive: once a response is fully sent, how long to wait for the first byte of the next request before closing **silently** (no 408). `0` ⇒ `read_timeout_ms`; `-1` (any negative) ⇒ never. With no read timeout it also bounds a new connection's wait for its first byte. Never applies to a request parked on a watch, a parked write, or a taken-over connection (WebSocket, h2c) |
+| `idle_timeout_ms` | keep-alive: once a response is fully sent, how long to wait for the first byte of the next request before closing **silently** (no 408). `0` ⇒ `read_timeout_ms`; `-1` (any negative) ⇒ never. With no read timeout it also bounds a new connection's wait for its first byte (over TLS, its first decrypted byte, so the handshake too). Never applies to a request parked on a watch, a parked write, or a taken-over connection (WebSocket, h2c) |
 
 Deadlines are enforced by each worker's sweep, which runs every
 `Limits.sweep_interval_ms()` (a quarter of the shortest timeout, clamped to
@@ -116,11 +116,13 @@ limits. Do not rely on it to reap connections.
 
 Set `ServerConfig.tls_config` (e.g. `tls.new_self_signed()`) and `certificates` for
 HTTPS on the **epoll** backend; the other backends are plaintext. The handshake
-is bounded by `read_timeout_ms`: the first request's deadline starts at accept,
-before any TLS record arrives, so a client that connects and never finishes its
-handshake is closed (silently) once it expires. Set a read timeout on any
-public HTTPS server: `idle_timeout_ms` alone only bounds the wait for the
-first byte, not a handshake that has started.
+is bounded from accept, before any TLS record arrives: by `read_timeout_ms`,
+or, when that is 0, by `idle_timeout_ms` (a new connection's idle deadline runs
+until its first decrypted byte, so it covers the whole handshake). A client
+that connects and never finishes its handshake is closed (silently) once the
+deadline expires. Still set a read timeout on any public HTTPS server:
+`idle_timeout_ms` alone does not bound a request that has started arriving
+(slowloris).
 
 ## Internals (where to look)
 
