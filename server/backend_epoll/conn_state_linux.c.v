@@ -98,8 +98,12 @@ mut:
 	read_buf       []u8 // persistent request buffer; len = bytes buffered
 	write_buf      []u8 // persistent response buffer; [write_off..len) pending
 	write_off      int
-	read_deadline  u64 // monotonic ns; >0 while a request is mid-read (read_timeout)
+	read_deadline  u64 // monotonic ns; >0 while a request is mid-read (read_timeout) — from accept for the first one
 	write_deadline u64 // monotonic ns; >0 while a batch is parked (write_timeout)
+	// monotonic ns; >0 while the connection waits for the first byte of a
+	// request: a keep-alive connection at rest after a response, or a new one
+	// when read_timeout_ms is 0. Expiry closes silently.
+	idle_deadline u64
 	// Deferred file body to stream with sendfile(2) AFTER write_buf drains (a
 	// handler appended its headers to write_buf and handed the body off via
 	// core.queue_file). file_fd is BORROWED (the asset table owns it) and is
@@ -139,9 +143,11 @@ mut:
 	takeover_state voidptr
 }
 
-// PlainState is the per-worker connection table. `parked` counts connections
-// with an armed deadline, so the worker only pays for timeout sweeps when
-// something is actually mid-transfer.
+// PlainState is the per-worker connection table. `parked` counts armed
+// deadlines (read, write and idle), so a worker with nothing armed never
+// wakes for a sweep. With a read or idle timeout set, every open connection
+// normally carries one (from accept on), except while it is parked on a watch
+// or taken over; the sweep itself is rate-limited to sweep_interval_ms().
 pub struct PlainState {
 mut:
 	conns []&ConnState
@@ -154,6 +160,21 @@ mut:
 	// to the worker's peak concurrent connection count. Per-worker: no locking.
 	free_conns []&ConnState
 	parked     int
+	// Resolved once per worker from Limits (0 = off): the accept-time read
+	// budget and the keep-alive idle budget (Limits.idle_ms()), in ns.
+	read_ns u64
+	idle_ns u64
+	// The batch clock: read once per worker loop iteration, and only when a
+	// timeout is configured. Every deadline armed or checked in that batch
+	// uses it, so the request path never reads the clock itself.
+	now        u64
+	next_sweep u64 // monotonic ns; the sweep scans the table only once now >= this
+}
+
+// tick reads the batch clock (see PlainState.now).
+@[inline]
+fn (mut st PlainState) tick() {
+	st.now = time.sys_mono_now()
 }
 
 pub fn new_plain_state() PlainState {
@@ -217,7 +238,7 @@ fn state_for(mut st PlainState, fd int) &ConnState {
 @[inline]
 fn park_write(epoll_fd int, fd int, limits core.Limits, mut st PlainState, mut cs ConnState) {
 	if limits.write_timeout_ms > 0 && cs.write_deadline == 0 {
-		cs.write_deadline = time.sys_mono_now() + u64(limits.write_timeout_ms) * 1_000_000
+		cs.write_deadline = st.now + u64(limits.write_timeout_ms) * 1_000_000
 		st.parked++
 	}
 	epoll.mod_fd_in_epoll(epoll_fd, fd, (u32(C.EPOLLIN) | u32(C.EPOLLOUT) | u32(C.EPOLLET)))
@@ -322,20 +343,70 @@ fn flush_batch(epoll_fd int, fd int, limits core.Limits, active_conns &core.Coun
 	return true
 }
 
-// handle_writable_plain drains a parked batch when the socket is writable.
-// Returns false if the connection was closed (the worker must then skip any
-// further events for this fd in the current batch).
+// conn_birth handles the first EPOLLOUT of a connection that has no state yet:
+// accept registered it with EPOLLOUT (accept_events) because a deadline must
+// start at accept. It creates the state, arms that deadline — READ when
+// read_timeout_ms is set (it bounds the silence and the whole first request),
+// otherwise IDLE (a connection that has sent nothing is idle) — and switches
+// the fd back to EPOLLIN|EPOLLET. Returns true so the worker still runs the
+// EPOLLIN half of the same event: the request often arrives with the
+// connection, and under EPOLLET a skipped edge is never reported again.
+@[inline]
+fn conn_birth(epoll_fd int, fd int, mut st PlainState) bool {
+	if st.read_ns == 0 && st.idle_ns == 0 {
+		// Accept never armed EPOLLOUT: nil means a close raced this event in
+		// the same batch.
+		return false
+	}
+	// MOD before reading (never after: a read that closes the fd lets accept
+	// reuse the number). A failed MOD means the fd is no longer in this epoll
+	// — a stale event for a connection closed earlier in the batch.
+	if epoll.mod_fd_in_epoll(epoll_fd, fd, (u32(C.EPOLLIN) | u32(C.EPOLLET))) != 0 {
+		return false
+	}
+	mut cs := state_for(mut st, fd)
+	if st.read_ns > 0 {
+		cs.read_deadline = st.now + st.read_ns
+	} else {
+		cs.idle_deadline = st.now + st.idle_ns
+	}
+	st.parked++
+	return true
+}
+
+// arm_idle_deadline starts the keep-alive idle clock at a request boundary:
+// the response is fully handed to the kernel and the connection is back to
+// waiting for a new request. Anything else keeps its own clock or none —
+// bytes of the next request buffered (the read deadline governs), a streamed
+// body still draining, parked on a watch, taken over, closing, or a write
+// still pending (the write deadline governs). Arms only when unarmed, never
+// refreshes: a burst that read nothing cannot extend the idle wait, and a
+// served request always re-arms fresh because its first byte cleared it.
+//
+// Called from the serve_conn tail and the handle_writable_plain drain, never
+// from flush_batch: the SSE flush in on_watch_ready runs flush_batch BEFORE it
+// re-parks the connection (awaiting_fd is still -1 there).
+@[inline]
+fn arm_idle_deadline(mut st PlainState, mut cs ConnState) {
+	if st.idle_ns == 0 || cs.idle_deadline != 0 || cs.read_buf.len != 0 || cs.body_drain != 0
+		|| cs.awaiting_fd >= 0 || cs.takeover != unsafe { nil } || cs.close_after_flush
+		|| cs.write_off < cs.write_buf.len || cs.file_remaining > 0 {
+		return
+	}
+	cs.idle_deadline = st.now + st.idle_ns
+	st.parked++
+}
+
+// handle_writable_plain drains a parked batch when the socket is writable; on
+// an fd with no state yet it is the connection's birth (conn_birth). Returns
+// false if the connection was closed or the event is stale (the worker must
+// then skip any further events for this fd in the current batch).
 @[direct_array_access; manualfree]
 fn handle_writable_plain(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainState) bool {
-	if fd >= st.conns.len {
-		return false
+	if fd >= st.conns.len || unsafe { st.conns[fd] == nil } {
+		return conn_birth(epoll_fd, fd, mut st)
 	}
 	mut cs := st.conns[fd]
-	if unsafe { cs == nil } {
-		// EPOLLOUT is only armed after state exists; nil means a close raced
-		// this event in the same batch.
-		return false
-	}
 	if cs.body_drain > 0 {
 		// A streamed upload's response is buffered in write_buf but MUST stay held
 		// until the body is fully drained (drain-then-respond). If an earlier batch
@@ -393,39 +464,44 @@ fn handle_writable_plain(epoll_fd int, fd int, active_conns &core.Counter, mut s
 		return false
 	}
 	epoll.mod_fd_in_epoll(epoll_fd, fd, (u32(C.EPOLLIN) | u32(C.EPOLLET))) // stop watching writability
+	// The parked reply is fully out: back at a request boundary.
+	arm_idle_deadline(mut st, mut cs)
 	return true
 }
 
-// sweep_timeouts closes connections whose read/write deadline has passed.
-// Called from the worker only when something is parked and a timeout is set,
-// so it costs nothing on an idle/fast server.
+// sweep_timeouts closes connections whose read/write/idle deadline has passed
+// (as of the batch clock st.now). The worker calls it only when a deadline is
+// armed, and at most once per sweep_interval_ms() — never after every batch.
 @[direct_array_access; manualfree]
 fn sweep_timeouts(epoll_fd int, active_conns &core.Counter, mut st PlainState) {
-	now := time.sys_mono_now()
+	now := st.now
 	for fd in 0 .. st.conns.len {
 		cs := st.conns[fd]
 		if unsafe { cs == nil } {
 			continue
 		}
 		if cs.read_deadline > 0 && now > cs.read_deadline {
-			// A taken-over connection no longer speaks HTTP — the 408 bytes
-			// would be protocol garbage to its peer; just close.
-			if cs.takeover == unsafe { nil } {
+			// 408 only when part of a request arrived — a peer that never spoke
+			// (the accept-time deadline) gets a silent close. A taken-over
+			// connection no longer speaks HTTP — the 408 bytes would be protocol
+			// garbage to its peer; just close.
+			if cs.takeover == unsafe { nil } && (cs.read_buf.len > 0 || cs.body_drain > 0) {
 				response.send_status_408_response(fd) // couldn't finish the request in time
 			}
 			close_conn(epoll_fd, fd, active_conns, mut st)
 		} else if cs.write_deadline > 0 && now > cs.write_deadline {
 			close_conn(epoll_fd, fd, active_conns, mut st)
+		} else if cs.idle_deadline > 0 && now > cs.idle_deadline {
+			close_conn(epoll_fd, fd, active_conns, mut st) // idle keep-alive: silent
 		}
 	}
 }
 
-// close_conn frees the connection's buffers, clears its table slot and
-// releases the fd. The ConnState struct itself is reclaimed by the GC once
-// the slot no longer references it. NOT idempotent (release_conn always
-// runs): every close site must make sure it is the only one closing — the
-// bool returns of flush_batch / drain_requests / handle_writable_plain exist
-// exactly for that.
+// close_conn resets the connection's state, returns it to the per-worker pool
+// (buffers kept, see PlainState.free_conns), clears its table slot and
+// releases the fd. NOT idempotent (release_conn always runs): every close
+// site must make sure it is the only one closing — the bool returns of
+// flush_batch / drain_requests / handle_writable_plain exist exactly for that.
 @[direct_array_access; manualfree]
 fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainState) {
 	if fd < st.conns.len {
@@ -435,6 +511,9 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 				st.parked--
 			}
 			if cs.write_deadline != 0 {
+				st.parked--
+			}
+			if cs.idle_deadline != 0 {
 				st.parked--
 			}
 			// Reuse instead of free: reset to a pristine state and return to the
@@ -451,6 +530,7 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			cs.write_off = 0
 			cs.read_deadline = 0
 			cs.write_deadline = 0
+			cs.idle_deadline = 0
 			cs.file_fd = -1
 			cs.file_off = 0
 			cs.file_remaining = 0
