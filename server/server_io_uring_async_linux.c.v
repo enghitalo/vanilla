@@ -36,8 +36,10 @@ module server
 //     reused slot found at drain time is consumed against a scratch buffer).
 //
 // Parked-connection deadlines: read/write deadlines are cleared at park (no
-// client op is armed, so neither timeout applies) and re-arm naturally at
-// resume. A hung query on a vanished client therefore pins the slot until the
+// client op is armed, so neither timeout applies — nor the idle one: a parked
+// request is never idle-reaped) and re-arm naturally at resume (a read deadline
+// for a buffered partial, else the idle deadline, via iou_arm_recv). A hung
+// query on a vanished client therefore pins the slot until the
 // query returns — the same known gap as the epoll runtime (async_linux.c.v:29);
 // bound it DB-side with e.g. statement_timeout. A parked-deadline sweep is a
 // follow-up shared with epoll.
@@ -408,7 +410,9 @@ fn iou_drain_requests(mut env IouEnv, mut conn io_uring.Connection, limits Limit
 			.suspend {
 				// Park: no client op will be armed until the watch resumes. Clear the
 				// read deadline — nothing is mid-read, and the sweep must not shut a
-				// parked connection down as a slow reader.
+				// parked connection down as a slow reader (a shutdown with no op in
+				// flight would produce no CQE either). `idle` is already false: this
+				// request's first byte cleared it.
 				conn.awaiting_fd = event_loop.last_watched
 				conn.read_deadline = 0
 			}
@@ -536,7 +540,12 @@ fn iou_finish_resume(mut env IouEnv, mut conn io_uring.Connection, limits Limits
 		iou_release(worker, mut conn, active_conns, limits.max_connections > 0)
 		return
 	}
-	iou_arm_recv(worker, mut conn, limits)
+	// Back to reading: a read deadline for a buffered partial, else the idle
+	// deadline. A recv that cannot be queued leaves no op in flight — drop the
+	// connection (safe: nothing is in flight) instead of stranding it.
+	if !iou_arm_recv(worker, mut conn, limits) {
+		iou_release(worker, mut conn, active_conns, limits.max_connections > 0)
+	}
 }
 
 // handle_io_uring_poll runs a parked request's continuation when its watched fd
