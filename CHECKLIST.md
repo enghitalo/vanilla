@@ -577,29 +577,31 @@
   framing, max_connections, read timeout, graceful shutdown, 2 MiB upload
   drain) passes on Windows; sustained-load run: ~287K req/s, 0 errors.
 
-### 21. Add Timeout Support to Event Loops
+### 21. Add Timeout Support to Event Loops — ✅ RESOLVED (kqueue still open)
 - **Files:** All backend files
 - **Issue:** Infinite waits in epoll_wait/kevent/etc
 - **Impact:** Connections can hang forever
-- **Priority:** 🟡 MEDIUM
-- **Effort:** 1 hour
-- **Strategy:**
-  ```v
-  // Epoll: Replace -1 with timeout
-  num_events := C.epoll_wait(epoll_fd, &events[0], max_events, 5000) // 5 second timeout
-
-  // Kqueue: Set timeout struct
-  timeout := C.timespec{
-      tv_sec: 5
-      tv_nsec: 0
-  }
-  num_events := C.kevent(kq, 0, 0, &events[0], max_events, &timeout)
-
-  // Check for stale connections on timeout
-  cleanup_stale_connections()
-  ```
-- **Dependencies:** None
-- **Testing:** Test connection timeout behavior
+- **Resolution:** `core.Limits` carries `read_timeout_ms`, `write_timeout_ms`
+  and `idle_timeout_ms` (0 inherits `read_timeout_ms`, -1 = never). Each worker
+  keeps per-connection deadlines and sweeps them at most once per
+  `Limits.sweep_interval_ms()`, which is also its blocking-wait timeout while a
+  deadline may be armed; with no timeout set there is no sweep and no wake.
+  A deadline is armed at **accept** (the read deadline, or the idle one when
+  there is no read timeout), so a connection that never sends a byte (or
+  never finishes its TLS handshake) is reaped and
+  frees its `max_connections` slot; idle keep-alive connections are closed
+  silently after the idle budget. 408 only for a partial request. The
+  original plan (a fixed 5-second `epoll_wait`/`kevent` timeout) was not used:
+  a rate-limited sweep costs nothing when no timeout is configured.
+- **Still open:** the kqueue (darwin) backend enforces none of these timeouts
+  (nor `max_connections`).
+- **Testing:** `tests/backend_behaviors_test.v` — `check_silent_conn_timeout`,
+  `check_idle_keepalive_timeout`, `check_idle_opt_out`,
+  `check_reaped_slots_free_max_connections`, `check_keepalive_under_timeouts`,
+  run as `test_{epoll,iouring,poll,iocp}_*`; `tests/tls_timeouts_test.v` for
+  the HTTPS path (`-d vanilla_tls`, `.github/workflows/tls_backend.yml`);
+  end to end through an example in `examples/request_limits/src/main_test.v`;
+  `core/limits_test.v` for the `idle_ms()` / `sweep_interval_ms()` rules.
 
 ### 22. Validate File Descriptors Before Operations
 - **Files:** All backend files
@@ -1363,6 +1365,9 @@
       // Verify timeout and cleanup
   }
   ```
+- **Done so far:** `test_connection_timeout` exists as
+  `check_silent_conn_timeout` + `check_reaped_slots_free_max_connections` in
+  `tests/backend_behaviors_test.v` (every backend except kqueue) — see #21.
 
 ### 40. E2E Integration Tests
 - **Directory:** `tests/integration/`
@@ -1529,7 +1534,7 @@
 - [ ] #10 - Host header validation (20 min)
 - [ ] #11 - Case-insensitive headers (1 hour)
 - [ ] #18 - Epoll keep-alive (2 hours)
-- [ ] #21 - Timeouts (1 hour)
+- [x] #21 - Timeouts (kqueue still open — see #21)
 - [ ] #22 - FD validation (30 min)
 
 **Total:** ~5 hours

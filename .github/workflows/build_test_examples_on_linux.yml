@@ -10,6 +10,7 @@ jobs:
   examples-building-and-testing:
     runs-on: ubuntu-latest
     name: ${{ matrix.folder }}
+    timeout-minutes: 20 # backstop for a hung vtest e2e test (no client timeouts)
     strategy:
       fail-fast: false # Continue other jobs if one fails
       matrix:
@@ -85,6 +86,9 @@ jobs:
   repo-tests:
     runs-on: ubuntu-latest
     name: tests/ (behaviours, UDS, vtest)
+    # vtest has no client-side timeouts: a liveness regression (a connection
+    # the server never reaps) hangs instead of failing, and this is the backstop.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Set up V

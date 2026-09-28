@@ -277,6 +277,15 @@ fn main() {
 		limits:          server.Limits{
 			max_header_bytes: 16 * 1024
 			read_timeout_ms:  10_000
+			// idle_timeout_ms: -1 is REQUIRED here. /webcam returns .done after
+			// the headers and hands its fd to the broadcaster thread, so the
+			// core sees an idle keep-alive connection. With the default (0 =
+			// inherit read_timeout_ms) every viewer would be closed after 10s —
+			// and the broadcaster, which still holds the fd number, would then
+			// write MJPEG frames into whatever new connection the kernel gives
+			// that number next. The read timeout still bounds silent connects
+			// and slow requests.
+			idle_timeout_ms:  -1
 			// NOTE: no write_timeout_ms — the webcam stream is intentionally
 			// long-lived, so a write deadline would reap healthy viewers.
 		}

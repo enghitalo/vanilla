@@ -91,6 +91,16 @@ curl -s http://localhost:3000/webcam | head -c 80
 - **No `write_timeout_ms`.** The webcam response is intentionally long-lived; a
   write deadline would reap healthy viewers. The file path is short-lived and
   unaffected.
+- **`idle_timeout_ms: -1`.** `/webcam` hands its fd to the broadcaster after
+  the headers, so to the core the connection looks idle. With the default
+  (`0` inherits `read_timeout_ms`, 10 s here) every viewer would be closed
+  after 10 s — and the broadcaster, which still holds that fd number, would
+  write frames into whichever new connection the kernel gives it next (the
+  close/reuse race below, turned from rare into routine). The cost: idle
+  keep-alive connections on `/` and `/video` are not reaped either (the read
+  timeout still reaps silent connects and slow requests). A server that needs
+  both should stream through the core (`.suspend` + `watch_fd`) instead of
+  handing the fd off.
 - **fd ownership** follows the SSE pattern: the worker only reads (it closes the
   fd on disconnect); the broadcaster only writes and drops fds that fail. The
   small close/reuse race is the accepted cost of not parking a thread per viewer.

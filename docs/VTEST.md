@@ -14,7 +14,7 @@ iterations; 64-conn slowloris storm: all reaped by the server's own
    cannot exercise SO_REUSEPORT sharding or cross-worker behavior; vtest can.
 2. **No test-side clocks.** There is no timeout anywhere in a vtest test. The only
    clock in the program is the server's own config (`Limits.read_timeout_ms`,
-   `write_timeout_ms`, shutdown grace). A stalled-client test *completes* because
+   `write_timeout_ms`, `idle_timeout_ms`, shutdown grace). A stalled-client test *completes* because
    the server's reaper closes the connection — the test exercises the timeout
    machinery instead of duplicating it. If the server loses liveness entirely, the
    test hangs: that is the correct signal (CI step timeout is the backstop).
@@ -58,6 +58,7 @@ pub mut:
 
 pub struct Outcome {
 pub:
+	group          Group        // this call's connections, for a later wait()/send()
 	conns          []ConnResult // SAME order as the scripts passed in: position = identity
 	inflight_after i64          // server counters sampled after shutdown drain —
 	active_after   i64          // assert == 0 to prove nothing leaked
@@ -70,7 +71,8 @@ pub fn drive(config server.ServerConfig, scripts []Script) !Outcome
 // Session form, for cross-connection choreography (SSE, shutdown-while-in-flight):
 pub fn start(config server.ServerConfig) !&Harness
 pub fn (mut h Harness) fire(scripts []Script) !Outcome   // returns when THESE scripts' last round completed; conns stay open in the reactor
-pub fn (mut h Harness) wait(group GroupId, until fn (acc []u8) bool) !Outcome // block until predicate holds on every conn of the group (or EOF)
+pub fn (mut h Harness) wait(group Group, until fn (acc []u8) bool) !Outcome // block until predicate holds on every conn of the group (or EOF)
+pub fn (mut h Harness) send(group Group, bytes []u8, until fn (acc []u8) bool) !Outcome // write bytes on every still-open conn of the group, then wait like wait()
 pub fn (mut h Harness) stop()                             // close client fds, shutdown server, join reactor
 
 // Predicates (pure fns over accumulated bytes — the client-side mirror of the
@@ -94,6 +96,11 @@ pub fn repeat(n int, s Script) []Script
 - **Rounds** sequence *within* a connection with no barrier across connections.
   `fire()` sequences *groups* of connections: an ordering step for choreography
   (subscribe-all → publish → expect events) with completion, never sleeps.
+- **Continuing a conversation:** `send(out.group, bytes, until)` writes more
+  bytes on connections a previous `fire()` left open — e.g. a second request
+  after the server's clock has moved on (a later `fire()` whose connections the
+  server had to reap), proving the first connection was NOT reaped in between.
+  `wait(group, until)` is `send` with no bytes.
 - **No client timeouts, ever.** The reactor blocks in `poll(fds, -1)`. Progress
   comes from the server (bytes or close). See goal 2 for the hang contract.
 
@@ -185,6 +192,17 @@ Server-side change in `new_server` (cold path only):
 3. io_uring allows one live ring per process: within one test binary, a test must
    fully `stop()`/shutdown its io_uring server before the next starts (the
    sequential-tests-per-file pattern already guarantees this).
+4. Connections held open across `fire()` groups are subject to the server's
+   idle deadline: with `read_timeout_ms` set, `idle_timeout_ms` inherits it, so a
+   keep-alive connection that sits between groups gets EOF after `idle_ms()`.
+   A test that parks connections (SSE subscribers, a later `send()`) needs
+   `idle_timeout_ms: -1` or no read timeout. `-1` only exempts a connection
+   that sits *between* requests: one whose first request is not complete yet
+   (silent, or a partial head continued later with `send()`) stays under
+   `read_timeout_ms` from accept, so such a test needs no read timeout at all
+   (nor a positive `idle_timeout_ms`, which is then armed at accept instead).
+   A "backstop" `read_timeout_ms` stays safe when the script sends all its
+   bytes at once and never idles.
 
 ## Migration plan (each step = one commit, `v test .` green)
 
@@ -211,4 +229,5 @@ Server-side change in `new_server` (cold path only):
   for anything they cannot express is "write the sockets by hand with testkit",
   which remains supported.
 - Tests that would hang on a liveness bug hang instead of failing fast — accepted
-  and intended (goal 2); CI step timeouts bound the damage.
+  and intended (goal 2); the `timeout-minutes` on every CI job that runs `tests/`
+  or example tests bound the damage (and run them under `timeout` locally).

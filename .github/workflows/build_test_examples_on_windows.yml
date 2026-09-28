@@ -7,13 +7,20 @@ on:
     branches: [ main ]
 
 jobs:
-  # The server-module tests include the backend-agnostic behaviour suite
-  # (pipelining, split-request framing, max_connections, read timeout,
-  # graceful shutdown, large-upload streaming drain), which runs against the
-  # IOCP backend on Windows.
+  # The library module tests, then the backend-agnostic behaviour suite in
+  # tests/backend_behaviors_test.v (pipelining, split-request framing,
+  # max_connections, read timeout, connection reaping — silent connect, idle
+  # keep-alive, the idle opt-out, slots freed by reaping — graceful shutdown,
+  # large-upload streaming drain) against the IOCP backend: its test_iocp_*
+  # functions are the only Windows coverage of the IOCP connection state
+  # machine. (The module list below does not include tests/, so the suite
+  # needs its own step.)
   module-tests:
     runs-on: windows-latest
     name: server module tests
+    # vtest has no client-side timeouts: a liveness regression hangs instead of
+    # failing, and this is the backstop.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Set up V
@@ -26,10 +33,15 @@ jobs:
         shell: bash
         run: |
           v test server core http1_1 http2 websocket socket epoll io_uring kqueue iocp tls static_assets testkit
+      - name: Behaviour suite on IOCP
+        shell: bash
+        run: |
+          v test tests/backend_behaviors_test.v
 
   examples-building-and-testing:
     runs-on: windows-latest
     name: ${{ matrix.folder }}
+    timeout-minutes: 20 # backstop for a hung vtest e2e test (no client timeouts)
     strategy:
       fail-fast: false # Continue other jobs if one fails
       matrix:

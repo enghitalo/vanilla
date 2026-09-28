@@ -73,7 +73,9 @@ nothing). A trie would trade that for O(path-length) at the cost of "no magic".
 - **Query-string–correct matching** — the path is matched up to `?`, so neither a
   query nor a `/` inside it (e.g. `?redirect=/home`) can cause a false `404`.
 - **Bounded** — `Limits` cap header/body size and concurrent connections, and
-  read/write timeouts reap slow or stalled peers.
+  read/write/idle timeouts reap slow or stalled peers, connections that never
+  send a byte, and idle keep-alive connections — which is what keeps the
+  connection cap from filling up with dead peers.
 - **Graceful shutdown** — `SIGTERM`/`SIGINT` stop new accepts and drain in-flight
   requests before exit (clean rolling deploys).
 
