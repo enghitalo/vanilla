@@ -258,9 +258,25 @@ fn process_events_tls(worker_id int, epoll_fd int, handler core.Handler, make_st
 	}
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut sessions := map[int]&TlsConn{}
-	sweep_on := limits.read_timeout_ms > 0 || limits.write_timeout_ms > 0
+	// Resolved once: the keep-alive idle budget (0 = off) and the sweep cadence
+	// (0 = no deadline is ever armed: no sweep, no clock reads, no wakes).
+	idle_ms := limits.idle_ms()
+	sweep_ms := limits.sweep_interval_ms()
+	sweep_on := sweep_ms > 0
+	sweep_ns := u64(sweep_ms) * 1_000_000
+	mut next_sweep := u64(0)
+	mut sweep_wait := sweep_ms // ms until next_sweep, as of the last sweep call
+	// Reused by every sweep (cleared, never reallocated past its high-water
+	// mark): the sweep allocates nothing, which -gc none requires.
+	mut expired := []int{cap: 64}
+	unsafe { expired.flags.set(.noslices) } // a growth frees the old block
 	for {
-		wait_ms := if sweep_on && sessions.len > 0 { 250 } else { -1 }
+		// Every session may carry a deadline (from accept on), so while any
+		// exists wake no later than the next sweep is due; otherwise sleep
+		// until the next event. (sessions only changes in the batch or the
+		// sweep, and the sweep runs after any batch that leaves one, so
+		// sweep_wait is current whenever it is used.)
+		wait_ms := if sweep_on && sessions.len > 0 { sweep_wait } else { -1 }
 		num_events := C.epoll_wait(epoll_fd, &events[0], socket.max_connection_size, wait_ms)
 		if num_events < 0 {
 			if C.errno == C.EINTR {
@@ -277,18 +293,24 @@ fn process_events_tls(worker_id int, epoll_fd int, handler core.Handler, make_st
 				continue
 			}
 			if ev & u32(C.EPOLLOUT) != 0 {
-				handle_writable_fd_tls(epoll_fd, fd, active_conns, mut sessions)
+				// Also the birth of a connection accept registered with EPOLLOUT.
+				handle_writable_fd_tls(epoll_fd, fd, limits, idle_ms, active_conns, cfg, mut
+					sessions)
 				if fd !in sessions {
 					continue // session closed — skip the EPOLLIN half of this event
 				}
 			}
 			if ev & u32(C.EPOLLIN) != 0 {
-				handle_readable_fd_tls(handler, state, epoll_fd, fd, limits, counter, active_conns,
-					cfg, mut sessions)
+				handle_readable_fd_tls(handler, state, epoll_fd, fd, limits, idle_ms, counter,
+					active_conns, cfg, mut sessions)
 			}
 		}
+		// After the batch (or a timeout wake), reap expired connections — at
+		// most once per sweep interval: one clock read per busy batch, not a
+		// walk of every session.
 		if sweep_on && sessions.len > 0 {
-			sweep_timeouts_tls(epoll_fd, active_conns, mut sessions)
+			next_sweep, sweep_wait = sweep_timeouts_tls(epoll_fd, active_conns, next_sweep,
+				sweep_ns, mut expired, mut sessions)
 		}
 	}
 }
