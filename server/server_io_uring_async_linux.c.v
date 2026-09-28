@@ -31,9 +31,12 @@ module server
 //     the resume renders and flushes, the send fails on the dead peer, and the
 //     write-completion path releases the slot — the pooled DB reply is thereby
 //     always drained IN ORDER, so none of epoll's disconnect tombstoning
-//     (reactor_orphan_single / eager mark_dead) is needed for correctness. The
-//     `dead` tombstone on queue slots is kept as a defensive guard (a released /
-//     reused slot found at drain time is consumed against a scratch buffer).
+//     (reactor_orphan_single / eager mark_dead) is needed for that. The `dead`
+//     tombstone on queue slots IS load-bearing for the lost-resume close: a
+//     pipelined head released because it suspended without re-arming stays
+//     queued as dead, so its in-flight reply is still consumed in order
+//     against a scratch buffer — and a new client that reuses the released
+//     slot and fd number is never resumed with the stale continuation.
 //
 // Parked-connection deadlines: read/write deadlines are cleared at park (no
 // client op is armed, so neither timeout applies — nor the idle one: a parked
