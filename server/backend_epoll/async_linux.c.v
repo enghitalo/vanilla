@@ -1048,6 +1048,16 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 			// is pending (the DB-style "park, write later" case appends nothing here).
 			// flush_batch returns false only if it already closed the conn (peer gone /
 			// write error) — then we must NOT re-park it.
+			if event_loop.last_watched < 0 {
+				// Suspended without re-arming a watch (watch_fd failed, or was never
+				// called): nothing would ever resume this connection, and a parked
+				// connection holds no deadline — flush what was appended, then
+				// close (the same rule as drain_takeover).
+				if flush_batch(epoll_fd, client_fd, limits, active_conns, mut st, mut cs) {
+					close_conn(epoll_fd, client_fd, active_conns, mut st)
+				}
+				return
+			}
 			if cs.write_buf.len > cs.write_off {
 				if !flush_batch(epoll_fd, client_fd, limits, active_conns, mut st, mut cs) {
 					return

@@ -2,7 +2,8 @@
 // Connection-reaping edge cases on the plain epoll worker that
 // backend_behaviors_test.v does not cover: what the read/idle deadlines must
 // NOT reap (a taken-over connection, a parked request, a request streaming
-// from a watch), and the flows that keep a request open across edges
+// from a watch), a suspended request that can never resume (closed, not
+// leaked), and the flows that keep a request open across edges
 // (Expect: 100-continue, a streamed > 1 MiB upload) while those deadlines are
 // armed. Plus a connect storm whose requests arrive with the connection — the
 // accept-time EPOLLOUT birth edge must still serve the EPOLLIN half.
@@ -90,6 +91,8 @@ const et_delay_prefix = 'GET /delay'.bytes()
 const et_stream_prefix = 'GET /stream'.bytes()
 const et_up_prefix = 'GET /up'.bytes()
 const et_upload_prefix = 'POST /upload'.bytes()
+const et_lost_prefix = 'GET /lost'.bytes()
+const et_lost_req = 'GET /lost HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 
 // et_timerfd arms a CLOCK_MONOTONIC timerfd that first fires after `ms`, then
 // every `interval_ms` (0 = one-shot). itimerspec = {it_interval, it_value}.
@@ -127,6 +130,10 @@ fn et_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 		out << et_switching
 		return .done
 	}
+	if et_has_prefix(req, et_lost_prefix) {
+		event_loop.watch_fd(et_timerfd(50, 0), .readable, et_lost_rearm, unsafe { nil })
+		return .suspend
+	}
 	if et_has_prefix(req, et_upload_prefix) {
 		out << et_upload_ok // answered from the head; the body is drained unseen
 		return .done
@@ -141,6 +148,17 @@ fn et_delay_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload 
 	C.close(ready_fd)
 	out << et_delayed
 	return .done
+}
+
+// et_lost_rearm "re-parks" on an fd it just closed: the watch cannot be armed
+// (epoll ADD fails), yet it returns .suspend. Nothing would ever resume the
+// request, and it holds no deadline while suspended.
+fn et_lost_rearm(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	mut tmp := [8]u8{}
+	C.read(ready_fd, &tmp[0], 8)
+	C.close(ready_fd)
+	event_loop.watch_fd(ready_fd, .readable, et_lost_rearm, unsafe { nil })
+	return .suspend
 }
 
 // et_stream_tick appends one body piece per tick and re-parks (the SSE shape:
@@ -239,6 +257,34 @@ fn check_parked_request_not_reaped(backend server.IOBackend, limits server.Limit
 	assert c.frames[0].bytestr().ends_with('delayed'), '${backend}: expected the continuation answer, got: ${c.raw.bytestr()}'
 	assert c.eof, '${backend}: after the resumed response the idle deadline must close the connection'
 	assert !c.raw.bytestr().contains('408'), '${backend}: idle close must be silent'
+}
+
+// check_lost_resume_closed: a continuation that returns .suspend without a
+// live watch (watch_fd failed, or was never called) can never be resumed. The
+// connection must be closed then — not left waiting forever with no deadline
+// holding its max_connections slot. then_eof: only the server can end it.
+fn check_lost_resume_closed(backend server.IOBackend) ! {
+	out := vtest.drive(server.ServerConfig{
+		io_multiplexing: backend
+		handler:         et_handler
+		limits:          server.Limits{
+			read_timeout_ms: 300
+		}
+	}, [
+		vtest.Script{
+			rounds:   [
+				vtest.Round{
+					send: et_lost_req
+					want: 0
+				},
+			]
+			then_eof: true
+		},
+	])!
+	c := out.conns[0]
+	assert c.connect_err == '', c.connect_err
+	assert c.eof, '${backend}: a suspend that cannot be resumed must close the connection'
+	assert out.active_after == 0
 }
 
 // check_streaming_watch_not_idle_reaped: a continuation that streams (append,
@@ -410,6 +456,12 @@ fn test_epoll_streaming_watch_not_idle_reaped() ! {
 		check_streaming_watch_not_idle_reaped(.epoll, server.Limits{
 			read_timeout_ms: 300
 		})!
+	}
+}
+
+fn test_epoll_lost_resume_closed() ! {
+	$if linux {
+		check_lost_resume_closed(.epoll)!
 	}
 }
 
