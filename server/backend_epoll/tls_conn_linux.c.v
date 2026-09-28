@@ -12,7 +12,10 @@ module backend_epoll
 //   • EPOLLOUT writes  — a response that can't be flushed (TLS WANT_WRITE) is
 //     parked in `write_buf` and drained on EPOLLOUT (mbedTLS is re-called with
 //     the same arguments until it accepts them);
-//   • timeouts    — per-conn read/write deadlines, swept by the worker.
+//   • timeouts    — per-conn read/write/idle deadlines, swept by the worker.
+//     The first one starts at accept (the EPOLLOUT birth edge, see
+//     handle_writable_fd_tls), so a peer that never sends a byte, or stalls
+//     mid-handshake, is reaped like any other. Every expiry closes silently.
 //
 // Per-fd state lives in a per-worker `map[int]&TlsConn`; the worker is
 // single-threaded, so no locking.
@@ -37,8 +40,9 @@ mut:
 	resp_buf       []u8 // per-conn response buffer, pooled across requests (reset to len 0, reused)
 	write_buf      []u8 // response remaining to be flushed (mbedTLS retries same data)
 	write_off      int
-	read_deadline  u64 // monotonic ns; >0 while a request is mid-read
+	read_deadline  u64 // monotonic ns; >0 while a request is mid-read — from accept for the first one (bounds a silent connect + the handshake)
 	write_deadline u64 // monotonic ns; >0 while a response is parked
+	idle_deadline  u64 // monotonic ns; >0 while waiting for the first plaintext byte of a request: keep-alive idle, or a new connection when read_timeout_ms is 0
 }
 
 // tls_set_out subscribes/unsubscribes the fd from EPOLLOUT, but only issues the
@@ -128,22 +132,18 @@ fn tls_handshake_step(mut conn TlsConn, epoll_fd int, fd int, active_conns &core
 }
 
 @[direct_array_access; manualfree]
-fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config, mut sessions map[int]&TlsConn) {
+fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd int, limits core.Limits, idle_ms int, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config, mut sessions map[int]&TlsConn) {
 	stdatomic.add_i64(&counter.n, 1)
 	defer {
 		stdatomic.add_i64(&counter.n, -1)
 	}
 
-	mut conn := sessions[fd] or {
-		s := cfg.new_session(fd) or {
-			release_conn(epoll_fd, fd, active_conns)
+	// nil = no session yet (see handle_writable_fd_tls for why not `or {}`).
+	mut conn := unsafe { sessions[fd] }
+	if conn == unsafe { nil } {
+		conn = tls_open_conn(cfg, epoll_fd, fd, limits, idle_ms, active_conns, mut sessions) or {
 			return
 		}
-		nc := &TlsConn{
-			sess: s
-		}
-		sessions[fd] = nc
-		nc
 	}
 
 	// 1) Drive the handshake (spans multiple readiness events).
@@ -181,7 +181,10 @@ fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd 
 		}
 		if n == tls.want {
 			if buf.len == 0 {
-				conn.read_buf = buf // nothing buffered yet — return to the pool, no deadline
+				// No plaintext yet (a record fragment, or a non-application
+				// record): return the buffer to the pool. This is not a first
+				// byte, so an armed idle/accept deadline keeps running.
+				conn.read_buf = buf
 				return
 			}
 			tls_save_read(mut conn, buf, limits.read_timeout_ms) // partial — resume on EPOLLIN
@@ -202,6 +205,9 @@ fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd 
 		unsafe {
 			buf.len += n
 		}
+		// First plaintext byte of a request: the idle phase is over. If the
+		// request stays incomplete, tls_save_read arms its read deadline.
+		conn.idle_deadline = 0
 		req_cap := if limits.max_request_bytes > 0 {
 			limits.max_request_bytes
 		} else {
@@ -230,7 +236,8 @@ fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd 
 		// total == -1: incomplete — keep draining this burst
 	}
 
-	// Request complete — clear the read deadline.
+	// Request complete — clear the read deadline (for the first request, the
+	// one armed at accept).
 	conn.read_deadline = 0
 
 	// Per-connection response buffer, pooled across requests (reset to len 0 and
@@ -258,7 +265,8 @@ fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd 
 	conn.read_buf = buf // pool the read buffer's capacity for the next request
 	match step {
 		.done {
-			tls_send_or_park(epoll_fd, fd, limits, active_conns, mut sessions, mut conn, resp)
+			tls_send_or_park(epoll_fd, fd, limits, idle_ms, active_conns, mut sessions, mut
+				conn, resp)
 		}
 		.close {
 			// Flush-then-close: best-effort synchronous write of whatever the
@@ -305,10 +313,24 @@ fn tls_write_all_best_effort(mut conn TlsConn, fd int, resp []u8) {
 }
 
 // handle_writable_fd_tls resumes work blocked on writability: a handshake that
-// wanted to write, or a parked response.
+// wanted to write, or a parked response. An EPOLLOUT on an fd with no session
+// is the connection's birth (accept registered it with EPOLLOUT, see
+// accept_events): create the session, arm the accept-time deadline and switch
+// the fd back to EPOLLIN. The caller still runs the EPOLLIN half of the same
+// event, which starts the handshake if the ClientHello came with the connect.
 @[direct_array_access; manualfree]
-fn handle_writable_fd_tls(epoll_fd int, fd int, active_conns &core.Counter, mut sessions map[int]&TlsConn) {
-	mut conn := sessions[fd] or { return }
+fn handle_writable_fd_tls(epoll_fd int, fd int, limits core.Limits, idle_ms int, active_conns &core.Counter, cfg &tls.Config, mut sessions map[int]&TlsConn) {
+	// One lookup, nil on a miss. Not `sessions[fd] or {}`: on a miss that
+	// allocates its "key does not exist" error, once per connection — a leak
+	// under -gc none, and every connection's birth is a miss.
+	mut conn := unsafe { sessions[fd] }
+	if conn == unsafe { nil } {
+		mut nc := tls_open_conn(cfg, epoll_fd, fd, limits, idle_ms, active_conns, mut sessions) or {
+			return
+		}
+		tls_set_out(mut nc, epoll_fd, fd, false) // birth edge consumed — EPOLLIN only
+		return
+	}
 
 	if !conn.established {
 		// Handshake was waiting to write; advance it. If still not done, the step
@@ -340,13 +362,14 @@ fn handle_writable_fd_tls(epoll_fd int, fd int, active_conns &core.Counter, mut 
 	conn.write_buf = []u8{}
 	conn.write_off = 0
 	conn.write_deadline = 0
+	tls_arm_idle(mut conn, idle_ms)
 	tls_set_out(mut conn, epoll_fd, fd, false)
 }
 
 // tls_send_or_park encrypts and sends the whole response, or parks the remainder
 // for EPOLLOUT. Takes ownership of `resp` (frees it when fully sent or parked).
 @[manualfree]
-fn tls_send_or_park(epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut sessions map[int]&TlsConn, mut conn TlsConn, resp []u8) {
+fn tls_send_or_park(epoll_fd int, fd int, limits core.Limits, idle_ms int, active_conns &core.Counter, mut sessions map[int]&TlsConn, mut conn TlsConn, resp []u8) {
 	mut sent := 0
 	for sent < resp.len {
 		n := tls_write_chunk(mut conn, fd, unsafe { &u8(resp.data) + sent }, resp.len - sent)
@@ -368,7 +391,48 @@ fn tls_send_or_park(epoll_fd int, fd int, limits core.Limits, active_conns &core
 		done.len = 0
 	}
 	conn.resp_buf = done // return to the per-conn pool instead of freeing
+	tls_arm_idle(mut conn, idle_ms) // keep-alive: wait for the next request
 	tls_set_out(mut conn, epoll_fd, fd, false) // keep-alive; not waiting on writability
+}
+
+// tls_open_conn creates fd's session and per-connection state, on the
+// accept-time EPOLLOUT birth edge or, when accept registered no EPOLLOUT (no
+// deadline starts at accept), lazily on the first EPOLLIN. It arms the
+// accept-time deadline: READ when read_timeout_ms > 0 — it bounds the TCP
+// silence, the whole handshake (WANT_WRITE flights included) and the first
+// request, and progress never refreshes it — else IDLE (a connection that has
+// sent nothing is idle; its first plaintext byte clears it). watching_out
+// mirrors the mask the fd was registered with: were it false on an
+// EPOLLOUT-registered fd, tls_set_out(false) would short-circuit and every
+// later wake would report EPOLLOUT too. A session that cannot be created
+// releases the connection and returns none.
+fn tls_open_conn(cfg &tls.Config, epoll_fd int, fd int, limits core.Limits, idle_ms int, active_conns &core.Counter, mut sessions map[int]&TlsConn) ?&TlsConn {
+	s := cfg.new_session(fd) or {
+		release_conn(epoll_fd, fd, active_conns)
+		return none
+	}
+	mut conn := &TlsConn{
+		sess:         s
+		watching_out: accept_events(limits) & u32(C.EPOLLOUT) != 0
+	}
+	if limits.read_timeout_ms > 0 {
+		conn.read_deadline = time.sys_mono_now() + u64(limits.read_timeout_ms) * 1_000_000
+	} else if idle_ms > 0 {
+		conn.idle_deadline = time.sys_mono_now() + u64(idle_ms) * 1_000_000
+	}
+	sessions[fd] = conn
+	return conn
+}
+
+// tls_arm_idle starts the keep-alive idle clock once a response has been fully
+// handed to the kernel. Not while bytes of the next request are buffered: that
+// partial is governed by its read deadline. idle_ms is the worker's resolved
+// Limits.idle_ms() (0 = off).
+@[inline]
+fn tls_arm_idle(mut conn TlsConn, idle_ms int) {
+	if idle_ms > 0 && conn.read_buf.len == 0 {
+		conn.idle_deadline = time.sys_mono_now() + u64(idle_ms) * 1_000_000
+	}
 }
 
 fn tls_save_read(mut conn TlsConn, buf []u8, read_timeout_ms int) {
@@ -386,23 +450,33 @@ fn tls_park_write(mut conn TlsConn, resp []u8, sent int, write_timeout_ms int) {
 	}
 }
 
-// sweep_timeouts_tls closes TLS connections whose read/write deadline passed.
-// (No 408 is sent: encrypting a reply onto a stalled socket would itself block;
-// dropping the connection is the honest action.)
+// sweep_timeouts_tls closes TLS connections whose read, write or idle deadline
+// passed — silently in every phase (accept, handshake, request, parked
+// response, keep-alive idle): no 408 is sent, since encrypting a reply onto a
+// stalled socket would itself block and a peer that never spoke has nothing
+// to parse; dropping the connection is the honest action. Rate-limited: it
+// reads the clock once and walks the table only when `next_sweep` has come
+// (the worker's epoll_wait timeout is the same interval, so an idle worker
+// wakes for it). `expired` is the worker's reusable scratch, so a sweep
+// allocates nothing. Returns the next sweep time.
 @[manualfree]
-fn sweep_timeouts_tls(epoll_fd int, active_conns &core.Counter, mut sessions map[int]&TlsConn) {
+fn sweep_timeouts_tls(epoll_fd int, active_conns &core.Counter, next_sweep u64, interval_ns u64, mut expired []int, mut sessions map[int]&TlsConn) u64 {
 	now := time.sys_mono_now()
-	mut expired := []int{}
+	if now < next_sweep {
+		return next_sweep
+	}
+	expired.clear()
 	for fd, conn in sessions {
-		if conn.read_deadline > 0 && now > conn.read_deadline {
-			expired << fd
-		} else if conn.write_deadline > 0 && now > conn.write_deadline {
+		if (conn.read_deadline > 0 && now > conn.read_deadline)
+			|| (conn.write_deadline > 0 && now > conn.write_deadline)
+			|| (conn.idle_deadline > 0 && now > conn.idle_deadline) {
 			expired << fd
 		}
 	}
 	for fd in expired {
 		close_tls(epoll_fd, fd, active_conns, mut sessions)
 	}
+	return now + interval_ns
 }
 
 @[manualfree]
@@ -423,6 +497,10 @@ fn close_tls(epoll_fd int, fd int, active_conns &core.Counter, mut sessions map[
 		}
 		c.sess.free()
 		sessions.delete(fd)
+		// The TlsConn itself: no caller touches it after close_tls. Freed, not
+		// left to the GC, because the epoll build runs with -gc none and every
+		// reaped connection (a silent connect included) allocated one.
+		unsafe { free(c) }
 	}
 	release_conn(epoll_fd, fd, active_conns)
 }
