@@ -56,6 +56,7 @@ mut:
 	read_deadline     u64 // monotonic ns; >0 while waiting on a request: from accept for the first, from its first byte for a later one, or an idle deadline (see idle)
 	write_deadline    u64 // monotonic ns; >0 while a batch is pending
 	body_drain        i64 // >0 while a streamed large body is being discarded
+	drain_off         int // while body_drain > 0: where the held response to the streamed request starts in write_buf
 	close_after_flush bool
 	sent_100          bool
 	idle              bool // read_deadline is an idle deadline (nothing of a request has arrived yet): the first byte clears it, expiry closes silently
@@ -178,11 +179,13 @@ fn flush_pending(mut w WorkerState, mut cs PollConn, limits core.Limits) int {
 }
 
 // update_read_deadline — armed once while a request is mid-read (partial
-// bytes buffered or a body mid-drain), cleared once the read side is empty
-// (the request completed). Never refreshed by progress: an accept-time or
-// mid-request deadline keeps its total-time budget, the same semantics as
-// every other backend. An idle deadline is left alone — only the first byte
-// of the next request clears it (serve_readable).
+// bytes buffered or a body mid-drain), cleared once the read side is empty.
+// Never refreshed by progress: an accept-time or mid-request deadline keeps
+// its total-time budget, the same semantics as every other backend. Only a
+// completed request ends it (serve_readable clears it then), so a pipelined
+// partial behind that request is re-armed here with a fresh budget. An idle
+// deadline is left alone — only the first byte of the next request clears it
+// (serve_readable).
 @[inline]
 fn update_read_deadline(limits core.Limits, mut w WorkerState, mut cs PollConn) {
 	if cs.read_buf.len > 0 || cs.body_drain > 0 {
@@ -285,6 +288,7 @@ fn start_body_drain(h core.Handler, mut cs PollConn, limits core.Limits, state v
 		client_fd: cs.fd
 		register:  core.reject_register
 	}
+	cs.drain_off = cs.write_buf.len
 	if h(head, mut cs.write_buf, cs.fd, state, mut event_loop) != .done {
 		cs.write_buf << response.tiny_bad_request_response
 		return 2
@@ -337,6 +341,12 @@ fn serve_readable(h core.Handler, mut w WorkerState, i int, limits core.Limits, 
 				return false
 			}
 			cs.body_drain -= dn
+			if cs.body_drain == 0 && cs.read_deadline != 0 {
+				// The streamed request is complete: bytes that follow start the
+				// next request's own clock (as after drain_requests below).
+				cs.read_deadline = 0
+				w.parked--
+			}
 			continue
 		}
 		if cs.read_buf.len == cs.read_buf.cap {
@@ -390,9 +400,18 @@ fn serve_readable(h core.Handler, mut w WorkerState, i int, limits core.Limits, 
 			cs.read_deadline = 0
 			w.parked--
 		}
+		buffered := cs.read_buf.len
 		if !drain_requests(h, mut cs, limits, state) {
 			must_close = true
 			break
+		}
+		if cs.read_deadline != 0 && cs.read_buf.len < buffered {
+			// A request completed (drain_requests consumed it): what is still
+			// buffered is the NEXT request, whose clock starts at its first
+			// byte — now; update_read_deadline re-arms it below — not at accept
+			// or at the completed request's first byte.
+			cs.read_deadline = 0
+			w.parked--
 		}
 		if cs.read_buf.len > req_cap {
 			cs.write_buf << response.status_413_response
@@ -471,8 +490,9 @@ fn handle_writable(mut w WorkerState, i int, limits core.Limits, active_conns &c
 }
 
 // sweep_timeouts reaps every connection whose deadline passed (w.now). A read
-// deadline sends 408 only when part of a request is buffered; an idle wait,
-// or a peer that never spoke, closes silently.
+// deadline sends 408 only when part of a request is buffered and the 408 is
+// the next response on the wire; an idle wait, a peer that never spoke, or a
+// request stuck behind a response still being sent closes silently.
 @[direct_array_access]
 fn sweep_timeouts(mut w WorkerState, active_conns &core.Counter) {
 	now := w.now
@@ -480,7 +500,18 @@ fn sweep_timeouts(mut w WorkerState, active_conns &core.Counter) {
 	for i < w.conns.len {
 		cs := w.conns[i]
 		if cs.read_deadline > 0 && now > cs.read_deadline {
-			if cs.read_buf.len > 0 || cs.body_drain > 0 {
+			// The 408 goes straight to the socket, so it must not land inside or
+			// ahead of an earlier response still pending (a parked batch): only
+			// with nothing left to write, or — for a streamed body — when every
+			// earlier response is out and the one held for the timed-out
+			// request itself (which the 408 replaces) has not started (the
+			// flush is held for the whole drain).
+			at_boundary := if cs.body_drain > 0 {
+				cs.write_off == cs.drain_off
+			} else {
+				cs.write_off == cs.write_buf.len
+			}
+			if (cs.read_buf.len > 0 || cs.body_drain > 0) && at_boundary {
 				response.send_status_408_response(cs.fd)
 			}
 			w.close_conn_at(i, active_conns)
@@ -541,8 +572,9 @@ fn poll_worker(listener int, handler core.Handler, make_state fn () voidptr, lim
 		// With a deadline armed, block only until the next scan is due (at most
 		// one interval): a traffic wake just before next_sweep skips the scan,
 		// and waiting a full interval after it would make expiry up to two
-		// intervals late. w.now is this iteration's cached clock (no extra
-		// read); rounding up lands the wake at/after next_sweep.
+		// intervals late. w.now is the clock read after the last poll return,
+		// an EINTR included (no extra read); rounding up lands the wake at/after
+		// next_sweep.
 		wait_ms := if !(sweep_on && w.parked > 0) {
 			-1
 		} else if w.now >= w.next_sweep {
@@ -553,6 +585,15 @@ fn poll_worker(listener int, handler core.Handler, make_state fn () voidptr, lim
 		num := poll.wait(&w.pfds[0], u64(w.pfds.len), wait_ms)
 		if num < 0 {
 			if C.errno == C.EINTR {
+				// poll(2) is never restarted after a signal handler (whatever
+				// SA_RESTART says), so refresh the clock before the retry: the
+				// wait above then shrinks to what is left of the interval and
+				// reaches 0. A stale w.now would re-issue the full wait on every
+				// signal, and a steady stream of them (e.g. GC stop-the-world)
+				// would keep the scan from ever running on an idle worker.
+				if sweep_on {
+					w.now = time.sys_mono_now()
+				}
 				continue
 			}
 			C.perror(c'poll')
