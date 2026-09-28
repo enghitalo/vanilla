@@ -20,8 +20,11 @@
 //     memory, with the response HELD until the drain completes
 //     (drain-then-respond, same ordering contract as the epoll backend);
 //   • limits: max_connections (refused at accept), max_header/max_body (parser
-//     sentinels → 431/413), max_request_bytes (413), read/write timeouts
-//     (deadline sweep driven by the GetQueuedCompletionStatus timeout).
+//     sentinels → 431/413), max_request_bytes (413), read/idle/write timeouts
+//     (deadline sweep driven by the GetQueuedCompletionStatus timeout). A new
+//     connection's clock starts at the accept hand-off, so a peer that never
+//     sends a byte is reaped too; a keep-alive connection waiting for its next
+//     request is reaped by the idle deadline.
 //
 // The handler contract is core.Handler, unchanged. This worker has no watch
 // reactor yet (IOCP is completion-based; watching arbitrary readiness like
@@ -63,10 +66,6 @@ const win_max_pending_write = 8 * 1024 * 1024
 // is answered and the body is drained (recv'd into the fixed buffer and
 // discarded) instead of growing read_buf into a multi-MB block.
 const win_stream_body_above = 1024 * 1024
-// Deadline sweep cadence while something is parked (mirrors the epoll worker's
-// 250 ms timeout wait).
-const win_sweep_interval_ns = u64(250) * 1_000_000
-
 // Accept-loop errno values that mean the LISTENER itself is gone (closed by
 // shutdown()/test teardown), as opposed to a per-connection failure.
 const wsaeintr = 10004 // WSAEINTR: blocking accept canceled
@@ -111,8 +110,9 @@ mut:
 	// (deadline sweep): the state must stay alive until the canceled
 	// completion drains through the port, then it is recycled.
 	closing        bool
-	read_deadline  u64 // monotonic ns; >0 while a request is mid-read
+	read_deadline  u64 // monotonic ns; >0 while a request is mid-read (the first request's since accept)
 	write_deadline u64 // monotonic ns; >0 while a send is in flight
+	idle_deadline  u64 // monotonic ns; >0 while keep-alive waits for the next request's first byte
 	slot           int // index in WinState.conns, for O(1) swap-remove
 }
 
@@ -123,8 +123,9 @@ struct WinState {
 mut:
 	conns      []&WinConn
 	free_conns []&WinConn
-	parked     int // conns with an armed deadline — gates the sweep entirely
-	last_sweep u64
+	parked     int // armed deadlines (at most one per conn) — gates the sweep entirely
+	next_sweep u64 // monotonic ns; the sweep runs at most once per sweep interval
+	idle_ns    u64 // limits.idle_ms() in ns, resolved once per worker; 0 = no idle deadlines
 }
 
 // win_buf_view returns a non-owning []u8 window over buf[start..start+length]
@@ -175,7 +176,7 @@ fn win_conn_for(mut st WinState, fd int) &WinConn {
 	return cs
 }
 
-// win_clear_deadlines disarms both deadlines, keeping the parked count exact.
+// win_clear_deadlines disarms every deadline, keeping the parked count exact.
 @[inline]
 fn win_clear_deadlines(mut st WinState, mut cs WinConn) {
 	if cs.read_deadline != 0 {
@@ -184,6 +185,10 @@ fn win_clear_deadlines(mut st WinState, mut cs WinConn) {
 	}
 	if cs.write_deadline != 0 {
 		cs.write_deadline = 0
+		st.parked--
+	}
+	if cs.idle_deadline != 0 {
+		cs.idle_deadline = 0
 		st.parked--
 	}
 }
@@ -207,32 +212,37 @@ fn win_recycle(mut st WinState, mut cs WinConn) {
 	cs.closing = false
 	cs.read_deadline = 0
 	cs.write_deadline = 0
+	cs.idle_deadline = 0
 	cs.fd = -1
 	st.free_conns << cs
 }
 
 // win_close_conn tears a connection down when NO overlapped op is outstanding
-// (i.e. from within its own completion handler): close the socket, release the
-// accounting, recycle the state.
+// (i.e. from within its own completion handler): release the accounting, close
+// the socket, recycle the state. Decrement FIRST: once the peer can observe
+// the close its slot is already free, so a client that reconnects on EOF is
+// never refused by a count that has not caught up.
 fn win_close_conn(mut st WinState, mut cs WinConn, active_conns &core.Counter) {
 	win_clear_deadlines(mut st, mut cs)
-	socket.close_socket(cs.fd)
 	stdatomic.add_i64(&active_conns.n, -1)
+	socket.close_socket(cs.fd)
 	win_recycle(mut st, mut cs)
 }
 
 // win_kill_conn tears a connection down while an overlapped op IS outstanding
 // (the deadline sweep): closesocket cancels the op; the canceled completion
-// drains through the port and the worker loop recycles the state there.
+// drains through the port and the worker loop recycles the state there. The
+// slot is released before the close, as in win_close_conn.
 fn win_kill_conn(mut st WinState, mut cs WinConn, active_conns &core.Counter) {
 	win_clear_deadlines(mut st, mut cs)
 	cs.closing = true
-	socket.close_socket(cs.fd)
 	stdatomic.add_i64(&active_conns.n, -1)
+	socket.close_socket(cs.fd)
 }
 
-// win_sweep_timeouts closes connections whose read/write deadline has passed.
-// Runs only when something is parked and a timeout is configured.
+// win_sweep_timeouts closes connections whose read, idle or write deadline has
+// passed. The worker loop runs it only while a deadline is armed, at most once
+// per sweep interval.
 @[direct_array_access]
 fn win_sweep_timeouts(now u64, mut st WinState, active_conns &core.Counter) {
 	for i in 0 .. st.conns.len {
@@ -241,11 +251,19 @@ fn win_sweep_timeouts(now u64, mut st WinState, active_conns &core.Counter) {
 			continue
 		}
 		if cs.read_deadline > 0 && now > cs.read_deadline {
-			// Courtesy 408, BEST-EFFORT: the socket is non-blocking, so against
-			// a full send buffer (peer stopped reading) this fails with
-			// WSAEWOULDBLOCK instead of stalling the worker — the same EAGAIN
-			// drop the epoll backend's non-blocking sockets give it.
-			response.send_status_408_response(cs.fd)
+			// Courtesy 408 only once part of the request has arrived; a peer
+			// that never spoke (the accept-time deadline) is closed silently.
+			// BEST-EFFORT: the socket is non-blocking, so against a full send
+			// buffer (peer stopped reading) this fails with WSAEWOULDBLOCK
+			// instead of stalling the worker — the same EAGAIN drop the epoll
+			// backend's non-blocking sockets give it.
+			if cs.read_buf.len > 0 || cs.body_drain > 0 {
+				response.send_status_408_response(cs.fd)
+			}
+			win_kill_conn(mut st, mut cs, active_conns)
+		} else if cs.idle_deadline > 0 && now > cs.idle_deadline {
+			// Idle keep-alive (or a new connection that never sent a byte, when
+			// only an idle budget is set): close silently.
 			win_kill_conn(mut st, mut cs, active_conns)
 		} else if cs.write_deadline > 0 && now > cs.write_deadline {
 			win_kill_conn(mut st, mut cs, active_conns)
@@ -274,8 +292,19 @@ fn win_post_recv(mut cs WinConn) bool {
 }
 
 // win_post_send arms the connection's single send op over the pending
-// [write_off..len) window and starts the write deadline (once per batch).
+// [write_off..len) window and starts the write deadline (once per batch). The
+// requests being answered are complete, so the recv-side deadlines stop here
+// (the next recv re-arms them): only write_timeout_ms bounds a send, and the
+// sweep can never cut a response mid-flight with a 408 or a read/idle expiry.
 fn win_post_send(mut st WinState, mut cs WinConn, limits core.Limits) bool {
+	if cs.read_deadline != 0 {
+		cs.read_deadline = 0
+		st.parked--
+	}
+	if cs.idle_deadline != 0 {
+		cs.idle_deadline = 0
+		st.parked--
+	}
 	if limits.write_timeout_ms > 0 && cs.write_deadline == 0 {
 		cs.write_deadline = time.sys_mono_now() + u64(limits.write_timeout_ms) * 1_000_000
 		st.parked++
@@ -286,20 +315,38 @@ fn win_post_send(mut st WinState, mut cs WinConn, limits core.Limits) bool {
 	return iocp.post_send(cs.fd, &cs.write_op.wsabuf, &cs.write_op.ov)
 }
 
-// win_update_read_deadline arms the read deadline ONCE while a request is
-// mid-read (partial bytes buffered, or a large body mid-drain) and clears it
-// when the buffer is idle — the same once-per-request semantics as the other
-// backends (read_timeout_ms bounds the TOTAL time to receive a request).
+// win_update_read_deadline sets the recv-side deadline before each recv post
+// (never while a send is in flight — one op per connection):
+//   • part of a request buffered (or a large body mid-drain): its first byte
+//     ends any idle wait, and the read deadline is armed ONCE per request and
+//     never refreshed by progress — the same once-per-request semantics as the
+//     other backends (read_timeout_ms bounds the TOTAL time to receive a
+//     request; the first request's was armed at accept);
+//   • buffer empty: a request boundary (the response was fully sent, or the
+//     burst produced none), so the keep-alive idle deadline is armed afresh,
+//     replacing a read deadline left by the request just served.
 @[inline]
 fn win_update_read_deadline(limits core.Limits, mut st WinState, mut cs WinConn) {
 	if cs.read_buf.len > 0 || cs.body_drain > 0 {
+		if cs.idle_deadline != 0 {
+			cs.idle_deadline = 0
+			st.parked--
+		}
 		if limits.read_timeout_ms > 0 && cs.read_deadline == 0 {
 			cs.read_deadline = time.sys_mono_now() + u64(limits.read_timeout_ms) * 1_000_000
 			st.parked++
 		}
-	} else if cs.read_deadline != 0 {
+		return
+	}
+	if cs.read_deadline != 0 {
 		cs.read_deadline = 0
 		st.parked--
+	}
+	if st.idle_ns > 0 {
+		if cs.idle_deadline == 0 {
+			st.parked++
+		}
+		cs.idle_deadline = time.sys_mono_now() + st.idle_ns
 	}
 }
 
@@ -553,6 +600,8 @@ fn win_on_send(h core.Handler, mut st WinState, mut cs WinConn, n int, limits co
 		win_close_conn(mut st, mut cs, active_conns)
 		return
 	}
+	// Fully flushed: the next recv waits under the idle deadline, or under the
+	// read deadline when part of a pipelined request is already buffered.
 	win_arm_recv(h, mut st, mut cs, limits, active_conns, state)
 }
 
@@ -568,25 +617,53 @@ fn win_worker(port voidptr, h core.Handler, make_state fn () voidptr, limits cor
 		state = make_state()
 	}
 	mut st := WinState{
-		conns: []&WinConn{cap: 64}
+		conns:   []&WinConn{cap: 64}
+		idle_ns: u64(limits.idle_ms()) * 1_000_000
 	}
-	sweep_on := limits.read_timeout_ms > 0 || limits.write_timeout_ms > 0
+	// Deadline sweep cadence; 0 when no timeout is configured — then there are
+	// no deadlines, no clock reads and no sweep, and the wait never times out.
+	sweep_ns := u64(limits.sweep_interval_ms()) * 1_000_000
+	sweep_on := sweep_ns > 0
+	mut now := u64(0) // monotonic ns, read once per completion by the sweep gate
 	for {
 		mut bytes := u32(0)
 		mut key := usize(0)
 		mut ovp := &C.OVERLAPPED(unsafe { nil })
-		// Block until a completion arrives; wake every 250 ms only while a
-		// deadline is armed, so an idle worker burns zero CPU.
-		timeout := if sweep_on && st.parked > 0 { u32(250) } else { iocp.infinite }
+		// Block until a completion arrives. While a deadline is armed, wake no
+		// later than the next due sweep (at most one interval away, so a
+		// deadline is reaped at most one interval late); otherwise wait
+		// forever, so an idle worker burns zero CPU.
+		mut timeout := iocp.infinite
+		if sweep_on && st.parked > 0 {
+			timeout = 0
+			if st.next_sweep > now {
+				timeout = u32((st.next_sweep - now + 999_999) / 1_000_000)
+			}
+		}
 		ok := iocp.wait(port, &bytes, &key, &ovp, timeout)
 		if ovp == unsafe { nil } {
 			if ok && key == 0 {
 				break // shutdown wake
 			}
 			if ok && key != 0 {
-				// Accept hand-off: build the state and post the first recv.
+				// Accept hand-off: build the state, start the connection's
+				// clock and post the first recv. With read_timeout_ms the whole
+				// first request is bounded from here (a peer that never sends a
+				// byte is reaped, silently); with only an idle budget, the wait
+				// for its first byte is. win_arm_recv is bypassed: its buffer
+				// management is a no-op on an empty buffer, and its empty-buffer
+				// idle arm would replace this read deadline.
 				mut cs := win_conn_for(mut st, int(key))
-				win_arm_recv(h, mut st, mut cs, limits, active_conns, state)
+				if limits.read_timeout_ms > 0 {
+					cs.read_deadline = time.sys_mono_now() + u64(limits.read_timeout_ms) * 1_000_000
+					st.parked++
+				} else if st.idle_ns > 0 {
+					cs.idle_deadline = time.sys_mono_now() + st.idle_ns
+					st.parked++
+				}
+				if !win_post_recv(mut cs) {
+					win_close_conn(mut st, mut cs, active_conns)
+				}
 			}
 			// !ok with no overlapped = the timeout tick; fall through to sweep.
 		} else {
@@ -605,10 +682,13 @@ fn win_worker(port voidptr, h core.Handler, make_state fn () voidptr, limits cor
 				win_on_send(h, mut st, mut cs, int(bytes), limits, active_conns, state)
 			}
 		}
+		// Sweep gate: ONE clock read per completion, and only while a deadline
+		// is armed; the scan itself is rate-limited to once per interval, so a
+		// busy worker never walks its connection table after every completion.
 		if sweep_on && st.parked > 0 {
-			now := time.sys_mono_now()
-			if now - st.last_sweep >= win_sweep_interval_ns {
-				st.last_sweep = now
+			now = time.sys_mono_now()
+			if now >= st.next_sweep {
+				st.next_sweep = now + sweep_ns
 				win_sweep_timeouts(now, mut st, active_conns)
 			}
 		}
