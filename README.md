@@ -218,7 +218,7 @@ fn main() {
 | `examples/proxy_aware/` | `X-Forwarded-For` / real-IP extraction |
 | `examples/rate_limit/` | Token-bucket rate limiting |
 | `examples/redirects/` | 301/303/308 redirects |
-| `examples/request_limits/` | 413/431 body and header size limits |
+| `examples/request_limits/` | 413/431 body and header size limits, max connections, read/idle/write timeouts |
 | `examples/security_headers/` | HSTS, CSP, and other security headers |
 | `examples/sse/` | Server-Sent Events (sync broadcast) |
 | `examples/spa_static_assets/` | CSR/WASM SPA bundle (`application/wasm`, `.br`/`.gz`, immutable caching, SPA fallback) |
@@ -248,7 +248,7 @@ Two layers, no bespoke test mode on the server:
   readers (so a broken stream fails fast instead of hanging). Either way this
   drives the real backend end to end —
   epoll / io_uring / kqueue — including pipelining, request framing across TCP
-  segments, keep-alive, `Expect: 100-continue`, half-close, read timeouts, and the
+  segments, keep-alive, `Expect: 100-continue`, half-close, read/idle timeouts, and the
   async suspend/resume path. See
   [`tests/backend_behaviors_test.v`](tests/backend_behaviors_test.v)
   and the `*_end_to_end_test.v` files under [`examples/`](examples/).
@@ -422,13 +422,13 @@ See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark 
 - [x] `Host` header validation (RFC 9112 §3.2) — `validate_http1()` (exactly-one Host); demonstrated end-to-end in `examples/conformance/`
 - [ ] Reject `Content-Length` + `Transfer-Encoding` at the framing layer ([#104](https://github.com/enghitalo/vanilla/issues/104)) — the smuggling case the conformance handler can't fix alone
 - [ ] Flush a queued response before tearing down a half-closed connection ([#103](https://github.com/enghitalo/vanilla/issues/103)) — unblocks the live h1spec/Http11Probe gate
-- [x] Request timeouts — `Limits.read_timeout_ms` (408) / `write_timeout_ms`, enforced by the per-worker deadline sweep
+- [x] Request timeouts — `Limits.read_timeout_ms` / `write_timeout_ms` / `idle_timeout_ms`, enforced by the per-worker deadline sweep. The first request's read deadline starts at accept (it bounds a silent connect and the TLS handshake); 408 only for a partial request, silent close otherwise; idle keep-alive connections are reaped after `idle_timeout_ms` (0 = inherit `read_timeout_ms`, -1 = never). Not enforced on kqueue yet
 - [x] Chunked transfer-encoding in the request parser (`frame_chunked_total`)
 - [x] HTTP/2 — cleartext prior-knowledge via the takeover seam: HPACK (RFC 7541, Appendix C-verified), multiplexed streams, send-side flow control (`http2/` + `examples/http2_cleartext/`); TLS/ALPN and the HTTP/1.1 Upgrade handshake still open
 - [x] WebSocket upgrade (framing, ping/pong, close handshake) — `websocket/` codec + `examples/websocket_echo/` over the takeover seam
-- [x] TLS/HTTPS — epoll backend via `ServerConfig.tls_config`; `tls.new_self_signed()` issues a localhost/loopback certificate with proper SANs, `sans: ['IP:203.0.113.5']` targets a real host and `persist_dir:` keeps the identity across restarts (or `tls.new_from_pem` for CA-issued certs); other backends are plaintext
+- [x] TLS/HTTPS — epoll backend via `ServerConfig.tls_config`; `tls.new_self_signed()` issues a localhost/loopback certificate with proper SANs, `sans: ['IP:203.0.113.5']` targets a real host and `persist_dir:` keeps the identity across restarts (or `tls.new_from_pem` for CA-issued certs); the handshake is bounded by `read_timeout_ms` (its deadline starts at accept); other backends are plaintext
 - [ ] HTTPS example (`examples/https/`)
-- [x] Body-size cap + max-connections via `Limits` (`max_body_bytes` → 413, `max_request_bytes`, `max_connections`); a per-connection request-count limit is still open
+- [x] Body-size cap + max-connections via `Limits` (`max_body_bytes` → 413, `max_request_bytes`, `max_connections`); pair `max_connections` with a read or idle timeout — reaping silent and idle connections is what frees their slots. A per-connection request-count limit is still open
 - [ ] Response caching layer (ETag + `Last-Modified` auto-generation)
 - [ ] Logging middleware example (`examples/logging/`)
 - [ ] API documentation (godoc-style, inline)

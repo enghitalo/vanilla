@@ -82,21 +82,45 @@ and drains in-flight requests up to the grace period.
 
 ## Request limits (`ServerConfig.limits`)
 
-`Limits` gates abusive requests at the framing/accept layer (0 = unlimited, zero-cost):
+`Limits` gates abusive requests at the framing/accept layer. Every field
+defaults to 0 = unlimited and costs nothing unless set — with one exception:
+`idle_timeout_ms = 0` **inherits** `read_timeout_ms`, so setting a read timeout
+alone also reaps idle keep-alive connections. With both at 0 nothing is armed.
 
 | field | effect |
 |---|---|
 | `max_header_bytes` | **431** once the header block exceeds it |
 | `max_body_bytes` | **413** from the declared `Content-Length`, before buffering the body |
 | `max_request_bytes` | ceiling on a single buffered request (headers + body) |
-| `max_connections` | refuse new connections past this many concurrent (checked at accept) |
-| `read_timeout_ms` | **408** + close a connection that can't finish its request in time |
+| `max_connections` | refuse new connections past this many concurrent (checked at accept). Pair it with a read or idle timeout: without a deadline, connections that never send (or peers that vanish without a FIN) hold their slots forever and the server stops accepting |
+| `read_timeout_ms` | a request (head + body) must arrive complete within this long, else close. The **first** request's clock starts at **accept**, so it also bounds a connection that never sends a byte and the TLS handshake; a later request's clock starts at its first byte. Not refreshed on progress (the slowloris bound) — size it for your largest upload. **408** only if part of the request arrived (plaintext epoll / poll / iocp); a peer that sent nothing is closed silently, and TLS / io_uring always close silently |
 | `write_timeout_ms` | close a connection whose parked response can't drain in time |
+| `idle_timeout_ms` | keep-alive: once a response is fully sent, how long to wait for the first byte of the next request before closing **silently** (no 408). `0` ⇒ `read_timeout_ms`; `-1` (any negative) ⇒ never. With no read timeout it also bounds a new connection's wait for its first byte. Never applies to a request parked on a watch, a parked write, or a taken-over connection (WebSocket, h2c) |
+
+Deadlines are enforced by each worker's sweep, which runs every
+`Limits.sweep_interval_ms()` (a quarter of the shortest timeout, clamped to
+25–250 ms): a connection is closed at most one interval after its deadline.
+
+Use `idle_timeout_ms: -1` when a handler hands its fd to another thread to
+stream (the fd-handoff pattern in `examples/sse` and `examples/video_stream`):
+the core has seen the response finish, so the connection looks idle to it.
+Behind a load balancer that pools upstream connections, keep `idle_timeout_ms`
+longer than the balancer's own idle timeout, or it will reuse a connection the
+server is closing and answer 502.
+
+**kqueue (macOS) enforces none of `max_connections`, `read_timeout_ms`,
+`write_timeout_ms` or `idle_timeout_ms` yet** — only the header/body size
+limits. Do not rely on it to reap connections.
 
 ## TLS
 
 Set `ServerConfig.tls_config` (e.g. `tls.new_self_signed()`) and `certificates` for
-HTTPS on the **epoll** backend; the other backends are plaintext.
+HTTPS on the **epoll** backend; the other backends are plaintext. The handshake
+is bounded by `read_timeout_ms`: the first request's deadline starts at accept,
+before any TLS record arrives, so a client that connects and never finishes its
+handshake is closed (silently) once it expires. Set a read timeout on any
+public HTTPS server: `idle_timeout_ms` alone only bounds the wait for the
+first byte, not a handshake that has started.
 
 ## Internals (where to look)
 

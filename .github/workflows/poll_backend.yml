@@ -35,6 +35,7 @@ jobs:
   poll-reactor-tests:
     runs-on: ubuntu-latest
     name: behaviour suite under -d vanilla_poll
+    timeout-minutes: 20 # backstop for a hung vtest e2e test (no client timeouts)
     steps:
       - uses: actions/checkout@v4
       - name: Set up V
@@ -49,8 +50,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y liburing-dev linux-libc-dev
       # The whole behaviour suite (pipelining, split framing, max_connections,
-      # read timeout, large-body drain, half-close, 100-continue, graceful
-      # shutdown) runs against .poll via the $if vanilla_poll ? test fns, with
+      # read timeout, connection reaping, large-body drain, half-close,
+      # 100-continue, graceful shutdown) runs against .poll via the $if vanilla_poll ? test fns, with
       # the epoll checks as the in-binary control group. VANILLA_NO_IOURING is
       # the repo's own kill-switch for exactly this host class (see
       # iou_backend_available): hosted runners cap io_uring so a probe that
