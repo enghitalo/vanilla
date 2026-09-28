@@ -27,11 +27,6 @@ import core
 import tls
 import vtest
 
-#include <openssl/pem.h>
-
-fn C.BIO_new_mem_buf(buf voidptr, len int) &C.BIO
-fn C.PEM_read_bio_X509(bp &C.BIO, x voidptr, cb voidptr, u voidptr) &C.X509
-
 const tt_req = 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 // A request head that stops mid-header (never completes on its own) and the
 // bytes that complete it.
@@ -96,38 +91,6 @@ fn tt_unbufferable_len() int {
 	return n
 }
 
-// tt_openssl_parses reports whether OpenSSL (the test client) accepts the
-// PEM certificate.
-fn tt_openssl_parses(pem string) bool {
-	bio := C.BIO_new_mem_buf(pem.str, pem.len)
-	if bio == unsafe { nil } {
-		return false
-	}
-	x := C.PEM_read_bio_X509(bio, unsafe { nil }, unsafe { nil }, unsafe { nil })
-	C.BIO_free_all(bio)
-	if x == unsafe { nil } {
-		return false
-	}
-	C.X509_free(x)
-	return true
-}
-
-// tt_tls_config is a fresh self-signed identity the openssl client can parse.
-// tls.new_self_signed draws a random 12-byte serial and encodes it as is; when
-// it starts with 0x00 and a byte < 0x80 the DER INTEGER is not minimal (about
-// 1 certificate in 500), and OpenSSL 3 fails the handshake on it ("illegal
-// padding") before any timeout logic runs. Draw again rather than flake.
-fn tt_tls_config() !&tls.Config {
-	for _ in 0 .. 8 {
-		cfg := tls.new_self_signed()!
-		if tt_openssl_parses(cfg.cert_pem()) {
-			return cfg
-		}
-		cfg.free()
-	}
-	return error('tls.new_self_signed: no certificate OpenSSL can parse in 8 draws')
-}
-
 // tt_start serves tt_ok_handler over HTTPS on one epoll TLS worker. (`.epoll`
 // exists only on Linux, hence the gate.)
 fn tt_start(limits server.Limits) !&vtest.Harness {
@@ -135,7 +98,7 @@ fn tt_start(limits server.Limits) !&vtest.Harness {
 		return vtest.start(server.ServerConfig{
 			io_multiplexing: .epoll
 			workers:         1
-			tls_config:      tt_tls_config()!
+			tls_config:      tls.new_self_signed()!
 			handler:         tt_ok_handler
 			limits:          limits
 		})
