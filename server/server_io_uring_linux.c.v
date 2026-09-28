@@ -76,7 +76,9 @@ fn iou_release(worker &io_uring.Worker, mut conn io_uring.Connection, active_con
 }
 
 // iou_arm_recv posts the next recv and arms the read deadline. Every wait for
-// request bytes goes through here, so none is unbounded while a timeout is set:
+// request bytes goes through here, so a wait for a request's first byte is
+// bounded whenever an idle budget is on, and a partial request whenever
+// read_timeout_ms is (with only an idle budget, a started request is not):
 //   * a partial request is buffered: arm the read deadline (read_timeout_ms)
 //     unless one is already armed — the accept-time deadline or this request's
 //     own is kept, never refreshed by progress (slowloris bound);
@@ -575,10 +577,12 @@ fn io_uring_worker_loop(worker &io_uring.Worker, mut env IouEnv, limits Limits, 
 
 	// The deadline sweep runs only when a timeout (read, write or idle) is
 	// configured; otherwise the loop blocks indefinitely — no clock read, no wake
-	// (zero cost on the default path). When on, the sweep interval is both the
-	// wait timeout (an idle worker still wakes to reap) and the scan's rate limit
-	// (a busy worker does not walk its connection table after every batch), so a
-	// deadline is acted on at most about one interval late.
+	// (zero cost on the default path). When on, the sweep interval is the scan's
+	// rate limit (a busy worker does not walk its connection table after every
+	// batch), and the wait never blocks past the next due scan (an idle worker
+	// still wakes to reap), so a deadline is acted on at most one interval (plus
+	// the batch) late. Waiting a full interval after a batch that landed just
+	// before the scan was due would let it slip to almost two.
 	sweep_ms := limits.sweep_interval_ms()
 	sweep_on := sweep_ms > 0
 	sweep_ns := u64(sweep_ms) * 1_000_000
@@ -587,6 +591,7 @@ fn io_uring_worker_loop(worker &io_uring.Worker, mut env IouEnv, limits Limits, 
 		tv_nsec: i64(sweep_ns)
 	}
 	mut next_sweep := u64(0)
+	mut wait_ns := sweep_ns // time left until the next due scan
 
 	mut cqes := unsafe { [io_uring.drain_batch]&C.io_uring_cqe{} }
 	for {
@@ -596,6 +601,7 @@ fn io_uring_worker_loop(worker &io_uring.Worker, mut env IouEnv, limits Limits, 
 		mut ret := 0
 		if sweep_on {
 			mut first := &C.io_uring_cqe(unsafe { nil })
+			ts.tv_nsec = i64(wait_ns)
 			ret = C.io_uring_submit_and_wait_timeout(&worker.ring, &first, 1, &ts, unsafe { nil })
 		} else {
 			ret = C.io_uring_submit_and_wait(&worker.ring, 1)
@@ -641,6 +647,7 @@ fn io_uring_worker_loop(worker &io_uring.Worker, mut env IouEnv, limits Limits, 
 				iou_sweep_timeouts(worker, now)
 				next_sweep = now + sweep_ns
 			}
+			wait_ns = next_sweep - now
 		}
 	}
 }

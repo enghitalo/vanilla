@@ -221,11 +221,11 @@ pub mut:
 	response_buffer []u8
 	bytes_sent      int
 
-	// Monotonic-ns deadlines, >0 while armed. read_deadline bounds every wait for
-	// request bytes: from accept for the first request (read_timeout), from the
-	// first byte for a later one that arrives partial (read_timeout), and, while
-	// `idle` is set, the keep-alive wait for the next request's first byte (idle
-	// budget). write_deadline runs while a response batch has not finished sending
+	// Monotonic-ns deadlines, >0 while armed. read_deadline bounds the waits for
+	// request bytes that a Limits timeout covers: from accept for the first
+	// request (read_timeout), from the first byte for a later one that arrives
+	// partial (read_timeout), and, while `idle` is set, the keep-alive wait for
+	// the next request's first byte (idle budget). write_deadline runs while a response batch has not finished sending
 	// (write_timeout). The timeout sweep half-closes (shutdown) past-deadline
 	// connections; the in-flight recv/send then completes with an error and the
 	// normal path frees the slot.
