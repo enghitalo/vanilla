@@ -151,6 +151,7 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 	core.enable_takeover()
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut st := new_plain_state()
+	st.reactor = unsafe { &reactor } // close_conn tears a parked client's watch down
 	// Arm clientless background watches (timerfd refresh, signalfd, ...) on THIS
 	// worker's loop, once, before serving. client_fd = -1 makes the watch + its
 	// continuation take the clientless path (no conn, scratch buffer).
@@ -228,28 +229,32 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 				// fds were routed above. So this is either that birth — and
 				// conn_birth's MOD succeeds only while the fd is in this epoll —
 				// or a stale event for an fd closed earlier in this batch (a
-				// client, or a watch fd close_client tore down). accept may
+				// client, or a watch fd close_conn tore down). accept may
 				// already have reused that number, for a connection this worker
 				// does not own or for one whose own birth event is still queued
 				// here. Closing or serving a stale fd would release a slot that
 				// was already released, or build a zombie state whose deadline
-				// later closes someone else's socket: drop the event.
+				// later closes someone else's socket: drop the event. A stale
+				// event that carries EPOLLOUT for a number reused by a new
+				// connection in THIS epoll passes conn_birth, and adopting that
+				// connection is right: it is ours, and gets its deadline here.
 				if ev & u32(C.EPOLLOUT) == 0 || !conn_birth(epoll_fd, fd, mut st) {
 					continue
 				}
-				// Born, with nothing to write: skip the EPOLLOUT half.
-				if ev & (u32(C.EPOLLHUP) | u32(C.EPOLLERR)) != 0 {
-					close_client(mut reactor, epoll_fd, fd, active_conns, mut st) // gone already
-				} else if ev & u32(C.EPOLLIN) != 0 {
-					// The request often arrives with the connection, and under
-					// EPOLLET a skipped edge is never reported again.
+				// Born, with nothing to write: skip the EPOLLOUT half. Read on
+				// EPOLLIN (the request often arrives with the connection, and
+				// under EPOLLET a skipped edge is never reported again) and on
+				// EPOLLHUP/EPOLLERR too: the recv tells a dead peer (EOF or an
+				// error: closed) from a stale mask adopted above (nothing to
+				// read: the new connection keeps its accept-time deadline).
+				if ev & (u32(C.EPOLLIN) | u32(C.EPOLLHUP) | u32(C.EPOLLERR)) != 0 {
 					handle_readable(handler, mut reactor, epoll_fd, fd, limits, counter,
 						active_conns, mut st, state)
 				}
 				continue
 			}
 			if ev & (u32(C.EPOLLHUP) | u32(C.EPOLLERR)) != 0 {
-				close_client(mut reactor, epoll_fd, fd, active_conns, mut st) // tears any watch down first
+				close_conn(epoll_fd, fd, active_conns, mut st) // tears any watch down first
 				continue
 			}
 			if ev & u32(C.EPOLLOUT) != 0 {
