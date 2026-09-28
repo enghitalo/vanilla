@@ -186,7 +186,7 @@ Vanilla epoll backend today (`backend_epoll/worker_linux.c.v`,
 | Pipelining | **dropped** — `buf.trim(total)` discards trailing pipelined bytes | parse all, one batched send |
 | Recv buffer | fresh `[]u8{cap: 256}` allocated *per EPOLLIN event*, grown by doubling | persistent 8–16 KiB per-conn buffer, reused |
 | State lookup | `map[int]&ConnState` | flat fd-indexed array |
-| Wait strategy | `epoll_wait(-1)` (or 250 ms sweep) | adaptive timeout 0/-1 busy-poll hybrid |
+| Wait strategy | `epoll_wait(-1)` (or the `sweep_interval_ms()` tick, 25–250 ms, while a deadline is armed) | adaptive timeout 0/-1 busy-poll hybrid |
 | Response | handler allocates `[]u8`, one `send` per request, freed after | static prefix + itoa into reused write buffer |
 | Pinning | none | `sched_setaffinity` per worker |
 
@@ -390,8 +390,9 @@ for {
 ```
 
 One line of state, measurable latency/throughput win under load, zero cost
-idle. (Compose with the existing 250 ms sweep: use `0` when hot, `250`/`-1`
-as today when idle.)
+idle. (Compose with the deadline sweep: use `0` when hot, and when idle the
+time left to the next `sweep_interval_ms()` tick, or `-1` if no deadline is
+armed.)
 
 ### 8. Pin workers to cores
 

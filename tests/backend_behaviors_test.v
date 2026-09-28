@@ -343,6 +343,65 @@ fn check_idle_opt_out(backend server.IOBackend) ! {
 	assert c.frames.len == 2, '${backend}: the idle connection must serve its next request, got ${c.frames.len}'
 }
 
+// bb_big_len is a response body a fresh loopback connection cannot absorb in
+// one send while the client reads it: a non-blocking send takes at most the
+// send buffer (tcp_wmem max, 4 MiB by default) plus the new connection's
+// receive window (tcp_rmem default, 128 KiB) — so the server's synchronous
+// send hits EAGAIN and the response is finished by the writable drain
+// (EPOLLOUT / POLLOUT). It stays under the backends' 8 MiB pending-write cap
+// (sm_max_pending_write / pl_max_pending_write), which would close the
+// connection instead.
+const bb_big_len = 7 * 1024 * 1024
+
+// bb_big_handler answers with a bb_big_len body, built into the server-owned
+// buffer (a test-only allocation; the size is what matters here).
+fn bb_big_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	res << bb_upload_resp_head
+	bb_wi(mut res, bb_big_len)
+	res << bb_upload_resp_sep
+	old := res.len
+	unsafe {
+		res.grow_len(bb_big_len)
+		vmemset(&res[old], `x`, bb_big_len)
+	}
+	return .done
+}
+
+// check_idle_after_parked_write: a response too big to send synchronously
+// completes on the writable-drain path, and the connection is back at rest
+// only then — the idle deadline must be armed THERE too, or a keep-alive peer
+// that vanishes after a large download holds its slot forever.
+fn check_idle_after_parked_write(backend server.IOBackend) ! {
+	mut h := vtest.start(server.ServerConfig{
+		io_multiplexing: backend
+		handler:         bb_big_handler
+		limits:          server.Limits{
+			read_timeout_ms: 400
+		}
+	})!
+	defer {
+		h.stop()
+	}
+	out := h.fire([
+		vtest.Script{
+			rounds:   [
+				vtest.Round{
+					send: bb_req
+					want: 1
+				},
+			]
+			then_eof: true
+		},
+	])!
+	c := out.conns[0]
+	assert c.connect_err == '', c.connect_err
+	assert !c.unmet, '${backend}: the large response must arrive complete'
+	assert c.frames.len == 1
+	assert c.frames[0].len > bb_big_len
+	assert c.eof, '${backend}: after a drained large response the idle deadline must close the connection'
+	assert c.raw.len == c.frames[0].len, '${backend}: idle close must be silent (no 408)'
+}
+
 // check_reaped_slots_free_max_connections: the production lockout. Silent
 // connections fill max_connections; once their deadlines reap them, a new
 // connection must be SERVED, not refused at accept.
@@ -926,6 +985,12 @@ fn test_epoll_keepalive_under_timeouts() ! {
 	}
 }
 
+fn test_epoll_idle_after_parked_write() ! {
+	$if linux {
+		check_idle_after_parked_write(.epoll)!
+	}
+}
+
 fn test_epoll_graceful_shutdown() ! {
 	$if linux {
 		check_graceful_shutdown(.epoll)!
@@ -1035,6 +1100,14 @@ fn test_poll_keepalive_under_timeouts() ! {
 	$if linux {
 		$if vanilla_poll ? {
 			check_keepalive_under_timeouts(.poll)!
+		}
+	}
+}
+
+fn test_poll_idle_after_parked_write() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_idle_after_parked_write(.poll)!
 		}
 	}
 }
