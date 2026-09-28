@@ -33,20 +33,25 @@ fn maybe_pin_worker(cpu int) {
 	C.sched_setaffinity(0, usize(sizeof(set)), voidptr(&set[0]))
 }
 
-// release_conn closes a connection: removes it from epoll (which closes the fd)
-// and decrements the global active-connection count. Every connection-close site
-// goes through here so max_connections accounting stays exact.
+// release_conn closes a connection: decrements the global active-connection
+// count, then removes it from epoll (which closes the fd). Every
+// connection-close site goes through here so max_connections accounting stays
+// exact. Decrement FIRST: once the peer can observe the close, its slot is
+// already free, so a client that reconnects on EOF is never refused by a
+// count that has not caught up.
 @[inline]
 fn release_conn(epoll_fd int, fd int, active_conns &core.Counter) {
-	epoll.remove_fd_from_epoll(epoll_fd, fd)
 	stdatomic.add_i64(&active_conns.n, -1)
+	epoll.remove_fd_from_epoll(epoll_fd, fd)
 }
 
 // (The request-serving cycle lives in async_linux.c.v — handle_readable /
 // drain_requests / serve_conn — over the per-fd state in conn_state_linux.c.v.)
 
 // Accept loop for the main epoll thread. Distributes new client connections to worker threads (round-robin).
-fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits core.Limits, active_conns &core.Counter) {
+// `conn_events` is the mask each new fd is registered with (see
+// accept_events).
+fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits core.Limits, active_conns &core.Counter, conn_events u32) {
 	mut next_worker := 0
 	mut event := C.epoll_event{}
 
@@ -105,13 +110,16 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 				$if verbose ? {
 					eprintln('[epoll] Adding client fd ${client_conn_fd} to worker epoll fd ${epoll_fd}')
 				}
-				if epoll.add_fd_to_epoll(epoll_fd, client_conn_fd,
-					(u32(C.EPOLLIN) | u32(C.EPOLLET))) < 0 {
+				// Count it BEFORE registering: once the fd is in the worker's epoll
+				// set the worker can close it (and decrement) at any moment — with
+				// the accept-time EPOLLOUT edge that is immediate — so counting
+				// after the ADD could briefly undercount and over-admit.
+				stdatomic.add_i64(&active_conns.n, 1)
+				if epoll.add_fd_to_epoll(epoll_fd, client_conn_fd, conn_events) < 0 {
+					stdatomic.add_i64(&active_conns.n, -1)
 					socket.close_socket(client_conn_fd)
 					continue
 				}
-				// Registered successfully — count it (released at close via release_conn).
-				stdatomic.add_i64(&active_conns.n, 1)
 			}
 		}
 	}
@@ -323,5 +331,24 @@ pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () v
 	if after_server_start != unsafe { nil } {
 		after_server_start()
 	}
-	handle_accept_loop(socket_fd, main_epoll_fd, epoll_fds, limits, active_conns)
+	handle_accept_loop(socket_fd, main_epoll_fd, epoll_fds, limits, active_conns, accept_events(limits))
+}
+
+// accept_events is the epoll mask a freshly accepted fd is registered with.
+// Workers create per-connection state lazily, on the fd's first event, and
+// their deadline sweeps only see connections that have state — so with plain
+// EPOLLIN|EPOLLET a peer that never sends a byte (or a TLS client stuck
+// before its ClientHello) is invisible to the worker and is never reaped.
+// When a deadline must start at accept (read_timeout_ms, or an idle budget),
+// the fd is also registered for EPOLLOUT: a new socket is writable at once,
+// so the kernel queues exactly one event on ADD and the worker learns about
+// the connection immediately. The worker treats that first EPOLLOUT on an fd
+// without state as the connection's birth — it creates the state, arms the
+// accept-time deadline and switches the fd back to EPOLLIN|EPOLLET. With no
+// timeouts the mask is unchanged, so the default path pays nothing.
+fn accept_events(limits core.Limits) u32 {
+	if limits.read_timeout_ms > 0 || limits.idle_ms() > 0 {
+		return u32(C.EPOLLIN) | u32(C.EPOLLOUT) | u32(C.EPOLLET)
+	}
+	return u32(C.EPOLLIN) | u32(C.EPOLLET)
 }

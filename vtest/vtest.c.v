@@ -205,12 +205,20 @@ fn (h &Harness) dial() !int {
 // server closed it), then returns fresh results. This is the choreography
 // primitive: fire(subscribers) → fire(publisher) → wait(subscribers, count(...)).
 pub fn (mut h Harness) wait(group Group, until fn (acc []u8) bool) !Outcome {
+	return h.send(group, []u8{}, until)
+}
+
+// send writes `bytes` on every still-open connection of the group, then waits
+// like wait(). It continues a conversation on connections a previous fire()
+// left open — e.g. a second request after the server-side clock has moved on,
+// to prove the connection was NOT reaped in between.
+pub fn (mut h Harness) send(group Group, bytes []u8, until fn (acc []u8) bool) !Outcome {
 	for gi in group {
 		if h.conns[gi].eof {
 			continue
 		}
 		h.conns[gi].rounds << Round{
-			send:  []u8{}
+			send:  bytes
 			until: until
 		}
 		h.conns[gi].done = false

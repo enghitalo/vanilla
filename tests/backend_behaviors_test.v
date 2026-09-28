@@ -1,7 +1,8 @@
 // Behavioural end-to-end tests for the connection state machine, run against
 // EVERY backend: HTTP/1.1 pipelining, request framing across TCP segments,
-// max_connections, read timeout, large-body drain, half-close, Expect:
-// 100-continue, and graceful shutdown. Migrated from
+// max_connections, read timeout, connection reaping (a silent connect, an idle
+// keep-alive peer, the idle opt-out, max_connections slots freed by reaping),
+// large-body drain, half-close, Expect: 100-continue, and graceful shutdown. Migrated from
 // http_server/backend_behaviors_test.v onto vtest (docs/VTEST.md): scripts are
 // data, drive()/start() own the whole lifecycle, ports are always ephemeral,
 // and the only clocks are the server's own Limits — the stopwatches below
@@ -229,6 +230,193 @@ fn check_read_timeout(backend server.IOBackend) ! {
 	assert !c.unmet
 	assert !c.raw.bytestr().contains('200 OK'), '${backend}: stalled partial request must not be served a 200, got: ${c.raw.bytestr()}'
 	assert elapsed < 1500, '${backend}: server should end the stalled request promptly (read_timeout_ms=400), took ${elapsed}ms'
+}
+
+// silent_script is a connection that never sends a byte and requires the
+// SERVER to close it: it can only complete through the server's own clock.
+const silent_script = vtest.Script{
+	rounds:   [
+		vtest.Round{
+			send: []u8{}
+			want: 0
+		},
+	]
+	then_eof: true
+}
+
+// check_silent_conn_timeout: a connection that NEVER sends a byte (a raw TCP
+// connect; a client stuck before its TLS ClientHello is the same shape) must
+// be reaped by the deadline armed at accept — otherwise it holds a
+// max_connections slot forever. Run with read_timeout_ms (the first request's
+// budget starts at accept) and with only idle_timeout_ms (a connection that
+// has sent nothing is idle). A peer that never spoke gets no 408.
+fn check_silent_conn_timeout(backend server.IOBackend, limits server.Limits) ! {
+	mut h := vtest.start(server.ServerConfig{
+		io_multiplexing: backend
+		handler:         bb_ok_handler
+		limits:          limits
+	})!
+	defer {
+		h.stop()
+	}
+	sw := time.new_stopwatch()
+	out := h.fire([silent_script])!
+	elapsed := sw.elapsed().milliseconds()
+	c := out.conns[0]
+	assert c.connect_err == '', c.connect_err
+	assert c.eof, '${backend}: a silent connection must be closed by the accept-time deadline'
+	assert c.raw.len == 0, '${backend}: a peer that never spoke must be closed without a response, got: ${c.raw.bytestr()}'
+	assert elapsed < 1500, '${backend}: silent connection should be reaped promptly (400ms budget), took ${elapsed}ms'
+}
+
+// check_idle_keepalive_timeout: after a response, a keep-alive connection
+// whose peer goes quiet (a phone that switched networks sends no FIN) must be
+// closed SILENTLY (no 408) once the idle deadline passes. Run with only
+// read_timeout_ms (idle inherits it) and with only idle_timeout_ms.
+fn check_idle_keepalive_timeout(backend server.IOBackend, limits server.Limits) ! {
+	mut h := vtest.start(server.ServerConfig{
+		io_multiplexing: backend
+		handler:         bb_ok_handler
+		limits:          limits
+	})!
+	defer {
+		h.stop()
+	}
+	sw := time.new_stopwatch()
+	out := h.fire([
+		vtest.Script{
+			rounds:   [
+				vtest.Round{
+					send: bb_req
+					want: 1
+				},
+				vtest.Round{
+					send: []u8{}
+					want: 0
+				},
+			]
+			then_eof: true
+		},
+	])!
+	elapsed := sw.elapsed().milliseconds()
+	c := out.conns[0]
+	assert c.connect_err == '', c.connect_err
+	assert c.frames.len == 1, '${backend}: the request before going idle must be served, got ${c.frames.len}'
+	assert c.eof, '${backend}: an idle keep-alive connection must be closed by the idle deadline'
+	assert !c.raw.bytestr().contains('408'), '${backend}: idle close must be silent (no 408), got: ${c.raw.bytestr()}'
+	assert elapsed < 1500, '${backend}: idle connection should be reaped promptly (400ms budget), took ${elapsed}ms'
+}
+
+// check_idle_opt_out: idle_timeout_ms < 0 disables idle reaping even with a
+// read timeout set (a handler that hands the fd to another thread to stream
+// needs this). The witness is the server's own clock: connection B is silent,
+// so it is reaped by its accept-time read deadline, which fires at least
+// read_timeout_ms after A went idle — A must still serve a second request.
+fn check_idle_opt_out(backend server.IOBackend) ! {
+	mut h := vtest.start(server.ServerConfig{
+		io_multiplexing: backend
+		handler:         bb_ok_handler
+		limits:          server.Limits{
+			read_timeout_ms: 400
+			idle_timeout_ms: -1
+		}
+	})!
+	defer {
+		h.stop()
+	}
+	a := h.fire([
+		vtest.Script{
+			rounds: [
+				vtest.Round{
+					send: bb_req
+					want: 1
+				},
+			]
+		},
+	])!
+	assert a.conns[0].frames.len == 1
+	b := h.fire([silent_script])!
+	assert b.conns[0].eof, '${backend}: the silent witness must still be reaped by read_timeout_ms'
+	again := h.send(a.group, bb_req, vtest.frames(2))!
+	c := again.conns[0]
+	assert !c.eof, '${backend}: idle_timeout_ms: -1 must keep an idle keep-alive connection open'
+	assert c.frames.len == 2, '${backend}: the idle connection must serve its next request, got ${c.frames.len}'
+}
+
+// check_reaped_slots_free_max_connections: the production lockout. Silent
+// connections fill max_connections; once their deadlines reap them, a new
+// connection must be SERVED, not refused at accept.
+fn check_reaped_slots_free_max_connections(backend server.IOBackend) ! {
+	mut h := vtest.start(server.ServerConfig{
+		io_multiplexing: backend
+		handler:         bb_ok_handler
+		limits:          server.Limits{
+			max_connections: 2
+			read_timeout_ms: 300
+		}
+	})!
+	defer {
+		h.stop()
+	}
+	silent := h.fire(vtest.repeat(2, silent_script))!
+	for i, c in silent.conns {
+		assert c.eof, '${backend}: silent conn ${i} must be reaped'
+	}
+	next := h.fire([
+		vtest.Script{
+			rounds: [
+				vtest.Round{
+					send: bb_req
+				},
+			]
+		},
+	])!
+	c := next.conns[0]
+	assert c.connect_err == '', c.connect_err
+	assert c.frames.len == 1, '${backend}: reaped connections must free their max_connections slots'
+	assert c.frames[0].bytestr().starts_with('HTTP/1.1 200')
+}
+
+// check_keepalive_under_timeouts: with read and idle deadlines armed,
+// keep-alive must keep working — the idle deadline armed after response 1 is
+// replaced when request 2 starts (split across two writes), and a pipelined
+// pair is served in one burst.
+fn check_keepalive_under_timeouts(backend server.IOBackend) ! {
+	out := vtest.drive(server.ServerConfig{
+		io_multiplexing: backend
+		handler:         bb_ok_handler
+		limits:          server.Limits{
+			read_timeout_ms: 5000
+			idle_timeout_ms: 5000
+		}
+	}, [
+		vtest.Script{
+			rounds: [
+				vtest.Round{
+					send: bb_req
+					want: 1
+				},
+				vtest.Round{
+					send: bb_partial_head
+					want: 0
+				},
+				vtest.Round{
+					send: bb_split_tail
+					want: 1
+				},
+				vtest.Round{
+					send: bb_req.repeat(2)
+					want: 2
+				},
+			]
+		},
+	])!
+	c := out.conns[0]
+	assert c.connect_err == '', c.connect_err
+	assert !c.unmet, '${backend}: keep-alive broke under read/idle deadlines'
+	assert c.frames.len == 4, '${backend}: expected 4 responses, got ${c.frames.len}'
+	assert out.inflight_after == 0
+	assert out.active_after == 0
 }
 
 // check_large_upload_drain drives bodies larger than the streaming threshold
@@ -498,6 +686,66 @@ fn test_iouring_read_timeout() ! {
 	}
 }
 
+fn test_iouring_silent_conn_timeout() ! {
+	$if linux {
+		if !server.iou_backend_available() {
+			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
+			return
+		}
+		check_silent_conn_timeout(.io_uring, server.Limits{
+			read_timeout_ms: 400
+		})!
+		check_silent_conn_timeout(.io_uring, server.Limits{
+			idle_timeout_ms: 400
+		})!
+	}
+}
+
+fn test_iouring_idle_keepalive_timeout() ! {
+	$if linux {
+		if !server.iou_backend_available() {
+			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
+			return
+		}
+		check_idle_keepalive_timeout(.io_uring, server.Limits{
+			read_timeout_ms: 400
+		})!
+		check_idle_keepalive_timeout(.io_uring, server.Limits{
+			idle_timeout_ms: 400
+		})!
+	}
+}
+
+fn test_iouring_idle_opt_out() ! {
+	$if linux {
+		if !server.iou_backend_available() {
+			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
+			return
+		}
+		check_idle_opt_out(.io_uring)!
+	}
+}
+
+fn test_iouring_reaped_slots_free_max_connections() ! {
+	$if linux {
+		if !server.iou_backend_available() {
+			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
+			return
+		}
+		check_reaped_slots_free_max_connections(.io_uring)!
+	}
+}
+
+fn test_iouring_keepalive_under_timeouts() ! {
+	$if linux {
+		if !server.iou_backend_available() {
+			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
+			return
+		}
+		check_keepalive_under_timeouts(.io_uring)!
+	}
+}
+
 fn test_iouring_graceful_shutdown() ! {
 	$if linux {
 		if !server.iou_backend_available() {
@@ -554,6 +802,46 @@ fn test_iocp_read_timeout() ! {
 	}
 }
 
+fn test_iocp_silent_conn_timeout() ! {
+	$if windows {
+		check_silent_conn_timeout(unsafe { server.IOBackend(0) }, server.Limits{
+			read_timeout_ms: 400
+		})!
+		check_silent_conn_timeout(unsafe { server.IOBackend(0) }, server.Limits{
+			idle_timeout_ms: 400
+		})!
+	}
+}
+
+fn test_iocp_idle_keepalive_timeout() ! {
+	$if windows {
+		check_idle_keepalive_timeout(unsafe { server.IOBackend(0) }, server.Limits{
+			read_timeout_ms: 400
+		})!
+		check_idle_keepalive_timeout(unsafe { server.IOBackend(0) }, server.Limits{
+			idle_timeout_ms: 400
+		})!
+	}
+}
+
+fn test_iocp_idle_opt_out() ! {
+	$if windows {
+		check_idle_opt_out(unsafe { server.IOBackend(0) })!
+	}
+}
+
+fn test_iocp_reaped_slots_free_max_connections() ! {
+	$if windows {
+		check_reaped_slots_free_max_connections(unsafe { server.IOBackend(0) })!
+	}
+}
+
+fn test_iocp_keepalive_under_timeouts() ! {
+	$if windows {
+		check_keepalive_under_timeouts(unsafe { server.IOBackend(0) })!
+	}
+}
+
 fn test_iocp_graceful_shutdown() ! {
 	$if windows {
 		check_graceful_shutdown(unsafe { server.IOBackend(0) })!
@@ -595,6 +883,46 @@ fn test_epoll_max_connections() ! {
 fn test_epoll_read_timeout() ! {
 	$if linux {
 		check_read_timeout(.epoll)!
+	}
+}
+
+fn test_epoll_silent_conn_timeout() ! {
+	$if linux {
+		check_silent_conn_timeout(.epoll, server.Limits{
+			read_timeout_ms: 400
+		})!
+		check_silent_conn_timeout(.epoll, server.Limits{
+			idle_timeout_ms: 400
+		})!
+	}
+}
+
+fn test_epoll_idle_keepalive_timeout() ! {
+	$if linux {
+		check_idle_keepalive_timeout(.epoll, server.Limits{
+			read_timeout_ms: 400
+		})!
+		check_idle_keepalive_timeout(.epoll, server.Limits{
+			idle_timeout_ms: 400
+		})!
+	}
+}
+
+fn test_epoll_idle_opt_out() ! {
+	$if linux {
+		check_idle_opt_out(.epoll)!
+	}
+}
+
+fn test_epoll_reaped_slots_free_max_connections() ! {
+	$if linux {
+		check_reaped_slots_free_max_connections(.epoll)!
+	}
+}
+
+fn test_epoll_keepalive_under_timeouts() ! {
+	$if linux {
+		check_keepalive_under_timeouts(.epoll)!
 	}
 }
 
@@ -657,6 +985,56 @@ fn test_poll_read_timeout() ! {
 	$if linux {
 		$if vanilla_poll ? {
 			check_read_timeout(.poll)!
+		}
+	}
+}
+
+fn test_poll_silent_conn_timeout() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_silent_conn_timeout(.poll, server.Limits{
+				read_timeout_ms: 400
+			})!
+			check_silent_conn_timeout(.poll, server.Limits{
+				idle_timeout_ms: 400
+			})!
+		}
+	}
+}
+
+fn test_poll_idle_keepalive_timeout() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_idle_keepalive_timeout(.poll, server.Limits{
+				read_timeout_ms: 400
+			})!
+			check_idle_keepalive_timeout(.poll, server.Limits{
+				idle_timeout_ms: 400
+			})!
+		}
+	}
+}
+
+fn test_poll_idle_opt_out() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_idle_opt_out(.poll)!
+		}
+	}
+}
+
+fn test_poll_reaped_slots_free_max_connections() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_reaped_slots_free_max_connections(.poll)!
+		}
+	}
+}
+
+fn test_poll_keepalive_under_timeouts() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_keepalive_under_timeouts(.poll)!
 		}
 	}
 }
