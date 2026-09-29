@@ -231,6 +231,13 @@ fn detach_rejected_watch(mut reactor Reactor, epoll_fd int, ext_fd int, client_f
 	if ext_fd < 0 || ext_fd >= reactor.watches.len || !reactor.watches[ext_fd].active {
 		return
 	}
+	if ext_fd == client_fd {
+		// A watch on the client's own socket: drop the watch and give the socket
+		// back its connection registration. Only close_conn closes the socket.
+		reactor.reactor_clear(ext_fd)
+		epoll.mod_fd_in_epoll(epoll_fd, ext_fd, u32(C.EPOLLIN) | u32(C.EPOLLET))
+		return
+	}
 	if reactor.watches[ext_fd].queue.len > 0 {
 		reactor.reactor_mark_dead(ext_fd, client_fd)
 	} else if !reactor.reactor_orphan_single(ext_fd, client_fd) {
@@ -275,9 +282,10 @@ fn (mut r Reactor) reactor_orphan_single(ext_fd int, client_fd int) bool {
 // worker's epoll (level-triggered: simplest correct default for arbitrary
 // consumer fds). Runs on the worker thread, so no synchronization is needed.
 fn register_watch(mut w core.EventLoop, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
-	if ext_fd < 0 {
+	if ext_fd < 0 || ext_fd >= epoll.accept_tag {
 		// A consumer handed us a failed fd (e.g. timerfd_create returned -1); never
-		// index the flat table at a negative slot. Arm nothing.
+		// index the flat table at a negative slot. Arm nothing. (An fd at or above
+		// epoll.accept_tag could not be told apart from a tagged one in events.)
 		w.last_watched = -1
 		return
 	}
@@ -428,6 +436,7 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 			cs.body_drain -= dn
 			if cs.body_drain == 0 {
 				end_read_deadline(mut st, mut cs) // the streamed request is complete
+				cs.sent_100 = false // its 100 was its own; the next request gets one
 			}
 			continue
 		}
@@ -810,6 +819,7 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 	if cs.body_drain <= 0 {
 		cs.body_drain = 0
 		end_read_deadline(mut st, mut cs) // the whole body was buffered: complete
+		cs.sent_100 = false
 	}
 	unsafe {
 		cs.read_buf.len = 0 // head (and any buffered body bytes) consumed

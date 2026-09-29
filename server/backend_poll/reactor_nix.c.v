@@ -305,8 +305,9 @@ fn start_body_drain(h core.Handler, mut cs PollConn, limits core.Limits, state v
 	}
 	body_in_buf := cs.read_buf.len - head_len
 	cs.body_drain = i64(content_length) - i64(body_in_buf)
-	if cs.body_drain < 0 {
+	if cs.body_drain <= 0 {
 		cs.body_drain = 0
+		cs.sent_100 = false // the whole body was buffered: complete
 	}
 	unsafe {
 		cs.read_buf.len = 0
@@ -351,6 +352,9 @@ fn serve_readable(h core.Handler, mut w WorkerState, i int, limits core.Limits, 
 				return false
 			}
 			cs.body_drain -= dn
+			if cs.body_drain == 0 {
+				cs.sent_100 = false // the streamed request is complete: its 100 was its own
+			}
 			if cs.body_drain == 0 && cs.read_deadline != 0 {
 				// The streamed request is complete: bytes that follow start the
 				// next request's own clock (as after drain_requests below).

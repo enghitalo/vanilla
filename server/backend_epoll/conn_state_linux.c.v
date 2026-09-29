@@ -225,8 +225,12 @@ mut:
 	pad1      [56]u8
 	close_seq u64 // the worker's close_seq, published for the accept thread
 	pad2      [56]u8
+	sleeping  u64 // 1 while the worker is about to block with no timeout (written by the worker)
+	pad3      [56]u8
+	wake_fd   int = -1 // an eventfd in the worker's epoll: the accept thread writes it to wake a sleeping worker
 	fds       [birth_queue_cap]int
 	seqs      [birth_queue_cap]u64
+	accepted  [birth_queue_cap]u64 // monotonic ns of the accept: the connection's clock starts there
 }
 
 // has_room is called by the accept thread (the only producer, so the room can
@@ -237,14 +241,23 @@ fn (q &BirthQueue) has_room() bool {
 }
 
 // push appends fd (accept thread; after has_room). seq is the worker's
-// close_seq read before fd was registered in its epoll.
+// close_seq read before fd was registered in its epoll, accepted_ns the
+// accept time. A worker that announced it is about to sleep with no timeout
+// is woken through its eventfd: it stores `sleeping` and then re-checks the
+// tail, while this stores the tail and then checks `sleeping` (both seq_cst),
+// so at least one of them sees the other and the entry is never stranded.
 @[direct_array_access; inline]
-fn (mut q BirthQueue) push(fd int, seq u64) {
+fn (mut q BirthQueue) push(fd int, seq u64, accepted_ns u64) {
 	t := stdatomic.load_u64(&q.tail)
 	i := int(t & (birth_queue_cap - 1))
 	q.fds[i] = fd
 	q.seqs[i] = seq
+	q.accepted[i] = accepted_ns
 	stdatomic.store_u64(&q.tail, t + 1) // publishes the entry
+	if stdatomic.load_u64(&q.sleeping) != 0 {
+		one := u64(1)
+		C.write(q.wake_fd, &one, 8)
+	}
 }
 
 // drain_births gives a birth (state + accept-time deadline) to every queued
@@ -268,9 +281,21 @@ fn drain_births(mut st PlainState) {
 		if fd < st.conns.len && unsafe { st.conns[fd] != nil } {
 			continue // already born
 		}
-		conn_birth(fd, mut st)
+		conn_birth(fd, q.accepted[i], mut st) // the clock started at accept
 	}
 	stdatomic.store_u64(&q.head, t)
+}
+
+// birth_queue_pending is the worker's last look before an unbounded wait:
+// it announces the sleep, then re-checks for entries (see push).
+@[inline]
+fn birth_queue_pending(mut q BirthQueue) bool {
+	stdatomic.store_u64(&q.sleeping, 1)
+	if stdatomic.load_u64(&q.tail) != q.head {
+		stdatomic.store_u64(&q.sleeping, 0)
+		return true
+	}
+	return false
 }
 
 // tick reads the batch clock (see PlainState.now).
@@ -281,8 +306,8 @@ fn (mut st PlainState) tick() {
 
 pub fn new_plain_state() PlainState {
 	return PlainState{
-		conns:     []&ConnState{len: conn_table_min, init: unsafe { nil }}
-		closed_at: []u64{len: conn_table_min}
+		conns: []&ConnState{len: conn_table_min, init: unsafe { nil }}
+		// closed_at is allocated by the worker only when births are on.
 	}
 }
 
@@ -327,11 +352,13 @@ fn state_create(mut st PlainState, fd int) &ConnState {
 			grown[i] = st.conns[i]
 		}
 		st.conns = grown
-		mut stamps := []u64{len: new_len}
-		for i in 0 .. st.closed_at.len {
-			stamps[i] = st.closed_at[i]
+		if st.births {
+			mut stamps := []u64{len: new_len}
+			for i in 0 .. st.closed_at.len {
+				stamps[i] = st.closed_at[i]
+			}
+			st.closed_at = stamps
 		}
-		st.closed_at = stamps
 	}
 	if unsafe { st.conns[fd] == nil } {
 		// Reuse a retired ConnState (buffers retained, fields reset by close_conn)
@@ -486,12 +513,12 @@ fn flush_batch(epoll_fd int, fd int, limits core.Limits, active_conns &core.Coun
 // (process_events_plain), so it cannot fail and needs no syscall: EPOLLOUT is
 // dropped later, by the spurious-wake path of the connection's next event.
 @[inline]
-fn conn_birth(fd int, mut st PlainState) {
+fn conn_birth(fd int, start u64, mut st PlainState) {
 	mut cs := state_for(mut st, fd)
 	if st.read_ns > 0 {
-		cs.read_deadline = st.now + st.read_ns
+		cs.read_deadline = start + st.read_ns
 	} else {
-		cs.idle_deadline = st.now + st.idle_ns
+		cs.idle_deadline = start + st.idle_ns
 	}
 	st.parked++
 }

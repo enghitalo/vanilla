@@ -449,6 +449,44 @@ fn check_pipelined_expect_gets_its_100(backend server.IOBackend) ! {
 	assert c.frames.len >= 2
 }
 
+// check_streamed_expect_uploads_get_their_100: two streamed (> 1 MiB)
+// Expect: 100-continue uploads on one keep-alive connection. Each must be
+// prompted with its own 100 — the first upload's 100 must not suppress the
+// second's (it never passes the pipelined-request path that resets it).
+fn check_streamed_expect_uploads_get_their_100(backend server.IOBackend) ! {
+	head := 'POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: ${et_upload_body_len}\r\nExpect: 100-continue\r\n\r\n'.bytes()
+	body := []u8{len: et_upload_body_len, init: u8(0x61)}
+	out := vtest.drive(server.ServerConfig{
+		io_multiplexing: backend
+		workers:         1
+		handler:         et_handler
+	}, [
+		vtest.Script{
+			rounds: [
+				vtest.Round{
+					send:  head
+					until: vtest.count('100 Continue', 1)
+				},
+				vtest.Round{
+					send:  body
+					until: vtest.count('uploaded', 1)
+				},
+				vtest.Round{
+					send:  head
+					until: vtest.count('100 Continue', 2)
+				},
+				vtest.Round{
+					send:  body
+					until: vtest.count('uploaded', 2)
+				},
+			]
+		},
+	])!
+	c := out.conns[0]
+	assert c.connect_err == '', c.connect_err
+	assert !c.unmet, '${backend}: the second streamed Expect upload was not prompted with its own 100: ${c.raw#[..300].bytestr()}'
+}
+
 // check_takeover_not_idle_reaped: a taken-over connection keeps only its
 // mid-frame read deadline — sitting quiet between messages for longer than
 // the idle budget must not close it. The silent witness is reaped by its
@@ -1250,6 +1288,12 @@ fn test_epoll_pipelined_expect_gets_its_100() ! {
 	}
 }
 
+fn test_epoll_streamed_expect_uploads_get_their_100() ! {
+	$if linux {
+		check_streamed_expect_uploads_get_their_100(.epoll)!
+	}
+}
+
 fn test_epoll_streamed_upload_under_timeouts() ! {
 	$if linux {
 		check_streamed_upload_under_timeouts(.epoll)!
@@ -1317,6 +1361,14 @@ fn test_poll_pipelined_expect_gets_its_100() ! {
 	$if linux {
 		$if vanilla_poll ? {
 			check_pipelined_expect_gets_its_100(.poll)!
+		}
+	}
+}
+
+fn test_poll_streamed_expect_uploads_get_their_100() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_streamed_expect_uploads_get_their_100(.poll)!
 		}
 	}
 }
