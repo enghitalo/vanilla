@@ -201,6 +201,11 @@ fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd 
 		conn.read_buf = []u8{}
 	} else {
 		buf = []u8{len: 0, cap: 256}
+		// Both buffers live and die with this connection, so a growth must free
+		// the block it outgrew: under -gc none it would leak otherwise, once
+		// per connection. Safe: the handler only ever sees views of buf, and
+		// V keeps the old block of resp if the handler took a slice of it.
+		unsafe { buf.flags.set(.noslices) }
 	}
 	mut resp := []u8{}
 	if conn.resp_buf.cap > 0 {
@@ -246,6 +251,7 @@ fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd 
 			conn.read_deadline = 0
 			if resp.cap == 0 {
 				resp = []u8{len: 0, cap: 4096}
+				unsafe { resp.flags.set(.noslices) } // see buf above
 			}
 			step := handler(buf_view(buf, pos, total), mut resp, fd, state, mut event_loop)
 			pos += total
