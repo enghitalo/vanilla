@@ -328,6 +328,8 @@ static int setup(vtls_ctx *c) {
     int ret = mbedtls_ssl_config_defaults(&c->conf, MBEDTLS_SSL_IS_SERVER,
                                           MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
     if (ret != 0) return ret;
+    // TLS 1.3 only. vtls_write's unlocked flush relies on it too (all TLS 1.3
+    // suites are AEAD), as it does on renegotiation staying off: see there.
     mbedtls_ssl_conf_min_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_3);
     mbedtls_ssl_conf_max_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_3);
     // Pin the single suite so the kTLS crypto_info layout always matches (0x1301).
@@ -554,7 +556,18 @@ int vtls_write(void *sess, const unsigned char *buf, size_t len) {
     if (s->deferred) {
         // The record is encrypted and pending in mbedTLS (it saw WANT_WRITE).
         // Called again with the same arguments, as its API requires, it only
-        // flushes that record: no crypto, so no lock.
+        // flushes that record: no crypto, so no lock. Checked against Mbed
+        // TLS 4.2.0, where the call runs ssl_check_ctr_renegotiate, sizes the
+        // record (mbedtls_ssl_get_max_out_record_payload), then
+        // mbedtls_ssl_flush_output. It stays crypto-free only while:
+        //   - renegotiation is off (the default; never enabled here), else
+        //     the counter check can start a renegotiation handshake;
+        //   - no MTU is set on the session (mbedtls_ssl_set_mtu, a DTLS
+        //     setting; never called here), else sizing the record calls
+        //     mbedtls_ssl_get_record_expansion...
+        //   - ...which reads PSA's key store only for a CBC suite: the
+        //     version is pinned to TLS 1.3 (setup), whose suites are all AEAD.
+        // Change any of these and this call needs the lock too.
         s->deferred = 0;
         ret = mbedtls_ssl_write(&s->ssl, buf, len);
     }
