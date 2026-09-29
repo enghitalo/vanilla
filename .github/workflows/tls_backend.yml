@@ -5,6 +5,15 @@ name: TLS Backend (HTTPS on epoll)
 # path — mbedTLS handshake, deadlines armed at accept, the TLS sweep — is never
 # built or run in CI. Ubuntu's apt ships Mbed TLS 2.28; vanilla needs 4.x (PSA
 # crypto), so it is built from a pinned release tag and cached.
+#
+# Two legs, one per way Mbed TLS can be built (issue #157):
+#   threading off — the upstream default config (and distro packages such as
+#     Arch's): PSA Crypto's process-wide state is unlocked, so the shim
+#     serializes every call into Mbed TLS with its own lock;
+#   threading on  — MBEDTLS_THREADING_C + MBEDTLS_THREADING_PTHREAD: Mbed TLS
+#     locks that state itself, the shim's lock compiles out, and the TLS
+#     workers run their crypto in parallel.
+# The same tests run on both; tls/ checks the leg linked what it claims.
 
 on:
   push:
@@ -45,7 +54,17 @@ env:
 jobs:
   tls-tests:
     runs-on: ubuntu-latest
-    name: tls/ + TLS timeouts under -d vanilla_tls
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - threading: 'off'
+            expect: vanilla_expect_serialized_crypto
+          - threading: 'on'
+            expect: vanilla_expect_parallel_crypto
+    # The default leg keeps the job's original name, which a required status
+    # check may refer to.
+    name: ${{ matrix.threading == 'on' && 'tls/ + TLS e2e, Mbed TLS with threading' || 'tls/ + TLS timeouts under -d vanilla_tls' }}
     # vtest has no client-side timeouts by design: a liveness regression hangs
     # the test instead of failing it. This bounds the damage (it also covers a
     # cold Mbed TLS build).
@@ -66,16 +85,17 @@ jobs:
 
       # Mbed TLS 4, installed where tls/tls_mbedtls_d_vanilla_tls.c.v looks
       # (-I/usr/local/include -L/usr/local/lib -lmbedtls -lmbedx509
-      # -lmbedcrypto). Built once per tag: the install is staged with DESTDIR
-      # into a runner-owned directory so actions/cache can save and restore it,
-      # then copied into /usr/local on every run.
-      - name: Cache Mbed TLS ${{ env.MBEDTLS_TAG }}
+      # -lmbedcrypto). Built once per tag and leg: the install is staged with
+      # DESTDIR into a runner-owned directory so actions/cache can save and
+      # restore it, then copied into /usr/local on every run. (The default
+      # leg's key is unchanged from before the legs existed.)
+      - name: Cache Mbed TLS ${{ env.MBEDTLS_TAG }} (threading ${{ matrix.threading }})
         id: mbedtls-cache
         uses: actions/cache@v4
         with:
           path: ~/mbedtls-stage
-          key: mbedtls-${{ env.MBEDTLS_TAG }}-shared-${{ runner.os }}-${{ runner.arch }}
-      - name: Build Mbed TLS ${{ env.MBEDTLS_TAG }} from source
+          key: mbedtls-${{ env.MBEDTLS_TAG }}-shared${{ matrix.threading == 'on' && '-threading' || '' }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Build Mbed TLS ${{ env.MBEDTLS_TAG }} from source (threading ${{ matrix.threading }})
         if: steps.mbedtls-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
@@ -84,6 +104,16 @@ jobs:
           sudo apt-get install -y python3-jinja2 python3-jsonschema
           git clone --depth 1 --recursive -b "$MBEDTLS_TAG" \
             https://github.com/Mbed-TLS/mbedtls /tmp/mbedtls
+          if [ "${{ matrix.threading }}" = on ]; then
+            # The options live in TF-PSA-Crypto's crypto_config.h, which
+            # scripts/config.py edits. That header is installed, so vanilla is
+            # compiled against the config the library was built with (the
+            # options change struct layouts). Fail here if they did not apply.
+            (cd /tmp/mbedtls && python3 scripts/config.py set MBEDTLS_THREADING_C \
+              && python3 scripts/config.py set MBEDTLS_THREADING_PTHREAD)
+            test "$(grep -cE '^#define MBEDTLS_THREADING_(C|PTHREAD)( |$)' \
+              /tmp/mbedtls/tf-psa-crypto/include/psa/crypto_config.h)" = 2
+          fi
           # Shared libraries (the default is static-only). CMAKE_INSTALL_LIBDIR
           # pinned to lib so the files land in /usr/local/lib exactly.
           cmake -S /tmp/mbedtls -B /tmp/mbedtls/build \
@@ -100,6 +130,8 @@ jobs:
           sudo ldconfig
           grep -m1 'define MBEDTLS_VERSION_STRING ' /usr/local/include/mbedtls/build_info.h
           ls -l /usr/local/lib/libmbedtls.so /usr/local/lib/libmbedx509.so /usr/local/lib/libmbedcrypto.so
+          echo "threading options in the installed crypto_config.h:"
+          grep -E '^#define MBEDTLS_THREADING_' /usr/local/include/psa/crypto_config.h || echo '(none)'
 
       # `-cc gcc -no-parallel`: the same V-toolchain flake avoidance as every
       # other lane (tcc<->gcc fallback race on liburing's <stdatomic.h>, and the
@@ -119,12 +151,14 @@ jobs:
       # VANILLA_NO_IOURING: the repo's kill-switch for hosted runners whose
       # per-worker io_uring rings fail to init (see poll_backend.yml); the TLS
       # path runs on epoll.
+      # `-d ${{ matrix.expect }}`: tls/ checks the shim was compiled against
+      # the build this leg claims (test_parallel_crypto_matches_the_linked_build).
       - name: tls/ module tests
         shell: bash
         env:
           VANILLA_NO_IOURING: '1'
         run: |
-          v -cc gcc -no-parallel -d vanilla_tls test tls/
+          v -cc gcc -no-parallel -d vanilla_tls -d ${{ matrix.expect }} test tls/
       # HTTPS connection reaping end to end (read deadline armed at accept,
       # bounding silent connects and the handshake; idle keep-alive; slots
       # freed for max_connections). This exercises userspace mbedTLS: kTLS
@@ -147,10 +181,10 @@ jobs:
           v -cc gcc -no-parallel -d vanilla_tls test tests/tls_pipelining_test.v
       # Several TLS workers in one process (issue #157): many concurrent
       # handshakes and keep-alive requests over four workers, every connection
-      # completing. This lane's Mbed TLS uses the default config, without
-      # MBEDTLS_THREADING_C, so it runs the shim's crypto lock: before it the
-      # workers raced on PSA's process-wide state (failed connections, heap
-      # corruption).
+      # completing. The threading-off leg runs the shim's crypto lock (before
+      # it the workers raced on PSA's process-wide state: failed connections,
+      # heap corruption); the threading-on leg runs without it, on Mbed TLS's
+      # own locking.
       - name: TLS multi-worker e2e
         shell: bash
         env:

@@ -135,6 +135,11 @@ how Mbed TLS was built. Its PSA Crypto state (the key store, the RNG) is
 shared by the whole process:
 - **Built with `MBEDTLS_THREADING_C` and `MBEDTLS_THREADING_PTHREAD`:** Mbed
   TLS locks that state itself, and the workers run their crypto in parallel.
+  To build it so, run this in the Mbed TLS 4 source tree before configuring
+  it with CMake (the TLS CI lane's threading leg does the same):
+  `python3 scripts/config.py set MBEDTLS_THREADING_C && python3 scripts/config.py set MBEDTLS_THREADING_PTHREAD`.
+  Compile vanilla against the headers that build installs, since the options
+  change struct layouts.
 - **Built without them** (the upstream default config, and distro packages
   such as Arch's): every call into Mbed TLS takes one process-wide lock, so
   the workers take turns in the crypto library. That covers handshakes, and
