@@ -31,13 +31,18 @@ module server
 //     the resume renders and flushes, the send fails on the dead peer, and the
 //     write-completion path releases the slot — the pooled DB reply is thereby
 //     always drained IN ORDER, so none of epoll's disconnect tombstoning
-//     (reactor_orphan_single / eager mark_dead) is needed for correctness. The
-//     `dead` tombstone on queue slots is kept as a defensive guard (a released /
-//     reused slot found at drain time is consumed against a scratch buffer).
+//     (reactor_orphan_single / eager mark_dead) is needed for that. The `dead`
+//     tombstone on queue slots IS load-bearing for the lost-resume close: a
+//     pipelined head released because it suspended without re-arming stays
+//     queued as dead, so its in-flight reply is still consumed in order
+//     against a scratch buffer — and a new client that reuses the released
+//     slot and fd number is never resumed with the stale continuation.
 //
 // Parked-connection deadlines: read/write deadlines are cleared at park (no
-// client op is armed, so neither timeout applies) and re-arm naturally at
-// resume. A hung query on a vanished client therefore pins the slot until the
+// client op is armed, so neither timeout applies — nor the idle one: a parked
+// request is never idle-reaped) and re-arm naturally at resume (a read deadline
+// for a buffered partial, else the idle deadline, via iou_arm_recv). A hung
+// query on a vanished client therefore pins the slot until the
 // query returns — the same known gap as the epoll runtime (async_linux.c.v:29);
 // bound it DB-side with e.g. statement_timeout. A parked-deadline sweep is a
 // follow-up shared with epoll.
@@ -406,11 +411,22 @@ fn iou_drain_requests(mut env IouEnv, mut conn io_uring.Connection, limits Limit
 		match step {
 			.done {}
 			.suspend {
-				// Park: no client op will be armed until the watch resumes. Clear the
-				// read deadline — nothing is mid-read, and the sweep must not shut a
-				// parked connection down as a slow reader.
-				conn.awaiting_fd = event_loop.last_watched
-				conn.read_deadline = 0
+				if event_loop.last_watched < 0 {
+					// Suspended without a live watch (watch_fd refused its fd, or was
+					// never called): nothing would ever resume this request. Flush
+					// what was appended, then close (the epoll rule), instead of
+					// answering the next pipelined request in its place (the loop
+					// condition stops the drain).
+					conn.close_after_send = true
+				} else {
+					// Park: no client op will be armed until the watch resumes. Clear
+					// the read deadline — nothing is mid-read, and the sweep must not
+					// shut a parked connection down as a slow reader (a shutdown with
+					// no op in flight would produce no CQE either). `idle` is already
+					// false: this request's first byte cleared it.
+					conn.awaiting_fd = event_loop.last_watched
+					conn.read_deadline = 0
+				}
 			}
 			.close {
 				conn.close_after_send = true
@@ -516,7 +532,8 @@ fn iou_start_body_drain(mut env IouEnv, mut conn io_uring.Connection, total int,
 // that were pipelined behind the parked one (they may re-park), then flush the
 // held batch — or release / re-arm recv as the state demands. The io_uring
 // analogue of epoll's `.done → async_serve` re-drain, split from the poll handler
-// so the single-watch and pipelined paths share it.
+// so the single-watch and pipelined paths share it. With close_after_send set
+// (a resume that suspended without a live watch) it only flushes, then releases.
 fn iou_finish_resume(mut env IouEnv, mut conn io_uring.Connection, limits Limits, active_conns &core.Counter) {
 	worker := env.worker
 	if conn.read_buf.len > 0 && !conn.close_after_send {
@@ -536,7 +553,12 @@ fn iou_finish_resume(mut env IouEnv, mut conn io_uring.Connection, limits Limits
 		iou_release(worker, mut conn, active_conns, limits.max_connections > 0)
 		return
 	}
-	iou_arm_recv(worker, mut conn, limits)
+	// Back to reading: a read deadline for a buffered partial, else the idle
+	// deadline. A recv that cannot be queued leaves no op in flight — drop the
+	// connection (safe: nothing is in flight) instead of stranding it.
+	if !iou_arm_recv(worker, mut conn, limits) {
+		iou_release(worker, mut conn, active_conns, limits.max_connections > 0)
+	}
 }
 
 // handle_io_uring_poll runs a parked request's continuation when its watched fd
@@ -579,10 +601,20 @@ fn handle_io_uring_poll(cqe &C.io_uring_cqe, mut env IouEnv, limits Limits, acti
 			iou_finish_resume(mut env, mut *conn, limits, active_conns)
 		}
 		.suspend {
-			// Multi-step chain: register already queued a fresh oneshot poll. Stay
-			// parked; bytes (if any) stay HELD — no send while parked (see module
-			// comment; epoll's stream-as-you-go on .suspend is a follow-up here).
-			conn.awaiting_fd = event_loop.last_watched
+			if event_loop.last_watched < 0 {
+				// Suspended without re-arming a watch (watch_fd got a failed fd, or
+				// was never called): nothing would ever resume this connection — no
+				// op in flight, no poll, and a parked connection holds no deadline.
+				// Flush what was appended, then release (the epoll rule).
+				conn.close_after_send = true
+				iou_finish_resume(mut env, mut *conn, limits, active_conns)
+			} else {
+				// Multi-step chain: register already queued a fresh oneshot poll.
+				// Stay parked; bytes (if any) stay HELD — no send while parked (see
+				// module comment; epoll's stream-as-you-go on .suspend is a
+				// follow-up here).
+				conn.awaiting_fd = event_loop.last_watched
+			}
 		}
 		.close {
 			// A parked connection has no in-flight op, so releasing here is safe.
@@ -651,6 +683,19 @@ fn drain_pipelined_iou(mut env IouEnv, ext_fd int, ready_err bool, limits Limits
 				iou_finish_resume(mut env, mut *conn, limits, active_conns)
 			}
 			.suspend {
+				if event_loop.last_watched < 0 {
+					// Suspended without re-arming: this edge's poll is consumed and
+					// none was queued, so nothing is sure to ever re-run it (only a
+					// sibling's leftover poll or a later park on ext_fd might). Close
+					// it as on the single-watch path, but keep its slot as a
+					// TOMBSTONE: its query's reply must still be consumed in order,
+					// and the released pool slot can be reacquired with the same fd
+					// number — only `dead` keeps this continuation off that client.
+					env.watches[ext_fd].queue[0].dead = true
+					conn.close_after_send = true
+					iou_finish_resume(mut env, mut *conn, limits, active_conns)
+					break
+				}
 				// Front query not ready yet. The continuation re-armed ext_fd in place
 				// (iou_reactor_watch found it already queued — no duplicate) and
 				// register queued a fresh oneshot poll. Keep it at the head and stop:

@@ -221,17 +221,24 @@ pub mut:
 	response_buffer []u8
 	bytes_sent      int
 
-	// Monotonic-ns deadlines, >0 while the corresponding direction is mid-transfer:
-	// read_deadline while a partial request is mid-read (read_timeout), write_deadline
-	// while a response batch has not finished sending (write_timeout). The timeout
-	// sweep half-closes (shutdown) past-deadline connections; the in-flight recv/send
-	// then completes with an error and the normal path frees the slot.
+	// Monotonic-ns deadlines, >0 while armed. read_deadline bounds the waits for
+	// request bytes that a Limits timeout covers: from accept for the first
+	// request (read_timeout), from the first byte for a later one that arrives
+	// partial (read_timeout), and, while `idle` is set, the keep-alive wait for
+	// the next request's first byte (idle budget). write_deadline runs while a response batch has not finished sending
+	// (write_timeout). The timeout sweep half-closes (shutdown) past-deadline
+	// connections; the in-flight recv/send then completes with an error and the
+	// normal path frees the slot.
 	read_deadline  u64
 	write_deadline u64
 
 	// Set when the pending batch ends a malformed/oversized request: once it has
 	// been sent, release the connection instead of posting the next recv.
 	close_after_send bool
+	// True while read_deadline is an IDLE deadline: a recv is in flight, read_buf
+	// is empty and no byte of the next request has arrived. The first byte clears
+	// it together with the deadline.
+	idle bool
 
 	// >0 while a large upload body is being STREAMED: the head was already answered
 	// (its response held in response_buffer) and the remaining `body_drain` body
@@ -273,6 +280,14 @@ pub mut:
 	conns         []Connection
 	free_stack    []int
 	free_top      int
+	// Lowest conns index ever handed out. pool_acquire hands slots out top-down
+	// and reuses released ones first, so only [used_lo, conns.len) can be live —
+	// the deadline sweep scans just that range (it tracks peak concurrency, not
+	// max_conn_per_worker).
+	used_lo int
+	// Keep-alive idle budget in ns, resolved once at worker start from
+	// Limits.idle_ms(); 0 ⇒ no idle deadlines.
+	idle_ns u64
 	// Graceful-shutdown plumbing (set in io_uring_worker_main):
 	//   inflight — this worker's own in-flight-response counter; Server.shutdown()
 	//     sums all workers' counters to drain precisely. nil ⇒ not tracked.
@@ -290,6 +305,7 @@ pub fn pool_init(mut w Worker) {
 	w.conns = []Connection{len: max_conn_per_worker, init: Connection{}}
 	w.free_stack = []int{len: max_conn_per_worker}
 	w.free_top = 0
+	w.used_lo = max_conn_per_worker
 
 	// Initialize free list (all slots available)
 	for i in 0 .. max_conn_per_worker {
@@ -311,6 +327,9 @@ pub fn pool_acquire(mut w Worker, fd int) &Connection {
 	}
 	w.free_top--
 	idx := w.free_stack[w.free_top]
+	if idx < w.used_lo {
+		w.used_lo = idx
+	}
 	mut c := &w.conns[idx]
 	c.fd = fd
 	unsafe {
@@ -318,6 +337,7 @@ pub fn pool_acquire(mut w Worker, fd int) &Connection {
 	}
 	c.bytes_sent = 0
 	c.close_after_send = false
+	c.idle = false
 	c.read_deadline = 0
 	c.write_deadline = 0
 	c.body_drain = 0
@@ -395,6 +415,7 @@ pub fn pool_release(mut w Worker, mut c Connection) {
 	}
 	c.bytes_sent = 0
 	c.close_after_send = false
+	c.idle = false
 	c.read_deadline = 0
 	c.write_deadline = 0
 	c.body_drain = 0

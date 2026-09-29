@@ -61,6 +61,9 @@ permissions:
 jobs:
   conformance:
     runs-on: ubuntu-latest
+    # Runs tests/ and the example tests on vtest, which has no client-side
+    # timeouts: a liveness regression hangs instead of failing — the backstop.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Set up V

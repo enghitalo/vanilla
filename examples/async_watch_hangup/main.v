@@ -20,7 +20,7 @@ import core
 
 #include <unistd.h>
 
-fn C.pipe(fds &int) int
+fn C.pipe(fds &i32) int
 fn C.close(fd int) int
 
 const resp = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
@@ -29,11 +29,11 @@ const resp = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r
 // so the read-end immediately reports a hangup (the "producer" is gone). Composes
 // with a plain stateless handler — no make_state.
 fn on_start(worker_state voidptr, mut event_loop core.EventLoop) {
-	mut fds := [2]int{}
+	mut fds := [2]i32{} // C ints: V int is 64-bit
 	if C.pipe(&fds[0]) != 0 {
 		return
 	}
-	read_fd, write_fd := fds[0], fds[1]
+	read_fd, write_fd := int(fds[0]), int(fds[1])
 	C.close(write_fd) // producer gone -> read_fd reports EPOLLHUP on the next poll
 	event_loop.watch_fd(read_fd, .readable, on_source_event, unsafe { nil })
 }

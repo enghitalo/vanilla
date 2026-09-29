@@ -186,6 +186,12 @@ int vtls_use_self_signed(vtls_ctx *c, char *const *sans, size_t nsans) {
 
     unsigned char serial[12];
     psa_generate_random(serial, sizeof(serial));
+    // The serial is a DER INTEGER, written as given: clear the sign bit (it
+    // must be positive) and keep the first byte non-zero (a leading 0x00 is
+    // only valid before a byte >= 0x80, so a random one is non-minimal about
+    // 1 time in 500 - and OpenSSL 3 then refuses the certificate with
+    // "illegal padding"; with persist_dir that bad identity would be kept).
+    serial[0] = (unsigned char)((serial[0] & 0x7f) | 0x01);
     if ((ret = mbedtls_x509write_crt_set_serial_raw(&wc, serial, sizeof(serial))) != 0) goto done;
     mbedtls_x509write_crt_set_validity(&wc, "20250101000000", "20351231235959");
 

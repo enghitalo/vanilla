@@ -222,14 +222,62 @@ pub mut:
 }
 
 // Limits bounds resource use. Every field defaults to 0 = unlimited, so the
-// checks are zero-cost unless a server opts in. Re-exported publicly as
-// `server.Limits` for the ergonomic config API.
+// checks are zero-cost unless a server opts in — with ONE exception:
+// idle_timeout_ms = 0 inherits read_timeout_ms (Go net/http's IdleTimeout
+// rule), so a server that sets read_timeout_ms alone also reaps idle
+// keep-alive connections. With both at 0 nothing is armed. Re-exported
+// publicly as `server.Limits` for the ergonomic config API.
+//
+// Timeouts are enforced by each worker's deadline sweep, which runs every
+// sweep_interval_ms(): a connection is closed at most that long after its
+// deadline. The kqueue (darwin) backend does not enforce max_connections or
+// any timeout yet.
 pub struct Limits {
 pub:
 	max_header_bytes  int // > 0 ⇒ 431 Request Header Fields Too Large
 	max_body_bytes    int // > 0 ⇒ 413 Payload Too Large (rejected from Content-Length, before buffering)
 	max_request_bytes int // > 0 ⇒ ceiling on a single buffered request (headers+body); 0 ⇒ built-in default (8 MiB)
-	max_connections   int // > 0 ⇒ refuse new connections past this many concurrent (checked at accept)
-	read_timeout_ms   int // > 0 ⇒ close a connection that can't finish its request in this long (408)
+	max_connections   int // > 0 ⇒ refuse new connections past this many concurrent (checked at accept). Pair with read_timeout_ms: without a deadline, connections that never send (or peers that vanish) hold their slots forever
+	read_timeout_ms   int // > 0 ⇒ a request (head + body) must arrive complete within this long, else close — 408 if part of it arrived and no earlier response is still being sent (plaintext epoll/poll/iocp), silently otherwise. The FIRST request's clock starts at accept (it bounds a silent connect and the TLS handshake); a later request's starts at its first byte. Not refreshed on progress: size it for your largest upload
 	write_timeout_ms  int // > 0 ⇒ close a connection whose parked response can't drain in this long
+	idle_timeout_ms   int // keep-alive: after a response is fully sent, how long to wait for the first byte of the next request before closing silently. It bounds only the wait for a request's first byte: a started request is bounded by read_timeout_ms alone, so pair max_connections with read_timeout_ms (and write_timeout_ms, for peers that stop reading). 0 ⇒ read_timeout_ms; < 0 (use -1) ⇒ never, e.g. a handler that hands the fd to another thread to stream, or a proxy in front that manages upstream idle itself
+}
+
+// idle_ms resolves the keep-alive idle budget: idle_timeout_ms when > 0,
+// read_timeout_ms when idle_timeout_ms is 0, and 0 (off) when idle_timeout_ms
+// is negative. Backends resolve it once per worker, off the hot path. When
+// read_timeout_ms is 0 it also bounds a new connection's wait for its first
+// byte (a connection that has sent nothing is idle).
+pub fn (l Limits) idle_ms() int {
+	if l.idle_timeout_ms > 0 {
+		return l.idle_timeout_ms
+	}
+	if l.idle_timeout_ms == 0 && l.read_timeout_ms > 0 {
+		return l.read_timeout_ms
+	}
+	return 0
+}
+
+// sweep_interval_ms is how often a worker scans its connections for expired
+// deadlines: a quarter of the shortest active timeout, clamped to [25, 250]
+// ms. 0 when no timeout is set — then there is no sweep and an idle worker
+// never wakes. Rate-limiting the scan to this cadence keeps a busy worker from
+// walking its whole connection table after every batch.
+pub fn (l Limits) sweep_interval_ms() int {
+	mut shortest := 0
+	for t in [l.read_timeout_ms, l.write_timeout_ms, l.idle_ms()]! {
+		if t > 0 && (shortest == 0 || t < shortest) {
+			shortest = t
+		}
+	}
+	if shortest == 0 {
+		return 0
+	}
+	return if shortest / 4 < 25 {
+		25
+	} else if shortest / 4 > 250 {
+		250
+	} else {
+		shortest / 4
+	}
 }

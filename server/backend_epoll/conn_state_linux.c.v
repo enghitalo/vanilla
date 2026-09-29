@@ -22,6 +22,7 @@ module backend_epoll
 import core
 import epoll
 import http1_1.response
+import sync.stdatomic
 import time
 
 #include <errno.h>
@@ -98,7 +99,7 @@ mut:
 	read_buf       []u8 // persistent request buffer; len = bytes buffered
 	write_buf      []u8 // persistent response buffer; [write_off..len) pending
 	write_off      int
-	read_deadline  u64 // monotonic ns; >0 while a request is mid-read (read_timeout)
+	read_deadline  u64 // monotonic ns; >0 while a request is mid-read (read_timeout) — from accept for the first one
 	write_deadline u64 // monotonic ns; >0 while a batch is parked (write_timeout)
 	// Deferred file body to stream with sendfile(2) AFTER write_buf drains (a
 	// handler appended its headers to write_buf and handed the body off via
@@ -123,9 +124,10 @@ mut:
 	close_after_flush bool
 	// Set once a 100 Continue interim response has been sent for the request
 	// currently mid-read, so a peer that sends `Expect: 100-continue` and dribbles
-	// its body across edges is prompted exactly once (RFC 9110 §10.1.1). Reset per
-	// connection (a keep-alive connection may carry several Expect requests, but
-	// only one is ever mid-read at a time, and close_conn clears it).
+	// its body across edges is prompted exactly once (RFC 9110 §10.1.1). It refers
+	// to the request at the head of read_buf: cleared when that request completes
+	// (drain_requests consumed it, or its streamed body finished), so the next
+	// Expect request on a keep-alive connection gets its own 100.
 	sent_100 bool
 	// The conn-mode seam (issue #136): nil (the default) means the HTTP/1.1
 	// state machine drives this connection — the hot path pays exactly one
@@ -137,11 +139,24 @@ mut:
 	// protocol state, handed back on every call, never inspected here.
 	takeover       core.ConnHandler = unsafe { nil }
 	takeover_state voidptr
+	// The reaping fields below sit after the hot ones and leave the per-burst
+	// layout alone: with idle_timeout_ms off the request path never reads
+	// them (the per-recv idle check is gated on the worker's idle budget).
+	// monotonic ns; >0 while the connection waits for the first byte of a
+	// request: a keep-alive connection at rest after a response, or a new one
+	// when read_timeout_ms is 0. Expiry closes silently.
+	idle_deadline u64
+	// While body_drain > 0: where the output held for the streamed request
+	// starts in write_buf (start_body_drain). Everything before it answers
+	// earlier requests.
+	drain_off int
 }
 
-// PlainState is the per-worker connection table. `parked` counts connections
-// with an armed deadline, so the worker only pays for timeout sweeps when
-// something is actually mid-transfer.
+// PlainState is the per-worker connection table. `parked` counts armed
+// deadlines (read, write and idle), so a worker with nothing armed never
+// wakes for a sweep. With a read or idle timeout set, every open connection
+// normally carries one (from accept on), except while it is parked on a watch
+// or taken over; the sweep itself is rate-limited to sweep_interval_ms().
 pub struct PlainState {
 mut:
 	conns []&ConnState
@@ -154,19 +169,189 @@ mut:
 	// to the worker's peak concurrent connection count. Per-worker: no locking.
 	free_conns []&ConnState
 	parked     int
+	// Resolved once per worker from Limits (0 = off): the accept-time read
+	// budget and the keep-alive idle budget (Limits.idle_ms()), in ns.
+	read_ns u64
+	idle_ns u64
+	// The batch clock: read once per worker loop iteration, and only when a
+	// timeout is configured. Every deadline armed or checked in that batch
+	// uses it, so the request path never reads the clock itself.
+	now        u64
+	next_sweep u64 // monotonic ns; the sweep scans the table only once now >= this
+	// The listener's local address, set once at startup: an untagged
+	// leftover fd is detached only if it is not a socket accepted on it
+	// (leftover_fd). listen_port is its TCP port; listen_uds is set for an
+	// AF_UNIX listener instead.
+	listen_port int
+	listen_uds  bool
+	// The worker's watch reactor, so close_conn can tear a parked connection's
+	// watch down on every close path (see close_conn).
+	reactor &Reactor = unsafe { nil }
+	// close_seq counts this worker's closes; closed_at[fd] is its value at
+	// fd's last close (sized with conns), and batch_seq its value when the
+	// current batch of events began (closed_in_batch). The birth queue's
+	// entries carry it too (drain_births).
+	close_seq u64
+	batch_seq u64
+	closed_at []u64
+	// Accept-time births are on (a read or idle timeout is set): the close
+	// stamps below are kept, and accepted connections are handed over by the
+	// accept thread through births_q (see BirthQueue).
+	births   bool
+	births_q &BirthQueue = unsafe { nil }
+}
+
+// birth_queue_cap is the capacity of a worker's BirthQueue (a power of two).
+// When it is full the accept thread falls back to an EPOLLOUT registration.
+const birth_queue_cap = 4096
+
+// BirthQueue hands accepted connections from the accept thread to one plain
+// worker when accept-time births are on (a read or idle timeout is set), so
+// the worker learns about a connection that never sends a byte — and arms its
+// accept-time deadline — without an epoll event of its own. (Registering the
+// fd for EPOLLOUT does that too, but a new socket is writable at once, so the
+// edge wakes a sleeping worker a second time for every connection.) Single
+// producer (the accept thread), single consumer (the worker, at the start of
+// each loop iteration, so a connection queued before that pass is born with
+// its accept time before its first event is handled). A worker with nothing
+// armed first waits one bounded sweep interval; only when that runs out with
+// no event, no birth and no signal does it announce a sleep with no timeout,
+// and only then does a push wake it through its eventfd — so connection churn
+// does not pay that wake.
+// Each entry also carries the worker's close_seq as the
+// accept thread read it BEFORE registering the fd: a close of that connection
+// can only come later and stamps a larger value, so the worker can tell an
+// entry whose connection it has already closed — its number possibly reused
+// by another connection or fd — from a live one.
+@[heap]
+struct BirthQueue {
+mut:
+	head      u64 // next entry the worker reads (written by the worker)
+	pad0      [56]u8
+	tail      u64 // next entry the accept thread writes (written by the accept thread)
+	pad1      [56]u8
+	close_seq u64 // the worker's close_seq, published for the accept thread
+	pad2      [56]u8
+	sleeping  u64 // 1 while the worker is about to block with no timeout (written by the worker)
+	pad3      [56]u8
+	wake_fd   int = -1 // an eventfd in the worker's epoll: the accept thread writes it to wake a sleeping worker
+	fds       [birth_queue_cap]int
+	seqs      [birth_queue_cap]u64
+	accepted  [birth_queue_cap]u64 // monotonic ns of the accept: the connection's clock starts there
+}
+
+// has_room is called by the accept thread (the only producer, so the room can
+// only grow until its push).
+@[inline]
+fn (q &BirthQueue) has_room() bool {
+	return stdatomic.load_u64(&q.tail) - stdatomic.load_u64(&q.head) < birth_queue_cap
+}
+
+// push appends fd (accept thread; after has_room). seq is the worker's
+// close_seq read before fd was registered in its epoll, accepted_ns the
+// accept time. A worker that announced it is about to sleep with no timeout
+// is woken through its eventfd: it stores `sleeping` and then re-checks the
+// tail, while this stores the tail and then checks `sleeping` (both seq_cst),
+// so at least one of them sees the other and the entry is never stranded.
+@[direct_array_access; inline]
+fn (mut q BirthQueue) push(fd int, seq u64, accepted_ns u64) {
+	t := stdatomic.load_u64(&q.tail)
+	i := int(t & (birth_queue_cap - 1))
+	q.fds[i] = fd
+	q.seqs[i] = seq
+	q.accepted[i] = accepted_ns
+	stdatomic.store_u64(&q.tail, t + 1) // publishes the entry
+	if stdatomic.load_u64(&q.sleeping) != 0 {
+		one := u64(1)
+		C.write(q.wake_fd, &one, 8)
+	}
+}
+
+// drain_births gives a birth (state + accept-time deadline) to every queued
+// connection that is still unborn: not closed since it was queued (its close
+// would have stamped a larger close_seq) and without state yet (a connection
+// that sent something first was already born by its first event). No syscall.
+@[direct_array_access]
+fn drain_births(mut st PlainState) int {
+	mut q := st.births_q
+	h := q.head // only this worker writes head
+	t := stdatomic.load_u64(&q.tail)
+	if h == t {
+		return 0
+	}
+	mut born := 0
+	for n := h; n < t; n++ {
+		i := int(n & (birth_queue_cap - 1))
+		fd := q.fds[i]
+		if fd < st.closed_at.len && st.closed_at[fd] > q.seqs[i] {
+			continue // closed since queued: stale
+		}
+		if fd < st.conns.len && unsafe { st.conns[fd] != nil } {
+			continue // already born
+		}
+		conn_birth(fd, q.accepted[i], mut st) // the clock started at accept
+		born++
+	}
+	stdatomic.store_u64(&q.head, t)
+	return born
+}
+
+// birth_queue_pending is the worker's last look before an unbounded wait:
+// it announces the sleep, then re-checks for entries (see push).
+@[inline]
+fn birth_queue_pending(mut q BirthQueue) bool {
+	stdatomic.store_u64(&q.sleeping, 1)
+	if stdatomic.load_u64(&q.tail) != q.head {
+		stdatomic.store_u64(&q.sleeping, 0)
+		return true
+	}
+	return false
+}
+
+// tick reads the batch clock (see PlainState.now).
+@[inline]
+fn (mut st PlainState) tick() {
+	st.now = time.sys_mono_now()
 }
 
 pub fn new_plain_state() PlainState {
 	return PlainState{
 		conns: []&ConnState{len: conn_table_min, init: unsafe { nil }}
+		// closed_at is allocated by the worker only when births are on.
 	}
+}
+
+// closed_in_batch reports whether fd was closed during the current batch of
+// events (close_conn stamps it): any later event for it in the same batch is
+// stale — it describes the registration that close removed.
+@[direct_array_access; inline]
+fn (st &PlainState) closed_in_batch(fd int) bool {
+	return fd < st.closed_at.len && st.closed_at[fd] > st.batch_seq
 }
 
 // state_for returns the connection state for fd, creating it (with its
 // persistent buffers) on first use. The table grows by doubling, so fd
 // indexing stays O(1) with no hashing.
-@[direct_array_access]
+// state_for returns the connection state for fd, creating it on first use.
+// The lookup is the hot path (every event of an established connection) and
+// stays small enough to inline at both callers; creating one is not
+// (state_create).
+@[direct_array_access; inline]
 fn state_for(mut st PlainState, fd int) &ConnState {
+	if fd < st.conns.len {
+		cs := st.conns[fd]
+		if unsafe { cs != nil } {
+			return cs
+		}
+	}
+	return state_create(mut st, fd)
+}
+
+// state_create is state_for's slow path: it grows the table (and the
+// close stamps with it) and takes a pooled ConnState or allocates one. Kept
+// out of line so the event loop's hot code stays compact.
+@[direct_array_access; noinline]
+fn state_create(mut st PlainState, fd int) &ConnState {
 	if fd >= st.conns.len {
 		mut new_len := st.conns.len
 		for new_len <= fd {
@@ -177,6 +362,13 @@ fn state_for(mut st PlainState, fd int) &ConnState {
 			grown[i] = st.conns[i]
 		}
 		st.conns = grown
+		if st.births {
+			mut stamps := []u64{len: new_len}
+			for i in 0 .. st.closed_at.len {
+				stamps[i] = st.closed_at[i]
+			}
+			st.closed_at = stamps
+		}
 	}
 	if unsafe { st.conns[fd] == nil } {
 		// Reuse a retired ConnState (buffers retained, fields reset by close_conn)
@@ -217,7 +409,7 @@ fn state_for(mut st PlainState, fd int) &ConnState {
 @[inline]
 fn park_write(epoll_fd int, fd int, limits core.Limits, mut st PlainState, mut cs ConnState) {
 	if limits.write_timeout_ms > 0 && cs.write_deadline == 0 {
-		cs.write_deadline = time.sys_mono_now() + u64(limits.write_timeout_ms) * 1_000_000
+		cs.write_deadline = st.now + u64(limits.write_timeout_ms) * 1_000_000
 		st.parked++
 	}
 	epoll.mod_fd_in_epoll(epoll_fd, fd, (u32(C.EPOLLIN) | u32(C.EPOLLOUT) | u32(C.EPOLLET)))
@@ -322,6 +514,87 @@ fn flush_batch(epoll_fd int, fd int, limits core.Limits, active_conns &core.Coun
 	return true
 }
 
+// conn_birth creates the state of a connection that has none yet and arms
+// its accept-time deadline from `start`: READ when read_timeout_ms is set (it
+// bounds the silence and the whole first request), otherwise IDLE (a
+// connection that has sent nothing is idle). Two callers: drain_births, with
+// the accept time the accept thread recorded, and the worker loop, with the
+// batch clock, for a tagged first event of a connection the drain has not
+// born: queued after this pass's drain, or not queued at all (the EPOLLOUT
+// registration a full queue falls back to). Neither can fail or
+// needs a syscall; a fallback registration's EPOLLOUT is dropped later, by
+// the spurious-wake path of the connection's next event.
+@[inline]
+fn conn_birth(fd int, start u64, mut st PlainState) {
+	mut cs := state_for(mut st, fd)
+	if st.read_ns > 0 {
+		cs.read_deadline = start + st.read_ns
+	} else {
+		cs.idle_deadline = start + st.idle_ns
+	}
+	st.parked++
+}
+
+// leftover_fd reports whether fd, which has an event but no state and no
+// accept tag, is an app's fd left registered in this epoll (a finished watch's
+// pooled connection, timerfd, pipe or dialed socket) that the worker should
+// detach. Not when the fd is closed (EBADF: the kernel already dropped its
+// registration, and a DEL could only hit a number accept reused meanwhile),
+// and not for a socket accepted on this server's listener (its local address
+// is the listener's: accept reused the number, and its tagged birth event
+// follows). One getsockname, only on this rare path.
+@[direct_array_access; inline]
+fn (st &PlainState) leftover_fd(fd int) bool {
+	family, port, named := sock_local(fd)
+	if family == -1 {
+		return C.errno != C.EBADF // not a socket (a timerfd, pipe…) but open
+	}
+	if st.listen_uds {
+		return !(family == C.AF_UNIX && named)
+	}
+	return !((family == C.AF_INET || family == C.AF_INET6) && port == st.listen_port)
+}
+
+// sock_local reads fd's local address (getsockname): its family (-1 when fd
+// is not an open socket), its port for AF_INET/AF_INET6, and for AF_UNIX
+// whether it is bound to a path. The port sits at the same offset in
+// sockaddr_in and sockaddr_in6, and sun_path right after the family.
+@[direct_array_access]
+fn sock_local(fd int) (int, int, bool) {
+	mut a := [128]u8{} // sizeof(struct sockaddr_storage)
+	mut l := u32(128)
+	if C.getsockname(fd, voidptr(&a[0]), &l) != 0 || l < 2 {
+		return -1, 0, false
+	}
+	family := int(unsafe { *(&u16(&a[0])) }) // sa_family_t, host order
+	return family, int((u32(a[2]) << 8) | u32(a[3])), l > 2 && a[2] != 0 // port: network order
+}
+
+// arm_idle_deadline starts the keep-alive idle clock at a request boundary:
+// the response is fully handed to the kernel and the connection is back to
+// waiting for a new request. Anything else keeps its own clock or none —
+// bytes of the next request buffered or a read deadline still armed (the read
+// deadline governs: the accept-time one of a connection that has sent nothing
+// yet, woken by an event that read nothing), a streamed body still draining,
+// parked on a watch, taken over, closing, or a write still pending (the write
+// deadline governs). Arms only when unarmed, never refreshes: a burst that
+// read nothing cannot extend the idle wait, and a served request always
+// re-arms fresh because its first byte cleared it.
+//
+// Called from the serve_conn tail and the handle_writable_plain drain, never
+// from flush_batch: the SSE flush in on_watch_ready runs flush_batch BEFORE it
+// re-parks the connection (awaiting_fd is still -1 there).
+@[inline]
+fn arm_idle_deadline(mut st PlainState, mut cs ConnState) {
+	if st.idle_ns == 0 || cs.idle_deadline != 0 || cs.read_buf.len != 0 || cs.body_drain != 0
+		|| cs.read_deadline != 0 || cs.awaiting_fd >= 0 || cs.takeover != unsafe { nil }
+		|| cs.close_after_flush || cs.write_off < cs.write_buf.len || cs.file_remaining > 0 {
+		return
+	}
+	cs.idle_deadline = st.now + st.idle_ns
+	st.parked++
+}
+
 // handle_writable_plain drains a parked batch when the socket is writable.
 // Returns false if the connection was closed (the worker must then skip any
 // further events for this fd in the current batch).
@@ -332,8 +605,9 @@ fn handle_writable_plain(epoll_fd int, fd int, active_conns &core.Counter, mut s
 	}
 	mut cs := st.conns[fd]
 	if unsafe { cs == nil } {
-		// EPOLLOUT is only armed after state exists; nil means a close raced
-		// this event in the same batch.
+		// EPOLLOUT is only armed after state exists (an accept-time birth is
+		// handled by the worker loop); nil means a close raced this event in
+		// the same batch.
 		return false
 	}
 	if cs.body_drain > 0 {
@@ -393,48 +667,83 @@ fn handle_writable_plain(epoll_fd int, fd int, active_conns &core.Counter, mut s
 		return false
 	}
 	epoll.mod_fd_in_epoll(epoll_fd, fd, (u32(C.EPOLLIN) | u32(C.EPOLLET))) // stop watching writability
+	// The parked reply is fully out: back at a request boundary.
+	arm_idle_deadline(mut st, mut cs)
 	return true
 }
 
-// sweep_timeouts closes connections whose read/write deadline has passed.
-// Called from the worker only when something is parked and a timeout is set,
-// so it costs nothing on an idle/fast server.
+// sweep_timeouts closes connections whose read/write/idle deadline has passed
+// (as of the batch clock st.now). The worker calls it only when a deadline is
+// armed, and at most once per sweep_interval_ms() — never after every batch.
 @[direct_array_access; manualfree]
 fn sweep_timeouts(epoll_fd int, active_conns &core.Counter, mut st PlainState) {
-	now := time.sys_mono_now()
+	now := st.now
 	for fd in 0 .. st.conns.len {
 		cs := st.conns[fd]
 		if unsafe { cs == nil } {
 			continue
 		}
 		if cs.read_deadline > 0 && now > cs.read_deadline {
-			// A taken-over connection no longer speaks HTTP — the 408 bytes
-			// would be protocol garbage to its peer; just close.
-			if cs.takeover == unsafe { nil } {
+			// 408 only when part of a request arrived — a peer that never spoke
+			// (the accept-time deadline) gets a silent close. A taken-over
+			// connection no longer speaks HTTP — the 408 bytes would be protocol
+			// garbage to its peer; just close. And only at a response boundary:
+			// the 408 goes straight to the socket, so it must not land inside a
+			// response still pending (parked mid-send), nor ahead of one owed to
+			// an earlier request. That is nothing left to write or, for a
+			// streamed body, every earlier response out and the upload's own
+			// output (its held reply, after a 100 Continue not sent yet) not
+			// started: that request was never answered, and the 408 replaces
+			// its reply.
+			at_boundary := if cs.body_drain > 0 {
+				cs.write_off == cs.drain_off
+			} else {
+				cs.write_off >= cs.write_buf.len
+			}
+			if cs.takeover == unsafe { nil } && (cs.read_buf.len > 0 || cs.body_drain > 0)
+				&& at_boundary && cs.file_remaining <= 0 {
 				response.send_status_408_response(fd) // couldn't finish the request in time
 			}
 			close_conn(epoll_fd, fd, active_conns, mut st)
 		} else if cs.write_deadline > 0 && now > cs.write_deadline {
 			close_conn(epoll_fd, fd, active_conns, mut st)
+		} else if cs.idle_deadline > 0 && now > cs.idle_deadline {
+			close_conn(epoll_fd, fd, active_conns, mut st) // idle keep-alive: silent
 		}
 	}
 }
 
-// close_conn frees the connection's buffers, clears its table slot and
-// releases the fd. The ConnState struct itself is reclaimed by the GC once
-// the slot no longer references it. NOT idempotent (release_conn always
-// runs): every close site must make sure it is the only one closing — the
-// bool returns of flush_batch / drain_requests / handle_writable_plain exist
-// exactly for that.
+// close_conn resets the connection's state, returns it to the per-worker pool
+// (buffers kept, see PlainState.free_conns), clears its table slot and
+// releases the fd. NOT idempotent (release_conn always runs): every close
+// site must make sure it is the only one closing — the bool returns of
+// flush_batch / drain_requests / handle_writable_plain exist exactly for that.
 @[direct_array_access; manualfree]
 fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainState) {
 	if fd < st.conns.len {
 		mut cs := st.conns[fd]
 		if unsafe { cs != nil } {
+			// A connection closed while parked on a watch by a write-side path
+			// (write timeout, pending-write cap, a failed flush) must not leave
+			// that watch behind: it would fire against whatever connection reuses
+			// this fd (vanilla#100 hazard 2), and its request-owned fd would leak.
+			// Same teardown as close_client (which clears awaiting_fd first). Never
+			// the connection's own socket: release_conn below closes that.
+			if cs.awaiting_fd == fd {
+				// Parked on its own socket's writability: only the watch goes (an
+				// active entry would swallow the birth event of the next
+				// connection on this number); release_conn closes the socket.
+				st.reactor.reactor_clear(fd)
+			} else if cs.awaiting_fd >= 0 {
+				detach_rejected_watch(mut st.reactor, epoll_fd, cs.awaiting_fd, fd)
+			}
 			if cs.read_deadline != 0 {
 				st.parked--
 			}
 			if cs.write_deadline != 0 {
+				st.parked--
+			}
+			if cs.idle_deadline != 0 {
 				st.parked--
 			}
 			// Reuse instead of free: reset to a pristine state and return to the
@@ -451,10 +760,12 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			cs.write_off = 0
 			cs.read_deadline = 0
 			cs.write_deadline = 0
+			cs.idle_deadline = 0
 			cs.file_fd = -1
 			cs.file_off = 0
 			cs.file_remaining = 0
 			cs.body_drain = 0
+			cs.drain_off = 0
 			cs.awaiting_fd = -1
 			cs.close_after_flush = false
 			cs.sent_100 = false
@@ -462,6 +773,20 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			cs.takeover_state = unsafe { nil }
 			st.conns[fd] = unsafe { nil }
 			st.free_conns << cs
+		}
+	}
+	if st.births && fd < st.closed_at.len {
+		// Later events for fd in this batch, and birth-queue entries queued
+		// before this close, are stale (closed_in_batch, drain_births). A plain
+		// store: an indexed assignment compiles to a generic element copy.
+		st.close_seq++
+		unsafe {
+			*(&u64(st.closed_at.data) + fd) = st.close_seq
+		}
+		if st.births_q != unsafe { nil } {
+			// Before the close below frees the number: the accept thread reads
+			// it after accept() returns that number again (drain_births).
+			stdatomic.store_u64(&st.births_q.close_seq, st.close_seq)
 		}
 	}
 	release_conn(epoll_fd, fd, active_conns)

@@ -27,7 +27,6 @@ import epoll
 import http1_1.request_parser
 import http1_1.response
 import sync.stdatomic
-import time
 
 #include <errno.h>
 #include <sys/epoll.h>
@@ -232,6 +231,13 @@ fn detach_rejected_watch(mut reactor Reactor, epoll_fd int, ext_fd int, client_f
 	if ext_fd < 0 || ext_fd >= reactor.watches.len || !reactor.watches[ext_fd].active {
 		return
 	}
+	if ext_fd == client_fd {
+		// A watch on the client's own socket: drop the watch and give the socket
+		// back its connection registration. Only close_conn closes the socket.
+		reactor.reactor_clear(ext_fd)
+		epoll.mod_fd_in_epoll(epoll_fd, ext_fd, u32(C.EPOLLIN) | u32(C.EPOLLET))
+		return
+	}
 	if reactor.watches[ext_fd].queue.len > 0 {
 		reactor.reactor_mark_dead(ext_fd, client_fd)
 	} else if !reactor.reactor_orphan_single(ext_fd, client_fd) {
@@ -276,9 +282,10 @@ fn (mut r Reactor) reactor_orphan_single(ext_fd int, client_fd int) bool {
 // worker's epoll (level-triggered: simplest correct default for arbitrary
 // consumer fds). Runs on the worker thread, so no synchronization is needed.
 fn register_watch(mut w core.EventLoop, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
-	if ext_fd < 0 {
+	if ext_fd < 0 || ext_fd >= epoll.accept_tag {
 		// A consumer handed us a failed fd (e.g. timerfd_create returned -1); never
-		// index the flat table at a negative slot. Arm nothing.
+		// index the flat table at a negative slot. Arm nothing. (An fd at or above
+		// epoll.accept_tag could not be told apart from a tagged one in events.)
 		w.last_watched = -1
 		return
 	}
@@ -427,6 +434,10 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 				return
 			}
 			cs.body_drain -= dn
+			if cs.body_drain == 0 {
+				end_read_deadline(mut st, mut cs) // the streamed request is complete
+				cs.sent_100 = false // its 100 was its own; the next request gets one
+			}
 			continue
 		}
 		if cs.read_buf.len == cs.read_buf.cap {
@@ -471,6 +482,12 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 		}
 		unsafe {
 			cs.read_buf.len += n
+		}
+		// First byte of a request: the idle wait is over. If the request stays
+		// incomplete, update_read_deadline arms its read deadline below.
+		if st.idle_ns != 0 && cs.idle_deadline != 0 {
+			cs.idle_deadline = 0
+			st.parked--
 		}
 		if !drain_requests(h, mut reactor, epoll_fd, fd, limits, active_conns, mut st, mut cs,
 			state) {
@@ -536,26 +553,36 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 	// upgrade request and reads the socket to EAGAIN (edge-triggered contract).
 	if cs.takeover != unsafe { nil } {
 		serve_takeover_conn(mut reactor, epoll_fd, fd, limits, active_conns, mut st, mut cs, state)
+		return
 	}
+	// Every response of this burst is out: a request boundary (arm_idle_deadline
+	// declines if anything is still pending, buffered or parked).
+	arm_idle_deadline(mut st, mut cs)
 }
 
 // update_read_deadline arms the read deadline ONCE while a request is mid-read
 // (partial bytes buffered, or a large body mid-drain — a peer that stalls
-// mid-upload is still reaped) and clears it when the buffer is idle OR the
-// connection just parked on a watch — a parked request waits on its watched
-// fd, not on the client, and leftover bytes in read_buf are pipelined-behind
-// requests, not a stalled read. Like every other read path (TLS, io_uring),
-// the deadline is armed once and not refreshed on progress, so read_timeout_ms
-// — when set (default 0 = off) — bounds the TOTAL time to receive a request,
-// including a streamed body. Size it for the largest upload you accept.
+// mid-upload is still reaped) and clears it when the connection just parked on
+// a watch — a parked request waits on its watched fd, not on the client, and
+// leftover bytes in read_buf are pipelined-behind requests, not a stalled read.
+// Like every other read path (TLS, io_uring), the deadline is armed once and
+// not refreshed on progress, so read_timeout_ms — when set (default 0 = off) —
+// bounds the TOTAL time to receive a request, including a streamed body. Size
+// it for the largest upload you accept. A connection's first request keeps the
+// deadline conn_birth armed at accept; completing a request ends its deadline
+// where it completes (end_read_deadline), so a pipelined partial behind it is
+// armed afresh here. An empty read side therefore clears nothing on the HTTP
+// path: a wake that read nothing (a stale event adopted as a birth) keeps the
+// accept-time deadline. A taken-over connection clears it whenever its buffer
+// is empty (between messages).
 @[inline]
 fn update_read_deadline(limits core.Limits, mut st PlainState, mut cs ConnState) {
 	if cs.awaiting_fd < 0 && (cs.read_buf.len > 0 || cs.body_drain > 0) {
 		if limits.read_timeout_ms > 0 && cs.read_deadline == 0 {
-			cs.read_deadline = time.sys_mono_now() + u64(limits.read_timeout_ms) * 1_000_000
+			cs.read_deadline = st.now + u64(limits.read_timeout_ms) * 1_000_000
 			st.parked++
 		}
-	} else if cs.read_deadline != 0 {
+	} else if cs.read_deadline != 0 && (cs.awaiting_fd >= 0 || cs.takeover != unsafe { nil }) {
 		cs.read_deadline = 0
 		st.parked--
 	}
@@ -740,6 +767,21 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 		reactor:   unsafe { voidptr(&reactor) }
 		register:  register_watch
 	}
+	// The reply appended here is held until the body drains; while it is, the
+	// sweep may answer a stalled body with a 408 in its place (sweep_timeouts).
+	// So drain_off marks where this request's own output starts. That includes
+	// an interim 100 Continue that is still wholly unsent: serve_conn queues it
+	// last, right before the body fills read_buf, so it is the tail here. Once
+	// any of it is out, a 408 would land inside it.
+	cs.drain_off = cs.write_buf.len
+	cont := response.status_100_continue_response
+	if cs.sent_100 && cs.write_buf.len - cs.write_off == cont.len
+		&& unsafe { vmemcmp(&u8(cs.write_buf.data) + cs.write_off, cont.data, cont.len) } == 0 {
+		// The only unsent bytes ahead are this request's own interim 100 — not
+		// an earlier response still owed (sent_100 alone could be stale) — so
+		// the 408 may replace it too.
+		cs.drain_off = cs.write_off
+	}
 	head_step := h(head, mut cs.write_buf, fd, state, mut event_loop)
 	// A takeover queued on the streamed large-body path is unsupported (the body
 	// is still in flight — there is no clean byte at which the protocol could
@@ -774,8 +816,10 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 	// after the head response, so the body was never drained.)
 	body_in_buf := cs.read_buf.len - head_len
 	cs.body_drain = i64(content_length) - i64(body_in_buf)
-	if cs.body_drain < 0 {
+	if cs.body_drain <= 0 {
 		cs.body_drain = 0
+		end_read_deadline(mut st, mut cs) // the whole body was buffered: complete
+		cs.sent_100 = false
 	}
 	unsafe {
 		cs.read_buf.len = 0 // head (and any buffered body bytes) consumed
@@ -865,6 +909,17 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 				}
 			}
 			.suspend {
+				if event_loop.last_watched < 0 {
+					// Suspended without a live watch (watch_fd refused its fd, or was
+					// never called): nothing would ever resume this request. Flush
+					// what was appended and close, as drain_takeover does, instead
+					// of answering the next pipelined request in its place.
+					compact_read_buf(mut cs, pos)
+					if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
+						close_conn(epoll_fd, fd, active_conns, mut st)
+					}
+					return false
+				}
 				cs.awaiting_fd = event_loop.last_watched // park; leftover stays buffered for resume
 			}
 			.close {
@@ -886,7 +941,28 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 		}
 	}
 	compact_read_buf(mut cs, pos)
+	if pos > 0 {
+		end_read_deadline(mut st, mut cs)
+		// A 100 Continue was for the request at the head, which completed: the
+		// next one (pipelined, Expect: 100-continue) gets its own.
+		cs.sent_100 = false
+	}
 	return true
+}
+
+// end_read_deadline clears the read deadline of a request that just
+// completed (consumed by drain_requests, or a streamed body fully drained).
+// It is the only place the HTTP path ends a read deadline outside a park
+// (update_read_deadline). Anything still buffered is the NEXT request:
+// update_read_deadline then arms it a fresh deadline from this batch, so a
+// pipelined request never inherits the clock armed at accept or for the
+// request before it.
+@[inline]
+fn end_read_deadline(mut st PlainState, mut cs ConnState) {
+	if cs.read_deadline != 0 {
+		cs.read_deadline = 0
+		st.parked--
+	}
 }
 
 // compact_read_buf drops the first `pos` consumed bytes, keeping the leftover
@@ -1038,8 +1114,31 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 			// is pending (the DB-style "park, write later" case appends nothing here).
 			// flush_batch returns false only if it already closed the conn (peer gone /
 			// write error) — then we must NOT re-park it.
+			if event_loop.last_watched < 0 {
+				// Suspended without re-arming a watch (watch_fd failed, or was never
+				// called): nothing would ever resume this connection, and a parked
+				// connection holds no deadline — flush what was appended, then
+				// close (the same rule as drain_takeover).
+				if flush_batch(epoll_fd, client_fd, limits, active_conns, mut st, mut cs) {
+					close_conn(epoll_fd, client_fd, active_conns, mut st)
+				}
+				return
+			}
 			if cs.write_buf.len > cs.write_off {
 				if !flush_batch(epoll_fd, client_fd, limits, active_conns, mut st, mut cs) {
+					// The peer is gone and flush_batch closed the connection, but the
+					// watch the continuation just re-armed is not recorded on it yet
+					// (it parks after the flush): tear it down here, or it outlives the
+					// client — its request-owned fd (an SSE tick timer) leaks, and with
+					// accept-time births on its level-triggered edge would be dropped
+					// as stale forever. A self-watch (the client's own socket, which
+					// flush_batch already closed) only loses its watch entry.
+					if event_loop.last_watched == client_fd {
+						reactor.reactor_clear(client_fd)
+					} else {
+						detach_rejected_watch(mut reactor, epoll_fd, event_loop.last_watched,
+							client_fd)
+					}
 					return
 				}
 			}
@@ -1188,10 +1287,15 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 @[direct_array_access; manualfree]
 fn close_client(mut reactor Reactor, epoll_fd int, fd int, active_conns &core.Counter, mut st PlainState) {
 	if fd < st.conns.len {
-		cs := st.conns[fd]
+		mut cs := st.conns[fd]
 		if unsafe { cs != nil } && cs.awaiting_fd >= 0 {
 			ext_fd := cs.awaiting_fd
-			if ext_fd < reactor.watches.len && reactor.watches[ext_fd].queue.len > 0 {
+			cs.awaiting_fd = -1 // torn down here; close_conn must not detach it again
+			if ext_fd == fd {
+				// Parked on its own socket's writability: only the watch goes —
+				// close_conn's release_conn closes the socket, exactly once.
+				reactor.reactor_clear(ext_fd)
+			} else if ext_fd < reactor.watches.len && reactor.watches[ext_fd].queue.len > 0 {
 				// The fd is a SHARED, pipelined pg connection: detaching this one client
 				// must not clear the slot (siblings are still parked) nor close the pooled
 				// connection. Tombstone this client's slot — it stays in the queue so the

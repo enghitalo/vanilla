@@ -14,7 +14,7 @@ import core
 
 #include <unistd.h>
 
-fn C.pipe(fds &int) int
+fn C.pipe(fds &i32) int
 fn C.write(fd int, buf voidptr, n usize) int
 fn C.read(fd int, buf voidptr, n usize) int
 fn C.close(fd int) int
@@ -24,7 +24,7 @@ const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 
 // handle parks /async on a pipe read-end and answers everything else immediately.
 fn handle(req []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if req.bytestr().contains('/async') {
-		mut fds := [2]int{}
+		mut fds := [2]i32{} // C ints: V int is 64-bit
 		if C.pipe(unsafe { &fds[0] }) != 0 {
 			out << resp_ok
 			return .done
@@ -33,9 +33,9 @@ fn handle(req []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut eve
 		// consumer would instead watch a DB socket / upstream / timer that becomes
 		// ready later — the worker keeps serving others until then.
 		b := u8(1)
-		C.write(fds[1], &b, 1)
-		C.close(fds[1])
-		event_loop.watch_fd(fds[0], .readable, pipe_done, unsafe { nil })
+		C.write(int(fds[1]), &b, 1)
+		C.close(int(fds[1]))
+		event_loop.watch_fd(int(fds[0]), .readable, pipe_done, unsafe { nil })
 		return .suspend
 	}
 	out << resp_ok

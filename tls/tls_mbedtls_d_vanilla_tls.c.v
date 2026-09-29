@@ -10,8 +10,10 @@ import os
 
 #flag -I@VMODROOT/tls
 #flag -I/usr/local/include
-#flag -L/usr/local/lib -lmbedtls -lmbedx509 -lmbedcrypto
+// The shim BEFORE the libraries: with gcc's --as-needed (the Ubuntu/Debian
+// default) a library is only kept if an object listed before it uses it.
 #flag @VMODROOT/tls/vanilla_tls.c
+#flag -L/usr/local/lib -lmbedtls -lmbedx509 -lmbedcrypto
 
 #include "vanilla_tls.h"
 

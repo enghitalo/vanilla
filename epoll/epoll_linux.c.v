@@ -24,10 +24,27 @@ pub struct C.epoll_event {
 	events u32
 }
 
-// event_fd extracts the client fd stored in an epoll_event's data union.
+// accept_tag marks an fd registration made by the accept thread
+// (add_fd_to_epoll_tagged): bit 30 of the fd stored in the event's data. It
+// assumes descriptors stay below 2^30 — true unless fs.nr_open and the
+// process fd limit are raised past it (the default nr_open is 2^20); the
+// accept thread refuses a connection that would not fit. It lives in the
+// `int` member itself, so it is endian-neutral. A later MOD stores the plain
+// fd, dropping the tag.
+pub const accept_tag = 1 << 30
+
+// event_fd extracts the fd stored in an epoll_event's data union (without
+// the accept tag).
 @[inline]
 pub fn event_fd(ev C.epoll_event) int {
-	return C.v_epoll_event_get_fd(&ev)
+	return C.v_epoll_event_get_fd(&ev) & (accept_tag - 1)
+}
+
+// event_tagged reports whether the event comes from a registration made by
+// add_fd_to_epoll_tagged (and not modified since).
+@[inline]
+pub fn event_tagged(ev C.epoll_event) bool {
+	return C.v_epoll_event_get_fd(&ev) & accept_tag != 0
 }
 
 // Callbacks for epoll-driven IO events.
@@ -52,6 +69,22 @@ pub fn add_fd_to_epoll(epoll_fd int, fd int, events u32) int {
 		events: events
 	}
 	C.v_epoll_event_set_fd(&ev, fd)
+	if C.epoll_ctl(epoll_fd, C.EPOLL_CTL_ADD, fd, &ev) == -1 {
+		eprintln(@LOCATION)
+		C.perror(c'epoll_ctl')
+		return -1
+	}
+	return 0
+}
+
+// add_fd_to_epoll_tagged is add_fd_to_epoll with the accept tag in the
+// event data, so the worker can tell an accepted connection's events from
+// those of any other fd registered in its epoll (event_tagged).
+pub fn add_fd_to_epoll_tagged(epoll_fd int, fd int, events u32) int {
+	mut ev := C.epoll_event{
+		events: events
+	}
+	C.v_epoll_event_set_fd(&ev, fd | accept_tag)
 	if C.epoll_ctl(epoll_fd, C.EPOLL_CTL_ADD, fd, &ev) == -1 {
 		eprintln(@LOCATION)
 		C.perror(c'epoll_ctl')

@@ -16,7 +16,7 @@ module main
 //   • correct HTTP — 404 vs 405 (+ Allow), accurate Content-Length, and
 //     application/json for JSON bodies;
 //   • safe output — URL-derived values are JSON-escaped (no injection);
-//   • bounded — request size / connection limits and read/write timeouts;
+//   • bounded — request size / connection limits and read/write/idle timeouts;
 //   • graceful shutdown — SIGTERM/SIGINT drain in-flight work, then exit.
 import server
 import core
@@ -207,13 +207,17 @@ fn main() {
 			return .done
 		}
 		// Production limits: bound resource use so a single client can't exhaust
-		// the server. All default to 0 (unlimited) — set explicitly here.
+		// the server. All default to 0 (unlimited) — set explicitly here. The
+		// timeouts are what keep max_connections honest: they reap connections
+		// that never send a byte and keep-alive peers that vanished, which would
+		// otherwise hold their slots forever.
 		limits:          server.Limits{
 			max_header_bytes: 16 * 1024   // 16 KiB headers  -> 431
 			max_body_bytes:   1024 * 1024 // 1 MiB body     -> 413 (from Content-Length)
 			max_connections:  100_000     // refuse past this many concurrent
-			read_timeout_ms:  10_000      // finish the request within 10s or 408
+			read_timeout_ms:  10_000      // finish the request within 10s of accept / its first byte (408 if partial)
 			write_timeout_ms: 30_000      // drain a parked response within 30s
+			idle_timeout_ms:  75_000      // keep-alive wait for the next request; longer than a load balancer's usual 60s (0 would inherit 10s)
 		}
 	})!
 

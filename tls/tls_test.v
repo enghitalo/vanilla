@@ -1,6 +1,7 @@
 module tls
 
 import os
+import encoding.base64
 
 // These exercise the real Mbed TLS-backed implementation, so they only do
 // anything under `-d vanilla_tls`. In the default (stub) build they compile and
@@ -95,5 +96,51 @@ fn test_self_signed_persist_dir_keeps_identity() {
 		fresh.free()
 		second.free()
 		first.free()
+	}
+}
+
+// der_len reads the DER length at b[i] (short or long form) and returns
+// (length, index of the first content byte).
+fn der_len(b []u8, i int) (int, int) {
+	if b[i] < 0x80 {
+		return int(b[i]), i + 1
+	}
+	n := int(b[i] & 0x7f)
+	mut l := 0
+	for k in 0 .. n {
+		l = (l << 8) | int(b[i + 1 + k])
+	}
+	return l, i + 1 + n
+}
+
+// The certificate serial is a DER INTEGER: it must be minimally encoded and
+// positive, or OpenSSL 3 clients refuse the certificate ("illegal padding").
+// A random 12-byte serial written as is breaks that 1 time in 512; 2048 fresh
+// certificates (~2 s) catch such a regression ~98% of the time.
+fn test_self_signed_serial_is_minimal_positive_der() {
+	$if vanilla_tls ? {
+		for _ in 0 .. 2048 {
+			cfg := new_self_signed() or { panic('gen: ${err}') }
+			pem := cfg.cert_pem()
+			cfg.free()
+			body := pem.all_after('-----BEGIN CERTIFICATE-----').all_before('-----END CERTIFICATE-----').replace('\n',
+				'')
+			der := base64.decode(body)
+			// Certificate SEQUENCE -> tbsCertificate SEQUENCE -> [0] version -> serial.
+			assert der[0] == 0x30
+			_, tbs := der_len(der, 1)
+			assert der[tbs] == 0x30
+			_, inner := der_len(der, tbs + 1)
+			assert der[inner] == 0xa0 // explicit version tag
+			vlen, vstart := der_len(der, inner + 1)
+			si := vstart + vlen
+			assert der[si] == 0x02, 'serial must be an INTEGER'
+			slen, sstart := der_len(der, si + 1)
+			assert slen >= 1
+			assert der[sstart] & 0x80 == 0, 'serial must be positive'
+			if slen > 1 {
+				assert !(der[sstart] == 0 && der[sstart + 1] & 0x80 == 0), 'serial must be minimally encoded'
+			}
+		}
 	}
 }

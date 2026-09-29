@@ -17,6 +17,7 @@ on:
       - 'http1_1/**'
       - 'socket/**'
       - 'vtest/**'
+      - 'transport/**'
       - 'tests/**'
       - '.github/workflows/poll_backend.yml'
   pull_request:
@@ -28,6 +29,7 @@ on:
       - 'http1_1/**'
       - 'socket/**'
       - 'vtest/**'
+      - 'transport/**'
       - 'tests/**'
       - '.github/workflows/poll_backend.yml'
 
@@ -35,6 +37,7 @@ jobs:
   poll-reactor-tests:
     runs-on: ubuntu-latest
     name: behaviour suite under -d vanilla_poll
+    timeout-minutes: 20 # backstop for a hung vtest e2e test (no client timeouts)
     steps:
       - uses: actions/checkout@v4
       - name: Set up V
@@ -49,8 +52,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y liburing-dev linux-libc-dev
       # The whole behaviour suite (pipelining, split framing, max_connections,
-      # read timeout, large-body drain, half-close, 100-continue, graceful
-      # shutdown) runs against .poll via the $if vanilla_poll ? test fns, with
+      # read timeout, connection reaping, large-body drain, half-close,
+      # 100-continue, graceful shutdown) runs against .poll via the $if vanilla_poll ? test fns, with
       # the epoll checks as the in-binary control group. VANILLA_NO_IOURING is
       # the repo's own kill-switch for exactly this host class (see
       # iou_backend_available): hosted runners cap io_uring so a probe that
@@ -65,6 +68,16 @@ jobs:
           VANILLA_NO_IOURING: '1'
         run: |
           v -cc gcc -no-parallel -d vanilla_poll test tests/backend_behaviors_test.v
+      # The reaping edge cases that need no watch reactor (fresh deadline for a
+      # pipelined partial, no 408 inside a pending response, the stalled-upload
+      # 408, 100-continue and streamed uploads under deadlines, a connect storm)
+      # have test_poll_* twins in epoll_timeouts_test.v.
+      - name: Reaping edge cases with the poll reactor
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+        run: |
+          v -cc gcc -no-parallel -d vanilla_poll -run-only 'test_poll_*' test tests/epoll_timeouts_test.v
       # A flag-on example build proves the -d wiring links outside tests too.
       - name: Build an example with -d vanilla_poll
         shell: bash
