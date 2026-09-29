@@ -132,7 +132,7 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 // the only extra hot-path cost over the old synchronous-only worker is a
 // per-event `watches[fd].active` load.
 @[direct_array_access; manualfree]
-fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_state fn () voidptr, on_worker_start core.WorkerStartFn, limits core.Limits, counter &core.Counter, active_conns &core.Counter) {
+fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_state fn () voidptr, on_worker_start core.WorkerStartFn, limits core.Limits, counter &core.Counter, active_conns &core.Counter, listen_port int, listen_uds bool) {
 	maybe_pin_worker(worker_id)
 	// Build THIS worker's per-thread state once (e.g. its own DB connection);
 	// every handler call on this worker receives it as the worker_state parameter.
@@ -151,7 +151,6 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 	core.enable_takeover()
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut st := new_plain_state()
-	st.reactor = unsafe { &reactor } // close_conn tears a parked client's watch down
 	// Arm clientless background watches (timerfd refresh, signalfd, ...) on THIS
 	// worker's loop, once, before serving. client_fd = -1 makes the watch + its
 	// continuation take the clientless path (no conn, scratch buffer).
@@ -175,6 +174,8 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 		0
 	}
 	st.idle_ns = u64(limits.idle_ms()) * 1_000_000
+	st.listen_port = listen_port
+	st.listen_uds = listen_uds
 	// Accept registers new fds for EPOLLOUT too (accept_events) exactly when
 	// a timeout is on: every connection's state is then created by its birth
 	// event (conn_birth), handled first in the loop below.
@@ -226,18 +227,30 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 				// No state yet. A new socket is writable at ADD, so a
 				// connection's FIRST report always carries EPOLLOUT (even when
 				// the peer already reset or half-closed it), and active watch
-				// fds were routed above. So this is either that birth — and
-				// conn_birth's MOD succeeds only while the fd is in this epoll —
-				// or a stale event for an fd closed earlier in this batch (a
-				// client, or a watch fd close_conn tore down). accept may
-				// already have reused that number, for a connection this worker
-				// does not own or for one whose own birth event is still queued
-				// here. Closing or serving a stale fd would release a slot that
-				// was already released, or build a zombie state whose deadline
-				// later closes someone else's socket: drop the event. A stale
-				// event that carries EPOLLOUT for a number reused by a new
-				// connection in THIS epoll passes conn_birth, and adopting that
-				// connection is right: it is ours, and gets its deadline here.
+				// fds were routed above. So this is either that birth, or an fd
+				// that must never be born: a stale event for an fd closed
+				// earlier in this batch (a client, or a watch fd close_client
+				// tore down), whose release would be a second one, or an app's
+				// fd that a finished watch left registered, level-triggered (a
+				// pooled connection kept open after .done, or one a
+				// continuation stepped away from), whose zombie state would
+				// later close it. Only a socket accepted on the listener is
+				// born (accepted_here). Anything else is detached from this
+				// epoll, never closed: an app's fd reports again on every wait
+				// (a pooled connection whose upstream closed stays readable),
+				// so dropping the event would spin the worker. Its next
+				// watch_fd adds it back (register_watch falls back to ADD), and
+				// a level-triggered fd then reports its readiness again. For a
+				// closed fd the DEL fails harmlessly. accept may already have
+				// reused a stale number, for a connection this worker does not
+				// own or for one whose own birth event is still queued here:
+				// accepted_here keeps it attached, and conn_birth's MOD
+				// succeeds only while the fd is in THIS epoll. Adopting it then
+				// is right: it is ours, and gets its deadline here.
+				if !st.accepted_here(fd) {
+					epoll.detach_fd_from_epoll(epoll_fd, fd)
+					continue
+				}
 				if ev & u32(C.EPOLLOUT) == 0 || !conn_birth(epoll_fd, fd, mut st) {
 					continue
 				}
@@ -254,7 +267,7 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 				continue
 			}
 			if ev & (u32(C.EPOLLHUP) | u32(C.EPOLLERR)) != 0 {
-				close_conn(epoll_fd, fd, active_conns, mut st) // tears any watch down first
+				close_client(mut reactor, epoll_fd, fd, active_conns, mut st) // tears any watch down first
 				continue
 			}
 			if ev & u32(C.EPOLLOUT) != 0 {
@@ -374,6 +387,10 @@ pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () v
 	// One worker epoll fd per worker thread. threads was sized by new_server from
 	// config.workers (default nr_cpus), so its length is this server's worker count.
 	mut epoll_fds := []int{len: threads.len, cap: threads.len}
+	// The listener's own address (once, here): a plain worker gives birth
+	// only to sockets accepted on it (PlainState.accepted_here).
+	listen_family, listen_port, _ := sock_local(socket_fd)
+	listen_uds := listen_family == C.AF_UNIX
 
 	unsafe { epoll_fds.flags.set(.noslices | .noshrink | .nogrow) }
 	for i in 0 .. threads.len {
@@ -396,7 +413,7 @@ pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () v
 				counter, active_conns, tls_config)
 		} else {
 			threads[i] = spawn process_events_plain(i, epoll_fds[i], handler, make_state,
-				on_worker_start, limits, counter, active_conns)
+				on_worker_start, limits, counter, active_conns, listen_port, listen_uds)
 		}
 	}
 

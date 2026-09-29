@@ -115,12 +115,13 @@ mut:
 	// head was already answered, this many body bytes are still to be consumed
 	// off the socket before the connection is ready for its next request.
 	body_drain i64
-	// While body_drain > 0: where the reply held for the streamed request
-	// starts in write_buf. Everything before it answers earlier requests.
+	// While body_drain > 0: where the output held for the streamed request
+	// starts in write_buf (start_body_drain). Everything before it answers
+	// earlier requests.
 	drain_off int
 	// The external fd this connection is parked on while awaiting a watch
-	// (-1 = not parked). close_conn tears that watch down, whichever path
-	// closes the connection mid-await.
+	// (-1 = not parked). Lets the worker tear the watch down if the client
+	// closes mid-await.
 	awaiting_fd int = -1
 	// Set when the client half-closed its write side (recv → 0 / EOF) while a
 	// response was still pending: the request half is done, but we still owe the
@@ -172,9 +173,11 @@ mut:
 	// uses it, so the request path never reads the clock itself.
 	now        u64
 	next_sweep u64 // monotonic ns; the sweep scans the table only once now >= this
-	// This worker's watch registry (set once by process_events_plain), so
-	// close_conn can tear down the watch of a connection closed mid-await.
-	reactor &Reactor = unsafe { nil }
+	// The listener's local address, set once at startup: the worker gives
+	// birth only to a socket accepted on it (accepted_here). listen_port is
+	// its TCP port; listen_uds is set for an AF_UNIX listener instead.
+	listen_port int
+	listen_uds  bool
 }
 
 // tick reads the batch clock (see PlainState.now).
@@ -356,7 +359,8 @@ fn flush_batch(epoll_fd int, fd int, limits core.Limits, active_conns &core.Coun
 // whole first request), otherwise IDLE (a connection that has sent nothing is
 // idle) — and switches the fd back to EPOLLIN|EPOLLET. Returns false, and
 // creates nothing, for a stale event (see process_events_plain). Called only
-// when accept-time births are on.
+// when accept-time births are on, and only for a socket accepted on this
+// server's listener (accepted_here, checked by the worker).
 @[inline]
 fn conn_birth(epoll_fd int, fd int, mut st PlainState) bool {
 	// MOD before reading (never after: a read that closes the fd lets accept
@@ -375,6 +379,43 @@ fn conn_birth(epoll_fd int, fd int, mut st PlainState) bool {
 	return true
 }
 
+// accepted_here reports whether fd is a client socket accepted on this
+// server's listener, by its local address (getsockname): an accepted TCP
+// socket holds the listening port; an accepted AF_UNIX socket reports the
+// listener's path, while a dialed or socketpair end is unnamed. Anything else
+// fails: a timerfd, pipe or eventfd (ENOTSOCK), an fd already closed (EBADF),
+// or the app's own dialed socket (an ephemeral local port). One syscall per
+// event on an fd with no state (a birth, a stale event, or an app's fd the
+// worker then detaches), never on an event of an established connection. It
+// assumes an accepted TCP socket's local port is the listening port: true for
+// a plain listen and behind iptables REDIRECT/DNAT (getsockname returns the
+// translated port), not under BPF socket steering (sk_lookup), where it is
+// the port the client dialed. Such a connection is never born: it is detached
+// unserved and, holding no deadline, never reaped.
+@[direct_array_access; inline]
+fn (st &PlainState) accepted_here(fd int) bool {
+	family, port, named := sock_local(fd)
+	if st.listen_uds {
+		return family == C.AF_UNIX && named
+	}
+	return (family == C.AF_INET || family == C.AF_INET6) && port == st.listen_port
+}
+
+// sock_local reads fd's local address (getsockname): its family (-1 when fd
+// is not an open socket), its port for AF_INET/AF_INET6, and for AF_UNIX
+// whether it is bound to a path. The port sits at the same offset in
+// sockaddr_in and sockaddr_in6, and sun_path right after the family.
+@[direct_array_access]
+fn sock_local(fd int) (int, int, bool) {
+	mut a := [128]u8{} // sizeof(struct sockaddr_storage)
+	mut l := u32(128)
+	if C.getsockname(fd, voidptr(&a[0]), &l) != 0 || l < 2 {
+		return -1, 0, false
+	}
+	family := int(unsafe { *(&u16(&a[0])) }) // sa_family_t, host order
+	return family, int((u32(a[2]) << 8) | u32(a[3])), l > 2 && a[2] != 0 // port: network order
+}
+
 // arm_idle_deadline starts the keep-alive idle clock at a request boundary:
 // the response is fully handed to the kernel and the connection is back to
 // waiting for a new request. Anything else keeps its own clock or none —
@@ -387,8 +428,8 @@ fn conn_birth(epoll_fd int, fd int, mut st PlainState) bool {
 // re-arms fresh because its first byte cleared it.
 //
 // Called from the serve_conn tail and the handle_writable_plain drain, never
-// from flush_batch: most of its callers are not at a request boundary (a
-// streaming continuation's piece, a takeover's frames, a reply before a close).
+// from flush_batch: the SSE flush in on_watch_ready runs flush_batch BEFORE it
+// re-parks the connection (awaiting_fd is still -1 there).
 @[inline]
 fn arm_idle_deadline(mut st PlainState, mut cs ConnState) {
 	if st.idle_ns == 0 || cs.idle_deadline != 0 || cs.read_buf.len != 0 || cs.body_drain != 0
@@ -496,9 +537,10 @@ fn sweep_timeouts(epoll_fd int, active_conns &core.Counter, mut st PlainState) {
 			// the 408 goes straight to the socket, so it must not land inside a
 			// response still pending (parked mid-send), nor ahead of one owed to
 			// an earlier request. That is nothing left to write or, for a
-			// streamed body, every earlier response out and the reply held for
-			// the upload itself not started: that request was never answered,
-			// and the 408 replaces its reply.
+			// streamed body, every earlier response out and the upload's own
+			// output (its held reply, after a 100 Continue not sent yet) not
+			// started: that request was never answered, and the 408 replaces
+			// its reply.
 			at_boundary := if cs.body_drain > 0 {
 				cs.write_off == cs.drain_off
 			} else {
@@ -519,22 +561,14 @@ fn sweep_timeouts(epoll_fd int, active_conns &core.Counter, mut st PlainState) {
 
 // close_conn resets the connection's state, returns it to the per-worker pool
 // (buffers kept, see PlainState.free_conns), clears its table slot and
-// releases the fd. A connection parked on a watch has that watch torn down
-// first, whatever closes it (a hangup, a failed write, the write timeout, the
-// pending-write cap): a request-owned fd is closed, a pooled one tombstoned
-// (detach_watch). Otherwise the watch would stay armed for a client that is
-// gone, and fire against whichever connection reuses its number. NOT
-// idempotent (release_conn always runs): every close site must make sure it
-// is the only one closing — the bool returns of flush_batch / drain_requests
-// / handle_writable_plain exist exactly for that.
+// releases the fd. NOT idempotent (release_conn always runs): every close
+// site must make sure it is the only one closing — the bool returns of
+// flush_batch / drain_requests / handle_writable_plain exist exactly for that.
 @[direct_array_access; manualfree]
 fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainState) {
 	if fd < st.conns.len {
 		mut cs := st.conns[fd]
 		if unsafe { cs != nil } {
-			if cs.awaiting_fd >= 0 {
-				detach_watch(mut st.reactor, epoll_fd, cs.awaiting_fd, fd)
-			}
 			if cs.read_deadline != 0 {
 				st.parked--
 			}
