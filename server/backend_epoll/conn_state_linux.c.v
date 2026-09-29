@@ -22,6 +22,7 @@ module backend_epoll
 import core
 import epoll
 import http1_1.response
+import sync.stdatomic
 import time
 
 #include <errno.h>
@@ -185,10 +186,91 @@ mut:
 	// The worker's watch reactor, so close_conn can tear a parked connection's
 	// watch down on every close path (see close_conn).
 	reactor &Reactor = unsafe { nil }
-	// The worker loop's batch number (one per epoll_wait) and, per fd, the
-	// batch in which it was last closed (closed_in_batch). Sized with conns.
-	batch     u64
+	// close_seq counts this worker's closes; closed_at[fd] is its value at
+	// fd's last close (sized with conns), and batch_seq its value when the
+	// current batch of events began (closed_in_batch). The birth queue's
+	// entries carry it too (drain_births).
+	close_seq u64
+	batch_seq u64
 	closed_at []u64
+	// Accept-time births are on (a read or idle timeout is set): the close
+	// stamps below are kept, and accepted connections are handed over by the
+	// accept thread through births_q (see BirthQueue).
+	births   bool
+	births_q &BirthQueue = unsafe { nil }
+}
+
+// birth_queue_cap is the capacity of a worker's BirthQueue (a power of two).
+// When it is full the accept thread falls back to an EPOLLOUT registration.
+const birth_queue_cap = 4096
+
+// BirthQueue hands accepted connections from the accept thread to one plain
+// worker when accept-time births are on (a read or idle timeout is set), so
+// the worker learns about a connection that never sends a byte — and arms its
+// accept-time deadline — without an epoll event of its own. (Registering the
+// fd for EPOLLOUT does that too, but a new socket is writable at once, so the
+// edge wakes a sleeping worker a second time for every connection.) Single
+// producer (the accept thread), single consumer (the worker, at the end of
+// each loop iteration). Each entry also carries the worker's close_seq as the
+// accept thread read it BEFORE registering the fd: a close of that connection
+// can only come later and stamps a larger value, so the worker can tell an
+// entry whose connection it has already closed — its number possibly reused
+// by another connection or fd — from a live one.
+@[heap]
+struct BirthQueue {
+mut:
+	head      u64 // next entry the worker reads (written by the worker)
+	pad0      [56]u8
+	tail      u64 // next entry the accept thread writes (written by the accept thread)
+	pad1      [56]u8
+	close_seq u64 // the worker's close_seq, published for the accept thread
+	pad2      [56]u8
+	fds       [birth_queue_cap]int
+	seqs      [birth_queue_cap]u64
+}
+
+// has_room is called by the accept thread (the only producer, so the room can
+// only grow until its push).
+@[inline]
+fn (q &BirthQueue) has_room() bool {
+	return stdatomic.load_u64(&q.tail) - stdatomic.load_u64(&q.head) < birth_queue_cap
+}
+
+// push appends fd (accept thread; after has_room). seq is the worker's
+// close_seq read before fd was registered in its epoll.
+@[direct_array_access; inline]
+fn (mut q BirthQueue) push(fd int, seq u64) {
+	t := stdatomic.load_u64(&q.tail)
+	i := int(t & (birth_queue_cap - 1))
+	q.fds[i] = fd
+	q.seqs[i] = seq
+	stdatomic.store_u64(&q.tail, t + 1) // publishes the entry
+}
+
+// drain_births gives a birth (state + accept-time deadline) to every queued
+// connection that is still unborn: not closed since it was queued (its close
+// would have stamped a larger close_seq) and without state yet (a connection
+// that sent something first was already born by its first event). No syscall.
+@[direct_array_access]
+fn drain_births(mut st PlainState) {
+	mut q := st.births_q
+	h := q.head // only this worker writes head
+	t := stdatomic.load_u64(&q.tail)
+	if h == t {
+		return
+	}
+	for n := h; n < t; n++ {
+		i := int(n & (birth_queue_cap - 1))
+		fd := q.fds[i]
+		if fd < st.closed_at.len && st.closed_at[fd] > q.seqs[i] {
+			continue // closed since queued: stale
+		}
+		if fd < st.conns.len && unsafe { st.conns[fd] != nil } {
+			continue // already born
+		}
+		conn_birth(fd, mut st)
+	}
+	stdatomic.store_u64(&q.head, t)
 }
 
 // tick reads the batch clock (see PlainState.now).
@@ -209,7 +291,7 @@ pub fn new_plain_state() PlainState {
 // stale — it describes the registration that close removed.
 @[direct_array_access; inline]
 fn (st &PlainState) closed_in_batch(fd int) bool {
-	return fd < st.closed_at.len && st.closed_at[fd] == st.batch
+	return fd < st.closed_at.len && st.closed_at[fd] > st.batch_seq
 }
 
 // state_for returns the connection state for fd, creating it (with its
@@ -654,11 +736,18 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			st.free_conns << cs
 		}
 	}
-	if fd < st.closed_at.len {
-		// Later events for fd in this batch are stale (closed_in_batch). A
-		// plain store: an indexed assignment compiles to a generic element copy.
+	if st.births && fd < st.closed_at.len {
+		// Later events for fd in this batch, and birth-queue entries queued
+		// before this close, are stale (closed_in_batch, drain_births). A plain
+		// store: an indexed assignment compiles to a generic element copy.
+		st.close_seq++
 		unsafe {
-			*(&u64(st.closed_at.data) + fd) = st.batch
+			*(&u64(st.closed_at.data) + fd) = st.close_seq
+		}
+		if st.births_q != unsafe { nil } {
+			// Before the close below frees the number: the accept thread reads
+			// it after accept() returns that number again (drain_births).
+			stdatomic.store_u64(&st.births_q.close_seq, st.close_seq)
 		}
 	}
 	release_conn(epoll_fd, fd, active_conns)

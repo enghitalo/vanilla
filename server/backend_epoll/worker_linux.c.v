@@ -51,9 +51,12 @@ fn release_conn(epoll_fd int, fd int, active_conns &core.Counter) {
 // Accept loop for the main epoll thread. Distributes new client connections to worker threads (round-robin).
 // `conn_events` is the mask each new fd is registered with (see
 // accept_events).
-fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits core.Limits, active_conns &core.Counter, conn_events u32) {
+fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits core.Limits, active_conns &core.Counter, conn_events u32, queues []&BirthQueue) {
 	mut next_worker := 0
 	mut event := C.epoll_event{}
+	// With accept-time births (EPOLLOUT in conn_events) the registration is
+	// tagged, so the worker knows a connection's first event. Decided once.
+	births := conn_events & u32(C.EPOLLOUT) != 0
 
 	for {
 		// Wait for events on the main epoll fd (listening socket)
@@ -113,6 +116,7 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 				socket.set_tcp_nodelay(client_conn_fd)
 				// Distribute client connection to worker threads (round-robin)
 				epoll_fd := epoll_fds[next_worker]
+				worker := next_worker
 				next_worker = (next_worker + 1) % epoll_fds.len
 				$if verbose ? {
 					eprintln('[epoll] Adding client fd ${client_conn_fd} to worker epoll fd ${epoll_fd}')
@@ -122,17 +126,29 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 				// the accept-time EPOLLOUT edge that is immediate — so counting
 				// after the ADD could briefly undercount and over-admit.
 				stdatomic.add_i64(&active_conns.n, 1)
-				// With accept-time births (EPOLLOUT in the mask) the registration is
-				// tagged, so the worker knows the birth event is a connection's.
-				added := if conn_events & u32(C.EPOLLOUT) != 0 {
-					epoll.add_fd_to_epoll_tagged(epoll_fd, client_conn_fd, conn_events)
-				} else {
-					epoll.add_fd_to_epoll(epoll_fd, client_conn_fd, conn_events)
+				if !births {
+					if epoll.add_fd_to_epoll(epoll_fd, client_conn_fd, conn_events) < 0 {
+						stdatomic.add_i64(&active_conns.n, -1)
+						socket.close_socket(client_conn_fd)
+					}
+					continue
 				}
-				if added < 0 {
+				// A plain worker is told about the connection through its birth
+				// queue instead of an EPOLLOUT edge (which would wake it once more
+				// per connection); the entry's close_seq is read BEFORE the fd is
+				// registered (see BirthQueue). A full queue falls back to EPOLLOUT,
+				// as does the TLS worker (no queue).
+				mut q := queues[worker]
+				queued := q != unsafe { nil } && q.has_room()
+				seq := if queued { stdatomic.load_u64(&q.close_seq) } else { u64(0) }
+				events := if queued { u32(C.EPOLLIN) | u32(C.EPOLLET) } else { conn_events }
+				if epoll.add_fd_to_epoll_tagged(epoll_fd, client_conn_fd, events) < 0 {
 					stdatomic.add_i64(&active_conns.n, -1)
 					socket.close_socket(client_conn_fd)
 					continue
+				}
+				if queued {
+					q.push(client_conn_fd, seq)
 				}
 			}
 		}
@@ -146,7 +162,7 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 // the only extra hot-path cost over the old synchronous-only worker is a
 // per-event `watches[fd].active` load.
 @[direct_array_access; manualfree]
-fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_state fn () voidptr, on_worker_start core.WorkerStartFn, limits core.Limits, counter &core.Counter, active_conns &core.Counter, listen_port int, listen_uds bool) {
+fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_state fn () voidptr, on_worker_start core.WorkerStartFn, limits core.Limits, counter &core.Counter, active_conns &core.Counter, listen_port int, listen_uds bool, births_q &BirthQueue) {
 	maybe_pin_worker(worker_id)
 	// Build THIS worker's per-thread state once (e.g. its own DB connection);
 	// every handler call on this worker receives it as the worker_state parameter.
@@ -191,10 +207,12 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 	st.idle_ns = u64(limits.idle_ms()) * 1_000_000
 	st.listen_port = listen_port
 	st.listen_uds = listen_uds
+	st.births_q = births_q
 	// Accept registers new fds for EPOLLOUT too (accept_events) exactly when
 	// a timeout is on: every connection's state is then created by its birth
 	// event (conn_birth), handled first in the loop below.
 	births := st.read_ns != 0 || st.idle_ns != 0
+	st.births = births
 	// Adaptive epoll_wait timeout (busy-poll hybrid). After a wait that returned
 	// events, poll again with timeout 0: under sustained load the next batch is
 	// usually already queued, so we skip the block→wake scheduler round-trip that
@@ -210,6 +228,12 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 			// The end-of-batch check below keeps next_sweep ahead of st.now
 			// whenever a deadline is armed; +1 rounds the ms up.
 			if st.next_sweep > st.now { int((st.next_sweep - st.now) / 1_000_000) + 1 } else { 0 }
+		} else if births {
+			// Nothing armed, but the accept thread may queue a connection at
+			// any moment without waking this worker: look again within one
+			// sweep interval (drain_births below), so a connection that never
+			// sends is born, and reaped, at most one interval late.
+			sweep_ms
 		} else {
 			-1
 		}
@@ -229,7 +253,7 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 		if sweep_on {
 			st.tick() // the batch clock: one read per iteration, reused by every deadline
 		}
-		st.batch++ // close_conn stamps each close with it (closed_in_batch)
+		st.batch_seq = st.close_seq // closes from here on are in this batch (closed_in_batch)
 		hot = num_events > 0
 		for i in 0 .. num_events {
 			fd := epoll.event_fd(events[i])
@@ -277,9 +301,9 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 					}
 					continue
 				}
-				if ev & u32(C.EPOLLOUT) == 0 {
-					continue // not a first report: stale
-				}
+				// A tagged event on an fd with no state, not closed in this batch:
+				// the connection's first report (its birth-queue entry, if any,
+				// then finds it born).
 				conn_birth(fd, mut st)
 				// Born, with nothing to write: skip the EPOLLOUT half. Read on
 				// EPOLLIN (the request often arrives with the connection, and
@@ -309,6 +333,11 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 				handle_readable(handler, mut reactor, epoll_fd, fd, limits, counter, active_conns, mut
 					st, state)
 			}
+		}
+		// Connections the accept thread queued since the last pass: give the
+		// still-silent ones their accept-time deadline.
+		if st.births_q != unsafe { nil } {
+			drain_births(mut st)
 		}
 		// After handling this batch (or a timeout wake with num_events == 0),
 		// reap any connection whose read/write/idle deadline has passed — at most
@@ -421,6 +450,15 @@ pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () v
 	// One worker epoll fd per worker thread. threads was sized by new_server from
 	// config.workers (default nr_cpus), so its length is this server's worker count.
 	mut epoll_fds := []int{len: threads.len, cap: threads.len}
+	// One birth queue per plain worker, only when accept-time births are on
+	// (see BirthQueue); the TLS worker is told by an EPOLLOUT edge instead.
+	queue_births := tls_config == unsafe { nil } && accept_events(limits) & u32(C.EPOLLOUT) != 0
+	mut queues := []&BirthQueue{len: threads.len, init: unsafe { nil }}
+	if queue_births {
+		for i in 0 .. threads.len {
+			queues[i] = &BirthQueue{}
+		}
+	}
 	// The listener's own address (once, here): a plain worker never detaches
 	// a socket accepted on it (PlainState.leftover_fd).
 	listen_family, listen_port, _ := sock_local(socket_fd)
@@ -447,7 +485,7 @@ pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () v
 				counter, active_conns, tls_config)
 		} else {
 			threads[i] = spawn process_events_plain(i, epoll_fds[i], handler, make_state,
-				on_worker_start, limits, counter, active_conns, listen_port, listen_uds)
+				on_worker_start, limits, counter, active_conns, listen_port, listen_uds, queues[i])
 		}
 	}
 
@@ -457,7 +495,8 @@ pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () v
 	if after_server_start != unsafe { nil } {
 		after_server_start()
 	}
-	handle_accept_loop(socket_fd, main_epoll_fd, epoll_fds, limits, active_conns, accept_events(limits))
+	handle_accept_loop(socket_fd, main_epoll_fd, epoll_fds, limits, active_conns, accept_events(limits),
+		queues)
 }
 
 // accept_events is the epoll mask a freshly accepted fd is registered with.
