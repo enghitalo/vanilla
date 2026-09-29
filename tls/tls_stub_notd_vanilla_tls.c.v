@@ -46,6 +46,8 @@ pub fn (s &Session) read_into(ptr &u8, len int) int {
 	return closed
 }
 
+pub fn (s &Session) mark_readable() {}
+
 pub fn (s &Session) write_from(ptr &u8, len int) int {
 	return closed
 }

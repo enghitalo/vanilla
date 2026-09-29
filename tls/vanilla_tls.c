@@ -14,6 +14,7 @@
 #include <mbedtls/asn1.h>
 #include <psa/crypto.h>
 #include <psa/crypto_values.h>
+#include <stddef.h> /* offsetof */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>  /* one-time kTLS engage/fallback log to stderr */
@@ -56,12 +57,23 @@ typedef struct {
     int have_server;
 } vtls_keys;
 
+// Ciphertext read ahead of mbedTLS on the userspace path (see vtls_bio_recv).
+// Holds a typical request record, or a burst of small pipelined ones, in one
+// recv; larger asks bypass it.
+#define VTLS_READAHEAD 4096
+
 typedef struct {
     mbedtls_ssl_context ssl;
     mbedtls_net_context net;
     vtls_keys keys;  // captured during the handshake, consumed by vtls_enable_ktls
     int ktls;        // 1 once kTLS TX+RX are both installed (reads/writes are plaintext)
     int ktls_failed; // 1 if a setsockopt failed AFTER the ULP attached → caller must close
+    // The socket may hold unread bytes: set by vtls_mark_readable (every
+    // readable edge), cleared by a recv that came back short or EAGAIN.
+    int readable;
+    int readahead;   // 1 once the handshake left the session on userspace mbedTLS
+    size_t ra_off, ra_len; // unread ciphertext is ra[ra_off..ra_len]
+    unsigned char ra[VTLS_READAHEAD];
 } vtls_session;
 
 // Pin the negotiated suite to exactly TLS_AES_128_GCM_SHA256 (0x1301) so the kTLS
@@ -298,13 +310,63 @@ int vtls_set_alpn(vtls_ctx *c, const char *list) {
 
 // ---- per-connection session -------------------------------------------------
 
+// vtls_bio_recv is the session's receive callback. mbedTLS asks for exact
+// lengths (a 5-byte record header, then the record body), so over a plain
+// recv every record costs two syscalls, and no read ever comes back short:
+// the caller could not tell a drained socket from one with more records
+// queued without a third, EAGAIN, recv. Once the handshake is over
+// (readahead), a small ask is served from `ra`, refilled by one recv of up to
+// VTLS_READAHEAD bytes: a burst of records costs one syscall. A short recv
+// proves the socket drained (TCP returns everything queued, up to the length
+// asked), so `readable` drops and later asks return WANT_READ without a
+// syscall; bytes arriving after that recv raise a new edge (EPOLLET), whose
+// vtls_mark_readable re-arms it. During the handshake the reads stay exact:
+// vtls_enable_ktls requires that mbedTLS consumed nothing past the client's
+// Finished, or the kernel would miss those records.
+// ctx is &session->net (so the send side stays plain mbedtls_net_send).
+static int vtls_bio_recv(void *ctx, unsigned char *buf, size_t len) {
+    vtls_session *s = (vtls_session *)((char *)ctx - offsetof(vtls_session, net));
+    if (s->ra_off < s->ra_len) {
+        size_t n = s->ra_len - s->ra_off;
+        if (n > len) n = len;
+        memcpy(buf, s->ra + s->ra_off, n);
+        s->ra_off += n;
+        return (int)n;
+    }
+    if (!s->readable) return MBEDTLS_ERR_SSL_WANT_READ;
+    // A large ask (a big record's body) goes straight into mbedTLS's buffer.
+    int ahead = s->readahead && len < VTLS_READAHEAD;
+    unsigned char *dst = ahead ? s->ra : buf;
+    size_t want = ahead ? VTLS_READAHEAD : len;
+    ssize_t r;
+    do {
+        r = recv(s->net.fd, dst, want, 0);
+    } while (r < 0 && errno == EINTR);
+    if (r < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            s->readable = 0;
+            return MBEDTLS_ERR_SSL_WANT_READ;
+        }
+        return MBEDTLS_ERR_NET_RECV_FAILED;
+    }
+    if (r == 0) return 0; // EOF: mbedTLS reports MBEDTLS_ERR_SSL_CONN_EOF
+    if ((size_t)r < want) s->readable = 0;
+    if (!ahead) return (int)r;
+    s->ra_len = (size_t)r;
+    s->ra_off = (size_t)r < len ? (size_t)r : len;
+    memcpy(buf, s->ra, s->ra_off);
+    return (int)s->ra_off;
+}
+
 void *vtls_session_new(vtls_ctx *c, int fd) {
+    // calloc: every read-ahead field starts empty/off.
     vtls_session *s = (vtls_session *)calloc(1, sizeof(vtls_session));
     if (!s) return NULL;
     mbedtls_ssl_init(&s->ssl);
     if (mbedtls_ssl_setup(&s->ssl, &c->conf) != 0) { free(s); return NULL; }
     s->net.fd = fd; // already accepted + non-blocking
-    mbedtls_ssl_set_bio(&s->ssl, &s->net, mbedtls_net_send, mbedtls_net_recv, NULL);
+    s->readable = 1; // the ClientHello may have arrived with the connect
+    mbedtls_ssl_set_bio(&s->ssl, &s->net, mbedtls_net_send, vtls_bio_recv, NULL);
     // Capture the TLS 1.3 application traffic secrets for the kTLS handoff (per-ssl;
     // there is no config-level variant in Mbed TLS 4). s->keys is zeroed by calloc.
     mbedtls_ssl_set_export_keys_cb(&s->ssl, on_export_keys, &s->keys);
@@ -338,6 +400,8 @@ int vtls_handshake(void *sess) {
     int ret = mbedtls_ssl_handshake(&((vtls_session *)sess)->ssl);
     return (ret == 0) ? VTLS_OK : map_ret(ret);
 }
+
+void vtls_mark_readable(void *sess) { ((vtls_session *)sess)->readable = 1; }
 
 int vtls_read(void *sess, unsigned char *buf, size_t len) {
     int ret = mbedtls_ssl_read(&((vtls_session *)sess)->ssl, buf, len);
@@ -445,7 +509,8 @@ int vtls_enable_ktls(void *sess, int fd) {
     }
     // Handoff hazard: if mbedtls already decrypted-and-buffered application data, the
     // kernel (reading raw from the socket) would never see it. Stay userspace then.
-    if (mbedtls_ssl_get_bytes_avail(&s->ssl) != 0 || mbedtls_ssl_check_pending(&s->ssl) != 0) {
+    if (mbedtls_ssl_get_bytes_avail(&s->ssl) != 0 || mbedtls_ssl_check_pending(&s->ssl) != 0
+        || s->ra_off < s->ra_len) {
         ktls_log_fb("mbedtls holds buffered plaintext at handoff");
         goto done;
     }
@@ -492,6 +557,9 @@ done:
     memset(&tx, 0, sizeof(tx));
     memset(&rx, 0, sizeof(rx));
     memset(&s->keys, 0, sizeof(s->keys));
+    // Staying on userspace mbedTLS: from now on reads go through the read-ahead
+    // (see vtls_bio_recv). With kTLS the kernel reads the socket instead.
+    s->readahead = !s->ktls;
     return s->ktls;
 }
 

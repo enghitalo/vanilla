@@ -454,15 +454,18 @@ fn process_events_tls(worker_id int, epoll_fd int, handler core.Handler, make_st
 				close_tls(epoll_fd, fd, active_conns, mut sessions)
 				continue
 			}
+			mut resume := false
 			if ev & u32(C.EPOLLOUT) != 0 {
 				// Also the birth of a connection accept registered with EPOLLOUT.
-				handle_writable_fd_tls(epoll_fd, fd, limits, idle_ms, active_conns, cfg, mut
-					sessions)
+				resume = handle_writable_fd_tls(epoll_fd, fd, limits, idle_ms, active_conns,
+					cfg, mut sessions)
 				if fd !in sessions {
 					continue // session closed — skip the EPOLLIN half of this event
 				}
 			}
-			if ev & u32(C.EPOLLIN) != 0 {
+			// resume: a parked response drained (or the handshake completed), so
+			// read even without EPOLLIN — bytes left unread meanwhile get no new edge.
+			if ev & u32(C.EPOLLIN) != 0 || resume {
 				handle_readable_fd_tls(handler, state, epoll_fd, fd, limits, idle_ms, counter,
 					active_conns, cfg, mut sessions)
 			}

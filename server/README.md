@@ -124,6 +124,12 @@ deadline expires. Still set a read timeout on any public HTTPS server:
 `idle_timeout_ms` alone does not bound a request that has started arriving
 (slowloris).
 
+HTTP/1.1 pipelining works over TLS as over plaintext: every complete request
+a read burst carries is answered, in order, and the responses go out
+together. While a response waits for the socket to drain (WANT_WRITE),
+nothing more is read or answered on that connection; the requests pipelined
+behind it are answered once it is out.
+
 ## Internals (where to look)
 
 - `../core/core.v` — the handler contract: `Handler`, `Step`, `WakeFn`, `EventLoop`.

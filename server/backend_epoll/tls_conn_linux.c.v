@@ -7,11 +7,14 @@ module backend_epoll
 // Mirrors the plain state machine (conn_state.c.v) over a TLS session:
 //   • handshake   — driven across epoll edges; WANT_READ waits on EPOLLIN,
 //     WANT_WRITE arms EPOLLOUT (a handshake flight can fill the send buffer);
-//   • cross-edge reads — a request split across TLS records / round-trips is
-//     buffered per-fd in `read_buf` and resumed on the next EPOLLIN;
+//   • pipelining  — every edge reads to the end of the burst and answers every
+//     complete request in order, batching the responses into one send; a
+//     request split across TLS records / round-trips is buffered per-fd in
+//     `read_buf` and resumed on the next EPOLLIN;
 //   • EPOLLOUT writes  — a response that can't be flushed (TLS WANT_WRITE) is
 //     parked in `write_buf` and drained on EPOLLOUT (mbedTLS is re-called with
-//     the same arguments until it accepts them);
+//     the same arguments until it accepts them). Nothing is read or served
+//     while it is parked; reading resumes once it drains;
 //   • timeouts    — per-conn read/write/idle deadlines, swept by the worker.
 //     The first one starts at accept (the EPOLLOUT birth edge, see
 //     handle_writable_fd_tls), so a peer that never sends a byte, or stalls
@@ -29,6 +32,21 @@ import time
 #include <sys/epoll.h>
 
 const tls_max_request_bytes = 8 * 1024 * 1024
+// One full TLS record of plaintext (2^14). Responses to pipelined requests
+// are appended into one buffer and sent together; once it holds this much it
+// is sent before the next request is served: mbedTLS encrypts at most one
+// record per write, so below it batching packs small responses into one
+// record and one syscall, and above it there is nothing left to save. It also
+// caps how far a read that fills the read buffer grows it (a pipelined burst
+// is then read a record at a time, not a few hundred bytes at a time).
+const tls_record_bytes = 16 * 1024
+
+// TlsFlush is how a send of a whole response batch ended (tls_flush).
+enum TlsFlush {
+	sent   // all of it went out: the caller may reuse the buffer
+	parked // the rest waits for EPOLLOUT in write_buf, which now owns the buffer
+	failed // fatal: the caller closes (the buffer is still its own)
+}
 
 struct TlsConn {
 mut:
@@ -131,6 +149,9 @@ fn tls_handshake_step(mut conn TlsConn, epoll_fd int, fd int, active_conns &core
 	return true
 }
 
+// handle_readable_fd_tls runs on a readable edge, and when reads resume after
+// a parked response drained (handle_writable_fd_tls). It drives the handshake,
+// then reads to the end of the burst and answers every complete request.
 @[direct_array_access; manualfree]
 fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd int, limits core.Limits, idle_ms int, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config, mut sessions map[int]&TlsConn) {
 	stdatomic.add_i64(&counter.n, 1)
@@ -145,6 +166,9 @@ fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd 
 			return
 		}
 	}
+	if !conn.ktls {
+		conn.sess.mark_readable() // this edge may have brought bytes (see vtls_mark_readable)
+	}
 
 	// 1) Drive the handshake (spans multiple readiness events).
 	if !conn.established {
@@ -154,21 +178,133 @@ fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd 
 		// established — fall through: a request may already be buffered by TLS.
 	}
 
-	// 2) Read one complete request over TLS. Reuse the per-conn read buffer: a
-	// partial from a prior edge (len>0) or an empty buffer pooled from the last
-	// completed request (len==0, cap>0). Allocate only on this conn's first use.
+	// 2) A response parked on WANT_WRITE owns the write side until it drains:
+	// mbedTLS must be re-called with the same data, and on kTLS a new response
+	// would interleave with it. Read nothing and serve nothing meanwhile: the
+	// bytes wait in the socket (or in mbedTLS), and handle_writable_fd_tls
+	// resumes here once the parked response is out.
+	if conn.write_buf.len > 0 {
+		return
+	}
+
+	// 3) Read to the end of the burst, answering every complete request as it
+	// arrives. Edge-triggered: bytes not read now raise no new edge, so a burst
+	// must be drained. Reuse the per-conn buffers (moved out here, handed back
+	// on every exit): read_buf holds a partial, or requests left unserved
+	// behind a parked response, or is empty and pooled; resp_buf is the pooled
+	// response buffer, which collects every response of the burst.
 	mut buf := []u8{}
 	if conn.read_buf.cap > 0 {
 		unsafe {
-			buf = conn.read_buf // move (preserves a partial; empty otherwise)
+			buf = conn.read_buf // move (preserves buffered bytes; empty otherwise)
 		}
 		conn.read_buf = []u8{}
 	} else {
 		buf = []u8{len: 0, cap: 256}
 	}
-
+	mut resp := []u8{}
+	if conn.resp_buf.cap > 0 {
+		unsafe {
+			resp = conn.resp_buf // move out of the pool (allocated below on first use)
+		}
+		conn.resp_buf = []u8{}
+	}
+	req_cap := if limits.max_request_bytes > 0 {
+		limits.max_request_bytes
+	} else {
+		tls_max_request_bytes
+	}
+	// The TLS worker has no watch reactor: register is a stub that arms nothing,
+	// so a handler that calls event_loop.watch_fd and suspends is dropped below.
+	mut event_loop := core.EventLoop{
+		client_fd: fd
+		loop_fd:   epoll_fd
+		register:  core.reject_register
+	}
+	mut sent := false // a response went out in this call: a request boundary (idle)
+	mut drained := false // kTLS: a short recv emptied the socket (userspace: vtls_read tracks it)
+	mut filled := false // the last read filled the buffer: the burst may be larger
 	for {
-		if buf.len == buf.cap {
+		// Answer every complete request buffered, in order. Bytes left from an
+		// earlier call come first: after a parked response drained, no edge
+		// reports them again.
+		mut pos := 0
+		for pos < buf.len {
+			// _idx twin: plain int, no per-request !int boxing. >=0 complete, -1
+			// incomplete, < -1 a framing/limit error (the TLS path drops on any error).
+			total := request_parser.frame_request_length_lim_idx(buf_view(buf, pos,
+				buf.len - pos), limits.max_header_bytes, limits.max_body_bytes)
+			if total == -1 {
+				break
+			}
+			if total < -1 {
+				tls_drop(epoll_fd, fd, active_conns, mut sessions, mut conn, buf, resp) // malformed/too-large → drop
+				return
+			}
+			// Request complete: its read deadline (for the first request, the one
+			// armed at accept) is over.
+			conn.read_deadline = 0
+			if resp.cap == 0 {
+				resp = []u8{len: 0, cap: 4096}
+			}
+			step := handler(buf_view(buf, pos, total), mut resp, fd, state, mut event_loop)
+			pos += total
+			match step {
+				.done {}
+				.close {
+					// Flush-then-close: best-effort synchronous write of everything
+					// appended (the responses before it, then the handler's error
+					// response), then drop the session. A send that cannot complete
+					// now (want/want_write) is abandoned — the connection is closing.
+					tls_write_all_best_effort(mut conn, fd, resp)
+					tls_drop(epoll_fd, fd, active_conns, mut sessions, mut conn, buf, resp)
+					return
+				}
+				.suspend {
+					// Parking is not supported over TLS (no reactor on this worker; see
+					// core.reject_register): nothing was armed, so nothing leaks — drop the
+					// connection rather than strand a request that can never be resumed.
+					// Loud on purpose: a handler that works on plaintext and silently
+					// RSTs over HTTPS is otherwise undiagnosable from the server side.
+					eprintln('[tls] handler returned .suspend but the TLS worker has no watch reactor; dropping the connection')
+					tls_drop(epoll_fd, fd, active_conns, mut sessions, mut conn, buf, resp)
+					return
+				}
+			}
+			if resp.len >= tls_record_bytes {
+				match tls_flush(mut conn, epoll_fd, fd, limits.write_timeout_ms, resp) {
+					.sent {
+						unsafe {
+							resp.len = 0
+						}
+						sent = true
+					}
+					.parked {
+						// Stop here: what is left (requests not answered yet, a
+						// partial) waits in read_buf and is served when reads
+						// resume. No read deadline meanwhile: the parked response
+						// runs on write_timeout_ms, and a slow download must not
+						// reap the requests queued behind it.
+						tls_compact(mut buf, pos)
+						conn.read_buf = buf
+						return
+					}
+					.failed {
+						tls_drop(epoll_fd, fd, active_conns, mut sessions, mut conn, buf, resp)
+						return
+					}
+				}
+			}
+		}
+		tls_compact(mut buf, pos)
+		if buf.len > req_cap {
+			tls_drop(epoll_fd, fd, active_conns, mut sessions, mut conn, buf, resp) // the pending request is too large
+			return
+		}
+		if drained {
+			break
+		}
+		if buf.len == buf.cap || (filled && buf.cap < tls_record_bytes) {
 			unsafe { buf.grow_cap(buf.cap) }
 		}
 		spare := buf.cap - buf.len
@@ -180,114 +316,68 @@ fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd 
 			conn.sess.read_into(unsafe { &u8(buf.data) + buf.len }, spare)
 		}
 		if n == tls.want {
-			if buf.len == 0 {
-				// No plaintext yet (a record fragment, or a non-application
-				// record): return the buffer to the pool. This is not a first
-				// byte, so an armed idle/accept deadline keeps running.
-				conn.read_buf = buf
-				return
-			}
-			tls_save_read(mut conn, buf, limits.read_timeout_ms) // partial — resume on EPOLLIN
-			return
+			break // the burst is drained
 		}
-		if n == tls.want_write {
-			// Rare (post-handshake key update / ticket): TLS needs to write before
-			// it can read more. Park the partial read and wait for EPOLLOUT.
-			tls_save_read(mut conn, buf, limits.read_timeout_ms)
-			tls_set_out(mut conn, epoll_fd, fd, true)
-			return
-		}
-		if n <= 0 { // closed / fatal
-			unsafe { buf.free() }
-			close_tls(epoll_fd, fd, active_conns, mut sessions)
+		if n <= 0 {
+			// Closed or fatal. A want_write lands here too: a TLS 1.3 server's
+			// mbedtls_ssl_read writes only an alert ahead of a fatal error (no
+			// renegotiation, no post-handshake message it accepts). Answers the
+			// peer already has coming are still sent, best effort (a client may
+			// pipeline and then half-close).
+			tls_write_all_best_effort(mut conn, fd, resp)
+			tls_drop(epoll_fd, fd, active_conns, mut sessions, mut conn, buf, resp)
 			return
 		}
 		unsafe {
 			buf.len += n
 		}
+		filled = n == spare
+		// kTLS: a recv that came back short emptied the socket, and a record
+		// arriving later raises a new edge, so skip the EAGAIN recv. (Userspace
+		// mbedTLS asks for exact lengths, so vtls_read applies this rule to its
+		// own read-ahead instead.)
+		if conn.ktls && !filled {
+			drained = true
+		}
 		// First plaintext byte of a request: the idle phase is over. If the
-		// request stays incomplete, tls_save_read arms its read deadline.
+		// request stays incomplete, its read deadline is armed below.
 		conn.idle_deadline = 0
-		req_cap := if limits.max_request_bytes > 0 {
-			limits.max_request_bytes
-		} else {
-			tls_max_request_bytes
-		}
-		if buf.len > req_cap {
-			unsafe { buf.free() }
-			close_tls(epoll_fd, fd, active_conns, mut sessions)
-			return
-		}
-		// _idx twin: plain int, no per-request !int boxing. >=0 complete, -1
-		// incomplete, < -1 a framing/limit error (the TLS path drops on any error).
-		total := request_parser.frame_request_length_lim_idx(buf, limits.max_header_bytes,
-			limits.max_body_bytes)
-		if total >= 0 {
-			if buf.len > total {
-				buf.trim(total)
+	}
+
+	// 4) The burst is drained: send what it answered. What is left in buf is
+	// at most one partial request.
+	if resp.len > 0 {
+		match tls_flush(mut conn, epoll_fd, fd, limits.write_timeout_ms, resp) {
+			.sent {
+				unsafe {
+					resp.len = 0
+				}
+				sent = true
 			}
-			break
-		}
-		if total < -1 {
-			unsafe { buf.free() }
-			close_tls(epoll_fd, fd, active_conns, mut sessions) // malformed/too-large → drop
-			return
-		}
-		// total == -1: incomplete — keep draining this burst
-	}
-
-	// Request complete — clear the read deadline (for the first request, the
-	// one armed at accept).
-	conn.read_deadline = 0
-
-	// Per-connection response buffer, pooled across requests (reset to len 0 and
-	// reused; allocated on first use). The handler appends raw response bytes.
-	mut resp := []u8{}
-	if conn.resp_buf.cap > 0 {
-		unsafe {
-			resp = conn.resp_buf // move out of the pool
-		}
-		conn.resp_buf = []u8{}
-	} else {
-		resp = []u8{len: 0, cap: 4096}
-	}
-	// The TLS worker has no watch reactor: register is a stub that arms nothing,
-	// so a handler that calls event_loop.watch_fd and suspends is dropped below.
-	mut event_loop := core.EventLoop{
-		client_fd: fd
-		loop_fd:   epoll_fd
-		register:  core.reject_register
-	}
-	step := handler(buf, mut resp, fd, state, mut event_loop)
-	unsafe {
-		buf.len = 0
-	}
-	conn.read_buf = buf // pool the read buffer's capacity for the next request
-	match step {
-		.done {
-			tls_send_or_park(epoll_fd, fd, limits, idle_ms, active_conns, mut sessions, mut
-				conn, resp)
-		}
-		.close {
-			// Flush-then-close: best-effort synchronous write of whatever the
-			// handler appended (e.g. its error response), then drop the session.
-			// A send that cannot complete now (want/want_write) is abandoned —
-			// the connection is closing anyway.
-			tls_write_all_best_effort(mut conn, fd, resp)
-			unsafe { resp.free() }
-			close_tls(epoll_fd, fd, active_conns, mut sessions)
-		}
-		.suspend {
-			// Parking is not supported over TLS (no reactor on this worker; see
-			// core.reject_register): nothing was armed, so nothing leaks — drop the
-			// connection rather than strand a request that can never be resumed.
-			// Loud on purpose: a handler that works on plaintext and silently
-			// RSTs over HTTPS is otherwise undiagnosable from the server side.
-			eprintln('[tls] handler returned .suspend but the TLS worker has no watch reactor; dropping the connection')
-			unsafe { resp.free() }
-			close_tls(epoll_fd, fd, active_conns, mut sessions)
+			.parked {
+				conn.read_buf = buf // a partial waits for the resume (see above)
+				return
+			}
+			.failed {
+				tls_drop(epoll_fd, fd, active_conns, mut sessions, mut conn, buf, resp)
+				return
+			}
 		}
 	}
+	conn.read_buf = buf
+	conn.resp_buf = resp // back to the per-conn pool (len 0)
+	if buf.len > 0 {
+		// A partial request: its own read deadline, armed once and never
+		// refreshed by progress (for the first request, the one armed at accept
+		// is still running). A pipelined partial never inherits the clock of the
+		// request before it: completing that one cleared it.
+		if limits.read_timeout_ms > 0 && conn.read_deadline == 0 {
+			conn.read_deadline = time.sys_mono_now() + u64(limits.read_timeout_ms) * 1_000_000
+		}
+	} else if sent {
+		tls_arm_idle(mut conn, idle_ms) // every response is out and nothing is buffered
+	}
+	tls_set_out(mut conn, epoll_fd, fd, false) // keep-alive; not waiting on writability
 }
 
 // tls_write_chunk writes one chunk over the session — kTLS plaintext send or
@@ -318,30 +408,33 @@ fn tls_write_all_best_effort(mut conn TlsConn, fd int, resp []u8) {
 // accept_events): create the session, arm the accept-time deadline and switch
 // the fd back to EPOLLIN. The caller still runs the EPOLLIN half of the same
 // event, which starts the handshake if the ClientHello came with the connect.
+// Returns true when reads must resume (the caller runs handle_readable_fd_tls
+// even without EPOLLIN): a parked response just drained, or the handshake
+// just completed. Bytes that arrived meanwhile raised their edge already (and
+// were left unread), so no new one is coming for them.
 @[direct_array_access; manualfree]
-fn handle_writable_fd_tls(epoll_fd int, fd int, limits core.Limits, idle_ms int, active_conns &core.Counter, cfg &tls.Config, mut sessions map[int]&TlsConn) {
+fn handle_writable_fd_tls(epoll_fd int, fd int, limits core.Limits, idle_ms int, active_conns &core.Counter, cfg &tls.Config, mut sessions map[int]&TlsConn) bool {
 	// One lookup, nil on a miss. Not `sessions[fd] or {}`: on a miss that
 	// allocates its "key does not exist" error, once per connection — a leak
 	// under -gc none, and every connection's birth is a miss.
 	mut conn := unsafe { sessions[fd] }
 	if conn == unsafe { nil } {
 		mut nc := tls_open_conn(cfg, epoll_fd, fd, limits, idle_ms, active_conns, mut sessions) or {
-			return
+			return false
 		}
 		tls_set_out(mut nc, epoll_fd, fd, false) // birth edge consumed — EPOLLIN only
-		return
+		return false
 	}
 
 	if !conn.established {
 		// Handshake was waiting to write; advance it. If still not done, the step
-		// re-arms the right readiness; if done, it falls through with nothing parked.
-		tls_handshake_step(mut conn, epoll_fd, fd, active_conns, mut sessions)
-		return
+		// re-arms the right readiness; if done, a request may already be waiting.
+		return tls_handshake_step(mut conn, epoll_fd, fd, active_conns, mut sessions)
 	}
 
 	if conn.write_buf.len == 0 {
 		tls_set_out(mut conn, epoll_fd, fd, false) // spurious — stop watching writability
-		return
+		return false
 	}
 
 	for conn.write_off < conn.write_buf.len {
@@ -352,10 +445,10 @@ fn handle_writable_fd_tls(epoll_fd int, fd int, limits core.Limits, idle_ms int,
 			continue
 		}
 		if n == tls.want || n == tls.want_write {
-			return
+			return false
 		}
 		close_tls(epoll_fd, fd, active_conns, mut sessions) // fatal
-		return
+		return false
 	}
 	// Fully flushed — keep-alive; drop the parked state and stop watching writability.
 	unsafe { conn.write_buf.free() }
@@ -364,12 +457,14 @@ fn handle_writable_fd_tls(epoll_fd int, fd int, limits core.Limits, idle_ms int,
 	conn.write_deadline = 0
 	tls_arm_idle(mut conn, idle_ms)
 	tls_set_out(mut conn, epoll_fd, fd, false)
+	return true
 }
 
-// tls_send_or_park encrypts and sends the whole response, or parks the remainder
-// for EPOLLOUT. Takes ownership of `resp` (frees it when fully sent or parked).
+// tls_flush sends the whole response batch, or parks the unsent remainder on
+// EPOLLOUT (write_buf then owns `resp`). It never closes: on .failed the
+// caller does, and `resp` is still its own.
 @[manualfree]
-fn tls_send_or_park(epoll_fd int, fd int, limits core.Limits, idle_ms int, active_conns &core.Counter, mut sessions map[int]&TlsConn, mut conn TlsConn, resp []u8) {
+fn tls_flush(mut conn TlsConn, epoll_fd int, fd int, write_timeout_ms int, resp []u8) TlsFlush {
 	mut sent := 0
 	for sent < resp.len {
 		n := tls_write_chunk(mut conn, fd, unsafe { &u8(resp.data) + sent }, resp.len - sent)
@@ -378,21 +473,39 @@ fn tls_send_or_park(epoll_fd int, fd int, limits core.Limits, idle_ms int, activ
 			continue
 		}
 		if n == tls.want || n == tls.want_write {
-			tls_park_write(mut conn, resp, sent, limits.write_timeout_ms) // ownership → parked
+			tls_park_write(mut conn, resp, sent, write_timeout_ms) // ownership → parked
 			tls_set_out(mut conn, epoll_fd, fd, true)
-			return
+			return .parked
 		}
-		unsafe { resp.free() }
-		close_tls(epoll_fd, fd, active_conns, mut sessions)
+		return .failed
+	}
+	return .sent
+}
+
+// tls_drop hands back the buffers handle_readable_fd_tls moved out of conn,
+// then closes the connection: close_tls frees them with the session.
+@[inline]
+fn tls_drop(epoll_fd int, fd int, active_conns &core.Counter, mut sessions map[int]&TlsConn, mut conn TlsConn, buf []u8, resp []u8) {
+	conn.read_buf = buf
+	conn.resp_buf = resp
+	close_tls(epoll_fd, fd, active_conns, mut sessions)
+}
+
+// tls_compact drops the first `pos` bytes of `buf` (the requests just
+// answered), moving what is left (a partial, or requests not answered yet)
+// to the front.
+@[direct_array_access; inline]
+fn tls_compact(mut buf []u8, pos int) {
+	if pos <= 0 {
 		return
 	}
-	mut done := unsafe { resp }
-	unsafe {
-		done.len = 0
+	left := buf.len - pos
+	if left > 0 {
+		unsafe { C.memmove(buf.data, &u8(buf.data) + pos, usize(left)) }
 	}
-	conn.resp_buf = done // return to the per-conn pool instead of freeing
-	tls_arm_idle(mut conn, idle_ms) // keep-alive: wait for the next request
-	tls_set_out(mut conn, epoll_fd, fd, false) // keep-alive; not waiting on writability
+	unsafe {
+		buf.len = left
+	}
 }
 
 // tls_open_conn creates fd's session and per-connection state, on the
@@ -432,13 +545,6 @@ fn tls_open_conn(cfg &tls.Config, epoll_fd int, fd int, limits core.Limits, idle
 fn tls_arm_idle(mut conn TlsConn, idle_ms int) {
 	if idle_ms > 0 && conn.read_buf.len == 0 {
 		conn.idle_deadline = time.sys_mono_now() + u64(idle_ms) * 1_000_000
-	}
-}
-
-fn tls_save_read(mut conn TlsConn, buf []u8, read_timeout_ms int) {
-	conn.read_buf = buf
-	if read_timeout_ms > 0 && conn.read_deadline == 0 {
-		conn.read_deadline = time.sys_mono_now() + u64(read_timeout_ms) * 1_000_000
 	}
 }
 
