@@ -323,7 +323,7 @@ int vtls_set_alpn(vtls_ctx *c, const char *list) {
 // vtls_mark_readable re-arms it. During the handshake the reads stay exact:
 // vtls_enable_ktls requires that mbedTLS consumed nothing past the client's
 // Finished, or the kernel would miss those records.
-// ctx is &session->net (so the send side stays plain mbedtls_net_send).
+// ctx is &session->net (the send side, vtls_bio_send, needs only the fd).
 static int vtls_bio_recv(void *ctx, unsigned char *buf, size_t len) {
     vtls_session *s = (vtls_session *)((char *)ctx - offsetof(vtls_session, net));
     if (s->ra_off < s->ra_len) {
@@ -358,6 +358,25 @@ static int vtls_bio_recv(void *ctx, unsigned char *buf, size_t len) {
     return (int)s->ra_off;
 }
 
+// vtls_bio_send is the session's send callback: mbedtls_net_send, but with
+// MSG_NOSIGNAL. mbedtls_net_send uses write(), and once a send has met the
+// peer's reset (ECONNRESET), the next write to the dead socket — the rest of
+// a response, or the close_notify vtls_session_free sends — raises SIGPIPE,
+// whose default action ends the whole server: any client that aborts while a
+// response is in flight would take every connection down with it. (The kTLS
+// path sends with MSG_NOSIGNAL too.)
+static int vtls_bio_send(void *ctx, const unsigned char *buf, size_t len) {
+    int fd = ((mbedtls_net_context *)ctx)->fd;
+    ssize_t r;
+    do {
+        r = send(fd, buf, len, MSG_NOSIGNAL);
+    } while (r < 0 && errno == EINTR);
+    if (r >= 0) return (int)r;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return MBEDTLS_ERR_SSL_WANT_WRITE;
+    if (errno == EPIPE || errno == ECONNRESET) return MBEDTLS_ERR_NET_CONN_RESET;
+    return MBEDTLS_ERR_NET_SEND_FAILED;
+}
+
 void *vtls_session_new(vtls_ctx *c, int fd) {
     // calloc: every read-ahead field starts empty/off.
     vtls_session *s = (vtls_session *)calloc(1, sizeof(vtls_session));
@@ -366,7 +385,7 @@ void *vtls_session_new(vtls_ctx *c, int fd) {
     if (mbedtls_ssl_setup(&s->ssl, &c->conf) != 0) { free(s); return NULL; }
     s->net.fd = fd; // already accepted + non-blocking
     s->readable = 1; // the ClientHello may have arrived with the connect
-    mbedtls_ssl_set_bio(&s->ssl, &s->net, mbedtls_net_send, vtls_bio_recv, NULL);
+    mbedtls_ssl_set_bio(&s->ssl, &s->net, vtls_bio_send, vtls_bio_recv, NULL);
     // Capture the TLS 1.3 application traffic secrets for the kTLS handoff (per-ssl;
     // there is no config-level variant in Mbed TLS 4). s->keys is zeroed by calloc.
     mbedtls_ssl_set_export_keys_cb(&s->ssl, on_export_keys, &s->keys);

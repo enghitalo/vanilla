@@ -24,6 +24,14 @@ import tls
 import vtest
 
 #include <netinet/tcp.h>
+#include <signal.h>
+
+struct C.linger {
+	l_onoff  int
+	l_linger int
+}
+
+fn C.signal(sig int, handler voidptr) voidptr
 
 // Every request path is 4 bytes: `/big`, or `/NNN`, which the handler echoes
 // as the body, so the client can check the order of the answers.
@@ -327,6 +335,47 @@ fn check_tls_pipelined_partial_fresh_deadline() ! {
 	assert got == tp_resp(2), 'a pipelined partial must not inherit the accept-time deadline, got: "${got.bytestr()}" (empty = reaped)'
 }
 
+// A client that resets the connection mid-response must not kill the
+// server. Userspace mbedTLS used to send with write(): the send that meets the
+// reset fails with ECONNRESET, and the next write to the dead socket — the
+// close_notify as the server drops the session — raised SIGPIPE, whose
+// default action ends the whole process (every worker, every connection). The
+// client reads at full speed, so the server is inside its send loop when the
+// reset lands, then aborts. SIGPIPE is at its default action here: were it
+// raised, this test binary would die with it.
+fn check_tls_client_reset_mid_response() ! {
+	mut h := tp_start(server.Limits{})!
+	defer {
+		h.stop()
+	}
+	C.signal(C.SIGPIPE, C.SIG_DFL)
+	defer {
+		os.signal_ignore(.pipe)
+	}
+	for _ in 0 .. 5 {
+		mut a := tp_dial(h.port())!
+		a.write(tp_big_req)!
+		tp_read_n(mut a, 256 * 1024)
+		// Abort: linger 0 makes close() send a RST. The openssl client never
+		// writes to this connection again (no close_notify), so only the
+		// server can hit the dead socket.
+		linger := C.linger{
+			l_onoff:  1
+			l_linger: 0
+		}
+		C.setsockopt(a.handle, C.SOL_SOCKET, C.SO_LINGER, &linger, sizeof(linger))
+		C.close(a.handle)
+	}
+	// One worker handles events in order: the resets come before this
+	// connection's handshake. The server must still be serving.
+	mut b := tp_dial(h.port())!
+	defer {
+		tp_close(mut b)
+	}
+	b.write(tp_req(1))!
+	assert tp_read_n(mut b, tp_resp(1).len) == tp_resp(1), 'the server must survive clients that reset mid-response'
+}
+
 // --- tests -------------------------------------------------------------------
 
 fn test_tls_pipelined_in_one_record() ! {
@@ -369,6 +418,14 @@ fn test_tls_pipelined_partial_fresh_deadline() ! {
 	$if linux {
 		$if vanilla_tls ? {
 			check_tls_pipelined_partial_fresh_deadline()!
+		}
+	}
+}
+
+fn test_tls_client_reset_mid_response() ! {
+	$if linux {
+		$if vanilla_tls ? {
+			check_tls_client_reset_mid_response()!
 		}
 	}
 }
