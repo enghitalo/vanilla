@@ -144,3 +144,18 @@ fn test_self_signed_serial_is_minimal_positive_der() {
 		}
 	}
 }
+
+// Each leg of the TLS CI lane (.github/workflows/tls_backend.yml) builds Mbed
+// TLS one way and says which: the threading leg must really link a build with
+// MBEDTLS_THREADING_C (no crypto lock in the shim), the default leg one
+// without it (every call takes the lock), or the e2e tests after this would
+// exercise the other path than the leg claims. No-op without the define.
+fn test_parallel_crypto_matches_the_linked_build() {
+	$if vanilla_tls ? {
+		$if vanilla_expect_parallel_crypto ? {
+			assert parallel_crypto(), 'this leg builds Mbed TLS with MBEDTLS_THREADING_C, but the shim was compiled without it'
+		} $else $if vanilla_expect_serialized_crypto ? {
+			assert !parallel_crypto(), 'this leg builds the default Mbed TLS config, without MBEDTLS_THREADING_C, but the shim was compiled with it'
+		}
+	}
+}
