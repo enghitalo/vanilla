@@ -476,7 +476,7 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 		}
 		// First byte of a request: the idle wait is over. If the request stays
 		// incomplete, update_read_deadline arms its read deadline below.
-		if cs.idle_deadline != 0 {
+		if st.idle_ns != 0 && cs.idle_deadline != 0 {
 			cs.idle_deadline = 0
 			st.parked--
 		}
@@ -922,6 +922,9 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 	compact_read_buf(mut cs, pos)
 	if pos > 0 {
 		end_read_deadline(mut st, mut cs)
+		// A 100 Continue was for the request at the head, which completed: the
+		// next one (pipelined, Expect: 100-continue) gets its own.
+		cs.sent_100 = false
 	}
 	return true
 }
@@ -1107,8 +1110,11 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 					// (it parks after the flush): tear it down here, or it outlives the
 					// client — its request-owned fd (an SSE tick timer) leaks, and with
 					// accept-time births on its level-triggered edge would be dropped
-					// as stale forever. Not the client's own socket (already closed).
-					if event_loop.last_watched != client_fd {
+					// as stale forever. A self-watch (the client's own socket, which
+					// flush_batch already closed) only loses its watch entry.
+					if event_loop.last_watched == client_fd {
+						reactor.reactor_clear(client_fd)
+					} else {
 						detach_rejected_watch(mut reactor, epoll_fd, event_loop.last_watched,
 							client_fd)
 					}

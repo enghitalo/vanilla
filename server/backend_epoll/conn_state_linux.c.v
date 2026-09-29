@@ -137,8 +137,9 @@ mut:
 	// protocol state, handed back on every call, never inspected here.
 	takeover       core.ConnHandler = unsafe { nil }
 	takeover_state voidptr
-	// The reaping fields below are touched only at request boundaries, so
-	// they sit after the hot ones and leave the per-burst layout alone.
+	// The reaping fields below sit after the hot ones and leave the per-burst
+	// layout alone: with idle_timeout_ms off the request path never reads
+	// them (the per-recv idle check is gated on the worker's idle budget).
 	// monotonic ns; >0 while the connection waits for the first byte of a
 	// request: a keep-alive connection at rest after a response, or a new one
 	// when read_timeout_ms is 0. Expiry closes silently.
@@ -175,9 +176,10 @@ mut:
 	// uses it, so the request path never reads the clock itself.
 	now        u64
 	next_sweep u64 // monotonic ns; the sweep scans the table only once now >= this
-	// The listener's local address, set once at startup: the worker gives
-	// birth only to a socket accepted on it (accepted_here). listen_port is
-	// its TCP port; listen_uds is set for an AF_UNIX listener instead.
+	// The listener's local address, set once at startup: an untagged
+	// leftover fd is detached only if it is not a socket accepted on it
+	// (leftover_fd). listen_port is its TCP port; listen_uds is set for an
+	// AF_UNIX listener instead.
 	listen_port int
 	listen_uds  bool
 	// The worker's watch reactor, so close_conn can tear a parked connection's
@@ -412,26 +414,24 @@ fn conn_birth(fd int, mut st PlainState) {
 	st.parked++
 }
 
-// accepted_here reports whether fd is a client socket accepted on this
-// server's listener, by its local address (getsockname): an accepted TCP
-// socket holds the listening port; an accepted AF_UNIX socket reports the
-// listener's path, while a dialed or socketpair end is unnamed. Anything else
-// fails: a timerfd, pipe or eventfd (ENOTSOCK), an fd already closed (EBADF),
-// or the app's own dialed socket (an ephemeral local port). One syscall per
-// event on an fd with no state (a birth, a stale event, or an app's fd the
-// worker then detaches), never on an event of an established connection. It
-// assumes an accepted TCP socket's local port is the listening port: true for
-// a plain listen and behind iptables REDIRECT/DNAT (getsockname returns the
-// translated port), not under BPF socket steering (sk_lookup), where it is
-// the port the client dialed. Such a connection is never born: it is detached
-// unserved and, holding no deadline, never reaped.
+// leftover_fd reports whether fd, which has an event but no state and no
+// accept tag, is an app's fd left registered in this epoll (a finished watch's
+// pooled connection, timerfd, pipe or dialed socket) that the worker should
+// detach. Not when the fd is closed (EBADF: the kernel already dropped its
+// registration, and a DEL could only hit a number accept reused meanwhile),
+// and not for a socket accepted on this server's listener (its local address
+// is the listener's: accept reused the number, and its tagged birth event
+// follows). One getsockname, only on this rare path.
 @[direct_array_access; inline]
-fn (st &PlainState) accepted_here(fd int) bool {
+fn (st &PlainState) leftover_fd(fd int) bool {
 	family, port, named := sock_local(fd)
-	if st.listen_uds {
-		return family == C.AF_UNIX && named
+	if family == -1 {
+		return C.errno != C.EBADF // not a socket (a timerfd, pipe…) but open
 	}
-	return (family == C.AF_INET || family == C.AF_INET6) && port == st.listen_port
+	if st.listen_uds {
+		return !(family == C.AF_UNIX && named)
+	}
+	return !((family == C.AF_INET || family == C.AF_INET6) && port == st.listen_port)
 }
 
 // sock_local reads fd's local address (getsockname): its family (-1 when fd
@@ -608,7 +608,12 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			// this fd (vanilla#100 hazard 2), and its request-owned fd would leak.
 			// Same teardown as close_client (which clears awaiting_fd first). Never
 			// the connection's own socket: release_conn below closes that.
-			if cs.awaiting_fd >= 0 && cs.awaiting_fd != fd {
+			if cs.awaiting_fd == fd {
+				// Parked on its own socket's writability: only the watch goes (an
+				// active entry would swallow the birth event of the next
+				// connection on this number); release_conn closes the socket.
+				st.reactor.reactor_clear(fd)
+			} else if cs.awaiting_fd >= 0 {
 				detach_rejected_watch(mut st.reactor, epoll_fd, cs.awaiting_fd, fd)
 			}
 			if cs.read_deadline != 0 {

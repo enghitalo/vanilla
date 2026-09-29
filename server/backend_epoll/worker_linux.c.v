@@ -102,6 +102,13 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 					socket.close_socket(client_conn_fd)
 					continue
 				}
+				// A tagged registration needs the fd below epoll.accept_tag; one
+				// that high only exists if nr_open was raised past 2^30. Refuse it
+				// rather than mistake its events for another fd's.
+				if client_conn_fd >= epoll.accept_tag && conn_events & u32(C.EPOLLOUT) != 0 {
+					socket.close_socket(client_conn_fd)
+					continue
+				}
 				// Disable Nagle so small responses are not delayed.
 				socket.set_tcp_nodelay(client_conn_fd)
 				// Distribute client connection to worker threads (round-robin)
@@ -237,6 +244,13 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 				continue
 			}
 			if births && (fd >= st.conns.len || unsafe { st.conns[fd] == nil }) {
+				if st.closed_in_batch(fd) {
+					// A client closed earlier in this batch: this event describes
+					// the registration that close removed (accept may already have
+					// reused the number, for a connection whose own birth event
+					// arrives with a later wait). Nothing to do.
+					continue
+				}
 				// No state yet, and active watch fds were routed above. With
 				// births on, accept registers every connection TAGGED
 				// (epoll.add_fd_to_epoll_tagged) and for EPOLLOUT: a new socket is
@@ -252,20 +266,19 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 					// spin the worker: it would report again on every wait. Its
 					// next watch_fd adds it back (register_watch falls back to ADD)
 					// and a level-triggered fd then reports its readiness again.
-					// A socket accepted on the listener is kept: the number was
-					// reused by accept, and its own tagged birth event follows.
-					if !st.accepted_here(fd) {
+					// Only an OPEN fd that is not a socket accepted on the listener
+					// is detached. A closed one (a watch fd torn down earlier in
+					// this batch) has no registration left: a DEL could only hit a
+					// connection accept reused the number for in between. An
+					// accepted socket is kept: the number was reused, and its own
+					// tagged birth event follows.
+					if st.leftover_fd(fd) {
 						epoll.detach_fd_from_epoll(epoll_fd, fd)
 					}
 					continue
 				}
-				if ev & u32(C.EPOLLOUT) == 0 || st.closed_in_batch(fd) {
-					// A tagged event with no EPOLLOUT is not a first report, and
-					// an fd closed earlier in this batch is not this registration
-					// any more (accept may have reused the number, for a
-					// connection of this worker or another): both are stale. A
-					// reused number's own birth event arrives with a later wait.
-					continue
+				if ev & u32(C.EPOLLOUT) == 0 {
+					continue // not a first report: stale
 				}
 				conn_birth(fd, mut st)
 				// Born, with nothing to write: skip the EPOLLOUT half. Read on
@@ -408,8 +421,8 @@ pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () v
 	// One worker epoll fd per worker thread. threads was sized by new_server from
 	// config.workers (default nr_cpus), so its length is this server's worker count.
 	mut epoll_fds := []int{len: threads.len, cap: threads.len}
-	// The listener's own address (once, here): a plain worker gives birth
-	// only to sockets accepted on it (PlainState.accepted_here).
+	// The listener's own address (once, here): a plain worker never detaches
+	// a socket accepted on it (PlainState.leftover_fd).
 	listen_family, listen_port, _ := sock_local(socket_fd)
 	listen_uds := listen_family == C.AF_UNIX
 

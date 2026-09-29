@@ -423,6 +423,9 @@ fn serve_readable(h core.Handler, mut w WorkerState, i int, limits core.Limits, 
 			cs.read_deadline = 0
 			w.parked--
 		}
+		if cs.read_buf.len < buffered {
+			cs.sent_100 = false // the head request completed; the next gets its own 100
+		}
 		if cs.read_buf.len > req_cap {
 			cs.write_buf << response.status_413_response
 			must_close = true

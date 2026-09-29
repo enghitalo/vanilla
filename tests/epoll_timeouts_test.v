@@ -413,6 +413,42 @@ fn check_reaped_under_gc_signals(backend server.IOBackend) ! {
 	assert out.conns[0].eof, '${backend}: a silent connection must be reaped under EINTR storms'
 }
 
+// check_pipelined_expect_gets_its_100: A asks for 100-continue and gets it;
+// A's body and the head of B (also Expect: 100-continue) then arrive in ONE
+// write. A is answered, and B must be prompted with its own 100 — the 100
+// already sent was A's, not B's.
+fn check_pipelined_expect_gets_its_100(backend server.IOBackend) ! {
+	out := vtest.drive(server.ServerConfig{
+		io_multiplexing: backend
+		workers:         1
+		handler:         et_handler
+		limits:          server.Limits{
+			read_timeout_ms: 5000
+		}
+	}, [
+		vtest.Script{
+			rounds: [
+				vtest.Round{
+					send:  et_expect_head
+					until: vtest.count('100 Continue', 1)
+				},
+				vtest.Round{
+					send:  et_concat(et_expect_body, et_expect_head)
+					until: vtest.count('100 Continue', 2)
+				},
+				vtest.Round{
+					send: et_expect_body
+					want: 2
+				},
+			]
+		},
+	])!
+	c := out.conns[0]
+	assert c.connect_err == '', c.connect_err
+	assert !c.unmet, '${backend}: the pipelined Expect request was not prompted with its own 100: ${c.raw.bytestr()}'
+	assert c.frames.len >= 2
+}
+
 // check_takeover_not_idle_reaped: a taken-over connection keeps only its
 // mid-frame read deadline — sitting quiet between messages for longer than
 // the idle budget must not close it. The silent witness is reaped by its
@@ -711,10 +747,9 @@ fn check_connect_storm_served(backend server.IOBackend, limits server.Limits) ! 
 // to see the peer gone. Every connection must be released exactly once. A
 // stale event for an fd already closed in the batch (a client, or the timer
 // its hangup tore down) must not release it again (active_conns drifts below
-// zero) or build a zombie. (Timers are not counted: a tick whose flush finds
-// the peer gone leaves its re-armed timer open, a known watch-teardown gap.
-// The worker detaches such a timer from its epoll at its next report, so it
-// costs no CPU.)
+// zero) or build a zombie. Every stream's timer is closed with its connection
+// too, including when a tick's flush is the first to see the peer gone (the
+// re-armed watch is torn down there).
 fn check_vanished_streams_released(backend server.IOBackend) ! {
 	before := et_open_fds()
 	out := vtest.drive(server.ServerConfig{
@@ -1209,6 +1244,12 @@ fn test_epoll_expect_100_under_timeouts() ! {
 	}
 }
 
+fn test_epoll_pipelined_expect_gets_its_100() ! {
+	$if linux {
+		check_pipelined_expect_gets_its_100(.epoll)!
+	}
+}
+
 fn test_epoll_streamed_upload_under_timeouts() ! {
 	$if linux {
 		check_streamed_upload_under_timeouts(.epoll)!
@@ -1226,8 +1267,6 @@ fn test_epoll_connect_storm_served() ! {
 	}
 }
 
-// The timers its vanished streams leave open (see
-// check_vanished_streams_released) stay open until this process exits.
 fn test_epoll_vanished_streams_released() ! {
 	$if linux {
 		check_vanished_streams_released(.epoll)!
@@ -1270,6 +1309,14 @@ fn test_poll_expect_100_under_timeouts() ! {
 	$if linux {
 		$if vanilla_poll ? {
 			check_expect_100_under_timeouts(.poll)!
+		}
+	}
+}
+
+fn test_poll_pipelined_expect_gets_its_100() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_pipelined_expect_gets_its_100(.poll)!
 		}
 	}
 }

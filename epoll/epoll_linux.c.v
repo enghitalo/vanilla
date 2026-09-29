@@ -25,10 +25,12 @@ pub struct C.epoll_event {
 }
 
 // accept_tag marks an fd registration made by the accept thread
-// (add_fd_to_epoll_tagged): bit 30 of the fd stored in the event's data. A
-// real fd never has it — the kernel caps descriptors below 2^30
-// (fs.nr_open) — and it lives in the `int` member itself, so it is
-// endian-neutral. A later MOD stores the plain fd, dropping the tag.
+// (add_fd_to_epoll_tagged): bit 30 of the fd stored in the event's data. It
+// assumes descriptors stay below 2^30 — true unless fs.nr_open and the
+// process fd limit are raised past it (the default nr_open is 2^20); the
+// accept thread refuses a connection that would not fit. It lives in the
+// `int` member itself, so it is endian-neutral. A later MOD stores the plain
+// fd, dropping the tag.
 pub const accept_tag = 1 << 30
 
 // event_fd extracts the fd stored in an epoll_event's data union (without
