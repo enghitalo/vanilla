@@ -373,12 +373,53 @@ fn et_never(acc []u8) bool {
 	return false
 }
 
+// GcStorm forces a garbage collection every 20 ms until stopped. Each Boehm
+// collection stops every thread with a signal, so each worker's blocking wait
+// returns EINTR far more often than its sweep interval — the condition that
+// once kept a quiet worker from ever sweeping (it retried a wait computed
+// from a stale clock), so its silent connections were never reaped. (A no-op
+// under -gc none.)
+struct GcStorm {
+mut:
+	stop i64
+}
+
+fn gc_storm(mut s GcStorm) {
+	for stdatomic.load_i64(&s.stop) == 0 {
+		gc_collect()
+		time.sleep(20 * time.millisecond)
+	}
+}
+
+// check_reaped_under_gc_signals: a silent connection is still reaped when the
+// worker's wait is interrupted (EINTR) every 20 ms — shorter than its 100 ms
+// sweep interval (read_timeout_ms 400). then_eof: only the server can end it.
+fn check_reaped_under_gc_signals(backend server.IOBackend) ! {
+	mut storm := &GcStorm{}
+	t := spawn gc_storm(mut storm)
+	defer {
+		stdatomic.store_i64(&storm.stop, 1)
+		t.wait()
+	}
+	out := vtest.drive(server.ServerConfig{
+		io_multiplexing: backend
+		workers:         1
+		handler:         et_handler
+		limits:          server.Limits{
+			read_timeout_ms: 400
+		}
+	}, [et_silent])!
+	assert out.conns[0].connect_err == '', out.conns[0].connect_err
+	assert out.conns[0].eof, '${backend}: a silent connection must be reaped under EINTR storms'
+}
+
 // check_takeover_not_idle_reaped: a taken-over connection keeps only its
 // mid-frame read deadline — sitting quiet between messages for longer than
 // the idle budget must not close it. The silent witness is reaped by its
 // accept-time deadline, which is at least as long as the idle budget.
 fn check_takeover_not_idle_reaped(backend server.IOBackend, limits server.Limits) ! {
 	mut h := vtest.start(server.ServerConfig{
+		workers:         1
 		io_multiplexing: backend
 		handler:         et_handler
 		limits:          limits
@@ -558,6 +599,7 @@ fn check_streaming_watch_not_idle_reaped(backend server.IOBackend, limits server
 // 200, then idle closes the connection silently.
 fn check_expect_100_under_timeouts(backend server.IOBackend) ! {
 	mut h := vtest.start(server.ServerConfig{
+		workers:         1
 		io_multiplexing: backend
 		handler:         et_handler
 		limits:          server.Limits{
@@ -603,6 +645,7 @@ fn check_streamed_upload_under_timeouts(backend server.IOBackend) ! {
 	rest := []u8{len: et_upload_body_len - et_upload_chunk_len, init: u8(0x61)}
 	full_body := []u8{len: et_upload_body_len, init: u8(0x61)}
 	mut h := vtest.start(server.ServerConfig{
+		workers:         1
 		io_multiplexing: backend
 		handler:         et_handler
 		limits:          server.Limits{
@@ -697,17 +740,18 @@ fn check_vanished_streams_released(backend server.IOBackend) ! {
 	assert out.active_after == 0, '${backend}: active_conns drifted to ${out.active_after}'
 	// Every stream's timer must be closed with its connection. drive() settles
 	// the connection count; a timer closed on the tick that found its peer gone
-	// may follow a moment later, so allow the same bounded settle (the server
-	// keeps its own couple of fds; leaked timers would be dozens).
+	// may follow a moment later, so allow the same bounded settle. The stopped
+	// server keeps 2 fds of its own; a leaked timer per vanished stream would
+	// be one per stream (128).
 	mut leaked := et_open_fds() - before
 	for _ in 0 .. 500 {
-		if leaked < 16 {
+		if leaked < 6 {
 			break
 		}
 		time.sleep(time.millisecond)
 		leaked = et_open_fds() - before
 	}
-	assert leaked < 16, '${backend}: ${leaked} fds leaked — a watch outlived its client'
+	assert leaked < 6, '${backend}: ${leaked} fds leaked — a watch outlived its client'
 }
 
 fn et_open_fds() int {
@@ -1099,6 +1143,12 @@ fn test_epoll_lost_resume_closed() ! {
 	}
 }
 
+fn test_epoll_reaped_under_gc_signals() ! {
+	$if linux {
+		check_reaped_under_gc_signals(.epoll)!
+	}
+}
+
 fn test_epoll_pipelined_partial_fresh_deadline() ! {
 	$if linux {
 		// A partial head, completed together with the next request's partial.
@@ -1241,6 +1291,14 @@ fn test_poll_connect_storm_served() ! {
 			check_connect_storm_served(.poll, server.Limits{
 				idle_timeout_ms: 2000
 			})!
+		}
+	}
+}
+
+fn test_poll_reaped_under_gc_signals() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_reaped_under_gc_signals(.poll)!
 		}
 	}
 }

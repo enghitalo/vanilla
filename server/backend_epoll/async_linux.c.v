@@ -765,8 +765,13 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 	// last, right before the body fills read_buf, so it is the tail here. Once
 	// any of it is out, a 408 would land inside it.
 	cs.drain_off = cs.write_buf.len
-	if cs.sent_100 && cs.write_buf.len - cs.write_off >= response.status_100_continue_response.len {
-		cs.drain_off -= response.status_100_continue_response.len
+	cont := response.status_100_continue_response
+	if cs.sent_100 && cs.write_buf.len - cs.write_off == cont.len
+		&& unsafe { vmemcmp(&u8(cs.write_buf.data) + cs.write_off, cont.data, cont.len) } == 0 {
+		// The only unsent bytes ahead are this request's own interim 100 — not
+		// an earlier response still owed (sent_100 alone could be stale) — so
+		// the 408 may replace it too.
+		cs.drain_off = cs.write_off
 	}
 	head_step := h(head, mut cs.write_buf, fd, state, mut event_loop)
 	// A takeover queued on the streamed large-body path is unsupported (the body

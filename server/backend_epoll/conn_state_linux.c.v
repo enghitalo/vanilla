@@ -100,10 +100,6 @@ mut:
 	write_off      int
 	read_deadline  u64 // monotonic ns; >0 while a request is mid-read (read_timeout) — from accept for the first one
 	write_deadline u64 // monotonic ns; >0 while a batch is parked (write_timeout)
-	// monotonic ns; >0 while the connection waits for the first byte of a
-	// request: a keep-alive connection at rest after a response, or a new one
-	// when read_timeout_ms is 0. Expiry closes silently.
-	idle_deadline u64
 	// Deferred file body to stream with sendfile(2) AFTER write_buf drains (a
 	// handler appended its headers to write_buf and handed the body off via
 	// core.queue_file). file_fd is BORROWED (the asset table owns it) and is
@@ -115,10 +111,6 @@ mut:
 	// head was already answered, this many body bytes are still to be consumed
 	// off the socket before the connection is ready for its next request.
 	body_drain i64
-	// While body_drain > 0: where the output held for the streamed request
-	// starts in write_buf (start_body_drain). Everything before it answers
-	// earlier requests.
-	drain_off int
 	// The external fd this connection is parked on while awaiting a watch
 	// (-1 = not parked). Lets the worker tear the watch down if the client
 	// closes mid-await.
@@ -145,6 +137,16 @@ mut:
 	// protocol state, handed back on every call, never inspected here.
 	takeover       core.ConnHandler = unsafe { nil }
 	takeover_state voidptr
+	// The reaping fields below are touched only at request boundaries, so
+	// they sit after the hot ones and leave the per-burst layout alone.
+	// monotonic ns; >0 while the connection waits for the first byte of a
+	// request: a keep-alive connection at rest after a response, or a new one
+	// when read_timeout_ms is 0. Expiry closes silently.
+	idle_deadline u64
+	// While body_drain > 0: where the output held for the streamed request
+	// starts in write_buf (start_body_drain). Everything before it answers
+	// earlier requests.
+	drain_off int
 }
 
 // PlainState is the per-worker connection table. `parked` counts armed
@@ -181,6 +183,10 @@ mut:
 	// The worker's watch reactor, so close_conn can tear a parked connection's
 	// watch down on every close path (see close_conn).
 	reactor &Reactor = unsafe { nil }
+	// The worker loop's batch number (one per epoll_wait) and, per fd, the
+	// batch in which it was last closed (closed_in_batch). Sized with conns.
+	batch     u64
+	closed_at []u64
 }
 
 // tick reads the batch clock (see PlainState.now).
@@ -191,15 +197,42 @@ fn (mut st PlainState) tick() {
 
 pub fn new_plain_state() PlainState {
 	return PlainState{
-		conns: []&ConnState{len: conn_table_min, init: unsafe { nil }}
+		conns:     []&ConnState{len: conn_table_min, init: unsafe { nil }}
+		closed_at: []u64{len: conn_table_min}
 	}
+}
+
+// closed_in_batch reports whether fd was closed during the current batch of
+// events (close_conn stamps it): any later event for it in the same batch is
+// stale — it describes the registration that close removed.
+@[direct_array_access; inline]
+fn (st &PlainState) closed_in_batch(fd int) bool {
+	return fd < st.closed_at.len && st.closed_at[fd] == st.batch
 }
 
 // state_for returns the connection state for fd, creating it (with its
 // persistent buffers) on first use. The table grows by doubling, so fd
 // indexing stays O(1) with no hashing.
-@[direct_array_access]
+// state_for returns the connection state for fd, creating it on first use.
+// The lookup is the hot path (every event of an established connection) and
+// stays small enough to inline at both callers; creating one is not
+// (state_create).
+@[direct_array_access; inline]
 fn state_for(mut st PlainState, fd int) &ConnState {
+	if fd < st.conns.len {
+		cs := st.conns[fd]
+		if unsafe { cs != nil } {
+			return cs
+		}
+	}
+	return state_create(mut st, fd)
+}
+
+// state_create is state_for's slow path: it grows the table (and the
+// close stamps with it) and takes a pooled ConnState or allocates one. Kept
+// out of line so the event loop's hot code stays compact.
+@[direct_array_access; noinline]
+fn state_create(mut st PlainState, fd int) &ConnState {
 	if fd >= st.conns.len {
 		mut new_len := st.conns.len
 		for new_len <= fd {
@@ -210,6 +243,11 @@ fn state_for(mut st PlainState, fd int) &ConnState {
 			grown[i] = st.conns[i]
 		}
 		st.conns = grown
+		mut stamps := []u64{len: new_len}
+		for i in 0 .. st.closed_at.len {
+			stamps[i] = st.closed_at[i]
+		}
+		st.closed_at = stamps
 	}
 	if unsafe { st.conns[fd] == nil } {
 		// Reuse a retired ConnState (buffers retained, fields reset by close_conn)
@@ -355,23 +393,16 @@ fn flush_batch(epoll_fd int, fd int, limits core.Limits, active_conns &core.Coun
 	return true
 }
 
-// conn_birth handles the first report of a connection that has no state yet
-// (it carries EPOLLOUT): accept registered it with EPOLLOUT (accept_events)
-// because a deadline must start at accept. It creates the state, arms that
-// deadline — READ when read_timeout_ms is set (it bounds the silence and the
-// whole first request), otherwise IDLE (a connection that has sent nothing is
-// idle) — and switches the fd back to EPOLLIN|EPOLLET. Returns false, and
-// creates nothing, for a stale event (see process_events_plain). Called only
-// when accept-time births are on, and only for a socket accepted on this
-// server's listener (accepted_here, checked by the worker).
+// conn_birth creates the state of a connection at its first report — the
+// tagged EPOLLOUT edge accept registered it for (accept_events), because a
+// deadline must start at accept — and arms that deadline: READ when
+// read_timeout_ms is set (it bounds the silence and the whole first request),
+// otherwise IDLE (a connection that has sent nothing is idle). The worker
+// calls it only for a live, tagged registration of this epoll
+// (process_events_plain), so it cannot fail and needs no syscall: EPOLLOUT is
+// dropped later, by the spurious-wake path of the connection's next event.
 @[inline]
-fn conn_birth(epoll_fd int, fd int, mut st PlainState) bool {
-	// MOD before reading (never after: a read that closes the fd lets accept
-	// reuse the number). A failed MOD means the fd is no longer in this epoll
-	// — a stale event for a connection closed earlier in the batch.
-	if epoll.mod_fd_in_epoll(epoll_fd, fd, (u32(C.EPOLLIN) | u32(C.EPOLLET))) != 0 {
-		return false
-	}
+fn conn_birth(fd int, mut st PlainState) {
 	mut cs := state_for(mut st, fd)
 	if st.read_ns > 0 {
 		cs.read_deadline = st.now + st.read_ns
@@ -379,7 +410,6 @@ fn conn_birth(epoll_fd int, fd int, mut st PlainState) bool {
 		cs.idle_deadline = st.now + st.idle_ns
 	}
 	st.parked++
-	return true
 }
 
 // accepted_here reports whether fd is a client socket accepted on this
@@ -578,7 +608,7 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			// this fd (vanilla#100 hazard 2), and its request-owned fd would leak.
 			// Same teardown as close_client (which clears awaiting_fd first). Never
 			// the connection's own socket: release_conn below closes that.
-			if cs.awaiting_fd >= 0 && cs.awaiting_fd != fd && st.reactor != unsafe { nil } {
+			if cs.awaiting_fd >= 0 && cs.awaiting_fd != fd {
 				detach_rejected_watch(mut st.reactor, epoll_fd, cs.awaiting_fd, fd)
 			}
 			if cs.read_deadline != 0 {
@@ -617,6 +647,13 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			cs.takeover_state = unsafe { nil }
 			st.conns[fd] = unsafe { nil }
 			st.free_conns << cs
+		}
+	}
+	if fd < st.closed_at.len {
+		// Later events for fd in this batch are stale (closed_in_batch). A
+		// plain store: an indexed assignment compiles to a generic element copy.
+		unsafe {
+			*(&u64(st.closed_at.data) + fd) = st.batch
 		}
 	}
 	release_conn(epoll_fd, fd, active_conns)

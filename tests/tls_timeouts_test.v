@@ -24,6 +24,7 @@
 // stopwatches MEASURE server-clock events after they completed.
 import os
 import time
+import sync.stdatomic
 import net
 import net.openssl
 import server
@@ -479,6 +480,24 @@ fn check_tls_trickled_request(served_first bool) ! {
 
 // --- tests -------------------------------------------------------------------
 
+// GcStorm forces a garbage collection every 20 ms until stopped. Each Boehm
+// collection stops every thread with a signal, so each worker's blocking wait
+// returns EINTR far more often than its sweep interval — the condition that
+// once kept a quiet worker from ever sweeping (it retried a wait computed
+// from a stale clock), so its silent connections were never reaped. (A no-op
+// under -gc none.)
+struct GcStorm {
+mut:
+	stop i64
+}
+
+fn gc_storm(mut s GcStorm) {
+	for stdatomic.load_i64(&s.stop) == 0 {
+		gc_collect()
+		time.sleep(20 * time.millisecond)
+	}
+}
+
 fn test_tls_silent_connect_reaped() ! {
 	$if linux {
 		$if vanilla_tls ? {
@@ -487,6 +506,25 @@ fn test_tls_silent_connect_reaped() ! {
 			})!
 			check_tls_silent_connect(server.Limits{
 				idle_timeout_ms: 400
+			})!
+		}
+	}
+}
+
+// The TLS worker's sweep must survive a stream of EINTRs (GC stop-the-world
+// signals every 20 ms, against a 100 ms sweep interval): a silent connection
+// is still reaped.
+fn test_tls_silent_connect_reaped_under_gc_signals() ! {
+	$if linux {
+		$if vanilla_tls ? {
+			mut storm := &GcStorm{}
+			t := spawn gc_storm(mut storm)
+			defer {
+				stdatomic.store_i64(&storm.stop, 1)
+				t.wait()
+			}
+			check_tls_silent_connect(server.Limits{
+				read_timeout_ms: 400
 			})!
 		}
 	}
