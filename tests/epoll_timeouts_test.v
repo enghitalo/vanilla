@@ -39,7 +39,7 @@ fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) in
 fn C.read(fd int, buf voidptr, count usize) int
 fn C.write(fd int, buf voidptr, count usize) int
 fn C.close(fd int) int
-fn C.socketpair(domain int, typ int, protocol int, sv &int) int
+fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
 fn C.clock() i64 // this process's CPU time, in CLOCKS_PER_SEC (1e6 on POSIX) units
 
 const et_req = 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
@@ -225,24 +225,24 @@ fn et_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 		return .suspend
 	}
 	if et_has_prefix(req, et_pool_prefix) {
-		mut sv := [2]int{}
+		mut sv := [2]i32{} // C ints: V int is 64-bit
 		if C.socketpair(C.AF_UNIX, C.SOCK_STREAM, 0, &sv[0]) != 0 {
 			return .close // no response: the test fails on the missing frame
 		}
 		reply := [u8(`x`)]!
-		C.write(sv[1], &reply[0], 1) // the upstream's reply, ready at once
+		C.write(int(sv[1]), &reply[0], 1) // the upstream's reply, ready at once
 		pair := voidptr(usize(u32(sv[0])) | (usize(u32(sv[1])) << 32))
-		event_loop.watch_fd(sv[0], .readable, et_pool_done, pair)
+		event_loop.watch_fd(int(sv[0]), .readable, et_pool_done, pair)
 		return .suspend
 	}
 	if et_has_prefix(req, et_sock_prefix) {
-		mut sv := [2]int{}
+		mut sv := [2]i32{} // C ints: V int is 64-bit
 		if C.socketpair(C.AF_UNIX, C.SOCK_STREAM, 0, &sv[0]) != 0 {
 			return .close // no response: the test fails on the missing frame
 		}
 		// Both ends ride in the payload: low 32 bits, high 32 bits.
 		pair := voidptr(usize(u32(sv[0])) | (usize(u32(sv[1])) << 32))
-		event_loop.watch_fd(sv[0], .writable, et_sock_step, pair)
+		event_loop.watch_fd(int(sv[0]), .writable, et_sock_step, pair)
 		return .suspend
 	}
 	out << et_ok
