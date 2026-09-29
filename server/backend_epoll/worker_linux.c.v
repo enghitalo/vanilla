@@ -550,6 +550,11 @@ pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () v
 		}
 	}
 
+	if tls_config != unsafe { nil } && threads.len > 1 && !tls.parallel_crypto() {
+		// Correct either way (the shim serializes calls into Mbed TLS), but the
+		// workers take turns in the crypto library: say how to lift that.
+		eprintln('[tls] Mbed TLS was built without MBEDTLS_THREADING_C: the ${threads.len} TLS workers take turns in the crypto library (handshakes, and record crypto without kTLS). Build Mbed TLS with MBEDTLS_THREADING_C and MBEDTLS_THREADING_PTHREAD to run it in parallel.')
+	}
 	println('listening on http://localhost:${port}/')
 	// Server is accepting (listener + workers up); fire the one-shot lifecycle hook
 	// on this (main) thread right before we block in the accept loop.

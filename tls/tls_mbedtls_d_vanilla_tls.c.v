@@ -18,6 +18,7 @@ import os
 #include "vanilla_tls.h"
 
 fn C.vtls_global_init() int
+fn C.vtls_parallel_crypto() int
 fn C.vtls_ctx_new() voidptr
 fn C.vtls_ctx_free(ctx voidptr)
 fn C.vtls_use_self_signed(ctx voidptr, sans &&char, nsans usize) int
@@ -38,6 +39,15 @@ fn C.vtls_ktls_active(sess voidptr) int
 fn C.vtls_ktls_failed(sess voidptr) int
 
 // init performs process-wide crypto init (psa_crypto_init). Call once at startup.
+// parallel_crypto reports whether TLS workers can run their crypto in
+// parallel: true when the linked Mbed TLS was built with MBEDTLS_THREADING_C
+// (it locks PSA's process-wide state itself). When false, every call into Mbed
+// TLS takes one process-wide lock, so several workers stay correct but take
+// turns in the crypto library (handshakes, and record crypto without kTLS).
+pub fn parallel_crypto() bool {
+	return C.vtls_parallel_crypto() == 1
+}
+
 pub fn initialize() ! {
 	if C.vtls_global_init() != 0 {
 		return error('vtls: psa_crypto_init failed')
