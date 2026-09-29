@@ -1097,6 +1097,16 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 			}
 			if cs.write_buf.len > cs.write_off {
 				if !flush_batch(epoll_fd, client_fd, limits, active_conns, mut st, mut cs) {
+					// The peer is gone and flush_batch closed the connection, but the
+					// watch the continuation just re-armed is not recorded on it yet
+					// (it parks after the flush): tear it down here, or it outlives the
+					// client — its request-owned fd (an SSE tick timer) leaks, and with
+					// accept-time births on its level-triggered edge would be dropped
+					// as stale forever. Not the client's own socket (already closed).
+					if event_loop.last_watched != client_fd {
+						detach_rejected_watch(mut reactor, epoll_fd, event_loop.last_watched,
+							client_fd)
+					}
 					return
 				}
 			}
@@ -1245,10 +1255,15 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 @[direct_array_access; manualfree]
 fn close_client(mut reactor Reactor, epoll_fd int, fd int, active_conns &core.Counter, mut st PlainState) {
 	if fd < st.conns.len {
-		cs := st.conns[fd]
+		mut cs := st.conns[fd]
 		if unsafe { cs != nil } && cs.awaiting_fd >= 0 {
 			ext_fd := cs.awaiting_fd
-			if ext_fd < reactor.watches.len && reactor.watches[ext_fd].queue.len > 0 {
+			cs.awaiting_fd = -1 // torn down here; close_conn must not detach it again
+			if ext_fd == fd {
+				// Parked on its own socket's writability: only the watch goes —
+				// close_conn's release_conn closes the socket, exactly once.
+				reactor.reactor_clear(ext_fd)
+			} else if ext_fd < reactor.watches.len && reactor.watches[ext_fd].queue.len > 0 {
 				// The fd is a SHARED, pipelined pg connection: detaching this one client
 				// must not clear the slot (siblings are still parked) nor close the pooled
 				// connection. Tombstone this client's slot — it stays in the queue so the

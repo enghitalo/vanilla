@@ -151,6 +151,7 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 	core.enable_takeover()
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut st := new_plain_state()
+	st.reactor = unsafe { &reactor }
 	// Arm clientless background watches (timerfd refresh, signalfd, ...) on THIS
 	// worker's loop, once, before serving. client_fd = -1 makes the watch + its
 	// continuation take the clientless path (no conn, scratch buffer).

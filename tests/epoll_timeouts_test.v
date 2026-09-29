@@ -26,6 +26,7 @@ import os
 import server
 import core
 import sync.stdatomic
+import time
 import vtest
 
 $if linux {
@@ -672,6 +673,7 @@ fn check_connect_storm_served(backend server.IOBackend, limits server.Limits) ! 
 // The worker detaches such a timer from its epoll at its next report, so it
 // costs no CPU.)
 fn check_vanished_streams_released(backend server.IOBackend) ! {
+	before := et_open_fds()
 	out := vtest.drive(server.ServerConfig{
 		io_multiplexing: backend
 		handler:         et_handler
@@ -693,6 +695,24 @@ fn check_vanished_streams_released(backend server.IOBackend) ! {
 		assert !c.unmet, '${backend}: stream ${i} did not start: ${c.raw.bytestr()}'
 	}
 	assert out.active_after == 0, '${backend}: active_conns drifted to ${out.active_after}'
+	// Every stream's timer must be closed with its connection. drive() settles
+	// the connection count; a timer closed on the tick that found its peer gone
+	// may follow a moment later, so allow the same bounded settle (the server
+	// keeps its own couple of fds; leaked timers would be dozens).
+	mut leaked := et_open_fds() - before
+	for _ in 0 .. 500 {
+		if leaked < 16 {
+			break
+		}
+		time.sleep(time.millisecond)
+		leaked = et_open_fds() - before
+	}
+	assert leaked < 16, '${backend}: ${leaked} fds leaked — a watch outlived its client'
+}
+
+fn et_open_fds() int {
+	fds := os.ls('/proc/self/fd') or { return 0 }
+	return fds.len
 }
 
 fn et_always(acc []u8) bool {

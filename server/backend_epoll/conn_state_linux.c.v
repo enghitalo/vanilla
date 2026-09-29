@@ -178,6 +178,9 @@ mut:
 	// its TCP port; listen_uds is set for an AF_UNIX listener instead.
 	listen_port int
 	listen_uds  bool
+	// The worker's watch reactor, so close_conn can tear a parked connection's
+	// watch down on every close path (see close_conn).
+	reactor &Reactor = unsafe { nil }
 }
 
 // tick reads the batch clock (see PlainState.now).
@@ -569,6 +572,15 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 	if fd < st.conns.len {
 		mut cs := st.conns[fd]
 		if unsafe { cs != nil } {
+			// A connection closed while parked on a watch by a write-side path
+			// (write timeout, pending-write cap, a failed flush) must not leave
+			// that watch behind: it would fire against whatever connection reuses
+			// this fd (vanilla#100 hazard 2), and its request-owned fd would leak.
+			// Same teardown as close_client (which clears awaiting_fd first). Never
+			// the connection's own socket: release_conn below closes that.
+			if cs.awaiting_fd >= 0 && cs.awaiting_fd != fd && st.reactor != unsafe { nil } {
+				detach_rejected_watch(mut st.reactor, epoll_fd, cs.awaiting_fd, fd)
+			}
 			if cs.read_deadline != 0 {
 				st.parked--
 			}
