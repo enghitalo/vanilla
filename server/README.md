@@ -130,6 +130,18 @@ together. While a response waits for the socket to drain (WANT_WRITE),
 nothing more is read or answered on that connection; the requests pipelined
 behind it are answered once it is out.
 
+Every worker can serve TLS. How much of the crypto runs in parallel depends on
+how Mbed TLS was built. Its PSA Crypto state (the key store, the RNG) is
+shared by the whole process:
+- **Built with `MBEDTLS_THREADING_C` and `MBEDTLS_THREADING_PTHREAD`:** Mbed
+  TLS locks that state itself, and the workers run their crypto in parallel.
+- **Built without them** (the upstream default config, and distro packages
+  such as Arch's): every call into Mbed TLS takes one process-wide lock, so
+  the workers take turns in the crypto library. That covers handshakes, and
+  record crypto unless kTLS carries it. Parsing, handlers and syscalls still
+  run in parallel. The server says so at startup when it runs more than one
+  TLS worker, and `tls.parallel_crypto()` reports which build is linked.
+
 ## Internals (where to look)
 
 - `../core/core.v` — the handler contract: `Handler`, `Step`, `WakeFn`, `EventLoop`.

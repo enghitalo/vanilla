@@ -8,6 +8,10 @@ module tls
 
 const not_built = 'vtls: built without TLS support — rebuild with `-d vanilla_tls` (and install Mbed TLS 4)'
 
+pub fn parallel_crypto() bool {
+	return true
+}
+
 pub fn initialize() ! {
 	return error(not_built)
 }

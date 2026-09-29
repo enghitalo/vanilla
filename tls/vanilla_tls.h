@@ -19,6 +19,13 @@ typedef struct vtls_ctx vtls_ctx; // server-wide TLS config (cert + key + ssl co
 // Process-wide one-time init (psa_crypto_init). Returns 0 on success.
 int vtls_global_init(void);
 
+// 1 if the linked Mbed TLS was built with MBEDTLS_THREADING_C (it locks PSA's
+// process-wide state itself, so TLS workers run their crypto in parallel); 0
+// if not, in which case every entry point here takes one process-wide lock and
+// the workers take turns in the crypto library. Either way the functions are
+// safe to call from several threads, on distinct sessions.
+int vtls_parallel_crypto(void);
+
 // Create/destroy a server TLS context.
 vtls_ctx *vtls_ctx_new(void);
 void vtls_ctx_free(vtls_ctx *ctx);
