@@ -11,7 +11,8 @@
 // deadline; no 408 inside a pending response, yet a stalled streamed upload
 // still gets its 408, also after Expect: 100-continue; streams whose clients
 // all vanish at once are released exactly once; an app's fd that a finished
-// watch left registered is never adopted as a connection; and a request that
+// watch left registered is never adopted as a connection, nor spun on once
+// it reads EOF (a pooled fd whose upstream went away); and a request that
 // parks on its own client's writability leaves the connection serving.
 // The checks that need no watch reactor or takeover also run on the poll
 // backend (`-d vanilla_poll`), which shares the 408 / fresh-deadline rules.
@@ -24,6 +25,7 @@
 import os
 import server
 import core
+import sync.stdatomic
 import vtest
 
 $if linux {
@@ -34,8 +36,10 @@ $if linux {
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
 fn C.read(fd int, buf voidptr, count usize) int
+fn C.write(fd int, buf voidptr, count usize) int
 fn C.close(fd int) int
 fn C.socketpair(domain int, typ int, protocol int, sv &int) int
+fn C.clock() i64 // this process's CPU time, in CLOCKS_PER_SEC (1e6 on POSIX) units
 
 const et_req = 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 const et_ok = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
@@ -75,6 +79,21 @@ const et_big_fill = u8(`a`)
 // /sock parks on a socketpair end (.writable), then steps to a timer while
 // keeping that end open (and registered: its watch is level-triggered).
 const et_sock_req = 'GET /sock HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+
+// /pool parks on a pooled "upstream" (a socketpair end) for its reply, then
+// answers and keeps that end open for the next request (a plain watch_fd: the
+// examples/mesh and DB-pool pattern). The upstream then goes away.
+const et_pool_req = 'GET /pool HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+
+// EtPool is where /pool leaves its pooled end, for the check to inspect: its
+// number and its socket's inode (a closed fd's number is soon reused).
+struct EtPool {
+mut:
+	fd    i64 = -1
+	inode i64
+}
+
+const et_pool = &EtPool{}
 
 // /self parks on its own client socket becoming writable (the backpressure
 // pattern), then answers.
@@ -132,6 +151,7 @@ const et_big_prefix = 'GET /big'.bytes()
 const et_sock_prefix = 'GET /sock'.bytes()
 const et_forever_prefix = 'GET /forever'.bytes()
 const et_self_prefix = 'GET /self'.bytes()
+const et_pool_prefix = 'GET /pool'.bytes()
 
 // et_timerfd arms a CLOCK_MONOTONIC timerfd that first fires after `ms`, then
 // every `interval_ms` (0 = one-shot). itimerspec = {it_interval, it_value}.
@@ -203,6 +223,17 @@ fn et_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 		event_loop.watch_fd(client_fd, .writable, et_self_done, unsafe { nil })
 		return .suspend
 	}
+	if et_has_prefix(req, et_pool_prefix) {
+		mut sv := [2]int{}
+		if C.socketpair(C.AF_UNIX, C.SOCK_STREAM, 0, &sv[0]) != 0 {
+			return .close // no response: the test fails on the missing frame
+		}
+		reply := [u8(`x`)]!
+		C.write(sv[1], &reply[0], 1) // the upstream's reply, ready at once
+		pair := voidptr(usize(u32(sv[0])) | (usize(u32(sv[1])) << 32))
+		event_loop.watch_fd(sv[0], .readable, et_pool_done, pair)
+		return .suspend
+	}
 	if et_has_prefix(req, et_sock_prefix) {
 		mut sv := [2]int{}
 		if C.socketpair(C.AF_UNIX, C.SOCK_STREAM, 0, &sv[0]) != 0 {
@@ -247,6 +278,28 @@ fn et_sock_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload v
 	C.close(int(u32(pair >> 32)))
 	out << et_ok
 	return .done
+}
+
+// et_pool_done reads the upstream's reply and answers, keeping the pooled end
+// open (and registered: the watch is level-triggered) for reuse. Then the
+// upstream closes its end, as one that reaps idle connections would: from
+// now on the pooled end reads EOF, with no watch behind it.
+fn et_pool_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	mut tmp := [8]u8{}
+	C.read(ready_fd, &tmp[0], 8)
+	pair := u64(usize(watch_payload))
+	C.close(int(u32(pair >> 32)))
+	mut pool := unsafe { et_pool }
+	stdatomic.store_i64(&pool.inode, i64(et_fd_inode(ready_fd)))
+	stdatomic.store_i64(&pool.fd, i64(ready_fd))
+	out << et_ok
+	return .done
+}
+
+// et_fd_inode is the inode of what fd refers to now (0 if it is closed).
+fn et_fd_inode(fd int) u64 {
+	st := os.stat('/proc/self/fd/${fd}') or { return 0 }
+	return st.inode
 }
 
 // et_self_done answers once the client socket is writable (at once).
@@ -615,7 +668,9 @@ fn check_connect_storm_served(backend server.IOBackend, limits server.Limits) ! 
 // stale event for an fd already closed in the batch (a client, or the timer
 // its hangup tore down) must not release it again (active_conns drifts below
 // zero) or build a zombie. (Timers are not counted: a tick whose flush finds
-// the peer gone leaves its re-armed timer open, a known watch-teardown gap.)
+// the peer gone leaves its re-armed timer open, a known watch-teardown gap.
+// The worker detaches such a timer from its epoll at its next report, so it
+// costs no CPU.)
 fn check_vanished_streams_released(backend server.IOBackend) ! {
 	out := vtest.drive(server.ServerConfig{
 		io_multiplexing: backend
@@ -897,6 +952,53 @@ fn check_stepped_away_watch_not_adopted(backend server.IOBackend, uds string) ! 
 	assert out.active_after == 0, '${backend} ${uds}: active_conns drifted to ${out.active_after}'
 }
 
+// check_pooled_fd_eof_no_spin: a pooled fd kept open after its watch finished
+// stays registered, level-triggered. Once its upstream closes it, it reads
+// EOF on every epoll_wait, with no watch and no connection behind it. The
+// worker must not busy-loop on it (a report dropped on every wait never lets
+// epoll_wait block), must not adopt it as a connection (its close would free
+// a slot that was never counted) and must leave it open (the app owns it). The
+// window is the silent witness, reaped by its accept-time deadline after at
+// least 500 ms; the worker, blocked in epoll_wait, should use next to no CPU
+// in it. `uds` = '' listens on TCP; otherwise on that unix socket path.
+fn check_pooled_fd_eof_no_spin(backend server.IOBackend, uds string) ! {
+	mut h := vtest.start(server.ServerConfig{
+		io_multiplexing:  backend
+		handler:          et_handler
+		workers:          1
+		unix_socket_path: uds
+		limits:           server.Limits{
+			read_timeout_ms: 500
+			idle_timeout_ms: -1 // the client connection stays at rest meanwhile
+		}
+	})!
+	defer {
+		h.stop()
+	}
+	pool := h.fire([
+		vtest.Script{
+			rounds: [
+				vtest.Round{
+					send: et_pool_req
+					want: 1
+				},
+			]
+		},
+	])!
+	assert !pool.conns[0].unmet, '${backend} ${uds}: /pool not answered: ${pool.conns[0].raw.bytestr()}'
+	cpu0 := C.clock()
+	witness := h.fire([et_silent])!
+	cpu_us := C.clock() - cpu0
+	assert witness.conns[0].eof, '${backend} ${uds}: the silent witness must be reaped'
+	assert cpu_us < 100_000, '${backend} ${uds}: the worker busy-looped on a pooled fd whose upstream closed: ${cpu_us} us of CPU in a window of at least 500 ms'
+	again := h.send(pool.group, et_req, vtest.frames(2))!
+	assert !again.conns[0].eof && !again.conns[0].unmet, '${backend} ${uds}: the client connection stopped serving: ${again.conns[0].raw.bytestr()}'
+	assert again.active_after == 1, '${backend} ${uds}: active_conns drifted to ${again.active_after}'
+	pooled := int(stdatomic.load_i64(&et_pool.fd))
+	assert et_fd_inode(pooled) == u64(stdatomic.load_i64(&et_pool.inode)), '${backend} ${uds}: the pooled end was closed under the app'
+	C.close(pooled)
+}
+
 // check_self_watch_keepalive: a request parks on its own client socket
 // becoming writable (watch_fd(client_fd, .writable)), then answers. The
 // connection must go on serving: its next request is read and answered, and
@@ -1018,6 +1120,13 @@ fn test_epoll_stepped_away_watch_not_adopted() ! {
 	}
 }
 
+fn test_epoll_pooled_fd_eof_no_spin() ! {
+	$if linux {
+		check_pooled_fd_eof_no_spin(.epoll, '')!
+		check_pooled_fd_eof_no_spin(.epoll, os.join_path(os.temp_dir(), 'vanilla_et_pool_${os.getpid()}.sock'))!
+	}
+}
+
 fn test_epoll_self_watch_keepalive() ! {
 	$if linux {
 		check_self_watch_keepalive(.epoll)!
@@ -1047,9 +1156,8 @@ fn test_epoll_connect_storm_served() ! {
 	}
 }
 
-// Last of the epoll tests: the timers its vanished streams leave open (see
-// check_vanished_streams_released) keep the stopped server's worker busy
-// until this process exits.
+// The timers its vanished streams leave open (see
+// check_vanished_streams_released) stay open until this process exits.
 fn test_epoll_vanished_streams_released() ! {
 	$if linux {
 		check_vanished_streams_released(.epoll)!

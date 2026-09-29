@@ -173,9 +173,9 @@ mut:
 	// uses it, so the request path never reads the clock itself.
 	now        u64
 	next_sweep u64 // monotonic ns; the sweep scans the table only once now >= this
-	// The listener's local address, set once at startup: conn_birth adopts
-	// only a socket accepted on it (accepted_here). listen_port is its TCP
-	// port; listen_uds is set for an AF_UNIX listener instead.
+	// The listener's local address, set once at startup: the worker gives
+	// birth only to a socket accepted on it (accepted_here). listen_port is
+	// its TCP port; listen_uds is set for an AF_UNIX listener instead.
 	listen_port int
 	listen_uds  bool
 }
@@ -358,17 +358,11 @@ fn flush_batch(epoll_fd int, fd int, limits core.Limits, active_conns &core.Coun
 // deadline — READ when read_timeout_ms is set (it bounds the silence and the
 // whole first request), otherwise IDLE (a connection that has sent nothing is
 // idle) — and switches the fd back to EPOLLIN|EPOLLET. Returns false, and
-// creates nothing, for a stale event (see process_events_plain) and for an fd
-// that is not a socket accepted on this server's listener (accepted_here): an
-// app's fd left registered for EPOLLOUT by a spent level-triggered watch (its
-// continuation moved to another fd and kept this one open) also reaches here,
-// and adopting it would later close the app's fd and release a slot that was
-// never counted. Called only when accept-time births are on.
+// creates nothing, for a stale event (see process_events_plain). Called only
+// when accept-time births are on, and only for a socket accepted on this
+// server's listener (accepted_here, checked by the worker).
 @[inline]
 fn conn_birth(epoll_fd int, fd int, mut st PlainState) bool {
-	if !st.accepted_here(fd) {
-		return false
-	}
 	// MOD before reading (never after: a read that closes the fd lets accept
 	// reuse the number). A failed MOD means the fd is no longer in this epoll
 	// — a stale event for a connection closed earlier in the batch.
@@ -390,8 +384,14 @@ fn conn_birth(epoll_fd int, fd int, mut st PlainState) bool {
 // socket holds the listening port; an accepted AF_UNIX socket reports the
 // listener's path, while a dialed or socketpair end is unnamed. Anything else
 // fails: a timerfd, pipe or eventfd (ENOTSOCK), an fd already closed (EBADF),
-// or the app's own dialed socket (an ephemeral local port). One syscall, on a
-// birth only.
+// or the app's own dialed socket (an ephemeral local port). One syscall per
+// event on an fd with no state (a birth, a stale event, or an app's fd the
+// worker then detaches), never on an event of an established connection. It
+// assumes an accepted TCP socket's local port is the listening port: true for
+// a plain listen and behind iptables REDIRECT/DNAT (getsockname returns the
+// translated port), not under BPF socket steering (sk_lookup), where it is
+// the port the client dialed. Such a connection is never born: it is detached
+// unserved and, holding no deadline, never reaped.
 @[direct_array_access; inline]
 fn (st &PlainState) accepted_here(fd int) bool {
 	family, port, named := sock_local(fd)

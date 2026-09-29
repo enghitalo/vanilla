@@ -227,21 +227,30 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 				// No state yet. A new socket is writable at ADD, so a
 				// connection's FIRST report always carries EPOLLOUT (even when
 				// the peer already reset or half-closed it), and active watch
-				// fds were routed above. So this is either that birth — and
-				// conn_birth's MOD succeeds only while the fd is in this epoll —
-				// or a stale event for an fd closed earlier in this batch (a
-				// client, or a watch fd close_client tore down). accept may
-				// already have reused that number, for a connection this worker
-				// does not own or for one whose own birth event is still queued
-				// here. Closing or serving a stale fd would release a slot that
-				// was already released, or build a zombie state whose deadline
-				// later closes someone else's socket: drop the event. A stale
-				// event that carries EPOLLOUT for a number reused by a new
-				// connection in THIS epoll passes conn_birth, and adopting that
-				// connection is right: it is ours, and gets its deadline here.
-				// conn_birth refuses any other fd (accepted_here), such as an
-				// app's fd whose spent level-triggered watch still reports
-				// EPOLLOUT.
+				// fds were routed above. So this is either that birth, or an fd
+				// that must never be born: a stale event for an fd closed
+				// earlier in this batch (a client, or a watch fd close_client
+				// tore down), whose release would be a second one, or an app's
+				// fd that a finished watch left registered, level-triggered (a
+				// pooled connection kept open after .done, or one a
+				// continuation stepped away from), whose zombie state would
+				// later close it. Only a socket accepted on the listener is
+				// born (accepted_here). Anything else is detached from this
+				// epoll, never closed: an app's fd reports again on every wait
+				// (a pooled connection whose upstream closed stays readable),
+				// so dropping the event would spin the worker. Its next
+				// watch_fd adds it back (register_watch falls back to ADD), and
+				// a level-triggered fd then reports its readiness again. For a
+				// closed fd the DEL fails harmlessly. accept may already have
+				// reused a stale number, for a connection this worker does not
+				// own or for one whose own birth event is still queued here:
+				// accepted_here keeps it attached, and conn_birth's MOD
+				// succeeds only while the fd is in THIS epoll. Adopting it then
+				// is right: it is ours, and gets its deadline here.
+				if !st.accepted_here(fd) {
+					epoll.detach_fd_from_epoll(epoll_fd, fd)
+					continue
+				}
 				if ev & u32(C.EPOLLOUT) == 0 || !conn_birth(epoll_fd, fd, mut st) {
 					continue
 				}
@@ -378,8 +387,8 @@ pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () v
 	// One worker epoll fd per worker thread. threads was sized by new_server from
 	// config.workers (default nr_cpus), so its length is this server's worker count.
 	mut epoll_fds := []int{len: threads.len, cap: threads.len}
-	// The listener's own address (once, here): a plain worker's conn_birth
-	// adopts only sockets accepted on it (PlainState.accepted_here).
+	// The listener's own address (once, here): a plain worker gives birth
+	// only to sockets accepted on it (PlainState.accepted_here).
 	listen_family, listen_port, _ := sock_local(socket_fd)
 	listen_uds := listen_family == C.AF_UNIX
 
