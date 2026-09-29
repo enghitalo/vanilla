@@ -79,8 +79,16 @@ void vtls_session_free(void *sess);
 int vtls_handshake(void *sess);
 
 // Like recv/send but over TLS. read returns >=0 bytes, or VTLS_WANT / VTLS_ERROR.
+// Reads stop at a drained socket without a syscall (see vtls_mark_readable).
 int vtls_read(void *sess, unsigned char *buf, size_t len);
 int vtls_write(void *sess, const unsigned char *buf, size_t len);
+
+// Tell the session its socket may hold new bytes: call on every readable edge
+// (and when resuming reads), before vtls_handshake/vtls_read. Once a recv came
+// back short or EAGAIN, the session answers VTLS_WANT from its own state until
+// this is called again. That is the edge-triggered contract: a drained socket
+// raises a new edge for any byte that arrives later.
+void vtls_mark_readable(void *sess);
 
 // ---- kTLS: kernel record-crypto offload ------------------------------------
 

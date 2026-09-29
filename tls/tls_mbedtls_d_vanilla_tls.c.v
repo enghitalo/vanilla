@@ -31,6 +31,7 @@ fn C.vtls_session_new(ctx voidptr, fd int) voidptr
 fn C.vtls_session_free(sess voidptr)
 fn C.vtls_handshake(sess voidptr) int
 fn C.vtls_read(sess voidptr, buf &u8, len usize) int
+fn C.vtls_mark_readable(sess voidptr)
 fn C.vtls_write(sess voidptr, buf &u8, len usize) int
 fn C.vtls_enable_ktls(sess voidptr, fd int) int
 fn C.vtls_ktls_active(sess voidptr) int
@@ -209,6 +210,13 @@ pub fn (s &Session) handshake() int {
 // or `closed`. Raw pointer so the read loop can fill a buffer's spare capacity.
 pub fn (s &Session) read_into(ptr &u8, len int) int {
 	return C.vtls_read(s.sess, ptr, usize(len))
+}
+
+// mark_readable tells the session its socket may hold new bytes (a readable
+// edge, or reads resuming after a parked write). Until then, once a read found
+// the socket drained, handshake and read_into answer `want` without a syscall.
+pub fn (s &Session) mark_readable() {
+	C.vtls_mark_readable(s.sess)
 }
 
 // write_from encrypts `len` bytes from `ptr`. Returns bytes written (>=0),

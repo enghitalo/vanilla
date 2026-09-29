@@ -19,6 +19,7 @@ on:
       - 'vtest/**'
       - 'transport/**'
       - 'tests/tls_timeouts_test.v'
+      - 'tests/tls_pipelining_test.v'
       - '.github/workflows/tls_backend.yml'
   pull_request:
     branches: [ main ]
@@ -32,6 +33,7 @@ on:
       - 'vtest/**'
       - 'transport/**'
       - 'tests/tls_timeouts_test.v'
+      - 'tests/tls_pipelining_test.v'
       - '.github/workflows/tls_backend.yml'
 
 env:
@@ -131,3 +133,13 @@ jobs:
           VANILLA_NO_IOURING: '1'
         run: |
           v -cc gcc -no-parallel -d vanilla_tls test tests/tls_timeouts_test.v
+      # HTTP/1.1 pipelining over HTTPS (issue #152): every request of a burst
+      # answered in order, requests behind a response parked on WANT_WRITE
+      # answered after it (byte-exact), a pipelined partial on its own read
+      # deadline, and a client reset mid-response not killing the server.
+      - name: TLS pipelining e2e
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+        run: |
+          v -cc gcc -no-parallel -d vanilla_tls test tests/tls_pipelining_test.v
