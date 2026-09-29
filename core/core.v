@@ -238,9 +238,9 @@ pub:
 	max_body_bytes    int // > 0 ⇒ 413 Payload Too Large (rejected from Content-Length, before buffering)
 	max_request_bytes int // > 0 ⇒ ceiling on a single buffered request (headers+body); 0 ⇒ built-in default (8 MiB)
 	max_connections   int // > 0 ⇒ refuse new connections past this many concurrent (checked at accept). Pair with read_timeout_ms: without a deadline, connections that never send (or peers that vanish) hold their slots forever
-	read_timeout_ms   int // > 0 ⇒ a request (head + body) must arrive complete within this long, else close — 408 if part of it arrived (plaintext epoll/poll/iocp), silently otherwise. The FIRST request's clock starts at accept (it bounds a silent connect and the TLS handshake); a later request's starts at its first byte. Not refreshed on progress: size it for your largest upload
+	read_timeout_ms   int // > 0 ⇒ a request (head + body) must arrive complete within this long, else close — 408 if part of it arrived and no earlier response is still being sent (plaintext epoll/poll/iocp), silently otherwise. The FIRST request's clock starts at accept (it bounds a silent connect and the TLS handshake); a later request's starts at its first byte. Not refreshed on progress: size it for your largest upload
 	write_timeout_ms  int // > 0 ⇒ close a connection whose parked response can't drain in this long
-	idle_timeout_ms   int // keep-alive: after a response is fully sent, how long to wait for the first byte of the next request before closing silently. 0 ⇒ read_timeout_ms; < 0 (use -1) ⇒ never, e.g. a handler that hands the fd to another thread to stream, or a proxy in front that manages upstream idle itself
+	idle_timeout_ms   int // keep-alive: after a response is fully sent, how long to wait for the first byte of the next request before closing silently. It bounds only the wait for a request's first byte: a started request is bounded by read_timeout_ms alone, so pair max_connections with read_timeout_ms. 0 ⇒ read_timeout_ms; < 0 (use -1) ⇒ never, e.g. a handler that hands the fd to another thread to stream, or a proxy in front that manages upstream idle itself
 }
 
 // idle_ms resolves the keep-alive idle budget: idle_timeout_ms when > 0,

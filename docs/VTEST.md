@@ -18,6 +18,10 @@ iterations; 64-conn slowloris storm: all reaped by the server's own
    the server's reaper closes the connection — the test exercises the timeout
    machinery instead of duplicating it. If the server loses liveness entirely, the
    test hangs: that is the correct signal (CI step timeout is the backstop).
+   The one bounded wait: `drive()` gives the server up to its shutdown grace to
+   finish closing bookkeeping before it samples the leak counters
+   (`inflight_after`, `active_after`). It never decides a test's outcome — a
+   real leak never settles and the counters are then sampled as they are.
 3. **Starts when the server is ready, ends when everything answered.** The test
    author never sees readiness: `drive()`/`start()` own the lifecycle and fire the
    client reactor from `after_server_start`. A run terminates exactly when every
