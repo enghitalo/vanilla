@@ -909,6 +909,17 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 				}
 			}
 			.suspend {
+				if event_loop.last_watched < 0 {
+					// Suspended without a live watch (watch_fd refused its fd, or was
+					// never called): nothing would ever resume this request. Flush
+					// what was appended and close, as drain_takeover does, instead
+					// of answering the next pipelined request in its place.
+					compact_read_buf(mut cs, pos)
+					if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
+						close_conn(epoll_fd, fd, active_conns, mut st)
+					}
+					return false
+				}
 				cs.awaiting_fd = event_loop.last_watched // park; leftover stays buffered for resume
 			}
 			.close {

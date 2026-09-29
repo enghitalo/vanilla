@@ -124,9 +124,10 @@ mut:
 	close_after_flush bool
 	// Set once a 100 Continue interim response has been sent for the request
 	// currently mid-read, so a peer that sends `Expect: 100-continue` and dribbles
-	// its body across edges is prompted exactly once (RFC 9110 §10.1.1). Reset per
-	// connection (a keep-alive connection may carry several Expect requests, but
-	// only one is ever mid-read at a time, and close_conn clears it).
+	// its body across edges is prompted exactly once (RFC 9110 §10.1.1). It refers
+	// to the request at the head of read_buf: cleared when that request completes
+	// (drain_requests consumed it, or its streamed body finished), so the next
+	// Expect request on a keep-alive connection gets its own 100.
 	sent_100 bool
 	// The conn-mode seam (issue #136): nil (the default) means the HTTP/1.1
 	// state machine drives this connection — the hot path pays exactly one
@@ -210,8 +211,14 @@ const birth_queue_cap = 4096
 // accept-time deadline — without an epoll event of its own. (Registering the
 // fd for EPOLLOUT does that too, but a new socket is writable at once, so the
 // edge wakes a sleeping worker a second time for every connection.) Single
-// producer (the accept thread), single consumer (the worker, at the end of
-// each loop iteration). Each entry also carries the worker's close_seq as the
+// producer (the accept thread), single consumer (the worker, at the start of
+// each loop iteration, so a connection queued before that pass is born with
+// its accept time before its first event is handled). A worker with nothing
+// armed first waits one bounded sweep interval; only when that runs out with
+// no event, no birth and no signal does it announce a sleep with no timeout,
+// and only then does a push wake it through its eventfd — so connection churn
+// does not pay that wake.
+// Each entry also carries the worker's close_seq as the
 // accept thread read it BEFORE registering the fd: a close of that connection
 // can only come later and stamps a larger value, so the worker can tell an
 // entry whose connection it has already closed — its number possibly reused
@@ -265,13 +272,14 @@ fn (mut q BirthQueue) push(fd int, seq u64, accepted_ns u64) {
 // would have stamped a larger close_seq) and without state yet (a connection
 // that sent something first was already born by its first event). No syscall.
 @[direct_array_access]
-fn drain_births(mut st PlainState) {
+fn drain_births(mut st PlainState) int {
 	mut q := st.births_q
 	h := q.head // only this worker writes head
 	t := stdatomic.load_u64(&q.tail)
 	if h == t {
-		return
+		return 0
 	}
+	mut born := 0
 	for n := h; n < t; n++ {
 		i := int(n & (birth_queue_cap - 1))
 		fd := q.fds[i]
@@ -282,8 +290,10 @@ fn drain_births(mut st PlainState) {
 			continue // already born
 		}
 		conn_birth(fd, q.accepted[i], mut st) // the clock started at accept
+		born++
 	}
 	stdatomic.store_u64(&q.head, t)
+	return born
 }
 
 // birth_queue_pending is the worker's last look before an unbounded wait:
@@ -504,14 +514,16 @@ fn flush_batch(epoll_fd int, fd int, limits core.Limits, active_conns &core.Coun
 	return true
 }
 
-// conn_birth creates the state of a connection at its first report — the
-// tagged EPOLLOUT edge accept registered it for (accept_events), because a
-// deadline must start at accept — and arms that deadline: READ when
-// read_timeout_ms is set (it bounds the silence and the whole first request),
-// otherwise IDLE (a connection that has sent nothing is idle). The worker
-// calls it only for a live, tagged registration of this epoll
-// (process_events_plain), so it cannot fail and needs no syscall: EPOLLOUT is
-// dropped later, by the spurious-wake path of the connection's next event.
+// conn_birth creates the state of a connection that has none yet and arms
+// its accept-time deadline from `start`: READ when read_timeout_ms is set (it
+// bounds the silence and the whole first request), otherwise IDLE (a
+// connection that has sent nothing is idle). Two callers: drain_births, with
+// the accept time the accept thread recorded, and the worker loop, with the
+// batch clock, for a tagged first event of a connection the drain has not
+// born: queued after this pass's drain, or not queued at all (the EPOLLOUT
+// registration a full queue falls back to). Neither can fail or
+// needs a syscall; a fallback registration's EPOLLOUT is dropped later, by
+// the spurious-wake path of the connection's next event.
 @[inline]
 fn conn_birth(fd int, start u64, mut st PlainState) {
 	mut cs := state_for(mut st, fd)

@@ -148,6 +148,8 @@ const et_lines_prefix = 'GET /lines'.bytes()
 const et_upload_prefix = 'POST /upload'.bytes()
 const et_lost_prefix = 'GET /lost'.bytes()
 const et_lost_req = 'GET /lost HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const et_nowatch_prefix = 'GET /nowatch'.bytes()
+const et_ok_nowatch_ok = 'GET / HTTP/1.1\r\nHost: x\r\n\r\nGET /nowatch HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 const et_big_prefix = 'GET /big'.bytes()
 const et_sock_prefix = 'GET /sock'.bytes()
 const et_forever_prefix = 'GET /forever'.bytes()
@@ -201,6 +203,9 @@ fn et_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 	if et_has_prefix(req, et_lost_prefix) {
 		event_loop.watch_fd(et_timerfd(50, 0), .readable, et_lost_rearm, unsafe { nil })
 		return .suspend
+	}
+	if et_has_prefix(req, et_nowatch_prefix) {
+		return .suspend // no watch_fd: nothing can ever resume it
 	}
 	if et_has_prefix(req, et_upload_prefix) {
 		out << et_upload_ok // answered from the head; the body is drained unseen
@@ -631,6 +636,38 @@ fn check_lost_resume_closed(backend server.IOBackend) ! {
 	c := out.conns[0]
 	assert c.connect_err == '', c.connect_err
 	assert c.eof, '${backend}: a suspend that cannot be resumed must close the connection'
+	assert out.active_after == 0
+}
+
+// check_unwatched_suspend_closed: three pipelined requests, the middle one's
+// handler returns .suspend without a watch. Nothing can resume it, so the
+// connection is closed (the poll backend, which has no watch reactor, drops it
+// too) — after the first request's answer is flushed, and without answering
+// the third in the middle one's place: its client would take that answer for
+// the middle one's. Also run on io_uring, which has the same drain.
+fn check_unwatched_suspend_closed(backend server.IOBackend) ! {
+	out := vtest.drive(server.ServerConfig{
+		io_multiplexing: backend
+		handler:         et_handler
+		limits:          server.Limits{
+			read_timeout_ms: 300
+		}
+	}, [
+		vtest.Script{
+			rounds:   [
+				vtest.Round{
+					send: et_ok_nowatch_ok
+					want: 1
+				},
+			]
+			then_eof: true
+		},
+	])!
+	c := out.conns[0]
+	assert c.connect_err == '', c.connect_err
+	assert c.frames.len == 1, '${backend}: want only the first answer, got: ${c.raw.bytestr()}'
+	assert c.frames[0] == et_ok, '${backend}: the first answer was not flushed: ${c.raw.bytestr()}'
+	assert c.eof
 	assert out.active_after == 0
 }
 
@@ -1216,6 +1253,22 @@ fn test_epoll_lost_resume_closed() ! {
 	}
 }
 
+fn test_epoll_unwatched_suspend_closed() ! {
+	$if linux {
+		check_unwatched_suspend_closed(.epoll)!
+	}
+}
+
+fn test_iouring_unwatched_suspend_closed() ! {
+	$if linux {
+		if !server.iou_backend_available() {
+			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
+			return
+		}
+		check_unwatched_suspend_closed(.io_uring)!
+	}
+}
+
 fn test_epoll_reaped_under_gc_signals() ! {
 	$if linux {
 		check_reaped_under_gc_signals(.epoll)!
@@ -1369,6 +1422,14 @@ fn test_poll_streamed_expect_uploads_get_their_100() ! {
 	$if linux {
 		$if vanilla_poll ? {
 			check_streamed_expect_uploads_get_their_100(.poll)!
+		}
+	}
+}
+
+fn test_poll_unwatched_suspend_closed() ! {
+	$if linux {
+		$if vanilla_poll ? {
+			check_unwatched_suspend_closed(.poll)!
 		}
 	}
 }

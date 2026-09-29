@@ -411,13 +411,22 @@ fn iou_drain_requests(mut env IouEnv, mut conn io_uring.Connection, limits Limit
 		match step {
 			.done {}
 			.suspend {
-				// Park: no client op will be armed until the watch resumes. Clear the
-				// read deadline — nothing is mid-read, and the sweep must not shut a
-				// parked connection down as a slow reader (a shutdown with no op in
-				// flight would produce no CQE either). `idle` is already false: this
-				// request's first byte cleared it.
-				conn.awaiting_fd = event_loop.last_watched
-				conn.read_deadline = 0
+				if event_loop.last_watched < 0 {
+					// Suspended without a live watch (watch_fd refused its fd, or was
+					// never called): nothing would ever resume this request. Flush
+					// what was appended, then close (the epoll rule), instead of
+					// answering the next pipelined request in its place (the loop
+					// condition stops the drain).
+					conn.close_after_send = true
+				} else {
+					// Park: no client op will be armed until the watch resumes. Clear
+					// the read deadline — nothing is mid-read, and the sweep must not
+					// shut a parked connection down as a slow reader (a shutdown with
+					// no op in flight would produce no CQE either). `idle` is already
+					// false: this request's first byte cleared it.
+					conn.awaiting_fd = event_loop.last_watched
+					conn.read_deadline = 0
+				}
 			}
 			.close {
 				conn.close_after_send = true
