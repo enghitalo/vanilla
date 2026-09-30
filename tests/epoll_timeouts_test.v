@@ -12,8 +12,15 @@
 // still gets its 408, also after Expect: 100-continue; streams whose clients
 // all vanish at once are released exactly once; an app's fd that a finished
 // watch left registered is never adopted as a connection, nor spun on once
-// it reads EOF (a pooled fd whose upstream went away); and a request that
-// parks on its own client's writability leaves the connection serving.
+// it reads EOF (a pooled fd whose upstream went away), births on or off; and a
+// request that parks on its own client's writability leaves the connection
+// serving. And the #155 checks, each built as an exact order of events in one
+// epoll_wait batch (see "choreographed checks" below): the sweep's 408 to a
+// peer that is already gone must not raise SIGPIPE; a pipelined head whose
+// client vanished mid-stream keeps its result from the next client; a
+// continuation that steps away from an fd leaves no spin and no zombie
+// behind; and a stale event for an fd closed earlier in the batch neither
+// releases a connection twice nor wakes the new watch on a reused number.
 // The checks that need no watch reactor or takeover also run on the poll
 // backend (`-d vanilla_poll`), which shares the 408 / fresh-deadline rules.
 //
@@ -25,8 +32,10 @@
 import os
 import server
 import core
+import socket
 import sync.stdatomic
 import time
+import transport
 import vtest
 
 $if linux {
@@ -41,6 +50,8 @@ fn C.write(fd int, buf voidptr, count usize) int
 fn C.close(fd int) int
 fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
 fn C.clock() i64 // this process's CPU time, in CLOCKS_PER_SEC (1e6 on POSIX) units
+fn C.send(__fd int, __buf voidptr, __n usize, __flags int) int
+fn C.recv(__fd int, __buf voidptr, __n usize, __flags int) int
 
 const et_req = 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 const et_ok = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
@@ -95,6 +106,158 @@ mut:
 }
 
 const et_pool = &EtPool{}
+
+// --- choreographed checks (#155) ---------------------------------------------
+// Each needs a given order of events inside ONE epoll_wait batch. An
+// orchestrator handler produces it: with workers: 1 it runs on the only
+// worker, which is busy inside it, so the events it makes ready (closing a
+// hand-rolled client, writing a socketpair peer or a request into a client)
+// queue in the kernel's FIFO ready list and come back in that order in the
+// next batch. The server listens on a unix socket: a send to a closed AF_UNIX
+// peer fails at once (EPIPE), where a TCP peer that sent FIN takes one more.
+// No connection is opened while that batch runs: accept (another thread)
+// could hand it a number the batch frees. A check's helper connections are
+// opened, and served once, before its orchestrator.
+
+// EtChoreo is where those checks keep the fds their handlers act on: the
+// handlers run on the worker thread, the check on the test thread. -1 = unset.
+struct EtChoreo {
+mut:
+	a        i64 = -1 // hand-rolled client A's own end (an orchestrator closes it)
+	b        i64 = -1 // hand-rolled client B's own end (an orchestrator writes a request into it)
+	x        i64 = -1 // a watched socketpair end, server side
+	peer     i64 = -1 // x's peer: writing it makes x readable
+	up0      i64 = -1 // the mock pipelined upstream: the end every /pq parks on
+	up1      i64 = -1 // ...and the end its "DB" writes the results into, in order
+	pinned   i64 // 1 once /h6new's timer holds x's (freed) number
+	spurious i64 // continuations that ran with nothing ready
+}
+
+const et_ch = &EtChoreo{}
+
+fn et_ch_reset() {
+	mut c := unsafe { et_ch }
+	for p in [&c.a, &c.b, &c.x, &c.peer, &c.up0, &c.up1] {
+		stdatomic.store_i64(p, -1)
+	}
+	stdatomic.store_i64(&c.pinned, 0)
+	stdatomic.store_i64(&c.spurious, 0)
+}
+
+// et_ch_close closes and clears the fd kept in *p, if any. Each fd has one
+// closer at a time (its handler on the worker, or the check once the harness
+// stopped), so a load then a store is enough.
+fn et_ch_close(p &i64) {
+	fd := stdatomic.load_i64(p)
+	if fd >= 0 {
+		stdatomic.store_i64(p, -1)
+		C.close(int(fd))
+	}
+}
+
+// et_ch_write writes b into the fd kept in *p (a peer or a client end).
+fn et_ch_write(p &i64, b []u8) {
+	fd := stdatomic.load_i64(p)
+	if fd >= 0 {
+		et_write_all(int(fd), b)
+	}
+}
+
+fn et_uds(tag string) string {
+	return os.join_path(os.temp_dir(), 'vanilla_et_${tag}_${os.getpid()}.sock')
+}
+
+// et_dial connects a hand-rolled client to the unix socket at path and writes
+// req on it. Blocking: vtest does not own this fd, the check reads it itself.
+fn et_dial(path string, req []u8) !int {
+	fd := transport.dial_unix(path)!
+	socket.set_blocking(fd, true)
+	et_write_all(fd, req)
+	return fd
+}
+
+fn et_write_all(fd int, b []u8) {
+	mut off := 0
+	for off < b.len {
+		n := C.send(fd, unsafe { &b[off] }, usize(b.len - off), C.MSG_NOSIGNAL)
+		if n <= 0 {
+			return
+		}
+		off += n
+	}
+}
+
+// et_read_response reads one Content-Length framed response from a blocking
+// hand-rolled client. No timeout (the vtest liveness contract): a server that
+// never answers hangs the check, which the CI step timeout bounds.
+fn et_read_response(fd int) []u8 {
+	mut acc := []u8{}
+	mut buf := [4096]u8{}
+	for {
+		s := acc.bytestr()
+		head := s.index('\r\n\r\n') or { -1 }
+		if head >= 0 {
+			cl := s.all_after('Content-Length: ').all_before('\r\n').int()
+			if acc.len >= head + 4 + cl {
+				return acc[..head + 4 + cl]
+			}
+		}
+		n := C.recv(fd, &buf[0], usize(buf.len), 0)
+		if n <= 0 {
+			return acc
+		}
+		acc << buf[..n]
+	}
+	return acc
+}
+
+const et_zombie = 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\nzombie'.bytes()
+const et_spurious = 'HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: keep-alive\r\n\r\nspurious'.bytes()
+
+// /block408 holds the worker for longer than a 500 ms read budget plus a
+// sweep interval, then parks on a socketpair end that is already readable,
+// whose continuation closes client A.
+const et_block408_req = 'GET /block408 HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const et_block408_prefix = 'GET /block408'.bytes()
+
+// /park parks on a request-owned socketpair end (et_ch.x / et_ch.peer). Two
+// orchestrators then order a hangup of client A (parked there) and x's
+// readiness: /hupfirst closes A first, /readyfirst makes x readable first.
+const et_park_req = 'GET /park HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const et_park_prefix = 'GET /park'.bytes()
+const et_hupfirst_req = 'GET /hupfirst HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const et_hupfirst_prefix = 'GET /hupfirst'.bytes()
+const et_readyfirst_req = 'GET /readyfirst HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const et_readyfirst_prefix = 'GET /readyfirst'.bytes()
+
+// /h6orch closes client A (parked on x), writes /h6new into client B, then
+// makes x readable. /h6new parks on a fresh 300 ms timer that takes x's
+// number.
+const et_h6orch_req = 'GET /h6orch HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const et_h6orch_prefix = 'GET /h6orch'.bytes()
+const et_h6new_req = 'GET /h6new HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const et_h6new_prefix = 'GET /h6new'.bytes()
+
+// /pq pipelines on one mock upstream (et_ch.up0, persistent): every request
+// parks on it, and the results come back in order, one byte each. A `.`
+// streams the head of the parked request's response first. /qorch streams a
+// `.` to the head and closes client A (the head) behind it; /qfeed writes
+// the results `1` then `2`.
+const et_pq_req = 'GET /pq HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const et_pq_prefix = 'GET /pq'.bytes()
+const et_pq_head = 'HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const et_qorch_req = 'GET /qorch HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const et_qorch_prefix = 'GET /qorch'.bytes()
+const et_qfeed_req = 'GET /qfeed HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const et_qfeed_prefix = 'GET /qfeed'.bytes()
+
+// /stepw parks on a socketpair end (.writable), then steps to a 500 ms timer
+// keeping that end open. /stepr does the same on an end that is readable (a
+// complete request waits in it), then checks that nothing read it meanwhile.
+const et_stepw_req = 'GET /stepw HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const et_stepw_prefix = 'GET /stepw'.bytes()
+const et_stepr_req = 'GET /stepr HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const et_stepr_prefix = 'GET /stepr'.bytes()
 
 // /self parks on its own client socket becoming writable (the backpressure
 // pattern), then answers.
@@ -250,7 +413,224 @@ fn et_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 		event_loop.watch_fd(int(sv[0]), .writable, et_sock_step, pair)
 		return .suspend
 	}
+	return et_choreo_handler(req, mut out, mut event_loop)
+}
+
+// et_choreo_handler serves the routes of the choreographed checks (#155).
+fn et_choreo_handler(req []u8, mut out []u8, mut event_loop core.EventLoop) core.Step {
+	mut c := unsafe { et_ch }
+	if et_has_prefix(req, et_block408_prefix) {
+		// A blocking read on a timerfd holds the worker (lower bound only).
+		tfd := et_timerfd(1000, 0)
+		mut tmp := [8]u8{}
+		C.read(tfd, &tmp[0], 8)
+		C.close(tfd)
+		mut sv := [2]i32{}
+		if C.socketpair(C.AF_UNIX, C.SOCK_STREAM, 0, &sv[0]) != 0 {
+			return .close
+		}
+		one := [u8(`x`)]!
+		C.write(int(sv[1]), &one[0], 1)
+		pair := voidptr(usize(u32(sv[0])) | (usize(u32(sv[1])) << 32))
+		event_loop.watch_fd(int(sv[0]), .readable, et_block408_done, pair)
+		return .suspend
+	}
+	if et_has_prefix(req, et_park_prefix) {
+		mut sv := [2]i32{}
+		if C.socketpair(C.AF_UNIX, C.SOCK_STREAM, 0, &sv[0]) != 0 {
+			return .close
+		}
+		stdatomic.store_i64(&c.x, i64(sv[0]))
+		stdatomic.store_i64(&c.peer, i64(sv[1]))
+		event_loop.watch_fd(int(sv[0]), .readable, et_park_done, unsafe { nil })
+		return .suspend
+	}
+	if et_has_prefix(req, et_hupfirst_prefix) {
+		et_ch_close(&c.a)
+		et_ch_write(&c.peer, 'x'.bytes())
+		out << et_ok
+		return .done
+	}
+	if et_has_prefix(req, et_readyfirst_prefix) {
+		et_ch_write(&c.peer, 'x'.bytes())
+		et_ch_close(&c.a)
+		out << et_ok
+		return .done
+	}
+	if et_has_prefix(req, et_h6orch_prefix) {
+		et_ch_close(&c.a)
+		et_ch_write(&c.b, et_h6new_req)
+		et_ch_write(&c.peer, 'x'.bytes())
+		out << et_ok
+		return .done
+	}
+	if et_has_prefix(req, et_h6new_prefix) {
+		mut tfd := et_timerfd_nonblock(300)
+		// The kernel hands out the lowest free number, which is x's here unless
+		// a lower one is free too: fd numbers are process-wide, shared with the
+		// check's own clients and earlier checks. Pin it, as long as x is free.
+		x := int(stdatomic.load_i64(&c.x))
+		if tfd >= 0 && x >= 0 && tfd != x && et_fd_inode(x) == 0 {
+			C.dup2(i32(tfd), i32(x))
+			C.close(tfd)
+			tfd = x
+		}
+		if tfd == x {
+			stdatomic.store_i64(&c.pinned, 1)
+		}
+		event_loop.watch_fd(tfd, .readable, et_h6_done, unsafe { nil })
+		return .suspend
+	}
+	if et_has_prefix(req, et_pq_prefix) {
+		if stdatomic.load_i64(&c.up0) < 0 {
+			mut sv := [2]i32{}
+			if C.socketpair(C.AF_UNIX, C.SOCK_STREAM | C.SOCK_NONBLOCK, 0, &sv[0]) != 0 {
+				return .close
+			}
+			stdatomic.store_i64(&c.up1, i64(sv[1]))
+			stdatomic.store_i64(&c.up0, i64(sv[0]))
+		}
+		event_loop.watch_fd_persistent(int(stdatomic.load_i64(&c.up0)), .readable, et_pq_done,
+			unsafe { nil })
+		return .suspend
+	}
+	if et_has_prefix(req, et_qorch_prefix) {
+		et_ch_write(&c.up1, '.'.bytes())
+		et_ch_close(&c.a)
+		out << et_ok
+		return .done
+	}
+	if et_has_prefix(req, et_qfeed_prefix) {
+		et_ch_write(&c.up1, '12'.bytes())
+		out << et_ok
+		return .done
+	}
+	if et_has_prefix(req, et_stepw_prefix) {
+		mut sv := [2]i32{}
+		if C.socketpair(C.AF_UNIX, C.SOCK_STREAM, 0, &sv[0]) != 0 {
+			return .close
+		}
+		pair := voidptr(usize(u32(sv[0])) | (usize(u32(sv[1])) << 32))
+		event_loop.watch_fd(int(sv[0]), .writable, et_stepw_step, pair)
+		return .suspend
+	}
+	if et_has_prefix(req, et_stepr_prefix) {
+		mut sv := [2]i32{}
+		if C.socketpair(C.AF_UNIX, C.SOCK_STREAM | C.SOCK_NONBLOCK, 0, &sv[0]) != 0 {
+			return .close
+		}
+		et_write_all(int(sv[1]), et_req) // a whole request waits in sv[0]
+		pair := voidptr(usize(u32(sv[0])) | (usize(u32(sv[1])) << 32))
+		event_loop.watch_fd(int(sv[0]), .readable, et_stepr_step, pair)
+		return .suspend
+	}
 	out << et_ok
+	return .done
+}
+
+// et_block408_done closes client A behind the batch that runs it (A's hangup
+// is only reported by the next epoll_wait), then answers.
+fn et_block408_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	et_ch_close(unsafe { &et_ch.a })
+	pair := u64(usize(watch_payload))
+	C.close(int(u32(pair & 0xffff_ffff)))
+	C.close(int(u32(pair >> 32)))
+	out << et_ok
+	return .done
+}
+
+// et_park_done consumes x's byte, closes both ends and the connection.
+fn et_park_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	mut tmp := [8]u8{}
+	C.read(ready_fd, &tmp[0], 8)
+	mut c := unsafe { et_ch }
+	stdatomic.store_i64(&c.x, -1)
+	C.close(ready_fd)
+	et_ch_close(&c.peer)
+	return .close
+}
+
+// et_h6_done answers `ok` once its timer really expired, `spurious` if it
+// ran with nothing to read.
+fn et_h6_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	mut v := u64(0)
+	mut c := unsafe { et_ch }
+	if C.read(ready_fd, &v, 8) == 8 {
+		out << et_ok
+	} else {
+		stdatomic.add_i64(&c.spurious, 1)
+		out << et_spurious
+	}
+	C.close(ready_fd)
+	return .done
+}
+
+// et_timerfd_nonblock is a one-shot, non-blocking et_timerfd: a read before
+// it expires fails (EAGAIN) instead of blocking the worker.
+fn et_timerfd_nonblock(ms int) int {
+	tfd := C.timerfd_create(1, C.TFD_NONBLOCK) // 1 = CLOCK_MONOTONIC
+	if tfd < 0 {
+		return tfd
+	}
+	mut spec := [4]i64{}
+	spec[2] = i64(ms / 1000)
+	spec[3] = i64(ms % 1000) * 1_000_000
+	C.timerfd_settime(tfd, 0, unsafe { voidptr(&spec[0]) }, unsafe { nil })
+	return tfd
+}
+
+// et_pq_done takes the next result off the mock upstream, in order: `.`
+// streams the response head (payload 1 = head sent), a digit completes it.
+fn et_pq_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	mut b := [1]u8{}
+	if C.read(ready_fd, &b[0], 1) != 1 {
+		event_loop.watch_fd_persistent(ready_fd, .readable, et_pq_done, watch_payload)
+		return .suspend
+	}
+	if b[0] == `.` {
+		out << et_pq_head
+		event_loop.watch_fd_persistent(ready_fd, .readable, et_pq_done, voidptr(usize(1)))
+		return .suspend
+	}
+	if watch_payload == unsafe { nil } {
+		out << et_pq_head
+	}
+	out << b[0]
+	return .done
+}
+
+// et_stepw_step steps from the (writable) socketpair end to a 500 ms timer,
+// keeping the end open: from then on nothing watches it.
+fn et_stepw_step(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	event_loop.watch_fd(et_timerfd(500, 0), .readable, et_sock_done, watch_payload)
+	return .suspend
+}
+
+// et_stepr_step steps from the readable end to a 200 ms timer without reading.
+fn et_stepr_step(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	event_loop.watch_fd(et_timerfd(200, 0), .readable, et_stepr_done, watch_payload)
+	return .suspend
+}
+
+// et_stepr_done answers `ok` if the request is still unread in the end it
+// stepped away from and nothing was written back into it; `zombie` if the
+// worker served that end as if it were a client connection.
+fn et_stepr_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	mut tmp := [8]u8{}
+	C.read(ready_fd, &tmp[0], 8)
+	C.close(ready_fd)
+	pair := u64(usize(watch_payload))
+	s := int(u32(pair & 0xffff_ffff))
+	peer := int(u32(pair >> 32))
+	unread := C.recv(s, &tmp[0], 1, C.MSG_PEEK | C.MSG_DONTWAIT) == 1
+	answered := C.recv(peer, &tmp[0], 1, C.MSG_DONTWAIT) > 0
+	C.close(s)
+	C.close(peer)
+	if unread && !answered {
+		out << et_ok
+	} else {
+		out << et_zombie
+	}
 	return .done
 }
 
@@ -1209,6 +1589,271 @@ fn check_self_watch_keepalive(backend server.IOBackend) ! {
 	}
 	assert c.eof
 	assert out.active_after == 0, '${backend}: active_conns drifted to ${out.active_after}'
+}
+
+// Accept-time births on, with nothing expiring during a check.
+const et_births_on = server.Limits{
+	read_timeout_ms: 60000
+	idle_timeout_ms: -1
+}
+
+fn et_births(limits server.Limits) string {
+	return if limits.read_timeout_ms > 0 || limits.idle_timeout_ms > 0 {
+		'births on'
+	} else {
+		'births off'
+	}
+}
+
+fn et_uds_server(path string, limits server.Limits) server.ServerConfig {
+	return server.ServerConfig{
+		io_multiplexing:  .epoll
+		handler:          et_handler
+		workers:          1
+		unix_socket_path: path
+		limits:           limits
+	}
+}
+
+fn et_one(req []u8) vtest.Script {
+	return vtest.Script{
+		rounds: [
+			vtest.Round{
+				send: req
+				want: 1
+			},
+		]
+	}
+}
+
+// check_408_to_vanished_peer_no_sigpipe (#155): the sweep's 408 goes to a
+// peer that left after epoll_wait collected the batch, so its hangup is only
+// reported by the next one. Client A sends part of a request (it earns a 408);
+// /block408 holds the worker past A's 500 ms deadline and parks on an fd that
+// is already ready. The next pass (hot: epoll_wait(0), its clock now past the
+// deadline) runs the continuation, which closes A; its sweep then writes the
+// 408 to a closed AF_UNIX peer: EPIPE, and without MSG_NOSIGNAL a SIGPIPE,
+// whose default action kills this test binary. The witness proves the sweep ran.
+fn check_408_to_vanished_peer_no_sigpipe() ! {
+	path := et_uds('408')
+	et_ch_reset()
+	mut c := unsafe { et_ch }
+	mut h := vtest.start(et_uds_server(path, server.Limits{ read_timeout_ms: 500 }))!
+	defer {
+		h.stop()
+	}
+	stdatomic.store_i64(&c.a, i64(et_dial(path, 'GET / HTTP/1.1\r\nHo'.bytes())!))
+	x := h.fire([et_one(et_block408_req)])!
+	assert !x.conns[0].unmet && x.conns[0].frames.len == 1, '/block408 not answered: ${x.conns[0].raw.bytestr()}'
+	witness := h.fire([et_silent])!
+	assert witness.conns[0].eof, 'the silent witness must be reaped'
+}
+
+// check_pipelined_head_flush_failure (#155 H2): two clients pipelined on one
+// mock upstream. The head's continuation streams its response head and
+// suspends (its result is still in flight), and that flush finds client A
+// gone. Its queue slot must become a tombstone that consumes A's result when
+// it arrives; dropping it handed A's result (`1`) to the next client.
+fn check_pipelined_head_flush_failure(limits server.Limits) ! {
+	path := et_uds('pq')
+	et_ch_reset()
+	mut c := unsafe { et_ch }
+	mut h := vtest.start(et_uds_server(path, limits))!
+	defer {
+		h.stop()
+		et_ch_close(&c.up0)
+		et_ch_close(&c.up1)
+	}
+	label := et_births(limits)
+	stdatomic.store_i64(&c.a, i64(et_dial(path, et_pq_req)!))
+	second := h.fire([
+		vtest.Script{
+			rounds: [
+				vtest.Round{
+					send: et_pq_req
+					want: 0 // parks behind A, answered at the end
+				},
+			]
+		},
+	])!
+	feed := h.fire([et_one(et_req)])! // accepted before the orchestrated batch
+
+	orch := h.fire([et_one(et_qorch_req)])!
+	assert orch.conns[0].frames.len == 1, '${label}: /qorch not answered'
+	fed := h.send(feed.group, et_qfeed_req, vtest.frames(2))!
+	assert fed.conns[0].frames.len == 2, '${label}: /qfeed not answered'
+	out := h.wait(second.group, vtest.frames(1))!
+	r := out.conns[0]
+	assert !r.unmet && r.frames.len == 1, '${label}: the second client was not answered: ${r.raw.bytestr()}'
+	assert r.frames[0] == et_concat(et_pq_head, '2'.bytes()), "${label}: the second client got the first client's in-flight result: ${r.frames[0].bytestr()}"
+	// A's hangup was still queued in the batch whose flush closed it: a stale
+	// event, which must not release A again (the second client, the feed and
+	// the orchestrator stay open).
+	assert out.active_after == 3, '${label}: active_conns drifted to ${out.active_after}'
+}
+
+// check_stepped_away_watch (#155 H4): a continuation that steps from one fd
+// to another, keeping the first open, leaves it registered, level-triggered,
+// with no watch behind it — and with births off nothing else ever looks at it.
+// /stepw leaves a writable end for 500 ms: it reports on every epoll_wait, so
+// the worker spun. /stepr leaves a readable end with a request in it: the
+// worker served it as a client connection — read the request, wrote the
+// response back into it.
+fn check_stepped_away_watch(limits server.Limits) ! {
+	mut h := vtest.start(server.ServerConfig{
+		io_multiplexing: .epoll
+		handler:         et_handler
+		workers:         1
+		limits:          limits
+	})!
+	defer {
+		h.stop()
+	}
+	label := et_births(limits)
+	cpu0 := C.clock()
+	w := h.fire([et_one(et_stepw_req)])!
+	cpu_us := C.clock() - cpu0
+	assert !w.conns[0].unmet && w.conns[0].frames.len == 1, '${label}: /stepw not answered: ${w.conns[0].raw.bytestr()}'
+	assert cpu_us < 100_000, '${label}: the worker busy-looped on an end a continuation stepped away from: ${cpu_us} us of CPU in 500 ms'
+	r := h.fire([et_one(et_stepr_req)])!
+	assert !r.conns[0].unmet && r.conns[0].frames.len == 1, '${label}: /stepr not answered: ${r.conns[0].raw.bytestr()}'
+	assert r.conns[0].frames[0] == et_ok, '${label}: the end a continuation stepped away from was served as a connection'
+	assert r.active_after == 2, '${label}: active_conns drifted to ${r.active_after}'
+}
+
+// check_stale_event_after_close (#155 H5): an event for an fd the worker
+// closed earlier in the same batch describes a registration that is gone. It
+// must be dropped, births on or off. /hupfirst closes client A (parked on x)
+// and then makes x readable: A's hangup tears x down, and x's stale event
+// built a zombie on the closed number, whose close released a slot that was
+// never taken. /readyfirst makes x readable first: its continuation closes
+// A, and A's stale hangup released A a second time. Either way active_conns
+// fell below the two connections open (the orchestrator's and the barrier's).
+fn check_stale_event_after_close(limits server.Limits, orch []u8) ! {
+	path := et_uds('h5')
+	et_ch_reset()
+	mut c := unsafe { et_ch }
+	mut h := vtest.start(et_uds_server(path, limits))!
+	defer {
+		h.stop()
+		et_ch_close(&c.peer)
+	}
+	label := '${et_births(limits)} ${orch.bytestr().all_before(' HTTP')}'
+	stdatomic.store_i64(&c.a, i64(et_dial(path, et_park_req)!))
+	barrier := h.fire([et_one(et_req)])! // accepted before the orchestrated batch
+	o := h.fire([et_one(orch)])!
+	assert o.conns[0].frames.len == 1, '${label}: orchestrator not answered'
+	after := h.send(barrier.group, et_req, vtest.frames(2))!
+	assert after.conns[0].frames.len == 2, '${label}: barrier not answered'
+	assert after.active_after == 2, '${label}: active_conns is ${after.active_after} with 2 connections open: a stale event released a closed connection again'
+}
+
+// check_stale_event_not_routed_to_new_watch (#155 H6): in one batch, client
+// A's hangup tears down its watch fd x, client B's request then parks on a
+// fresh timer that takes x's number, and x's stale readiness follows. It must
+// not reach B's continuation, which would run with nothing ready (or block,
+// on a blocking fd): B answers `ok` only once its timer expires.
+fn check_stale_event_not_routed_to_new_watch(limits server.Limits) ! {
+	path := et_uds('h6')
+	et_ch_reset()
+	mut c := unsafe { et_ch }
+	mut h := vtest.start(et_uds_server(path, limits))!
+	defer {
+		h.stop()
+		et_ch_close(&c.peer)
+		et_ch_close(&c.b)
+	}
+	label := et_births(limits)
+	stdatomic.store_i64(&c.a, i64(et_dial(path, et_park_req)!))
+	stdatomic.store_i64(&c.b, i64(et_dial(path, []u8{})!))
+	o := h.fire([et_one(et_h6orch_req)])!
+	assert o.conns[0].frames.len == 1, '${label}: orchestrator not answered'
+	resp := et_read_response(int(stdatomic.load_i64(&c.b)))
+	assert stdatomic.load_i64(&c.pinned) == 1, "${label}: precondition: /h6new's timer did not take the torn-down number"
+	assert stdatomic.load_i64(&c.spurious) == 0, '${label}: a stale event for a torn-down fd ran the continuation of the new watch on its number'
+	assert resp == et_ok, '${label}: /h6new answered ${resp.bytestr()}'
+}
+
+// check_pooled_fd_eof_births_off: check_pooled_fd_eof_no_spin with births off
+// (the default Limits), where no birth guard looks at an fd with no state.
+// The pooled end reading EOF was taken for a client hanging up: the worker
+// closed the app's fd under it and released a slot that was never taken. The
+// window is a /delay request (900 ms), with the worker blocked in epoll_wait.
+fn check_pooled_fd_eof_births_off(uds string) ! {
+	mut h := vtest.start(server.ServerConfig{
+		io_multiplexing:  .epoll
+		handler:          et_handler
+		workers:          1
+		unix_socket_path: uds
+	})!
+	defer {
+		h.stop()
+	}
+	pool := h.fire([
+		vtest.Script{
+			rounds: [
+				vtest.Round{
+					send: et_pool_req
+					want: 1
+				},
+			]
+		},
+	])!
+	assert !pool.conns[0].unmet, '${uds}: /pool not answered: ${pool.conns[0].raw.bytestr()}'
+	cpu0 := C.clock()
+	window := h.fire([et_one(et_delay_req)])!
+	cpu_us := C.clock() - cpu0
+	assert window.conns[0].frames.len == 1, '${uds}: /delay not answered'
+	assert cpu_us < 100_000, '${uds}: the worker busy-looped on a pooled fd whose upstream closed: ${cpu_us} us of CPU in 900 ms'
+	again := h.send(pool.group, et_req, vtest.frames(2))!
+	assert !again.conns[0].eof && !again.conns[0].unmet, '${uds}: the client connection stopped serving: ${again.conns[0].raw.bytestr()}'
+	assert again.active_after == 2, '${uds}: active_conns drifted to ${again.active_after}'
+	pooled := int(stdatomic.load_i64(&et_pool.fd))
+	assert et_fd_inode(pooled) == u64(stdatomic.load_i64(&et_pool.inode)), '${uds}: the pooled end was closed under the app'
+	C.close(pooled)
+}
+
+fn test_epoll_408_to_vanished_peer_no_sigpipe() ! {
+	$if linux {
+		check_408_to_vanished_peer_no_sigpipe()!
+	}
+}
+
+fn test_epoll_pipelined_head_flush_failure() ! {
+	$if linux {
+		check_pipelined_head_flush_failure(et_births_on)!
+		check_pipelined_head_flush_failure(server.Limits{})!
+	}
+}
+
+fn test_epoll_stepped_away_watch() ! {
+	$if linux {
+		check_stepped_away_watch(server.Limits{})!
+		check_stepped_away_watch(et_births_on)!
+	}
+}
+
+fn test_epoll_stale_event_after_close() ! {
+	$if linux {
+		for limits in [server.Limits{}, et_births_on] {
+			check_stale_event_after_close(limits, et_hupfirst_req)!
+			check_stale_event_after_close(limits, et_readyfirst_req)!
+		}
+	}
+}
+
+fn test_epoll_stale_event_not_routed_to_new_watch() ! {
+	$if linux {
+		check_stale_event_not_routed_to_new_watch(server.Limits{})!
+		check_stale_event_not_routed_to_new_watch(et_births_on)!
+	}
+}
+
+fn test_epoll_pooled_fd_eof_births_off() ! {
+	$if linux {
+		check_pooled_fd_eof_births_off('')!
+		check_pooled_fd_eof_births_off(et_uds('pool_off'))!
+	}
 }
 
 fn test_epoll_takeover_not_idle_reaped() ! {
