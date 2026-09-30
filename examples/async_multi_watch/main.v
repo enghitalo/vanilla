@@ -31,7 +31,7 @@ fn one_shot_timer(ms int) int {
 	mut spec := [4]i64{} // { it_interval{0,0}, it_value{sec,nsec} } → one-shot
 	spec[2] = i64(ms / 1000)
 	spec[3] = i64(ms % 1000) * 1_000_000
-	C.timerfd_settime(tfd, 0, voidptr(&spec[0]), unsafe { nil })
+	C.timerfd_settime(tfd, 0, unsafe { voidptr(&spec[0]) }, unsafe { nil })
 	return tfd
 }
 
