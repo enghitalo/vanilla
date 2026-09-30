@@ -18,6 +18,9 @@ module http2
 //     pending buffer until WINDOW_UPDATE) and replenished eagerly on the
 //     receive side (bodies are consumed on arrival, so both windows snap
 //     back to full after every DATA frame).
+//   - a response may end with trailers: write_response_body(end_stream=false)
+//     then write_response_trailers, which waits behind any DATA still parked
+//     on flow control (gRPC's grpc-status travels this way).
 //   - trailers are decoded (HPACK state is connection-global and MUST see
 //     every block) but not surfaced; PRIORITY is parsed and ignored.
 //   - errors follow RFC 9113 §5.4: connection-fatal ones append a GOAWAY and
@@ -63,6 +66,10 @@ mut:
 	pending     []u8
 	pending_off int
 	pending_end bool
+	// response trailers (an HPACK block) held back while DATA ahead of them is
+	// still parked; flush_pending writes them as the stream's final HEADERS
+	trailers         []u8
+	trailers_pending bool
 }
 
 // ServerConn is one connection's HTTP/2 state. Allocate with new_server_conn
@@ -368,9 +375,11 @@ fn (mut c ServerConn) new_stream(stream_id u32) &StreamState {
 	s.send_window = c.init_send_window
 	s.pending_off = 0
 	s.pending_end = false
+	s.trailers_pending = false
 	s.headers.clear()
 	s.body.clear()
 	s.pending.clear()
+	s.trailers.clear()
 	c.streams[stream_id] = s
 	return s
 }
@@ -385,6 +394,7 @@ fn (mut c ServerConn) release_stream(stream_id u32) {
 		s.headers.clear()
 		s.body.clear()
 		s.pending.clear()
+		s.trailers.clear()
 		c.free_streams << s
 	}
 	c.streams.delete(stream_id)
@@ -765,10 +775,19 @@ pub fn (mut c ServerConn) write_response_headers(mut out []u8, stream_id u32, bl
 // and flushed as the peer's WINDOW_UPDATEs arrive (through consume). The
 // last DATA frame carries END_STREAM and releases the stream state.
 pub fn (mut c ServerConn) write_response_data(mut out []u8, stream_id u32, body []u8) {
+	c.write_response_body(mut out, stream_id, body, true)
+}
+
+// write_response_body is write_response_data with the ending left to the
+// caller: end_stream=false sends the body without END_STREAM and keeps the
+// stream open for write_response_trailers.
+pub fn (mut c ServerConn) write_response_body(mut out []u8, stream_id u32, body []u8, end_stream bool) {
 	mut s := c.streams[stream_id] or { return }
 	if body.len == 0 {
-		write_data_header(mut out, stream_id, 0, true)
-		c.release_stream(stream_id)
+		if end_stream {
+			write_data_header(mut out, stream_id, 0, true)
+			c.release_stream(stream_id)
+		}
 		return
 	}
 	// Emit directly from `body` as far as the connection + stream send windows
@@ -792,7 +811,7 @@ pub fn (mut c ServerConn) write_response_data(mut out []u8, stream_id u32, body 
 		if chunk > c.peer_max_frame {
 			chunk = c.peer_max_frame
 		}
-		last := off + chunk == body.len
+		last := off + chunk == body.len && end_stream
 		write_data_header(mut out, stream_id, chunk, last)
 		unsafe { out.push_many(&body[off], chunk) }
 		off += chunk
@@ -801,10 +820,25 @@ pub fn (mut c ServerConn) write_response_data(mut out []u8, stream_id u32, body 
 	}
 	if off < body.len {
 		unsafe { s.pending.push_many(&body[off], body.len - off) }
-		s.pending_end = true
-	} else {
+		s.pending_end = end_stream
+	} else if end_stream {
 		c.release_stream(stream_id)
 	}
+}
+
+// write_response_trailers ends an open response (write_response_body with
+// end_stream=false) with a trailer header block, as HEADERS + END_STREAM. If
+// part of the body is still parked on flow control, the block is copied and
+// sent right after that DATA drains, so trailers never overtake the body.
+pub fn (mut c ServerConn) write_response_trailers(mut out []u8, stream_id u32, block []u8) {
+	mut s := c.streams[stream_id] or { return }
+	if s.pending_off < s.pending.len {
+		s.trailers.clear()
+		s.trailers << block
+		s.trailers_pending = true
+		return
+	}
+	c.write_response_headers(mut out, stream_id, block, true)
 }
 
 fn (mut c ServerConn) flush_pending(mut out []u8, stream_id u32) {
@@ -832,7 +866,14 @@ fn (mut c ServerConn) flush_pending(mut out []u8, stream_id u32) {
 		c.conn_send_window -= i64(chunk)
 		s.send_window -= i64(chunk)
 	}
-	if s.pending_off == s.pending.len && s.pending_end {
-		c.release_stream(stream_id)
+	if s.pending_off == s.pending.len {
+		if s.pending_end {
+			c.release_stream(stream_id)
+		} else if s.trailers_pending {
+			// write_response_headers releases the stream (clearing s.trailers)
+			// only after the block has been copied into out
+			s.trailers_pending = false
+			c.write_response_headers(mut out, stream_id, s.trailers, true)
+		}
 	}
 }
