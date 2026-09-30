@@ -361,9 +361,11 @@ fn register_watch(mut w core.EventLoop, ext_fd int, interest core.WatchInterest,
 // drains the socket, answers every complete request, and parks only when a
 // handler actually suspends. The worker loop in worker_linux.c.v routes
 // watched-fd readiness to on_watch_ready and client reads here; the event
-// loop, accept, the busy-poll hybrid and the timeout sweep live there.
+// loop, accept, the busy-poll hybrid and the timeout sweep live there. `known`
+// is fd's state as the worker loop already looked it up — nil on the first
+// event of a connection with births off, whose state is created here.
 @[direct_array_access; manualfree]
-fn handle_readable(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, state voidptr) {
+fn handle_readable(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, known &ConnState, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, state voidptr) {
 	// In-flight window for the graceful-shutdown drain (per-worker counter, own
 	// cache line — uncontended, measured free on the hot path).
 	stdatomic.add_i64(&counter.n, 1)
@@ -371,7 +373,10 @@ fn handle_readable(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, li
 		stdatomic.add_i64(&counter.n, -1)
 	}
 
-	mut cs := state_for(mut st, fd)
+	mut cs := unsafe { known }
+	if unsafe { cs == nil } {
+		cs = state_create(mut st, fd)
+	}
 	// Already parked on a watch: a readable edge here is either the client hanging
 	// up or pipelining ahead. Peek to detect a close (tear the watch down); any
 	// data stays in the socket buffer and is read once the in-flight watch resumes.

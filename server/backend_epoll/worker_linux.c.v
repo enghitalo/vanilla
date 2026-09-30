@@ -326,7 +326,12 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 					active_conns, mut st, state)
 				continue
 			}
-			if fd >= st.conns.len || unsafe { st.conns[fd] == nil } {
+			// fd's state, looked up ONCE per event and handed to the handlers.
+			mut cs := unsafe { &ConnState(nil) }
+			if fd < st.conns.len {
+				cs = st.conns[fd]
+			}
+			if unsafe { cs == nil } {
 				if st.births_q != unsafe { nil } && fd == st.births_q.wake_fd {
 					// The accept thread queued a connection while this worker
 					// slept: reset the eventfd (drain_births above took the entry).
@@ -375,7 +380,7 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 					// A tagged event on an fd with no state, not closed in this
 					// batch: the connection's first report (its birth-queue entry,
 					// if any, then finds it born).
-					conn_birth(fd, st.now, mut st)
+					cs = conn_birth(fd, st.now, mut st)
 					// Born, with nothing to write: skip the EPOLLOUT half. Read on
 					// EPOLLIN (the request often arrives with the connection, and
 					// under EPOLLET a skipped edge is never reported again) and on
@@ -397,12 +402,12 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 				continue
 			}
 			if ev & u32(C.EPOLLOUT) != 0 {
-				if !handle_writable_plain(epoll_fd, fd, active_conns, mut st) {
+				if !handle_writable_plain(epoll_fd, fd, cs, active_conns, mut st) {
 					continue // connection closed — skip the EPOLLIN half of this event
 				}
 			}
 			if ev & u32(C.EPOLLIN) != 0 {
-				handle_readable(handler, mut reactor, epoll_fd, fd, limits, counter, active_conns, mut
+				handle_readable(handler, mut reactor, epoll_fd, fd, cs, limits, counter, active_conns, mut
 					st, state)
 			}
 		}

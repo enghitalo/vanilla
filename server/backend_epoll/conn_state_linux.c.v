@@ -552,9 +552,9 @@ fn flush_batch(epoll_fd int, fd int, limits core.Limits, active_conns &core.Coun
 // born: queued after this pass's drain, or not queued at all (the EPOLLOUT
 // registration a full queue falls back to). Neither can fail or
 // needs a syscall; a fallback registration's EPOLLOUT is dropped later, by
-// the spurious-wake path of the connection's next event.
+// the spurious-wake path of the connection's next event. Returns the state.
 @[inline]
-fn conn_birth(fd int, start u64, mut st PlainState) {
+fn conn_birth(fd int, start u64, mut st PlainState) &ConnState {
 	mut cs := state_for(mut st, fd)
 	if st.read_ns > 0 {
 		cs.read_deadline = start + st.read_ns
@@ -562,6 +562,7 @@ fn conn_birth(fd int, start u64, mut st PlainState) {
 		cs.idle_deadline = start + st.idle_ns
 	}
 	st.parked++
+	return cs
 }
 
 // leftover_fd reports whether fd, which has an event but no state and no
@@ -625,14 +626,12 @@ fn arm_idle_deadline(mut st PlainState, mut cs ConnState) {
 }
 
 // handle_writable_plain drains a parked batch when the socket is writable.
-// Returns false if the connection was closed (the worker must then skip any
-// further events for this fd in the current batch).
+// `known` is fd's state as the worker loop looked it up (nil: none). Returns
+// false if the connection was closed (the worker must then skip any further
+// events for this fd in the current batch).
 @[direct_array_access; manualfree]
-fn handle_writable_plain(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainState) bool {
-	if fd >= st.conns.len {
-		return false
-	}
-	mut cs := st.conns[fd]
+fn handle_writable_plain(epoll_fd int, fd int, known &ConnState, active_conns &core.Counter, mut st PlainState) bool {
+	mut cs := unsafe { known }
 	if unsafe { cs == nil } {
 		// EPOLLOUT is only armed after state exists (an accept-time birth is
 		// handled by the worker loop); nil means a close raced this event in
