@@ -634,7 +634,7 @@ fn test_stream_state_reused_across_requests() {
 		encode_status(mut rb, 200)
 		c.write_response_headers(mut out, sid, rb, false)
 		c.write_response_data(mut out, sid, 'ok'.bytes())
-		assert sid !in c.streams // released back to the free-list
+		assert !c.streams.has(sid) // released back to the free-list
 		sid += 2
 	}
 	assert c.streams.len == 0
@@ -658,7 +658,7 @@ fn test_response_data_within_window_does_not_buffer() {
 	encode_status(mut rb, 200)
 	c.write_response_headers(mut out, 1, rb, false)
 	c.write_response_data(mut out, 1, 'hello over http2'.bytes())
-	assert 1 !in c.streams // fit the window → emitted + released, none parked
+	assert !c.streams.has(1) // fit the window → emitted + released, none parked
 	frames := frames_of(out)
 	assert frames.len == 2
 	assert frames[1].fh.type_ == .data
@@ -795,4 +795,46 @@ fn test_empty_open_body_then_trailers() {
 	assert frames[1].fh.type_ == .headers
 	assert frames[1].fh.flags & flag_end_stream != 0
 	assert c.streams.len == 0
+}
+
+// post_request_block builds a POST header block whose :path and a custom
+// header are literals, so their strings come out of the decoder's arena.
+fn post_request_block(path string, tag string) []u8 {
+	mut block := []u8{}
+	encode_indexed(mut block, 3) // :method POST
+	encode_indexed(mut block, 6) // :scheme http
+	encode_literal_name_idx(mut block, 4, path) // :path
+	encode_literal_name_idx(mut block, 1, 'x.test') // :authority
+	encode_literal(mut block, 'x-tag', tag)
+	return block
+}
+
+fn test_request_headers_survive_an_interleaved_block() {
+	mut c := new_server_conn()
+	handshake(mut c)
+	mut input := []u8{}
+	// stream 1: headers only, its body still to come
+	b1 := post_request_block('/first/path', 'one')
+	write_frame_header(mut input, .headers, flag_end_headers, 1, b1.len)
+	input << b1
+	// stream 3: a complete request whose literals overwrite the decoder arena
+	b3 := post_request_block('/third', 'three-three')
+	write_frame_header(mut input, .headers, flag_end_headers | flag_end_stream, 3, b3.len)
+	input << b3
+	// stream 1's body ends it
+	write_data_header(mut input, 1, 2, true)
+	input << 'hi'.bytes()
+	mut out := []u8{}
+	mut reqs := []Http2Request{}
+	consumed, closing := c.consume(input, mut out, mut reqs)
+	assert consumed == input.len
+	assert !closing
+	assert reqs.len == 2
+	assert reqs[0].stream_id == 3
+	assert reqs[0].headers == [hf(':method', 'POST'), hf(':scheme', 'http'), hf(':path', '/third'),
+		hf(':authority', 'x.test'), hf('x-tag', 'three-three')]
+	assert reqs[1].stream_id == 1
+	assert reqs[1].headers == [hf(':method', 'POST'), hf(':scheme', 'http'),
+		hf(':path', '/first/path'), hf(':authority', 'x.test'), hf('x-tag', 'one')]
+	assert reqs[1].body.bytestr() == 'hi'
 }

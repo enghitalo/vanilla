@@ -205,3 +205,23 @@ fn test_encoder_helpers_roundtrip() ! {
 	// Stateless encoding must leave the peer's dynamic table untouched.
 	assert d.dynamic_size() == 0
 }
+
+fn test_decode_into_table_entries_outlive_the_arena() ! {
+	mut d := new_decoder(hpack_default_table_size)
+	mut fields := []HeaderField{}
+	// literal with incremental indexing, new name: custom-key: custom-header
+	// (RFC 7541 C.2.1) — the table must keep its own copy
+	d.decode_into(hx('400a637573746f6d2d6b65790d637573746f6d2d686561646572'), mut fields)!
+	assert fields.len == 1
+	assert fields[0].name == 'custom-key'
+	assert fields[0].value == 'custom-header'
+	// a later block's literals reuse the arena; index 62 must still read back
+	mut other := []u8{}
+	encode_literal(mut other, 'other-name', 'a-longer-other-value-to-overwrite')
+	d.decode_into(other, mut fields)!
+	assert fields[0].value == 'a-longer-other-value-to-overwrite'
+	d.decode_into(hx('be'), mut fields)!
+	assert fields.len == 1
+	assert fields[0].name == 'custom-key'
+	assert fields[0].value == 'custom-header'
+}

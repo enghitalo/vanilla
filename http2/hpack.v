@@ -217,10 +217,13 @@ mut:
 	dyn_size int           // sum of entry sizes (name + value + 32, RFC 7541 §4.1)
 	max_size int           // protocol ceiling (our SETTINGS_HEADER_TABLE_SIZE)
 	cur_max  int           // current limit, lowered/raised by table-size updates
-	// Reused Huffman-decode scratch: one buffer, cleared per Huffman string,
-	// so a Huffman-coded literal costs no per-string allocation (bytestr()
-	// copies the result out). RSS stays flat under `-gc none`.
-	huff_scratch []u8
+	// Per-block string arena: every literal a block decodes (raw or Huffman)
+	// is written here and handed out as a view, so decode_into allocates
+	// nothing per string. Reset at the start of each block and sized up front
+	// so it never reallocates under views already handed out; only entries
+	// added to the dynamic table are copied out, since the table outlives the
+	// block. RSS stays flat under `-gc none`.
+	arena []u8
 }
 
 // new_decoder returns a decoder whose dynamic table is capped at `max_size`
@@ -239,16 +242,34 @@ pub fn new_decoder(max_size int) HpackDecoder {
 pub fn (mut d HpackDecoder) decode(block []u8) ![]HeaderField {
 	mut out := []HeaderField{cap: 16}
 	d.decode_into(block, mut out)!
+	// decode_into's strings are views into the decoder's per-block arena;
+	// this allocating form returns owned copies.
+	for i in 0 .. out.len {
+		out[i] = HeaderField{
+			name:  out[i].name.clone()
+			value: out[i].value.clone()
+		}
+	}
 	return out
 }
 
 // decode_into is decode's zero-allocation form: it clears `out` and refills it,
 // reusing the caller's slice (a per-connection buffer) across header blocks
-// instead of returning a fresh one per request. Steady-state allocation is
-// zero — the churn that leaks under `-gc none`. Same fatal-error contract as
-// decode.
+// instead of returning a fresh one per request. Literal strings come back as
+// views into the decoder's arena, valid until the next decode_into; copy what
+// must outlive that (ServerConn copies each request's fields into its stream).
+// Steady-state allocation is zero — the churn that leaks under `-gc none`.
+// Same fatal-error contract as decode.
 pub fn (mut d HpackDecoder) decode_into(block []u8, mut out []HeaderField) ! {
 	out.clear()
+	d.arena.clear()
+	// Every decoded string lands in the arena, a raw literal at its own size
+	// and a Huffman one at most 8/5 of its octets (the shortest code is 5
+	// bits), so twice the block can never be outgrown: sized here, the arena
+	// does not reallocate while this block's views point into it.
+	if d.arena.cap < block.len * 2 {
+		d.arena = []u8{cap: block.len * 2}
+	}
 	mut pos := 0
 	mut decoded := 0
 	mut fields_seen := false
@@ -284,6 +305,12 @@ pub fn (mut d HpackDecoder) decode_into(block []u8, mut out []HeaderField) ! {
 			if decoded > max_decoded_block {
 				return error('hpack: header block too large decoded')
 			}
+			// The table outlives this block's arena: it keeps owned copies
+			// (a name taken from a table entry already is one).
+			if idx == 0 {
+				name = name.clone()
+			}
+			value = value.clone()
 			d.add(name, value)
 			fields_seen = true
 			out << HeaderField{
@@ -385,17 +412,18 @@ fn (mut d HpackDecoder) decode_str(block []u8, pos int) !(string, int) {
 	if n == 0 {
 		return '', p
 	}
-	src := unsafe { (&block[p]).vbytes(n) }
-	if !huff {
-		return src.bytestr(), p + n
+	// Written into the arena (never reallocated mid-block, see decode_into)
+	// and returned as a view: no allocation per string.
+	start := d.arena.len
+	if huff {
+		huffman_decode(unsafe { (&block[p]).vbytes(n) }, mut d.arena)!
+	} else {
+		unsafe { d.arena.push_many(&block[p], n) }
 	}
-	// Huffman decode into the decoder's reused scratch (cleared, capacity
-	// retained) instead of a fresh []u8 per string — the per-header allocation
-	// churn that leaks under `-gc none`. bytestr() copies out, so the scratch
-	// is free to be reused by the next string immediately.
-	d.huff_scratch.clear()
-	huffman_decode(src, mut d.huff_scratch)!
-	return d.huff_scratch.bytestr(), p + n
+	if d.arena.len == start {
+		return '', p + n
+	}
+	return unsafe { tos(&d.arena[start], d.arena.len - start) }, p + n
 }
 
 // decode_int reads an N-bit-prefix integer (§5.1). Accumulates in u64 so no

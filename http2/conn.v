@@ -27,7 +27,9 @@ module http2
 //     report close; refused/overflowing streams get RST_STREAM.
 
 // Http2Request is one complete request: decoded header list (pseudo-headers
-// like :method/:path included, in wire order) plus the reassembled body.
+// like :method/:path included, in wire order) plus the reassembled body. Both
+// live in the stream's pooled storage: valid until the response ends the
+// stream, so copy anything that must outlive it.
 pub struct Http2Request {
 pub:
 	stream_id u32
@@ -70,6 +72,8 @@ mut:
 	// still parked; flush_pending writes them as the stream's final HEADERS
 	trailers         []u8
 	trailers_pending bool
+	// backing bytes of `headers`: the fields point in here (see store_headers)
+	hdr_bytes []u8
 }
 
 // ServerConn is one connection's HTTP/2 state. Allocate with new_server_conn
@@ -80,7 +84,10 @@ mut:
 	dec          HpackDecoder
 	preface_seen bool
 	last_stream  u32
-	streams      map[u32]&StreamState
+	streams      StreamTable // open streams by id (fixed table, see streams.v)
+	// reused id list for walks over the open streams whose body may release
+	// some (the flow-control flushes)
+	iter_ids []u32
 	// Per-connection free-list of retired StreamStates, each retaining its
 	// body + pending buffers. release_stream resets and pushes here instead of
 	// dropping the pointer; new_stream pops from here instead of allocating.
@@ -113,7 +120,9 @@ mut:
 // the handler invocation that created it).
 pub fn new_server_conn() &ServerConn {
 	return &ServerConn{
-		dec: new_decoder(hpack_default_table_size)
+		dec:      new_decoder(hpack_default_table_size)
+		streams:  new_stream_table()
+		iter_ids: []u32{cap: max_concurrent_streams}
 	}
 }
 
@@ -320,8 +329,7 @@ fn (mut c ServerConn) on_headers(fh FrameHeader, payload []u8, mut out []u8, mut
 		}
 		off += 5
 	}
-	if fh.stream_id in c.streams {
-		s := c.streams[fh.stream_id] or { return .internal_error }
+	if s := c.streams.get(fh.stream_id) {
 		if s.remote_done {
 			return .stream_closed // HEADERS on half-closed (remote) (§5.1)
 		}
@@ -380,7 +388,8 @@ fn (mut c ServerConn) new_stream(stream_id u32) &StreamState {
 	s.body.clear()
 	s.pending.clear()
 	s.trailers.clear()
-	c.streams[stream_id] = s
+	s.hdr_bytes.clear()
+	c.streams.put(stream_id, s)
 	return s
 }
 
@@ -390,14 +399,14 @@ fn (mut c ServerConn) new_stream(stream_id u32) &StreamState {
 // must already have been served (the handler writes the response, which
 // releases the stream — the request is done being read by then).
 fn (mut c ServerConn) release_stream(stream_id u32) {
-	if mut s := c.streams[stream_id] {
+	if mut s := c.streams.get(stream_id) {
 		s.headers.clear()
 		s.body.clear()
 		s.pending.clear()
 		s.trailers.clear()
 		c.free_streams << s
 	}
-	c.streams.delete(stream_id)
+	c.streams.remove(stream_id)
 }
 
 fn (mut c ServerConn) finish_header_block(mut out []u8, mut reqs []Http2Request) ErrorCode {
@@ -427,9 +436,10 @@ fn (mut c ServerConn) finish_header_block(mut out []u8, mut reqs []Http2Request)
 	malformed := c.hdr_malformed || !ok
 	mut s := c.new_stream(stream_id)
 	// Copy the decoded fields into the stream's own retained storage: the
-	// scratch is overwritten by the next block, but a request's headers must
-	// survive until it is served (and other streams may decode meanwhile).
-	s.headers << c.scratch_fields
+	// scratch and the decoder's arena are overwritten by the next block, but
+	// a request's headers must survive until it is served (and other streams
+	// may decode meanwhile).
+	s.store_headers(c.scratch_fields)
 	s.rejected = malformed
 	s.declared_len = declared
 	if malformed {
@@ -447,8 +457,41 @@ fn (mut c ServerConn) finish_header_block(mut out []u8, mut reqs []Http2Request)
 // complete_stream ends a stream's request side: rejected streams and
 // content-length violations are dropped, everything else surfaces as a
 // complete request (the stream stays for the response to be written).
+// store_headers copies a decoded block into the stream: the field bytes go to
+// hdr_bytes, sized before the first copy so it never reallocates under the
+// fields pointing into it, and each field is re-pointed at its copy. Both
+// buffers are retained across the pooled StreamState's lives, so this
+// allocates nothing in steady state.
+fn (mut s StreamState) store_headers(fields []HeaderField) {
+	mut total := 0
+	for f in fields {
+		total += f.name.len + f.value.len
+	}
+	if s.hdr_bytes.cap < total {
+		s.hdr_bytes = []u8{cap: total}
+	}
+	for f in fields {
+		name := s.hdr_copy(f.name)
+		value := s.hdr_copy(f.value)
+		s.headers << HeaderField{
+			name:  name
+			value: value
+		}
+	}
+}
+
+@[inline]
+fn (mut s StreamState) hdr_copy(v string) string {
+	if v.len == 0 {
+		return ''
+	}
+	off := s.hdr_bytes.len
+	unsafe { s.hdr_bytes.push_many(v.str, v.len) }
+	return unsafe { tos(&s.hdr_bytes[off], v.len) }
+}
+
 fn (mut c ServerConn) complete_stream(stream_id u32, mut out []u8, mut reqs []Http2Request) {
-	mut s := c.streams[stream_id] or { return }
+	mut s := c.streams.get(stream_id) or { return }
 	s.remote_done = true
 	if s.rejected {
 		c.release_stream(stream_id)
@@ -586,13 +629,13 @@ fn (mut c ServerConn) on_data(fh FrameHeader, payload []u8, mut out []u8, mut re
 	if fh.stream_id == 0 {
 		return .protocol_error
 	}
-	if fh.stream_id !in c.streams {
+	if !c.streams.has(fh.stream_id) {
 		if fh.stream_id > c.last_stream {
 			return .protocol_error // DATA on an idle stream (§5.1, §6.1)
 		}
 		return .stream_closed // DATA on a fully closed stream (§5.1)
 	}
-	mut s := c.streams[fh.stream_id] or { return .internal_error }
+	mut s := c.streams.get(fh.stream_id) or { return .internal_error }
 	if s.remote_done {
 		return .stream_closed
 	}
@@ -660,9 +703,11 @@ fn (mut c ServerConn) on_settings(fh FrameHeader, payload []u8, mut out []u8) Er
 			c.init_send_window = i64(st.val)
 			// §6.9.2: a changed initial window retroactively adjusts every
 			// open stream's send window (it may go negative).
-			for id in c.streams.keys() {
-				mut s := c.streams[id] or { continue }
-				s.send_window += delta
+			for i in 0 .. stream_slots {
+				if c.streams.ids[i] != 0 {
+					mut s := c.streams.vals[i]
+					s.send_window += delta
+				}
 			}
 			window_changed = true
 		} else if st.id == setting_max_frame_size {
@@ -682,7 +727,8 @@ fn (mut c ServerConn) on_settings(fh FrameHeader, payload []u8, mut out []u8) Er
 	write_settings_ack(mut out)
 	if window_changed {
 		// A grown initial window may have unparked response DATA (§6.9.2).
-		for id in c.streams.keys() {
+		c.streams.ids_into(mut c.iter_ids)
+		for id in c.iter_ids {
 			c.flush_pending(mut out, id)
 		}
 	}
@@ -702,7 +748,8 @@ fn (mut c ServerConn) on_window_update(fh FrameHeader, payload []u8, mut out []u
 		if c.conn_send_window > i64(max_window) {
 			return .flow_control_error
 		}
-		for id in c.streams.keys() {
+		c.streams.ids_into(mut c.iter_ids)
+		for id in c.iter_ids {
 			c.flush_pending(mut out, id)
 		}
 		return .no_error
@@ -716,10 +763,10 @@ fn (mut c ServerConn) on_window_update(fh FrameHeader, payload []u8, mut out []u
 		c.release_stream(fh.stream_id)
 		return .no_error
 	}
-	if fh.stream_id !in c.streams {
+	if !c.streams.has(fh.stream_id) {
 		return .no_error // stream already finished — stale update, ignore
 	}
-	mut s := c.streams[fh.stream_id] or { return .internal_error }
+	mut s := c.streams.get(fh.stream_id) or { return .internal_error }
 	s.send_window += i64(inc)
 	if s.send_window > i64(max_window) {
 		write_rst_stream(mut out, fh.stream_id, .flow_control_error)
@@ -782,7 +829,7 @@ pub fn (mut c ServerConn) write_response_data(mut out []u8, stream_id u32, body 
 // caller: end_stream=false sends the body without END_STREAM and keeps the
 // stream open for write_response_trailers.
 pub fn (mut c ServerConn) write_response_body(mut out []u8, stream_id u32, body []u8, end_stream bool) {
-	mut s := c.streams[stream_id] or { return }
+	mut s := c.streams.get(stream_id) or { return }
 	if body.len == 0 {
 		if end_stream {
 			write_data_header(mut out, stream_id, 0, true)
@@ -831,7 +878,7 @@ pub fn (mut c ServerConn) write_response_body(mut out []u8, stream_id u32, body 
 // part of the body is still parked on flow control, the block is copied and
 // sent right after that DATA drains, so trailers never overtake the body.
 pub fn (mut c ServerConn) write_response_trailers(mut out []u8, stream_id u32, block []u8) {
-	mut s := c.streams[stream_id] or { return }
+	mut s := c.streams.get(stream_id) or { return }
 	if s.pending_off < s.pending.len {
 		s.trailers.clear()
 		s.trailers << block
@@ -842,7 +889,7 @@ pub fn (mut c ServerConn) write_response_trailers(mut out []u8, stream_id u32, b
 }
 
 fn (mut c ServerConn) flush_pending(mut out []u8, stream_id u32) {
-	mut s := c.streams[stream_id] or { return }
+	mut s := c.streams.get(stream_id) or { return }
 	for s.pending_off < s.pending.len {
 		mut allow := c.conn_send_window
 		if s.send_window < allow {
