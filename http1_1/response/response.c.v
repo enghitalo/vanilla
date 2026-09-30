@@ -5,6 +5,12 @@ module response
 fn C.send(__fd int, __buf voidptr, __n usize, __flags int) int
 fn C.perror(s &char)
 
+// send_flags keeps every send here from raising SIGPIPE on a peer that is
+// already gone (its default action kills the whole server): MSG_NOSIGNAL on
+// Linux. macOS/BSD suppress it per socket (SO_NOSIGPIPE, set at accept — see
+// socket.set_nosigpipe); Windows has no SIGPIPE.
+const send_flags = $if linux { C.MSG_NOSIGNAL } $else { 0 }
+
 pub const tiny_bad_request_response = 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 const status_444_response = 'HTTP/1.1 444 No Response\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 // 413/431 are pub so the epoll backend can APPEND them to a batched write
@@ -38,16 +44,10 @@ pub const status_100_continue_response = 'HTTP/1.1 100 Continue\r\n\r\n'.bytes()
 // reported as an error (the caller closes the fd) rather than silently
 // truncating — loud beats wrong. Small responses (the hot path) send in one go.
 pub fn send_response(fd int, buffer_ptr &u8, buffer_len int) ! {
-	// MSG_NOSIGNAL exists only on Linux; on macOS/BSD SIGPIPE suppression is
-	// per-socket via SO_NOSIGPIPE (set at accept — see socket.set_nosigpipe).
-	mut flags := 0
-	$if linux {
-		flags = C.MSG_NOSIGNAL
-	}
 	mut total_sent := 0
 	for total_sent < buffer_len {
 		sent := C.send(fd, unsafe { buffer_ptr + total_sent }, usize(buffer_len - total_sent),
-			flags)
+			send_flags)
 		if sent > 0 {
 			total_sent += sent
 			continue
@@ -61,21 +61,21 @@ pub fn send_response(fd int, buffer_ptr &u8, buffer_len int) ! {
 }
 
 pub fn send_bad_request_response(fd int) {
-	C.send(fd, tiny_bad_request_response.data, tiny_bad_request_response.len, 0)
+	C.send(fd, tiny_bad_request_response.data, tiny_bad_request_response.len, send_flags)
 }
 
 pub fn send_status_444_response(fd int) {
-	C.send(fd, status_444_response.data, status_444_response.len, 0)
+	C.send(fd, status_444_response.data, status_444_response.len, send_flags)
 }
 
 pub fn send_status_413_response(fd int) {
-	C.send(fd, status_413_response.data, status_413_response.len, 0)
+	C.send(fd, status_413_response.data, status_413_response.len, send_flags)
 }
 
 pub fn send_status_431_response(fd int) {
-	C.send(fd, status_431_response.data, status_431_response.len, 0)
+	C.send(fd, status_431_response.data, status_431_response.len, send_flags)
 }
 
 pub fn send_status_408_response(fd int) {
-	C.send(fd, status_408_response.data, status_408_response.len, 0)
+	C.send(fd, status_408_response.data, status_408_response.len, send_flags)
 }
