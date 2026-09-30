@@ -1,0 +1,101 @@
+name: Race Detector (-race)
+
+# The plain epoll worker's e2e suites built with V's data race detector (`v
+# -race`, ThreadSanitizer: https://github.com/vlang/v/pull/29139). The worker
+# is lock-free across threads — the accept thread hands connections to each
+# worker through a BirthQueue ring published with seq_cst atomics, and the
+# workers bump shared counters — so a missing happens-before edge is a real
+# bug that no functional test sees. TSan models C11 atomics; helgrind does
+# not, and reports that ring's correctly published slots as races (#164).
+# A race fails the step: the test binary exits 66 and the runner marks it
+# FAIL, with the V file:line stacks of both accesses in the log.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'server/**'
+      - 'epoll/**'
+      - 'core/**'
+      - 'http1_1/**'
+      - 'socket/**'
+      - 'vtest/**'
+      - 'transport/**'
+      - 'tests/**'
+      - '.github/workflows/race_detector.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'server/**'
+      - 'epoll/**'
+      - 'core/**'
+      - 'http1_1/**'
+      - 'socket/**'
+      - 'vtest/**'
+      - 'transport/**'
+      - 'tests/**'
+      - '.github/workflows/race_detector.yml'
+
+jobs:
+  race:
+    runs-on: ubuntu-latest
+    name: epoll e2e suites under -race
+    # vtest has no client-side timeouts (a liveness bug hangs, it does not
+    # fail) and TSan slows every memory access down: this is the backstop.
+    timeout-minutes: 30
+    env:
+      # The repo's kill-switch for hosted runners whose per-worker io_uring
+      # ring init fails after a passing probe (see poll_backend.yml). io_uring
+      # is not this job's subject: only the epoll checks run.
+      VANILLA_NO_IOURING: '1'
+      # Keep going after the first report, so the log shows every race.
+      VRACE: 'halt_on_error=0'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up V
+        uses: vlang/setup-v@v1.7
+      - name: Remove Vlang folder to avoid conflicts
+        shell: bash
+        run: |
+          rm -rf -v ./vlang || true
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev linux-libc-dev clang
+      # TSan maps its shadow memory at fixed ranges, which the runner kernel's
+      # 32-bit mmap randomization can collide with ("ThreadSanitizer:
+      # unexpected memory mapping"). 28 bits is the long-standing default.
+      - name: Make ASLR compatible with ThreadSanitizer
+        shell: bash
+        run: |
+          sudo sysctl -w vm.mmap_rnd_bits=28
+      # `v -race` prefers clang: gcc's TSan misses races on struct values (v
+      # help build-c). Use clang when its TSan runtime links and runs here,
+      # else fall back to gcc (libtsan ships with it).
+      - name: Pick the ThreadSanitizer compiler
+        shell: bash
+        run: |
+          printf 'int main(void) { return 0; }\n' > /tmp/tsan_probe.c
+          if clang -fsanitize=thread /tmp/tsan_probe.c -o /tmp/tsan_probe && /tmp/tsan_probe; then
+            echo 'RACE_CC=clang' >> "$GITHUB_ENV"
+          else
+            echo 'RACE_CC=gcc' >> "$GITHUB_ENV"
+          fi
+      - name: epoll_timeouts_test.v (watch runtime, reaping, stale events)
+        shell: bash
+        run: |
+          v -race -cc "$RACE_CC" -no-parallel -run-only 'test_epoll_*' test tests/epoll_timeouts_test.v
+      - name: backend_behaviors_test.v (epoll)
+        shell: bash
+        run: |
+          v -race -cc "$RACE_CC" -no-parallel -run-only 'test_epoll_*' test tests/backend_behaviors_test.v
+      - name: uds_test.v (epoll) and vtest smoke
+        shell: bash
+        run: |
+          v -race -cc "$RACE_CC" -no-parallel -run-only 'test_uds_epoll,test_dial_*,test_uds_vtest_scripts,test_uds_peer_cred,test_peer_cred_none_on_tcp' test tests/uds_test.v
+          v -race -cc "$RACE_CC" -no-parallel test tests/vtest_smoke_test.v
+      - name: Reactor unit tests
+        shell: bash
+        run: |
+          v -race -cc "$RACE_CC" -no-parallel test server/backend_epoll/reactor_pipelining_test.v
