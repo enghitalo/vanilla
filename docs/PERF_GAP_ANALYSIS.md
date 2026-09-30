@@ -495,6 +495,6 @@ GC makes the gap larger, in vanilla's favor of the raw contract.
 > under GC at scale.
 
 Benchmark each step in isolation with `-prod` (wrk/rewrk/gcannon, plain +
-pipelined profiles) and verify with helgrind, per CONTRIBUTING.md. Note: a couple
+pipelined profiles) and verify with `v -race`, per CONTRIBUTING.md. Note: a couple
 of small allocs per request look like noise at 4–16 cores but can be a multiple-x
 swing at 64 — confirm perf changes on a high-core run, not just a laptop.

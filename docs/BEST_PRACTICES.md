@@ -313,12 +313,19 @@ is a first-class guarantee — keep it that way.
 - Prefer per-connection / per-request state over global state.
 - If you must share, protect it (atomics, channels, or a lock) and measure the
   cost.
-- Verify with the race checker before merging:
+- Verify with the race detector before merging — ThreadSanitizer, with the V
+  file:line stacks of both accesses in each report:
 
   ```sh
-  v -prod -gc none .
-  valgrind --tool=helgrind ./vanilla
+  v -race -o vanilla .
+  ./vanilla          # drive it with real traffic; exit status 66 = a race was found
+  v -race test tests/
   ```
+
+  CI runs the epoll e2e suites under `-race`
+  ([race_detector.yml](../.github/workflows/race_detector.yml)). Prefer it to
+  `valgrind --tool=helgrind`, which does not model C11 atomics and reports
+  atomically published data (the BirthQueue ring, #164) as races.
 
 **Don't**
 
@@ -441,5 +448,5 @@ Performance claims must be measured, not assumed.
 - [ ] Responses carry correct framing and standard headers.
 - [ ] Inputs are bounded and validated.
 - [ ] Tests added/updated (raw-request E2E where it fits).
-- [ ] `helgrind` clean; benchmark shows no regression.
+- [ ] `v -race` clean; benchmark shows no regression.
 - [ ] No new abstraction layer that wasn't strictly necessary.
