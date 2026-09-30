@@ -1114,6 +1114,21 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 			// is pending (the DB-style "park, write later" case appends nothing here).
 			// flush_batch returns false only if it already closed the conn (peer gone /
 			// write error) — then we must NOT re-park it.
+			if event_loop.last_watched != ext_fd && !reactor.watches[ext_fd].active {
+				// Stepped away from ext_fd (to another fd, or to none) and kept it
+				// open: it is still registered, level-triggered, with nothing
+				// behind it. Left there it reports on every wait (a spin while it
+				// is writable), and with births off an event on an fd with no
+				// state is served as a new connection. Detach it — never close
+				// it, the app owns it; its next watch_fd adds it back — as the
+				// clientless path does. The client's own socket keeps its
+				// registration: restore it at once.
+				if ext_fd == client_fd {
+					epoll.mod_fd_in_epoll(epoll_fd, client_fd, u32(C.EPOLLIN) | u32(C.EPOLLET))
+				} else {
+					epoll.detach_fd_from_epoll(epoll_fd, ext_fd)
+				}
+			}
 			if event_loop.last_watched < 0 {
 				// Suspended without re-arming a watch (watch_fd failed, or was never
 				// called): nothing would ever resume this connection, and a parked
