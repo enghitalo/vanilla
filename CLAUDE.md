@@ -52,7 +52,8 @@ registry.
 - Allocate with intent: `[]u8{cap: n}` is uninitialized/noscan; large `cap`
   costs GC pressure. Size to the realistic case.
 - **Benchmark before/after** any perf change with `-prod`; verify thread safety
-  with `valgrind --tool=helgrind`.
+  with V's race detector, `v -race` (ThreadSanitizer). CI runs the epoll e2e
+  suites under it (`.github/workflows/race_detector.yml`).
 
 ## Before every commit
 
