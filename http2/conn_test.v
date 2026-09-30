@@ -684,3 +684,115 @@ fn test_rst_stream_drops_state() {
 	assert reqs.len == 0
 	assert c.streams.len == 0
 }
+
+// trailers_block builds a `grpc-status: 0` trailer block (a literal field).
+fn trailers_block() []u8 {
+	mut block := []u8{}
+	encode_literal(mut block, 'grpc-status', '0')
+	return block
+}
+
+// open_request_stream runs the handshake plus one complete GET on stream 1 and
+// returns the connection ready for its response.
+fn open_request_stream(window u32) &ServerConn {
+	mut c := new_server_conn()
+	mut input := []u8{}
+	input << preface_tail
+	if window > 0 {
+		write_settings(mut input, [
+			Setting{
+				id:  setting_initial_window_size
+				val: window
+			},
+		])
+	} else {
+		write_settings(mut input, [])
+	}
+	block := get_request_block()
+	write_frame_header(mut input, .headers, flag_end_headers | flag_end_stream, 1, block.len)
+	input << block
+	mut out := []u8{}
+	mut reqs := []Http2Request{}
+	consumed, closing := c.consume(input, mut out, mut reqs)
+	assert consumed == input.len
+	assert !closing
+	assert reqs.len == 1
+	return c
+}
+
+fn test_response_trailers_follow_an_open_body() ! {
+	mut c := open_request_stream(0)
+	mut out := []u8{}
+	mut resp_block := []u8{}
+	encode_status(mut resp_block, 200)
+	encode_literal(mut resp_block, 'content-type', 'application/grpc')
+	c.write_response_headers(mut out, 1, resp_block, false)
+	c.write_response_body(mut out, 1, [u8(0), 0, 0, 0, 2, 0x08, 0x03], false)
+	// the body went out without END_STREAM: the stream waits for its trailers
+	assert c.streams.len == 1
+	c.write_response_trailers(mut out, 1, trailers_block())
+	frames := frames_of(out)
+	assert frames.len == 3
+	assert frames[0].fh.type_ == .headers
+	assert frames[0].fh.flags & flag_end_stream == 0
+	assert frames[1].fh.type_ == .data
+	assert frames[1].fh.flags & flag_end_stream == 0
+	assert frames[1].payload == [u8(0), 0, 0, 0, 2, 0x08, 0x03]
+	assert frames[2].fh.type_ == .headers
+	assert frames[2].fh.flags & flag_end_stream != 0
+	assert frames[2].fh.flags & flag_end_headers != 0
+	mut d := new_decoder(hpack_default_table_size)
+	_ := d.decode(frames[0].payload)!
+	assert d.decode(frames[2].payload)! == [hf('grpc-status', '0')]
+	assert c.streams.len == 0
+}
+
+fn test_response_trailers_wait_for_parked_data() {
+	// A 25-byte open body against a 10-byte stream window: 10 bytes go out, 15
+	// park, and the trailers must not overtake them.
+	mut c := open_request_stream(10)
+	mut out := []u8{}
+	mut resp_block := []u8{}
+	encode_status(mut resp_block, 200)
+	c.write_response_headers(mut out, 1, resp_block, false)
+	c.write_response_body(mut out, 1, 'abcdefghijklmnopqrstuvwxy'.bytes(), false)
+	c.write_response_trailers(mut out, 1, trailers_block())
+	mut frames := frames_of(out)
+	assert frames.len == 2
+	assert frames[1].fh.type_ == .data
+	assert int(frames[1].fh.length) == 10
+	assert frames[1].fh.flags & flag_end_stream == 0
+	assert c.streams.len == 1
+	// The window reopens: the rest of the body, then the trailers, in that order.
+	out.clear()
+	mut wu := []u8{}
+	write_window_update(mut wu, 1, 15)
+	mut reqs := []Http2Request{}
+	_, closing := c.consume(wu, mut out, mut reqs)
+	assert !closing
+	frames = frames_of(out)
+	assert frames.len == 2
+	assert frames[0].fh.type_ == .data
+	assert frames[0].fh.flags & flag_end_stream == 0
+	assert frames[0].payload.bytestr() == 'klmnopqrstuvwxy'
+	assert frames[1].fh.type_ == .headers
+	assert frames[1].fh.flags & flag_end_stream != 0
+	assert c.streams.len == 0
+}
+
+fn test_empty_open_body_then_trailers() {
+	mut c := open_request_stream(0)
+	mut out := []u8{}
+	mut resp_block := []u8{}
+	encode_status(mut resp_block, 200)
+	c.write_response_headers(mut out, 1, resp_block, false)
+	// an empty, still-open body writes nothing
+	c.write_response_body(mut out, 1, []u8{}, false)
+	assert frames_of(out).len == 1
+	c.write_response_trailers(mut out, 1, trailers_block())
+	frames := frames_of(out)
+	assert frames.len == 2
+	assert frames[1].fh.type_ == .headers
+	assert frames[1].fh.flags & flag_end_stream != 0
+	assert c.streams.len == 0
+}
