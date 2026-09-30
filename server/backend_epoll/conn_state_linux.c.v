@@ -187,17 +187,17 @@ mut:
 	// The worker's watch reactor, so close_conn can tear a parked connection's
 	// watch down on every close path (see close_conn).
 	reactor &Reactor = unsafe { nil }
-	// close_seq counts this worker's closes; closed_at[fd] is its value at
-	// fd's last close (sized with conns), and batch_seq its value when the
-	// current batch of events began (closed_in_batch). The birth queue's
-	// entries carry it too (drain_births).
+	// close_seq counts this worker's closes (mark_stale: connections and the
+	// watch fds it tears down); closed_at[fd] is its value at fd's last close
+	// (grown on demand), and batch_seq its value when the current batch of
+	// events began (closed_in_batch). The birth queue's entries carry it too
+	// (drain_births).
 	close_seq u64
 	batch_seq u64
 	closed_at []u64
-	// Accept-time births are on (a read or idle timeout is set): the close
-	// stamps below are kept, and accepted connections are handed over by the
-	// accept thread through births_q (see BirthQueue).
-	births   bool
+	// With accept-time births on (a read or idle timeout is set), accepted
+	// connections are handed over by the accept thread through births_q (see
+	// BirthQueue).
 	births_q &BirthQueue = unsafe { nil }
 }
 
@@ -316,17 +316,53 @@ fn (mut st PlainState) tick() {
 
 pub fn new_plain_state() PlainState {
 	return PlainState{
-		conns: []&ConnState{len: conn_table_min, init: unsafe { nil }}
-		// closed_at is allocated by the worker only when births are on.
+		conns:     []&ConnState{len: conn_table_min, init: unsafe { nil }}
+		closed_at: []u64{len: conn_table_min}
 	}
 }
 
-// closed_in_batch reports whether fd was closed during the current batch of
-// events (close_conn stamps it): any later event for it in the same batch is
-// stale — it describes the registration that close removed.
+// closed_in_batch reports whether fd was closed (mark_stale) during the
+// current batch of events: any later event for it in the same batch is stale
+// — it describes the registration that close removed. One compare when the
+// batch closed nothing (the common case). Births on or off alike.
 @[direct_array_access; inline]
 fn (st &PlainState) closed_in_batch(fd int) bool {
-	return fd < st.closed_at.len && st.closed_at[fd] > st.batch_seq
+	return st.close_seq > st.batch_seq && fd < st.closed_at.len && st.closed_at[fd] > st.batch_seq
+}
+
+// mark_stale stamps fd, which the worker is about to close (a connection, or
+// a watch fd it tears down): events for fd that the current batch already
+// collected describe the registration the close removes (closed_in_batch
+// drops them), and so do birth-queue entries queued before (drain_births).
+// Published BEFORE the close frees the number: the accept thread reads it
+// after accept() returns that number again. A plain store: an indexed
+// assignment compiles to a generic element copy.
+@[direct_array_access; inline]
+fn (mut st PlainState) mark_stale(fd int) {
+	if fd >= st.closed_at.len {
+		st.grow_closed_at(fd)
+	}
+	st.close_seq++
+	unsafe {
+		*(&u64(st.closed_at.data) + fd) = st.close_seq
+	}
+	if st.births_q != unsafe { nil } {
+		stdatomic.store_u64(&st.births_q.close_seq, st.close_seq)
+	}
+}
+
+// grow_closed_at is mark_stale's slow path: doubles the stamp table past fd.
+@[direct_array_access; noinline]
+fn (mut st PlainState) grow_closed_at(fd int) {
+	mut new_len := if st.closed_at.len > 0 { st.closed_at.len } else { conn_table_min }
+	for new_len <= fd {
+		new_len *= 2
+	}
+	mut stamps := []u64{len: new_len}
+	for i in 0 .. st.closed_at.len {
+		stamps[i] = st.closed_at[i]
+	}
+	st.closed_at = stamps
 }
 
 // state_for returns the connection state for fd, creating it (with its
@@ -347,9 +383,9 @@ fn state_for(mut st PlainState, fd int) &ConnState {
 	return state_create(mut st, fd)
 }
 
-// state_create is state_for's slow path: it grows the table (and the
-// close stamps with it) and takes a pooled ConnState or allocates one. Kept
-// out of line so the event loop's hot code stays compact.
+// state_create is state_for's slow path: it grows the table and takes a
+// pooled ConnState or allocates one. Kept out of line so the event loop's hot
+// code stays compact.
 @[direct_array_access; noinline]
 fn state_create(mut st PlainState, fd int) &ConnState {
 	if fd >= st.conns.len {
@@ -362,13 +398,6 @@ fn state_create(mut st PlainState, fd int) &ConnState {
 			grown[i] = st.conns[i]
 		}
 		st.conns = grown
-		if st.births {
-			mut stamps := []u64{len: new_len}
-			for i in 0 .. st.closed_at.len {
-				stamps[i] = st.closed_at[i]
-			}
-			st.closed_at = stamps
-		}
 	}
 	if unsafe { st.conns[fd] == nil } {
 		// Reuse a retired ConnState (buffers retained, fields reset by close_conn)
@@ -523,9 +552,9 @@ fn flush_batch(epoll_fd int, fd int, limits core.Limits, active_conns &core.Coun
 // born: queued after this pass's drain, or not queued at all (the EPOLLOUT
 // registration a full queue falls back to). Neither can fail or
 // needs a syscall; a fallback registration's EPOLLOUT is dropped later, by
-// the spurious-wake path of the connection's next event.
+// the spurious-wake path of the connection's next event. Returns the state.
 @[inline]
-fn conn_birth(fd int, start u64, mut st PlainState) {
+fn conn_birth(fd int, start u64, mut st PlainState) &ConnState {
 	mut cs := state_for(mut st, fd)
 	if st.read_ns > 0 {
 		cs.read_deadline = start + st.read_ns
@@ -533,6 +562,7 @@ fn conn_birth(fd int, start u64, mut st PlainState) {
 		cs.idle_deadline = start + st.idle_ns
 	}
 	st.parked++
+	return cs
 }
 
 // leftover_fd reports whether fd, which has an event but no state and no
@@ -596,14 +626,12 @@ fn arm_idle_deadline(mut st PlainState, mut cs ConnState) {
 }
 
 // handle_writable_plain drains a parked batch when the socket is writable.
-// Returns false if the connection was closed (the worker must then skip any
-// further events for this fd in the current batch).
+// `known` is fd's state as the worker loop looked it up (nil: none). Returns
+// false if the connection was closed (the worker must then skip any further
+// events for this fd in the current batch).
 @[direct_array_access; manualfree]
-fn handle_writable_plain(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainState) bool {
-	if fd >= st.conns.len {
-		return false
-	}
-	mut cs := st.conns[fd]
+fn handle_writable_plain(epoll_fd int, fd int, known &ConnState, active_conns &core.Counter, mut st PlainState) bool {
+	mut cs := unsafe { known }
 	if unsafe { cs == nil } {
 		// EPOLLOUT is only armed after state exists (an accept-time birth is
 		// handled by the worker loop); nil means a close raced this event in
@@ -775,19 +803,8 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			st.free_conns << cs
 		}
 	}
-	if st.births && fd < st.closed_at.len {
-		// Later events for fd in this batch, and birth-queue entries queued
-		// before this close, are stale (closed_in_batch, drain_births). A plain
-		// store: an indexed assignment compiles to a generic element copy.
-		st.close_seq++
-		unsafe {
-			*(&u64(st.closed_at.data) + fd) = st.close_seq
-		}
-		if st.births_q != unsafe { nil } {
-			// Before the close below frees the number: the accept thread reads
-			// it after accept() returns that number again (drain_births).
-			stdatomic.store_u64(&st.births_q.close_seq, st.close_seq)
-		}
-	}
+	// Later events for fd in this batch, and birth-queue entries queued before
+	// this close, are stale (closed_in_batch, drain_births).
+	st.mark_stale(fd)
 	release_conn(epoll_fd, fd, active_conns)
 }
