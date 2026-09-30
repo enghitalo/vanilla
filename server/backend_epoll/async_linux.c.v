@@ -1258,9 +1258,14 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 				// streamed, keep it at the head, and stop: nothing behind it is ready.
 				if cs.write_buf.len > cs.write_off {
 					if !flush_batch(epoll_fd, client_fd, limits, active_conns, mut st, mut cs) {
-						reactor.watches[ext_fd].queue.delete(0) // conn closed on write
-						reactor.reactor_clear_if_drained(ext_fd)
-						continue
+						// The client is gone (flush_batch closed it), but its query is
+						// still in flight: tombstone the head, which the re-arm kept
+						// with its latest continuation. The dead branch above then
+						// consumes that result when it arrives and discards it.
+						// Dropping the slot instead handed the result to the next
+						// client in the queue. Nothing behind the head is ready.
+						reactor.reactor_mark_dead(ext_fd, client_fd)
+						break
 					}
 				}
 				cs.awaiting_fd = ext_fd
