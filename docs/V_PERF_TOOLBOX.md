@@ -146,7 +146,24 @@ it usable:
 
 - **Build with `-cc gcc`, not the default tcc** — callgrind can't resolve V app
   symbols from tcc's debug info (everything shows as a hex address); gcc emits
-  DWARF, so `main__*` / `pg_async__*` are named.
+  DWARF, so `pg_async__*` (and the unprefixed `main` module functions) are named.
+- **Line numbers are C lines, in a file V deletes.** Despite `v help build-c`,
+  `-g` emits no `#line`
+  ([vlang/v#29152](https://github.com/vlang/v/issues/29152)): the DWARF names
+  `src.c` in a `.<bin>.v3cc.*` build dir that V removes after linking, so
+  callgrind, helgrind, gdb and addr2line print `src.c:N` with nothing to open.
+  Keep the C with a `-cc` wrapper (in gdb,
+  `set substitute-path <DW_AT_comp_dir> /tmp/keptc`):
+
+  ```sh
+  mkdir -p /tmp/keptc && cat > /tmp/keepcc <<'EOF'
+  #!/bin/sh
+  for a; do case "$a" in *.c) cp "$a" /tmp/keptc/ ;; esac; done
+  exec gcc "$@"
+  EOF
+  chmod +x /tmp/keepcc
+  v -g -gc none -cc /tmp/keepcc .
+  ```
 - **`--instr-atstart=no`, then `callgrind_control -i on` *after* a hard warmup** —
   so pool bring-up + SCRAM + buffers reaching high-water run uninstrumented and
   only steady-state per-request work is counted.
