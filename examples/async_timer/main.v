@@ -38,7 +38,7 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
 		mut spec := [4]i64{}
 		spec[2] = i64(ms / 1000)
 		spec[3] = i64(ms % 1000) * 1_000_000
-		C.timerfd_settime(tfd, 0, voidptr(&spec[0]), unsafe { nil })
+		C.timerfd_settime(tfd, 0, unsafe { voidptr(&spec[0]) }, unsafe { nil })
 		event_loop.watch_fd(tfd, .readable, timer_done, unsafe { nil })
 		return .suspend
 	}
