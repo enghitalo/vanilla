@@ -41,10 +41,10 @@ fn C.memmove(__dest voidptr, __src voidptr, __n usize) voidptr
 // sendfile(2): copy bytes from a file fd straight to the socket inside the
 // kernel (no userspace bounce). With a non-NULL offset the kernel advances it
 // and leaves the file's own position untouched, so ONE shared fd is safe to
-// send from many connections/threads at once. pread is the userspace fallback
-// used when a pipelined response must follow the file body in byte order.
+// send from many connections/threads at once. core.append_file_region (pread)
+// is the userspace fallback, used when the file body must go out as bytes
+// because a pipelined response must follow it in order.
 fn C.sendfile(out_fd int, in_fd int, offset &i64, count usize) isize
-fn C.pread(fd int, buf voidptr, count usize, offset i64) isize
 
 const sm_max_request_bytes = 8 * 1024 * 1024
 // Bound a single sendfile(2) call so one connection can't monopolize the worker;
@@ -444,34 +444,6 @@ fn park_write(epoll_fd int, fd int, limits core.Limits, mut st PlainState, mut c
 	epoll.mod_fd_in_epoll(epoll_fd, fd, (u32(C.EPOLLIN) | u32(C.EPOLLOUT) | u32(C.EPOLLET)))
 }
 
-// append_file_region reads [off, off+len) from a borrowed file fd into `buf`.
-// Used to materialize a deferred sendfile body into the response buffer when a
-// pipelined response must follow it in order, and as the userspace fallback on
-// backends/OSes that can't sendfile.
-@[manualfree]
-fn append_file_region(mut buf []u8, file_fd int, off i64, length i64) {
-	if length <= 0 {
-		return
-	}
-	start := buf.len
-	unsafe { buf.grow_len(int(length)) }
-	mut got := i64(0)
-	for got < length {
-		n := C.pread(file_fd, unsafe { &u8(buf.data) + start + int(got) }, usize(length - got),
-
-			off + got)
-		if n <= 0 {
-			break // short read (file truncated mid-flight) — send what we got
-		}
-		got += i64(n)
-	}
-	if got < length {
-		unsafe {
-			buf.len = start + int(got)
-		}
-	}
-}
-
 // drain_file streams the connection's deferred file body to the socket with
 // sendfile(2), advancing file_off/file_remaining. Returns:
 //   1  fully sent (file_remaining == 0)
@@ -496,6 +468,23 @@ fn drain_file(fd int, mut cs ConnState) int {
 		return -1 // sent == 0 (unexpected EOF) or a hard error
 	}
 	return 1
+}
+
+// materialise_file reads the connection's deferred file region into write_buf
+// (core.append_file_region) and clears it, for when its bytes must go out
+// ahead of a response about to be appended. Returns false on a short read (the
+// file shrank after queue_file, or the read failed): the Content-Length
+// already in write_buf then promises bytes that do not exist, and anything
+// appended next would be read as the rest of that body, so the caller must
+// flush what is there and close, as flush_batch does when sendfile(2) hits an
+// early EOF (drain_file).
+@[inline]
+fn materialise_file(mut cs ConnState) bool {
+	want := cs.file_remaining
+	got := core.append_file_region(mut cs.write_buf, cs.file_fd, cs.file_off, want)
+	cs.file_fd = -1
+	cs.file_remaining = 0
+	return got == want
 }
 
 // flush_batch writes all pending response bytes then streams any deferred file
@@ -722,14 +711,16 @@ fn sweep_timeouts(epoll_fd int, active_conns &core.Counter, mut st PlainState) {
 			// streamed body, every earlier response out and the upload's own
 			// output (its held reply, after a 100 Continue not sent yet) not
 			// started: that request was never answered, and the 408 replaces
-			// its reply.
+			// its reply. A file region pending while a body streams is that held
+			// reply's own body (start_body_drain wrote out any earlier one), so
+			// the 408 replaces it too; otherwise it is a response mid-send.
 			at_boundary := if cs.body_drain > 0 {
 				cs.write_off == cs.drain_off
 			} else {
-				cs.write_off >= cs.write_buf.len
+				cs.write_off >= cs.write_buf.len && cs.file_remaining <= 0
 			}
 			if cs.takeover == unsafe { nil } && (cs.read_buf.len > 0 || cs.body_drain > 0)
-				&& at_boundary && cs.file_remaining <= 0 {
+				&& at_boundary {
 				response.send_status_408_response(fd) // couldn't finish the request in time
 			}
 			close_conn(epoll_fd, fd, active_conns, mut st)

@@ -781,6 +781,16 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 		return 0 // head not complete in the buffer yet — grow/recv more
 	}
 	content_length := total - head_len
+	// A file region deferred by an earlier response of this burst must go out
+	// (as bytes) ahead of anything appended below: the same ordering rule as
+	// drain_requests. It also keeps drain_off honest, since everything before
+	// it answers earlier requests. A short read closes, as there.
+	if cs.file_remaining > 0 && !materialise_file(mut cs) {
+		if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
+			close_conn(epoll_fd, fd, active_conns, mut st)
+		}
+		return 2
+	}
 	// max_body_bytes must hold on the STREAMED path too: the framed path rejects
 	// an oversized declared body with 413 (frame_request_length_lim_idx), and a
 	// body large enough to stream must not BYPASS that limit just because it
@@ -825,6 +835,12 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 	if _ := core.take_queued_takeover() {
 		streamed_takeover = true
 	}
+	// The sendfile slot is thread-local too, and taken whatever the step (as
+	// in drain_requests): a region left queued would be taken by the next
+	// .done on this worker, for any connection, and streamed after that
+	// response. On the rejected path below the region is dropped; whatever
+	// the handler appended stays, and the 400 follows it.
+	qf := core.take_queued_file() or { core.QueuedFile{} }
 	if head_step != .done || streamed_takeover {
 		// suspend/close on a streamed-body request is unsupported in v1 — answer
 		// 400 and drop, rather than leave a half-drained connection parked. The
@@ -840,6 +856,14 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 			close_conn(epoll_fd, fd, active_conns, mut st)
 		}
 		return 2
+	}
+	if qf.len > 0 {
+		// The held reply's body, handed off with core.queue_file: flush_batch
+		// streams it after write_buf, from the same end-of-burst flush (gated on
+		// body_drain == 0) that sends the reply.
+		cs.file_fd = qf.file_fd
+		cs.file_off = qf.off
+		cs.file_remaining = qf.len
 	}
 	// DRAIN-THEN-RESPOND: the head response is buffered in write_buf but is NOT
 	// flushed here. The body is drained first (the cs.body_drain branch in
@@ -900,11 +924,15 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 		}
 		// A file deferred by an earlier request in this batch must be emitted (as
 		// bytes, in order) BEFORE this next response is appended — same ordering
-		// rule as the synchronous drain_requests.
-		if cs.file_remaining > 0 {
-			append_file_region(mut cs.write_buf, cs.file_fd, cs.file_off, cs.file_remaining)
-			cs.file_fd = -1
-			cs.file_remaining = 0
+		// rule as the synchronous drain_requests. A short read (the file shrank)
+		// would leave that body shorter than its Content-Length, with this
+		// response read as its tail: stop answering, flush and close.
+		if cs.file_remaining > 0 && !materialise_file(mut cs) {
+			compact_read_buf(mut cs, pos)
+			if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
+				close_conn(epoll_fd, fd, active_conns, mut st)
+			}
+			return false
 		}
 		req := buf_view(cs.read_buf, pos, total)
 		// Only last_watched can be dirtied between iterations (register_watch is
@@ -923,19 +951,29 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 		// (a contract violation) must not leak its takeover into the next
 		// request this worker serves. nil cont = nothing was queued.
 		qt := core.take_queued_takeover() or { core.QueuedTakeover{} }
+		// The sendfile slot is thread-local too, and drained on every step for
+		// the same reason. A handler may have appended headers and handed its
+		// body off with core.queue_file: on .done and .close the region streams
+		// after write_buf drains (flush_batch). A .close response gets that one
+		// flush and then the close, parked or not, so its body is best-effort,
+		// bounded by the socket send buffer like the rest of that response (a
+		// short file is cut short by the same close). On .suspend it is dropped:
+		// a parked request has not answered yet, its continuation writes the
+		// response.
+		if qf := core.take_queued_file() {
+			if step != .suspend {
+				cs.file_fd = qf.file_fd
+				cs.file_off = qf.off
+				cs.file_remaining = qf.len
+			}
+		}
 		match step {
 			.done {
-				// Handler may have appended headers + handed its body off for
-				// sendfile(2); it streams after write_buf drains (flush_batch).
-				if qf := core.take_queued_file() {
-					cs.file_fd = qf.file_fd
-					cs.file_off = qf.off
-					cs.file_remaining = qf.len
-				}
-				// ...or handed the CONNECTION off (issue #136): from here on the
-				// bytes are no longer HTTP — stop parsing this burst as requests.
-				// The leftover stays buffered (compacted below) for the takeover
-				// drain, which runs after the switching response flushes.
+				// The handler may have handed the CONNECTION off (issue #136):
+				// from here on the bytes are no longer HTTP — stop parsing this
+				// burst as requests. The leftover stays buffered (compacted
+				// below) for the takeover drain, which runs after the switching
+				// response flushes.
 				if qt.cont != unsafe { nil } {
 					cs.takeover = qt.cont
 					cs.takeover_state = qt.state
@@ -1061,7 +1099,15 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 			reactor:   unsafe { voidptr(&reactor) }
 			register:  register_watch
 		}
+		// Every continuation runs with the sendfile gate closed: nothing takes
+		// the slot after one, so a region it queued would be taken by the next
+		// .done on this worker and streamed after that response, another
+		// client's. queue_file refuses instead and the continuation writes its
+		// body itself. The plain worker never narrows the gate otherwise, so it
+		// reopens right after the call.
+		core.set_queue_file_allowed(false)
 		step := cont(mut scratch, ext_fd, ready_err, entry_udata, state, mut bg_loop)
+		core.set_queue_file_allowed(true)
 		// A clientless watch has no connection to take over — drain the
 		// thread-local slot so a misbehaving continuation can't leak one.
 		if _ := core.take_queued_takeover() {
@@ -1094,7 +1140,9 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 		reactor:   unsafe { voidptr(&reactor) }
 		register:  register_watch
 	}
+	core.set_queue_file_allowed(false) // no file from a continuation (see above)
 	cont_step := cont(mut cs.write_buf, ext_fd, ready_err, entry_udata, state, mut event_loop)
+	core.set_queue_file_allowed(true)
 	if cont_step != .suspend && event_loop.last_watched >= 0 {
 		// Continuation re-watched but did not park (.done/.close after watch_fd):
 		// tear the stray watch down before the connection moves on / is closed.
@@ -1231,7 +1279,10 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 			// would refresh it, and a dedup that SKIPS dead slots would append a
 			// duplicate instead.
 			reactor.rearming_dead = true
+			// No file from a continuation (on_watch_ready).
+			core.set_queue_file_allowed(false)
 			dead_step := slot.cont(mut scratch, ext_fd, ready_err, slot.udata, state, mut dead_loop)
+			core.set_queue_file_allowed(true)
 			reactor.rearming_dead = false
 			// A dead client cannot be taken over — drain the thread-local slot.
 			if _ := core.take_queued_takeover() {
@@ -1251,8 +1302,10 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 			reactor:   unsafe { voidptr(&reactor) }
 			register:  register_watch
 		}
+		core.set_queue_file_allowed(false) // no file from a continuation (on_watch_ready)
 		pipelined_step := slot.cont(mut cs.write_buf, ext_fd, ready_err, slot.udata, state, mut
 			event_loop)
+		core.set_queue_file_allowed(true)
 		if pipelined_step != .suspend && event_loop.last_watched >= 0
 			&& event_loop.last_watched != ext_fd {
 			// Continuation watched a DIFFERENT fd but did not park: stray watch —

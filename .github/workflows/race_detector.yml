@@ -9,6 +9,11 @@ name: Race Detector (-race)
 # not, and reports that ring's correctly published slots as races (#164).
 # A race fails the step: the test binary exits 66 and the runner marks it
 # FAIL, with the V file:line stacks of both accesses in the log.
+#
+# static_assets/ and tls/ are paths too: the worker imports tls/ (the stub
+# when built without -d vanilla_tls), and static_assets/ is the handler side of
+# the worker's core.queue_file hand-off, shared by every worker thread; its
+# unit tests run under -race below, next to the core hand-off slot's.
 
 on:
   push:
@@ -22,6 +27,8 @@ on:
       - 'vtest/**'
       - 'transport/**'
       - 'tests/**'
+      - 'static_assets/**'
+      - 'tls/**'
       - '.github/workflows/race_detector.yml'
   pull_request:
     branches: [ main ]
@@ -34,6 +41,8 @@ on:
       - 'vtest/**'
       - 'transport/**'
       - 'tests/**'
+      - 'static_assets/**'
+      - 'tls/**'
       - '.github/workflows/race_detector.yml'
 
 jobs:
@@ -99,3 +108,8 @@ jobs:
         shell: bash
         run: |
           v -race -cc "$RACE_CC" -no-parallel test server/backend_epoll/reactor_pipelining_test.v
+      - name: static_assets and core hand-off slot unit tests
+        shell: bash
+        run: |
+          v -race -cc "$RACE_CC" -no-parallel test static_assets/
+          v -race -cc "$RACE_CC" -no-parallel test core/sendfile_slot_test.v core/file_region_test.v

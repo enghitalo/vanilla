@@ -80,6 +80,10 @@ fn main() {
 spawns the workers and blocks; `srv.shutdown(grace_ms int)` shuts the listeners
 and drains in-flight requests up to the grace period.
 
+On POSIX, `new_server` makes the whole process ignore SIGPIPE: a write to a
+peer that has closed or reset the connection fails with `EPIPE` instead of
+killing the process, and the server closes that connection.
+
 ## Request limits (`ServerConfig.limits`)
 
 `Limits` gates abusive requests at the framing/accept layer. Every field
