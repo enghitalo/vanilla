@@ -420,13 +420,26 @@ pub fn (s &AssetServer) respond(req_buffer []u8) ![]u8 {
 	if !request_parser.decode_into(mut hr) {
 		return err_malformed
 	}
-	// unsafe: neither call keeps the pointer, and a plain `&hr` would make V
-	// move `hr` to the heap (one allocation per call).
-	canned, asset, head := s.route(unsafe { &hr })
+	// The response is set through `resp` by a method that returns nothing, as
+	// respond_into does. Since V 04fc6a97, passing `&hr` to route and
+	// build_bytes here moved `hr` to the heap (one allocation per call), even
+	// under unsafe; this shape keeps it on the stack.
+	mut resp := []u8{}
+	s.respond_view(&hr, mut resp)
+	return resp
+}
+
+// respond_view sets `resp` to the response for a decoded request: a view of a
+// snapshot's bytes, or a constant. It copies and allocates nothing.
+fn (s &AssetServer) respond_view(req &request_parser.HttpRequest, mut resp []u8) {
+	canned, asset, head := s.route(req)
 	if isnil(asset) {
-		return canned
+		unsafe {
+			resp = canned // a view of a constant, as respond returned it
+		}
+		return
 	}
-	return s.build_bytes(asset, unsafe { &hr }, head)
+	resp = s.build_bytes(asset, req, head)
 }
 
 // respond_into decodes `req_buffer` and appends the response to `out`; see
