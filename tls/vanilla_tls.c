@@ -35,6 +35,15 @@
 #ifndef TLS_RX_EXPECT_NO_PAD
 #define TLS_RX_EXPECT_NO_PAD 4 /* linux/tls.h since 6.0; older headers lack it */
 #endif
+/* The one-time log flags and ktls_off use the generic __atomic builtins
+ * (__atomic_load/_store/_exchange): V's bundled tcc has those but not the
+ * _n forms, and defines no __ATOMIC_* order without <stdatomic.h>. tcc also
+ * miscompiles a load or exchange whose result pointer is not the address of
+ * a local or a global (a struct field, a pointer variable): the program
+ * crashes there. Load into a local, then assign. */
+#ifndef __ATOMIC_RELAXED
+#define __ATOMIC_RELAXED 0
+#endif
 
 struct vtls_ctx {
     mbedtls_ssl_config conf;
@@ -52,6 +61,10 @@ struct vtls_ctx {
     // hence they live here in the ctx, not on the stack.
     char alpn_buf[64];     // protocol names, NUL-separated in place
     const char *alpn[5];   // pointers into alpn_buf, NULL-terminated
+    // 1 = keep every new session on userspace Mbed TLS (vtls_set_ktls). Read
+    // and written with __atomic builtins: an operator may flip it while
+    // workers create sessions.
+    int ktls_off;
     // vtls_set_ktls_rx_no_pad: set before the server starts, copied into each
     // session by vtls_session_new (plain int: no thread writes it concurrently).
     int ktls_rx_no_pad;
@@ -78,6 +91,7 @@ typedef struct {
     vtls_keys keys;  // captured during the handshake, consumed by vtls_enable_ktls
     int ktls;        // 1 once kTLS TX+RX are both installed (reads/writes are plaintext)
     int ktls_failed; // 1 if a setsockopt failed AFTER the ULP attached → caller must close
+    int ktls_off;    // the config's vtls_set_ktls(0), as of this session's creation
     int ktls_rx_no_pad; // the ctx's opt-in: enable_ktls sets TLS_RX_EXPECT_NO_PAD
     // The socket may hold unread bytes: set by vtls_mark_readable (every
     // readable edge), cleared by a recv that came back short or EAGAIN.
@@ -366,6 +380,13 @@ const char *vtls_cert_pem(vtls_ctx *c) {
     return (c && c->cert_pem_len > 0) ? c->cert_pem : NULL;
 }
 
+// Allow or forbid kTLS for the sessions created from now on: vtls_session_new
+// copies the flag, and vtls_enable_ktls falls back cleanly when it is off.
+void vtls_set_ktls(vtls_ctx *c, int enabled) {
+    int off = enabled ? 0 : 1;
+    if (c) __atomic_store(&c->ktls_off, &off, __ATOMIC_RELAXED);
+}
+
 // Configure ALPN from a comma-separated list (e.g. "http/1.1" or "h2,http/1.1").
 // The server offers these in order; mbedTLS picks the first the client also
 // supports. The names are copied into the ctx (the config keeps the pointers).
@@ -497,6 +518,9 @@ void *vtls_session_new(vtls_ctx *c, int fd) {
     if (ret != 0) { free(s); return NULL; }
     s->net.fd = fd; // already accepted + non-blocking
     s->readable = 1; // the ClientHello may have arrived with the connect
+    int ktls_off; // a local: tcc miscompiles a load into a field (see the top)
+    __atomic_load(&c->ktls_off, &ktls_off, __ATOMIC_RELAXED);
+    s->ktls_off = ktls_off;
     s->ktls_rx_no_pad = c->ktls_rx_no_pad;
     mbedtls_ssl_set_bio(&s->ssl, &s->net, vtls_bio_send, vtls_bio_recv, NULL);
     // Capture the TLS 1.3 application traffic secrets for the kTLS handoff (per-ssl;
@@ -648,14 +672,29 @@ static int fill_crypto_info(const unsigned char secret[32],
 }
 
 // One-time kTLS outcome logging so a deployment can see whether kTLS engaged or
-// silently fell back to userspace TLS (≤2 lines per process: first engage + first
-// fallback). The distinction matters: a benchmark on a host without the `tls`
-// kernel module would otherwise measure the userspace path and look like a no-op.
+// silently fell back to userspace TLS (≤3 lines per process: first engage, first
+// fallback, first opt-out). The distinction matters: a benchmark on a host
+// without the `tls` kernel module would otherwise measure the userspace path and
+// look like a no-op.
+// The flags are claimed atomically: with MBEDTLS_THREADING_C the crypto lock
+// compiles out, so several workers can finish a handshake at once (a plain
+// test-then-set is a data race, which -race reports, and could log twice).
+// The deliberate opt-out (tls.Config.set_ktls(false)) has a line of its own,
+// so it never masks a real fallback (a host without the `tls` module).
 static int ktls_logged_ok = 0;
 static int ktls_logged_fb = 0;
+static int ktls_logged_off = 0;
+// ktls_first reports whether this call is the first to claim `flag`. The load
+// keeps every later call from writing the shared line.
+static int ktls_first(int *flag) {
+    int cur, one = 1, prev;
+    __atomic_load(flag, &cur, __ATOMIC_RELAXED);
+    if (cur != 0) return 0;
+    __atomic_exchange(flag, &one, &prev, __ATOMIC_RELAXED);
+    return prev == 0;
+}
 static void ktls_log_fb(const char *why) {
-    if (!ktls_logged_fb) {
-        ktls_logged_fb = 1;
+    if (ktls_first(&ktls_logged_fb)) {
         fprintf(stderr, "[ktls] fallback to userspace TLS: %s\n", why);
     }
 }
@@ -670,6 +709,14 @@ static int enable_ktls(vtls_session *s, int fd) {
     memset(&tx, 0, sizeof(tx));
     memset(&rx, 0, sizeof(rx));
 
+    // Turned off on the config (vtls_set_ktls): the same clean fallback as a host
+    // without the `tls` module, logged once under its own flag.
+    if (s->ktls_off) {
+        if (ktls_first(&ktls_logged_off)) {
+            fprintf(stderr, "[ktls] userspace TLS: disabled by tls.Config.set_ktls(false)\n");
+        }
+        goto done;
+    }
     // Must be the pinned single suite and both traffic secrets must be captured.
     if (mbedtls_ssl_get_ciphersuite_id_from_ssl(&s->ssl) != MBEDTLS_TLS1_3_AES_128_GCM_SHA256) {
         ktls_log_fb("ciphersuite is not TLS_AES_128_GCM_SHA256");
@@ -699,8 +746,7 @@ static int enable_ktls(vtls_session *s, int fd) {
     // socket changed, so the connection keeps running over userspace mbedtls
     // (errno ENOENT = the `tls` kernel module is not loaded).
     if (setsockopt(fd, SOL_TCP, TCP_ULP, "tls", sizeof("tls")) < 0) {
-        if (!ktls_logged_fb) {
-            ktls_logged_fb = 1;
+        if (ktls_first(&ktls_logged_fb)) {
             fprintf(stderr, "[ktls] fallback to userspace TLS: TCP_ULP failed (errno=%d %s)\n",
                     errno, strerror(errno));
         }
@@ -739,8 +785,7 @@ static int enable_ktls(vtls_session *s, int fd) {
         int one = 1;
         rx_no_pad = setsockopt(fd, SOL_TLS, TLS_RX_EXPECT_NO_PAD, &one, sizeof(one)) == 0;
     }
-    if (!ktls_logged_ok) {
-        ktls_logged_ok = 1;
+    if (ktls_first(&ktls_logged_ok)) {
         fprintf(stderr, "[ktls] engaged: kernel TLS TX+RX (TLS 1.3, AES-128-GCM%s)\n",
                 rx_no_pad ? ", RX no-pad" : "");
     }
@@ -768,3 +813,37 @@ int vtls_enable_ktls(void *sess, int fd) {
 int vtls_ktls_active(void *sess) { return ((vtls_session *)sess)->ktls; }
 
 int vtls_ktls_failed(void *sess) { return ((vtls_session *)sess)->ktls_failed; }
+
+// A fatal internal_error alert on a kTLS socket, for a connection about to be
+// closed mid-response. The record type is set per sendmsg with a SOL_TLS /
+// TLS_SET_RECORD_TYPE control message; a record of a new type makes the kernel
+// first push the data record a MSG_MORE send left open, which close() would
+// discard with every complete answer in it (neither a 0-byte send nor
+// shutdown(SHUT_WR) pushes it). Best effort: errors are ignored, the caller
+// closes next. A no-op on a userspace session.
+void vtls_ktls_abort(void *sess) {
+    vtls_session *s = (vtls_session *)sess;
+    if (!s || !s->ktls) return;
+    unsigned char alert[2] = { 2, 80 }; // level fatal, internal_error
+    union {
+        char buf[CMSG_SPACE(1)];
+        struct cmsghdr align;
+    } ctl;
+    struct iovec iov;
+    struct msghdr msg;
+    memset(&ctl, 0, sizeof(ctl));
+    memset(&msg, 0, sizeof(msg));
+    iov.iov_base = alert;
+    iov.iov_len = sizeof(alert);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = ctl.buf;
+    msg.msg_controllen = sizeof(ctl.buf);
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+    cm->cmsg_level = SOL_TLS;
+    cm->cmsg_type = TLS_SET_RECORD_TYPE;
+    cm->cmsg_len = CMSG_LEN(1);
+    *CMSG_DATA(cm) = 21; // content type: alert
+    // Never MSG_MORE: the ULP rejects it alongside a record type.
+    (void)sendmsg(s->net.fd, &msg, MSG_NOSIGNAL);
+}

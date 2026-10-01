@@ -37,6 +37,8 @@ fn C.vtls_write(sess voidptr, buf &u8, len usize) int
 fn C.vtls_enable_ktls(sess voidptr, fd int) int
 fn C.vtls_ktls_active(sess voidptr) int
 fn C.vtls_ktls_failed(sess voidptr) int
+fn C.vtls_ktls_abort(sess voidptr)
+fn C.vtls_set_ktls(ctx voidptr, enabled int)
 fn C.vtls_set_ktls_rx_no_pad(ctx voidptr, enabled int)
 
 // init performs process-wide crypto init (psa_crypto_init). Call once at startup.
@@ -173,6 +175,15 @@ pub fn (c &Config) set_alpn(protos string) ! {
 	}
 }
 
+// set_ktls allows (true, the default) or forbids kernel TLS for the sessions
+// created from now on. Forbidden, every connection stays on userspace Mbed TLS
+// after its handshake, as on a host without the `tls` kernel module (the
+// fallback is logged once): for tests of that path, and as an operator kill
+// switch. Connections already established keep the mode they have.
+pub fn (c &Config) set_ktls(enabled bool) {
+	C.vtls_set_ktls(c.ctx, int(enabled))
+}
+
 // set_ktls_rx_no_pad opts in to TLS_RX_EXPECT_NO_PAD on kTLS connections: the
 // kernel decrypts each record straight into the recv() buffer, saving a page
 // allocation and a full copy per record. Off by default: kernels before Linux
@@ -265,6 +276,14 @@ pub fn (s &Session) ktls_active() bool {
 // is then unusable for the userspace path, so the caller must close the connection.
 pub fn (s &Session) ktls_failed() bool {
 	return C.vtls_ktls_failed(s.sess) == 1
+}
+
+// ktls_abort sends a fatal alert on a kTLS session that is about to be closed
+// mid-response (best effort). The kernel first pushes the record a MSG_MORE
+// send left open, which a bare close would discard, so the answers already in
+// it reach the peer. A no-op on a userspace session.
+pub fn (s &Session) ktls_abort() {
+	C.vtls_ktls_abort(s.sess)
 }
 
 // alpn returns the protocol negotiated via ALPN (e.g. 'http/1.1'), or '' if the

@@ -134,6 +134,16 @@ together. While a response waits for the socket to drain (WANT_WRITE),
 nothing more is read or answered on that connection; the requests pipelined
 behind it are answered once it is out.
 
+After the handshake the record crypto moves into the kernel (kTLS) when the
+host has the `tls` module; otherwise the connection stays on Mbed TLS, and the
+server logs the fallback once. On a kTLS connection a handler can hand a file
+body off with `core.queue_file` (static_assets does it for files of at least
+`sendfile_min_bytes`): the headers go out with `MSG_MORE` and `sendfile(2)`
+streams the file into the same record, with no userspace copy. A
+userspace-TLS connection refuses the hand-off, so the handler appends the
+bytes. `tls_config.set_ktls(false)` keeps every new connection on Mbed TLS
+(tests of that path, or an operator kill switch).
+
 Every worker can serve TLS. How much of the crypto runs in parallel depends on
 how Mbed TLS was built. Its PSA Crypto state (the key store, the RNG) is
 shared by the whole process:

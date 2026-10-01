@@ -434,6 +434,11 @@ fn process_events_tls(worker_id int, epoll_fd int, handler core.Handler, make_st
 	if make_state != unsafe { nil } {
 		state = make_state()
 	}
+	// This worker can stream file bodies with sendfile(2) on kernel-TLS
+	// connections, where the kernel encrypts what sendfile writes. The
+	// hand-off (core.queue_file) is gated per request: handle_readable_fd_tls
+	// closes it for a userspace-TLS connection before calling the handler.
+	core.enable_sendfile()
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut sessions := map[int]&TlsConn{}
 	// Resolved once: the keep-alive idle budget (0 = off) and the sweep cadence

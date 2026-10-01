@@ -28,6 +28,8 @@ pub fn (c &Config) set_alpn(protos string) ! {
 	return error(not_built)
 }
 
+pub fn (c &Config) set_ktls(enabled bool) {}
+
 pub fn (c &Config) set_ktls_rx_no_pad(enabled bool) {}
 
 pub fn (c &Config) cert_pem() string {
@@ -69,6 +71,8 @@ pub fn (s &Session) ktls_active() bool {
 pub fn (s &Session) ktls_failed() bool {
 	return false
 }
+
+pub fn (s &Session) ktls_abort() {}
 
 pub fn (s &Session) alpn() string {
 	return ''

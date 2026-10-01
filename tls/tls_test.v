@@ -32,6 +32,29 @@ fn test_alpn_config() {
 	}
 }
 
+// A session is created from a config whose kTLS settings were changed, and
+// set_ktls(false) makes its enable_ktls take the clean opt-out (no handshake
+// needed). That runs every atomic in the C shim, so `v test tls/` builds and
+// runs the session path with each compiler. tcc, V's default, miscompiled an
+// __atomic_load in vtls_session_new: every HTTPS server it built crashed on
+// its first connection, and only the e2e tests reached that code. The
+// session never touches its fd here.
+fn test_new_session_after_ktls_settings() {
+	$if vanilla_tls ? {
+		initialize() or { panic('initialize: ${err}') }
+		cfg := new_self_signed() or { panic('gen: ${err}') }
+		cfg.set_ktls_rx_no_pad(true)
+		cfg.set_ktls(false)
+		mut p := os.pipe() or { panic('pipe: ${err}') }
+		s := cfg.new_session(p.read_fd) or { panic('new_session failed') }
+		assert !s.enable_ktls(p.read_fd), 'set_ktls(false) must keep the session on userspace TLS'
+		assert !s.ktls_failed() && !s.ktls_active()
+		s.free()
+		p.close()
+		cfg.free()
+	}
+}
+
 // The default certificate must be usable by real clients: SANs for localhost
 // and both loopback IPs, and an exportable key so the pair can be kept.
 fn test_self_signed_default_has_key_and_cert() {
