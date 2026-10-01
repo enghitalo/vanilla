@@ -32,6 +32,9 @@
 #ifndef SOL_TLS
 #define SOL_TLS 282
 #endif
+#ifndef TLS_RX_EXPECT_NO_PAD
+#define TLS_RX_EXPECT_NO_PAD 4 /* linux/tls.h since 6.0; older headers lack it */
+#endif
 
 struct vtls_ctx {
     mbedtls_ssl_config conf;
@@ -49,6 +52,9 @@ struct vtls_ctx {
     // hence they live here in the ctx, not on the stack.
     char alpn_buf[64];     // protocol names, NUL-separated in place
     const char *alpn[5];   // pointers into alpn_buf, NULL-terminated
+    // vtls_set_ktls_rx_no_pad: set before the server starts, copied into each
+    // session by vtls_session_new (plain int: no thread writes it concurrently).
+    int ktls_rx_no_pad;
 };
 
 // kTLS key capture: the TLS 1.3 application traffic secrets, filled by
@@ -72,6 +78,7 @@ typedef struct {
     vtls_keys keys;  // captured during the handshake, consumed by vtls_enable_ktls
     int ktls;        // 1 once kTLS TX+RX are both installed (reads/writes are plaintext)
     int ktls_failed; // 1 if a setsockopt failed AFTER the ULP attached → caller must close
+    int ktls_rx_no_pad; // the ctx's opt-in: enable_ktls sets TLS_RX_EXPECT_NO_PAD
     // The socket may hold unread bytes: set by vtls_mark_readable (every
     // readable edge), cleared by a recv that came back short or EAGAIN.
     int readable;
@@ -380,6 +387,12 @@ int vtls_set_alpn(vtls_ctx *c, const char *list) {
     return mbedtls_ssl_conf_alpn_protocols(&c->conf, c->alpn);
 }
 
+// Opt in to TLS_RX_EXPECT_NO_PAD on kTLS sessions created from now on (see
+// enable_ktls for when that is safe). No lock: called before the server starts.
+void vtls_set_ktls_rx_no_pad(vtls_ctx *c, int enabled) {
+    if (c) c->ktls_rx_no_pad = enabled != 0;
+}
+
 // ---- per-connection session -------------------------------------------------
 
 // vtls_bio_recv is the session's receive callback. mbedTLS asks for exact
@@ -484,6 +497,7 @@ void *vtls_session_new(vtls_ctx *c, int fd) {
     if (ret != 0) { free(s); return NULL; }
     s->net.fd = fd; // already accepted + non-blocking
     s->readable = 1; // the ClientHello may have arrived with the connect
+    s->ktls_rx_no_pad = c->ktls_rx_no_pad;
     mbedtls_ssl_set_bio(&s->ssl, &s->net, vtls_bio_send, vtls_bio_recv, NULL);
     // Capture the TLS 1.3 application traffic secrets for the kTLS handoff (per-ssl;
     // there is no config-level variant in Mbed TLS 4). s->keys is zeroed by calloc.
@@ -703,9 +717,32 @@ static int enable_ktls(vtls_session *s, int fd) {
         goto done;
     }
     s->ktls = 1; // keys now live in the kernel
+    // TLS_RX_EXPECT_NO_PAD, only when the config opted in (vtls_set_ktls_rx_no_pad).
+    // TLS 1.3 hides a record's real content type at the end of its plaintext,
+    // after optional zero padding, so by default the kernel decrypts every record
+    // into a clear-text skb of its own, finds the type, then copies the data out:
+    // one page allocation and one full copy per record. Told to expect no
+    // padding, it decrypts straight into the recv() buffer, and a padded or
+    // non-data record (KeyUpdate, alert) is detected and decrypted again the
+    // default way (counted in TlsRxNoPadViolation in /proc/net/tls_stat). That
+    // retry is correct only from Linux commit 1c8629651cb5 ("tls: rx: restore
+    // msg_iter before TLS 1.3 optimistic retry"; v7.2, v7.1.9+, v6.18.45+).
+    // Older kernels, back to 6.0, write decrypted bytes past the length recvmsg()
+    // returns: they corrupt the buffer ktls_recv fills (the pipelined requests
+    // in it) or fail the recv with EFAULT. Peers do not pad by default (Mbed TLS,
+    // OpenSSL, BoringSSL, rustls, Go and NSS), but RFC 8446 §5.4 allows it and
+    // OpenSSL pads when configured to (RecordPadding in openssl.cnf), hence
+    // opt-in: safe on a fixed kernel, or when the peers are known not to pad.
+    // Kernels before 6.0 reject the option and keep the default path.
+    int rx_no_pad = 0;
+    if (s->ktls_rx_no_pad) {
+        int one = 1;
+        rx_no_pad = setsockopt(fd, SOL_TLS, TLS_RX_EXPECT_NO_PAD, &one, sizeof(one)) == 0;
+    }
     if (!ktls_logged_ok) {
         ktls_logged_ok = 1;
-        fprintf(stderr, "[ktls] engaged: kernel TLS TX+RX (TLS 1.3, AES-128-GCM)\n");
+        fprintf(stderr, "[ktls] engaged: kernel TLS TX+RX (TLS 1.3, AES-128-GCM%s)\n",
+                rx_no_pad ? ", RX no-pad" : "");
     }
 
 done:
