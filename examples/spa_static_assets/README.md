@@ -31,6 +31,52 @@ always correct. Smaller files stay preloaded in RAM and are sent from a single
 precomputed buffer. Range, conditional GET, and `Accept-Encoding` negotiation
 all work over the `sendfile` path.
 
+### Following the disk (`follow_disk`)
+
+By default a representation is immutable after `new()`. With
+`follow_disk: true` a replaced file is served without a restart:
+
+```v
+assets := static_assets.new(static_assets.Config{
+	root:            'dist'
+	follow_disk:     true // rebuild a representation when its file changes
+	revalidate_ms:   100  // one stat(2) per representation per 100 ms; 0 = every request
+	memory_fallback: true // large files also kept in RAM, for workers that cannot sendfile
+})!
+```
+
+- A file counts as changed when its (dev, inode, size, mtime_ns, ctime_ns)
+  differs, never by "newer mtime", so a rename of a new file and a `cp -p`
+  restore of an older one are both seen. The first request after the
+  `revalidate_ms` window makes the one stat; the others pay a coarse clock read.
+- A new version is a new immutable snapshot (headers, body or fd, ETag, 304),
+  published with one atomic pointer store. Requests in flight keep the version
+  they loaded, and old versions are never freed, so nothing a worker is still
+  sending can change or go away under it. That costs memory (and one fd per
+  version of a file served with sendfile) for every change: fine for deploys,
+  not for files rewritten continuously.
+- Replace files atomically (write a temporary file in the same directory, then
+  rename it). Files added or deleted after `new()` are not followed; a deleted
+  file keeps serving its last version. Not supported on Windows.
+- `memory_fallback` keeps the bytes of files at or above `sendfile_min_bytes`
+  in RAM as well, so the io_uring backend (borrowed send) and userspace-TLS
+  connections send them from memory instead of reading the file per request.
+
+Each representation (identity, `.br`, `.gz`) has its own strong ETag, a 304
+carries `Vary: Accept-Encoding` when the asset is negotiable, and 200, HEAD,
+304 and 206 responses allocate nothing per request (`respond_into` /
+`respond_req_into`; `respond_req_into` takes a request the handler already
+decoded).
+
+**API changes (2026-10):** `Asset.etag`, `Asset.body`, `Asset.body_len` and
+`Asset.variants` are gone (representations live in per-asset snapshots); use
+`AssetServer.etag_for(path)` for the identity ETag. ETags are per
+representation and fixed width (`"` + 16 hex digits + `"`); for a file served
+from disk with sendfile it is a hash of its size and nanosecond mtime (was:
+size and mtime in seconds, in hex), so it stays the same across restarts and
+replicas. A Range request is answered from the identity representation, and
+its `If-None-Match` is compared against the identity ETag.
+
 ### Memory: flat RAM, no per-request allocation (2026-06)
 
 This module stays flat on RAM under load for two reasons:
@@ -41,7 +87,7 @@ This module stays flat on RAM under load for two reasons:
 - **Lookup key is a zero-copy view** — routing builds the asset key as a
   non-owning `tos` view straight into the request buffer
   (`key := tos(&buf[rs], rel_len)`, never retained — see
-  [`static_assets/static_assets.v:273`](../../static_assets/static_assets.v)),
+  [`static_assets/static_assets.v:384`](../../static_assets/static_assets.v)),
   not an allocating `substr`, so routing costs no per-request allocation.
 
 A hand-rolled handler that builds its key with `route[8..]` instead would

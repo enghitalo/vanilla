@@ -14,6 +14,8 @@ name: Race Detector (-race)
 # when built without -d vanilla_tls), and static_assets/ is the handler side of
 # the worker's core.queue_file hand-off, shared by every worker thread; its
 # unit tests run under -race below, next to the core hand-off slot's.
+# static_assets_race_test.v races readers against follow_disk rebuilding and
+# publishing snapshots of files that are replaced under them.
 
 on:
   push:
@@ -108,7 +110,7 @@ jobs:
         shell: bash
         run: |
           v -race -cc "$RACE_CC" -no-parallel test server/backend_epoll/reactor_pipelining_test.v
-      - name: static_assets and core hand-off slot unit tests
+      - name: static_assets (follow_disk race test included) and core hand-off slot unit tests
         shell: bash
         run: |
           v -race -cc "$RACE_CC" -no-parallel test static_assets/
