@@ -5,14 +5,14 @@ module core
 // This is the backend-agnostic bridge that lets a pure `(req, fd, out)` handler
 // ask the running worker to emit a file body with sendfile(2) instead of
 // copying it through the response buffer. Only a sendfile-capable worker (the
-// epoll plain worker) calls enable_sendfile(); everywhere else queue_file()
-// returns false and the caller writes the bytes itself, so this is a no-op on
-// the TLS worker, other backends, and non-Linux OSes.
+// epoll plain and TLS workers) calls enable_sendfile(); everywhere else
+// queue_file() returns false and the caller writes the bytes itself, so this is
+// a no-op on other backends and non-Linux OSes.
 //
 // A worker that can sendfile on some connections but not others narrows the
-// hand-off per request with set_queue_file_allowed(): a TLS worker, where
-// sendfile(2) writes plaintext that only a kernel-TLS socket encrypts, passes
-// false for a userspace-TLS connection. The plain worker never calls it.
+// hand-off per request with set_queue_file_allowed(): the epoll TLS worker,
+// where sendfile(2) writes plaintext that only a kernel-TLS socket encrypts,
+// passes false for a userspace-TLS connection. The plain worker never calls it.
 
 #include "@VMODROOT/core/sendfile_slot.h"
 
@@ -31,8 +31,9 @@ pub:
 }
 
 // enable_sendfile marks the calling worker thread as able to consume a queued
-// file via sendfile(2). Call once per capable worker (the epoll plain worker).
-// It also allows every request until set_queue_file_allowed says otherwise.
+// file via sendfile(2). Call once per capable worker (the epoll plain and TLS
+// workers). It also allows every request until set_queue_file_allowed says
+// otherwise.
 @[inline]
 pub fn enable_sendfile() {
 	C.vanilla_sf_enable()
@@ -52,7 +53,7 @@ pub fn set_queue_file_allowed(allowed bool) {
 // backend can't sendfile (a worker that never enabled it, a connection it is
 // not allowed on, a non-epoll backend, or a non-Linux OS) — the caller MUST
 // then write the body bytes itself (on POSIX, core.append_file_region reads
-// them into `out` without allocating). The epoll worker drains the slot after
+// them into `out` without allocating). The epoll workers drain the slot after
 // every core.Handler call (a pipelined request, or the head of a streamed
 // large body), whatever the step: a region queued by a step that returns
 // .suspend is dropped, and one queued by a step that returns .close is still

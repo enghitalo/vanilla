@@ -110,4 +110,15 @@ int vtls_enable_ktls(void *sess, int fd);
 int vtls_ktls_active(void *sess);
 int vtls_ktls_failed(void *sess);
 
+// On a kTLS session, send a fatal internal_error alert (best effort) before the
+// caller closes mid-response: the kernel first pushes the data record a
+// MSG_MORE send left open, so the bytes already in it are not lost. No-op on
+// a userspace session.
+void vtls_ktls_abort(void *sess);
+
+// Allow (1, the default) or forbid (0) kTLS for sessions created from now on.
+// Each session copies the setting at vtls_session_new; with 0 its
+// vtls_enable_ktls returns 0 (the clean userspace fallback, logged once).
+void vtls_set_ktls(vtls_ctx *ctx, int enabled);
+
 #endif /* VANILLA_TLS_H */

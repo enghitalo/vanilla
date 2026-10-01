@@ -15,7 +15,8 @@ name: Race Detector (-race)
 # the worker's core.queue_file hand-off, shared by every worker thread; its
 # unit tests run under -race below, next to the core hand-off slot's.
 # static_assets_race_test.v races readers against follow_disk rebuilding and
-# publishing snapshots of files that are replaced under them.
+# publishing snapshots of files that are replaced under them. The TLS worker's
+# e2e suites need Mbed TLS, so their -race step lives in tls_backend.yml.
 
 on:
   push:

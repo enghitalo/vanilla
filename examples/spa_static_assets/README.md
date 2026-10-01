@@ -25,9 +25,10 @@ Files at least `sendfile_min_bytes` (default 256 KiB) are served straight from
 disk to the socket with `sendfile(2)` — the body never passes through a
 userspace buffer. The handler calls `respond_into(req, mut out)` (not
 `respond()`): it appends the headers to `out` and hands the body off to the
-worker to stream. This is a Linux/epoll fast path; on TLS, other backends, or
-other OSes it transparently falls back to copying the body, so the response is
-always correct. Smaller files stay preloaded in RAM and are sent from a single
+worker to stream. This is a Linux/epoll fast path, kernel-TLS connections
+included (the kernel encrypts what `sendfile` writes); on userspace TLS, other
+backends, or other OSes it transparently falls back to copying the body, so the
+response is always correct. Smaller files stay preloaded in RAM and are sent from a single
 precomputed buffer. Range, conditional GET, and `Accept-Encoding` negotiation
 all work over the `sendfile` path.
 
