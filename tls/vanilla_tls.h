@@ -101,13 +101,24 @@ void vtls_mark_readable(void *sess);
 
 // After vtls_handshake() returns VTLS_OK, try to hand record encrypt/decrypt to the
 // kernel (TLS_TX + TLS_RX). Returns 1 if kTLS engaged — thereafter the caller does
-// PLAIN recv()/send() on the fd and the kernel does AES-128-GCM (decrypting straight
-// into the recv() buffer where the kernel supports TLS_RX_EXPECT_NO_PAD). Returns 0 to keep
+// PLAIN recv()/send() on the fd and the kernel does AES-128-GCM. Returns 0 to keep
 // using vtls_read/vtls_write (userspace mbedtls) — a safe fallback when the host
 // lacks the tls ULP. If it returns 0 AND vtls_ktls_failed() is 1, the socket is
 // half-converted and the caller MUST close the connection.
 int vtls_enable_ktls(void *sess, int fd);
 int vtls_ktls_active(void *sess);
 int vtls_ktls_failed(void *sess);
+
+// Opt in (enabled = 1) to TLS_RX_EXPECT_NO_PAD on the kTLS sessions of this
+// context: the kernel then decrypts each record straight into the recv()
+// buffer, saving a page allocation and a copy per record. Off by default.
+// Kernels before commit 1c8629651cb5 (fixed in v7.2, v7.1.9+, v6.18.45+)
+// mishandle a padded or non-data record in this mode: recvmsg() writes past
+// the length it returns, corrupting the received data. Peers do not pad by
+// default, but TLS 1.3 allows it (OpenSSL's RecordPadding), so enable it on a
+// fixed kernel, or when the peers are known not to pad. Kernels before 6.0
+// reject the option: kTLS then runs without it. Each session copies the
+// setting when created, so call it before the server starts.
+void vtls_set_ktls_rx_no_pad(vtls_ctx *ctx, int enabled);
 
 #endif /* VANILLA_TLS_H */
