@@ -42,8 +42,8 @@ fn C.memmove(__dest voidptr, __src voidptr, __n usize) voidptr
 // kernel (no userspace bounce). With a non-NULL offset the kernel advances it
 // and leaves the file's own position untouched, so ONE shared fd is safe to
 // send from many connections/threads at once. core.append_file_region (pread)
-// is the userspace fallback, used when the file body must go out as bytes: a
-// pipelined response must follow it in order, or the connection is closing.
+// is the userspace fallback, used when the file body must go out as bytes
+// because a pipelined response must follow it in order.
 fn C.sendfile(out_fd int, in_fd int, offset &i64, count usize) isize
 
 const sm_max_request_bytes = 8 * 1024 * 1024

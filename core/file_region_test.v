@@ -54,7 +54,10 @@ fn test_append_file_region_short_read_truncates_to_what_was_read() ! {
 	}
 }
 
-fn test_append_file_region_refuses_without_touching_the_buffer() {
+// Every refusal returns 0 and leaves the buffer's bytes as they were. Only the
+// bytes: a bad fd fails after the buffer was grown for the read, so its
+// capacity may have changed.
+fn test_append_file_region_refusals_leave_the_bytes_unchanged() {
 	$if !windows {
 		mut buf := 'HDR:'.bytes()
 		assert append_file_region(mut buf, -1, 0, 8) == 0 // EBADF

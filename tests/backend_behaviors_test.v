@@ -713,6 +713,8 @@ const bb_short_len = 60
 const bb_close_req = 'GET /close HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 const bb_suspend_req = 'GET /suspend HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 const bb_short_req = 'GET /short HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const bb_big_get_req = 'GET /big HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const bb_parkfile_req = 'GET /parkfile HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 const bb_close_sep = '\r\nConnection: close\r\n\r\n'.bytes()
 
 // bb_target_is reports whether the request line's target is exactly `target`,
@@ -744,12 +746,32 @@ fn bb_file_head(mut res []u8, length i64, sep []u8) {
 // bb_queue_region hands [off, off+length) of file_fd off with core.queue_file
 // and counts the accepted hand-off in `accepted`. Where queue_file refuses
 // (tcc builds compile the slot inert) it appends the bytes itself.
+// append_file_region is POSIX only; on Windows nothing runs these routes (the
+// checks that use them are epoll's), they only have to compile.
 fn bb_queue_region(mut res []u8, file_fd int, off i64, length i64, accepted &core.Counter) {
 	if core.queue_file(file_fd, off, length) {
 		stdatomic.add_i64(&accepted.n, 1)
 	} else {
-		core.append_file_region(mut res, file_fd, off, length)
+		$if !windows {
+			core.append_file_region(mut res, file_fd, off, length)
+		}
 	}
+}
+
+// BbFileRef is bb_file_handler's file and counter, handed to its continuation
+// as the watch payload.
+struct BbFileRef {
+	file_fd  int
+	accepted &core.Counter
+}
+
+// bb_file_cont is /parkfile's continuation: headers, then the region handed
+// off with bb_queue_region, .done.
+fn bb_file_cont(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	ref := unsafe { &BbFileRef(watch_payload) }
+	bb_file_head(mut out, bb_file_len, bb_upload_resp_sep)
+	bb_queue_region(mut out, ref.file_fd, bb_file_off, bb_file_len, ref.accepted)
+	return .done
 }
 
 // bb_file_handler serves these routes over one borrowed file fd, counting
@@ -759,14 +781,24 @@ fn bb_queue_region(mut res []u8, file_fd int, off i64, length i64, accepted &cor
 //               (a contract violation on purpose: the worker flushes the
 //               nothing appended and closes)
 //   /big      — headers, then the region handed off, .done (sent as the head
-//               of a streamed large body)
+//               of a streamed large body, and as a plain GET)
 //   /bigclose — queues the whole file and returns .close (sent as the head of
 //               a streamed large body, where the worker answers 400 instead)
 //   /short    — headers promising bb_short_len bytes, and that region handed
 //               off, which the file cannot fill
+//   /parkfile — parks on the client's own writability (the continuation runs
+//               on the worker's next pass), and bb_file_cont answers as /big
 //   other     — bb_ok_response, .done, nothing queued
 fn bb_file_handler(file_fd int, accepted &core.Counter) core.Handler {
-	return fn [file_fd, accepted] (req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	ref := &BbFileRef{
+		file_fd:  file_fd
+		accepted: accepted
+	}
+	return fn [file_fd, accepted, ref] (req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+		if bb_target_is(req, '/parkfile') {
+			event_loop.watch_fd(client_fd, .writable, bb_file_cont, voidptr(ref))
+			return .suspend
+		}
 		if bb_target_is(req, '/close') {
 			bb_file_head(mut res, bb_file_len, bb_close_sep)
 			bb_queue_region(mut res, file_fd, bb_file_off, bb_file_len, accepted)
@@ -829,8 +861,8 @@ fn bb_assert_handoffs(backend server.IOBackend, accepted &core.Counter, want i64
 // handler step, not only .done. One worker, so every connection below shares
 // that thread's slot, and each fire() completes before the next starts:
 //   1. GET /close queues a region and returns .close: the response must still
-//      carry that body (materialised into the write buffer before the close),
-//      byte-exact, then EOF.
+//      carry that body (sendfile(2) after the head, before the close; this
+//      small one fits the socket buffer), byte-exact, then EOF.
 //   2. GET / twice on a fresh connection: exactly two bb_ok_response. A region
 //      left queued by step 1 would be taken by the first .done and streamed
 //      after its response.
@@ -994,6 +1026,116 @@ fn check_queue_file_streamed_head(backend server.IOBackend) ! {
 	b := after_rejected.conns[0]
 	assert b.connect_err == '', b.connect_err
 	assert b.raw == want_two_ok, '${backend}: a region queued by a rejected streamed head leaked into the next connection: ${b.raw.bytestr()}'
+}
+
+// check_queue_file_before_streamed_head: a region queued by a pipelined
+// request is still waiting to be sent when the next request of the same burst
+// is a body over the streaming threshold (1 MiB), answered from its head
+// (start_body_drain). GET /big, then the upload's head and first chunk, go out
+// in one write: the worker answers GET /big and fills its read buffer with
+// that upload before it reaches EAGAIN and flushes. The region must go out
+// before the upload's reply, not be streamed after it. Then the rest of the
+// body and GET / on the same connection: GET /big's response with its region,
+// then bb_ok_response twice (the upload, GET /), in that order.
+fn check_queue_file_before_streamed_head(backend server.IOBackend) ! {
+	path, mut f := bb_file_fixture('queue_file_before_streamed')!
+	defer {
+		f.close()
+		os.rm(path) or {}
+	}
+	accepted := &core.Counter{}
+	mut h := vtest.start(server.ServerConfig{
+		io_multiplexing: backend
+		workers:         1
+		handler:         bb_file_handler(f.fd, accepted)
+	})!
+	defer {
+		h.stop()
+	}
+	upload_head :=
+		'POST /upload HTTP/1.1\r\nHost: x\r\nContent-Length: ${bb_upload_body_len}\r\n\r\n'.bytes()
+	first_chunk := []u8{len: bb_upload_chunk_len, init: u8(0x61)}
+	rest := []u8{len: bb_upload_body_len - bb_upload_chunk_len, init: u8(0x61)}
+	mut want := []u8{}
+	bb_file_head(mut want, bb_file_len, bb_upload_resp_sep)
+	want << bb_file_data[bb_file_off..bb_file_off + bb_file_len].bytes()
+	want << bb_ok_response
+	want << bb_ok_response
+	// A byte count, as in check_queue_file_streamed_head: the region sent
+	// after the upload's reply adds up to the same count.
+	want_len := want.len
+
+	out := h.fire([
+		vtest.Script{
+			rounds: [
+				vtest.Round{
+					send: bb_concat(bb_big_get_req, bb_concat(upload_head, first_chunk))
+					want: 0
+				},
+				vtest.Round{
+					send:  bb_concat(rest, bb_req)
+					until: fn [want_len] (acc []u8) bool {
+						return acc.len >= want_len
+					}
+				},
+			]
+		},
+	])!
+	c := out.conns[0]
+	assert c.connect_err == '', c.connect_err
+	assert !c.unmet, '${backend}: the pipelined requests around the streamed upload went unanswered'
+	assert c.raw == want, '${backend}: a region queued before a streamed upload must go out before the upload reply: ${c.raw.bytestr()}'
+	bb_assert_handoffs(backend, accepted, 1)
+}
+
+// check_queue_file_refused_in_continuation: nothing takes the slot after a
+// watch continuation, so a region one queued would be taken by the next .done
+// on that worker, whatever the connection, and streamed after that response.
+// queue_file must refuse it there, and the continuation writes the bytes
+// itself. GET /parkfile and GET / go out in one write: the parked response
+// must carry its region, then exactly bb_ok_response follows. A region left
+// queued would give headers, bb_ok_response, then the region: the same byte
+// count, so the round ends either way.
+fn check_queue_file_refused_in_continuation(backend server.IOBackend) ! {
+	path, mut f := bb_file_fixture('queue_file_continuation')!
+	defer {
+		f.close()
+		os.rm(path) or {}
+	}
+	accepted := &core.Counter{}
+	mut h := vtest.start(server.ServerConfig{
+		io_multiplexing: backend
+		workers:         1
+		handler:         bb_file_handler(f.fd, accepted)
+	})!
+	defer {
+		h.stop()
+	}
+	mut want := []u8{}
+	bb_file_head(mut want, bb_file_len, bb_upload_resp_sep)
+	want << bb_file_data[bb_file_off..bb_file_off + bb_file_len].bytes()
+	want << bb_ok_response
+	want_len := want.len
+
+	out := h.fire([
+		vtest.Script{
+			rounds: [
+				vtest.Round{
+					send:  bb_concat(bb_parkfile_req, bb_req)
+					until: fn [want_len] (acc []u8) bool {
+						return acc.len >= want_len
+					}
+				},
+			]
+		},
+	])!
+	c := out.conns[0]
+	assert c.connect_err == '', c.connect_err
+	assert !c.unmet, '${backend}: the parked request or the one pipelined behind it went unanswered'
+	assert c.raw == want, '${backend}: a region queued by a continuation went out after the next response: ${c.raw.bytestr()}'
+	// Refused whatever the compiler (under tcc the slot is inert anyway).
+	got := stdatomic.load_i64(&accepted.n)
+	assert got == 0, '${backend}: queue_file accepted ${got} hand-off(s) from a continuation'
 }
 
 // check_queue_file_short_read: a queued region the file cannot fill (it
@@ -1454,6 +1596,18 @@ fn test_epoll_queue_file_cleared_after_close() ! {
 fn test_epoll_queue_file_streamed_head() ! {
 	$if linux {
 		check_queue_file_streamed_head(.epoll)!
+	}
+}
+
+fn test_epoll_queue_file_before_streamed_head() ! {
+	$if linux {
+		check_queue_file_before_streamed_head(.epoll)!
+	}
+}
+
+fn test_epoll_queue_file_refused_in_continuation() ! {
+	$if linux {
+		check_queue_file_refused_in_continuation(.epoll)!
 	}
 }
 

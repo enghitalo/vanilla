@@ -24,8 +24,8 @@ struct SfEnableProbe {
 }
 
 // sf_probe_enable_on_a_fresh_slot never calls set_queue_file_allowed, like the
-// plain epoll worker: queue_file can only succeed after enable_sendfile if
-// enable opened the per-request gate as well.
+// plain epoll worker around its handler calls: queue_file can only succeed
+// after enable_sendfile if enable opened the per-request gate as well.
 fn sf_probe_enable_on_a_fresh_slot() SfEnableProbe {
 	queued_before := queue_file(3, 0, 10)
 	held_before := sf_slot_holds_a_region()
