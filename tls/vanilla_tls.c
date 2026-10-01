@@ -37,7 +37,10 @@
 #endif
 /* The one-time log flags and ktls_off use the generic __atomic builtins
  * (__atomic_load/_store/_exchange): V's bundled tcc has those but not the
- * _n forms, and defines no __ATOMIC_* order without <stdatomic.h>. */
+ * _n forms, and defines no __ATOMIC_* order without <stdatomic.h>. tcc also
+ * miscompiles a load or exchange whose result pointer is not the address of
+ * a local or a global (a struct field, a pointer variable): the program
+ * crashes there. Load into a local, then assign. */
 #ifndef __ATOMIC_RELAXED
 #define __ATOMIC_RELAXED 0
 #endif
@@ -515,7 +518,9 @@ void *vtls_session_new(vtls_ctx *c, int fd) {
     if (ret != 0) { free(s); return NULL; }
     s->net.fd = fd; // already accepted + non-blocking
     s->readable = 1; // the ClientHello may have arrived with the connect
-    __atomic_load(&c->ktls_off, &s->ktls_off, __ATOMIC_RELAXED);
+    int ktls_off; // a local: tcc miscompiles a load into a field (see the top)
+    __atomic_load(&c->ktls_off, &ktls_off, __ATOMIC_RELAXED);
+    s->ktls_off = ktls_off;
     s->ktls_rx_no_pad = c->ktls_rx_no_pad;
     mbedtls_ssl_set_bio(&s->ssl, &s->net, vtls_bio_send, vtls_bio_recv, NULL);
     // Capture the TLS 1.3 application traffic secrets for the kTLS handoff (per-ssl;

@@ -210,13 +210,13 @@ jobs:
       # large and pipelined bodies, a slow reader parked mid-file, follow_disk,
       # a file shorter than its Content-Length or failing in the sendfile phase
       # (the answers ahead of it still arrive), the sendfile slot drained on
-      # .close/.suspend, mixed routes.
+      # .close/.suspend, clients that reset mid-file, mixed routes.
       # A runner whose kernel lacks the module only warns: the kTLS runs then
       # fall back to userspace TLS, and the job still checks that path.
       - name: Load the tls kernel module (kTLS)
         shell: bash
         run: |
-          if sudo modprobe tls && [ -d /sys/module/tls ]; then
+          if sudo modprobe tls && [ -e /proc/net/tls_stat ]; then
             echo 'kTLS available'
           else
             echo '::warning title=kTLS not tested::sudo modprobe tls failed: the kTLS runs of tls_static_test.v fall back to userspace TLS, so sendfile(2) over kTLS goes untested'

@@ -105,9 +105,11 @@ fn tp_start(limits server.Limits) !&vtest.Harness {
 }
 
 // tp_start_no_pad is tp_start, opting in to TLS_RX_EXPECT_NO_PAD when no_pad
-// is set (otherwise the config keeps its default).
+// is set (otherwise the config keeps its default). SIGPIPE is not ignored
+// here: new_server ignores it process-wide before any client connects, which
+// covers the openssl client's writes too (see tt_start), and
+// check_tls_client_reset_mid_response relies on the server alone doing it.
 fn tp_start_no_pad(limits server.Limits, no_pad bool) !&vtest.Harness {
-	os.signal_ignore(.pipe) // see tt_start
 	$if linux {
 		cfg := tls.new_self_signed()!
 		if no_pad {
@@ -372,16 +374,15 @@ fn check_tls_pipelined_partial_fresh_deadline() ! {
 // close_notify as the server drops the session — raised SIGPIPE, whose
 // default action ends the whole process (every worker, every connection). The
 // client reads at full speed, so the server is inside its send loop when the
-// reset lands, then aborts. SIGPIPE is at its default action here: were it
-// raised, this test binary would die with it.
+// reset lands, then aborts. SIGPIPE goes back to its default action before
+// the server starts, so only what the server does protects it (its sends with
+// MSG_NOSIGNAL, and new_server's ignore, which sendfile(2) needs), not a
+// disposition inherited from the test runner or left by an earlier case.
 fn check_tls_client_reset_mid_response() ! {
+	C.signal(C.SIGPIPE, C.SIG_DFL)
 	mut h := tp_start(server.Limits{})!
 	defer {
 		h.stop()
-	}
-	C.signal(C.SIGPIPE, C.SIG_DFL)
-	defer {
-		os.signal_ignore(.pipe)
 	}
 	for _ in 0 .. 5 {
 		mut a := tp_dial(h.port())!

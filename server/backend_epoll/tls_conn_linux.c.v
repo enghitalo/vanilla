@@ -20,7 +20,8 @@ module backend_epoll
 //     the record holding the headers open, and sendfile(2) streams the file
 //     into it with no userspace copy (the kernel encrypts it like any send).
 //     The file is sent before the next pipelined request is answered, and one
-//     that cannot go out yet parks like a response. A userspace-TLS
+//     that cannot go out yet parks like a response; a step that closes gets
+//     one best-effort send of it before the close. A userspace-TLS
 //     connection never takes a file (sendfile writes plaintext): the hand-off
 //     is closed for it, so its handler appends the bytes;
 //   • timeouts    — per-conn read/write/idle deadlines, swept by the worker.
@@ -287,29 +288,28 @@ fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd 
 			pos += total
 			// The sendfile slot is thread-local: drain it after EVERY step, as
 			// the plain worker does, or a region left queued would be taken after
-			// the next .done on this worker, for any connection. On .done it is
-			// this response's body, sent by the flush below; on .close it is read
-			// into resp, so the last response stays whole through the
-			// best-effort write; on .suspend it is dropped with the connection.
+			// the next .done on this worker, for any connection. On .done and
+			// .close it is this response's body, sent after resp with sendfile(2)
+			// (only a kTLS connection can queue one): by the flush below, or by
+			// the one best-effort write before the close, bounded by the socket
+			// send buffer like the rest of that response (the plain worker's
+			// rule). On .suspend it is dropped with the connection.
 			if qf := core.take_queued_file() {
-				if step == .done {
+				if step != .suspend {
 					conn.file_fd = qf.file_fd
 					conn.file_off = qf.off
 					conn.file_remaining = qf.len
-				} else if step == .close {
-					// A short read needs no check: the close right after the write
-					// ends the response, so the peer sees it cut short.
-					core.append_file_region(mut resp, qf.file_fd, qf.off, qf.len)
 				}
 			}
 			match step {
 				.done {}
 				.close {
 					// Flush-then-close: best-effort synchronous write of everything
-					// appended (the responses before it, then the handler's error
-					// response), then drop the session. A send that cannot complete
-					// now (want/want_write) is abandoned — the connection is closing.
-					tls_write_all_best_effort(mut conn, fd, resp)
+					// appended (the responses before it, then the handler's
+					// response) and of the file queued behind it, then drop the
+					// session. A send that cannot complete now (want/want_write) is
+					// abandoned — the connection is closing.
+					tls_write_all_best_effort(mut conn, fd, mut resp)
 					tls_drop(epoll_fd, fd, active_conns, mut sessions, mut conn, buf, resp)
 					return
 				}
@@ -381,7 +381,7 @@ fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd 
 			// renegotiation, no post-handshake message it accepts). Answers the
 			// peer already has coming are still sent, best effort (a client may
 			// pipeline and then half-close).
-			tls_write_all_best_effort(mut conn, fd, resp)
+			tls_write_all_best_effort(mut conn, fd, mut resp)
 			tls_drop(epoll_fd, fd, active_conns, mut sessions, mut conn, buf, resp)
 			return
 		}
@@ -452,17 +452,52 @@ fn tls_write_chunk(mut conn TlsConn, fd int, ptr &u8, len int) int {
 	}
 }
 
-// tls_write_all_best_effort synchronously writes as much of `resp` as the TLS
-// session will take right now — used only on the .close path, where a partial
-// send is acceptable (the connection is being dropped).
-fn tls_write_all_best_effort(mut conn TlsConn, fd int, resp []u8) {
+// tls_send_best_effort synchronously writes as much of `buf` as the TLS
+// session will take right now, and reports whether all of it went out. Only
+// for a connection about to close, where a partial send is acceptable.
+fn tls_send_best_effort(mut conn TlsConn, fd int, buf []u8) bool {
 	mut off := 0
-	for off < resp.len {
-		n := tls_write_chunk(mut conn, fd, unsafe { &u8(resp.data) + off }, resp.len - off)
+	for off < buf.len {
+		n := tls_write_chunk(mut conn, fd, unsafe { &u8(buf.data) + off }, buf.len - off)
 		if n <= 0 {
-			return
+			return false
 		}
 		off += n
+	}
+	return true
+}
+
+// tls_write_all_best_effort is the one write before a close: as much of
+// `resp`, then of the file a .close step queued behind it (kTLS, sendfile(2)
+// as in tls_flush), as the session will take right now. What it cannot send
+// now is dropped with the connection. A socket that refuses sendfile(2) gets
+// the rest of the file as bytes in `resp` (tls_file_to_bytes). A file body
+// cut short ends with the fatal alert: the batch ahead of it went out with
+// MSG_MORE, and the alert pushes the record that left open, which the close
+// would discard with the answers in it (see tls_drain_file).
+fn tls_write_all_best_effort(mut conn TlsConn, fd int, mut resp []u8) {
+	with_file := conn.file_remaining > 0
+	for tls_send_best_effort(mut conn, fd, resp) {
+		if conn.file_remaining <= 0 {
+			return // all of it went out
+		}
+		r := tls_drain_file(fd, mut conn)
+		if r == 1 || r == -1 {
+			return // sent, or failed after tls_drain_file's alert
+		}
+		if r == 0 {
+			break // the socket is full
+		}
+		// -2: `resp` is all sent, so it takes the rest of the file as bytes.
+		unsafe {
+			resp.len = 0
+		}
+		if !tls_file_to_bytes(mut conn, fd, mut resp) {
+			return // short: sent what was read, then the alert
+		}
+	}
+	if with_file {
+		conn.sess.ktls_abort()
 	}
 }
 
@@ -534,15 +569,25 @@ fn handle_writable_fd_tls(epoll_fd int, fd int, limits core.Limits, idle_ms int,
 				conn.write_buf.len = 0
 			}
 			conn.write_off = 0
-			if tls_file_to_bytes(mut conn, mut conn.write_buf) {
+			if tls_file_to_bytes(mut conn, fd, mut conn.write_buf) {
 				continue
 			}
 		}
 		close_tls(epoll_fd, fd, active_conns, mut sessions) // fatal, or the file shrank
 		return false
 	}
-	// Fully flushed — keep-alive; drop the parked state and stop watching writability.
-	unsafe { conn.write_buf.free() }
+	// Fully flushed — keep-alive; drop the parked state and stop watching
+	// writability. write_buf is the batch's resp buffer (tls_park_write), and
+	// the pool stays empty while it is parked: it goes back to the pool for
+	// the next request instead of being freed and allocated again.
+	if conn.resp_buf.cap == 0 {
+		unsafe {
+			conn.write_buf.len = 0
+		}
+		conn.resp_buf = conn.write_buf
+	} else {
+		unsafe { conn.write_buf.free() }
+	}
 	conn.write_buf = []u8{}
 	conn.write_off = 0
 	conn.write_deadline = 0
@@ -595,7 +640,7 @@ fn tls_flush(mut conn TlsConn, epoll_fd int, fd int, write_timeout_ms int, mut r
 					resp.len = 0
 				}
 				sent = 0
-				if !tls_file_to_bytes(mut conn, mut resp) {
+				if !tls_file_to_bytes(mut conn, fd, mut resp) {
 					return .failed
 				}
 			}
@@ -644,20 +689,22 @@ fn tls_drain_file(fd int, mut conn TlsConn) int {
 	return 1
 }
 
-// tls_file_to_bytes reads the rest of the connection's file body into `buf`
-// (core.append_file_region) and clears it, for a kTLS socket that refused
-// sendfile(2); no_sendfile then closes the hand-off for this connection, so
-// its later files come from the handler as bytes. Returns false on a short
-// read (the file shrank under a Content-Length already on the wire), after
-// the fatal alert that pushes the record left open (see tls_drain_file): the
-// caller closes.
-fn tls_file_to_bytes(mut conn TlsConn, mut buf []u8) bool {
+// tls_file_to_bytes reads the rest of the connection's file body into the
+// empty `buf` (core.append_file_region) and clears it, for a kTLS socket that
+// refused sendfile(2); no_sendfile then closes the hand-off for this
+// connection, so its later files come from the handler as bytes. Returns
+// false on a short read (the file shrank under a Content-Length already on
+// the wire): the bytes it did read are sent first, best effort, as
+// sendfile(2) would have sent them before its EOF, then the fatal alert that
+// pushes the record left open (see tls_drain_file); the caller closes.
+fn tls_file_to_bytes(mut conn TlsConn, fd int, mut buf []u8) bool {
 	want := conn.file_remaining
 	got := core.append_file_region(mut buf, conn.file_fd, conn.file_off, want)
 	conn.file_fd = -1
 	conn.file_remaining = 0
 	conn.no_sendfile = true
 	if got != want {
+		tls_send_best_effort(mut conn, fd, buf)
 		conn.sess.ktls_abort()
 		return false
 	}
