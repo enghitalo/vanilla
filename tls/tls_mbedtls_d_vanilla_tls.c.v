@@ -39,6 +39,7 @@ fn C.vtls_ktls_active(sess voidptr) int
 fn C.vtls_ktls_failed(sess voidptr) int
 fn C.vtls_ktls_abort(sess voidptr)
 fn C.vtls_set_ktls(ctx voidptr, enabled int)
+fn C.vtls_set_ktls_rx_no_pad(ctx voidptr, enabled int)
 
 // init performs process-wide crypto init (psa_crypto_init). Call once at startup.
 // parallel_crypto reports whether TLS workers can run their crypto in
@@ -181,6 +182,18 @@ pub fn (c &Config) set_alpn(protos string) ! {
 // switch. Connections already established keep the mode they have.
 pub fn (c &Config) set_ktls(enabled bool) {
 	C.vtls_set_ktls(c.ctx, int(enabled))
+}
+
+// set_ktls_rx_no_pad opts in to TLS_RX_EXPECT_NO_PAD on kTLS connections: the
+// kernel decrypts each record straight into the recv() buffer, saving a page
+// allocation and a full copy per record. Off by default: kernels before Linux
+// commit 1c8629651cb5 (fixed in v7.2, v7.1.9+, v6.18.45+) corrupt the received
+// data when a record turns out padded or not application data. Peers do not
+// pad by default, but TLS 1.3 allows it (OpenSSL's RecordPadding), so enable
+// it on a fixed kernel, or when the peers are known not to pad. Kernels before
+// 6.0 lack the option and keep the default path. Call before the server starts.
+pub fn (c &Config) set_ktls_rx_no_pad(enabled bool) {
+	C.vtls_set_ktls_rx_no_pad(c.ctx, int(enabled))
 }
 
 // cert_pem returns the certificate as PEM, to hand to clients that must trust

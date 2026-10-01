@@ -30,6 +30,8 @@ pub fn (c &Config) set_alpn(protos string) ! {
 
 pub fn (c &Config) set_ktls(enabled bool) {}
 
+pub fn (c &Config) set_ktls_rx_no_pad(enabled bool) {}
+
 pub fn (c &Config) cert_pem() string {
 	return ''
 }
