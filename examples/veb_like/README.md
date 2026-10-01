@@ -63,7 +63,9 @@ nothing). A trie would trade that for O(path-length) at the cost of "no magic".
 ## Production properties
 
 - **Never crashes on bad input** — a request the parser rejects is answered
-  `400`, not `panic`ked (a panic would take down the whole worker thread).
+  `400`, not `panic`ked. A panic would end the whole server process (every
+  worker and every open connection, not just one worker thread), so run it
+  under a supervisor that restarts it.
 - **Correct HTTP status** — `404` for an unknown path; `405 Method Not Allowed`
   (with an `Allow` header) when the path exists under another method.
 - **Accurate `Content-Length`** — computed from the body, never hand-typed.
@@ -77,7 +79,9 @@ nothing). A trie would trade that for O(path-length) at the cost of "no magic".
   send a byte, and idle keep-alive connections — which is what keeps the
   connection cap from filling up with dead peers.
 - **Graceful shutdown** — `SIGTERM`/`SIGINT` stop new accepts and drain in-flight
-  requests before exit (clean rolling deploys).
+  requests before exit (clean rolling deploys). The signal handler only wakes a
+  normal thread through a pipe, and that thread calls `shutdown()` (see
+  [Graceful Shutdown](../../README.md#3-graceful-shutdown)).
 
 ## Run
 

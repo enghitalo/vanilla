@@ -12,10 +12,11 @@ import vtest
 //   2. shutdown() returns promptly on an idle server (the drain is PRECISE —
 //      per-worker in-flight counters, not the full grace);
 //   3. after shutdown, new connections are refused.
-// The signal wiring in main() is the one part not covered here: it is exactly
-// `os.signal_opt(.term, ...) -> srv.shutdown(2000)`, and driving a real
-// SIGTERM needs a spawned process — the process-level oracle stays in the
-// example's README narrative.
+// The signal wiring in main() is the one part not covered here: the
+// `os.signal_opt(.term / .int, ...)` handler only writes a byte to a pipe, and
+// a spawned thread reading it calls `srv.shutdown(2000)` then `exit(0)`.
+// Driving a real SIGTERM needs a spawned process, so the process-level oracle
+// stays in the example's README narrative.
 
 const gs_req = 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 

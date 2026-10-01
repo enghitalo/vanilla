@@ -12,7 +12,7 @@ module main
 //
 // Production properties wired here:
 //   • never crashes on bad input — a malformed request is answered 400, not
-//     panicked (a panic would take down the worker thread);
+//     panicked (a panic would end the whole server process, all workers);
 //   • correct HTTP — 404 vs 405 (+ Allow), accurate Content-Length, and
 //     application/json for JSON bodies;
 //   • safe output — URL-derived values are JSON-escaped (no injection);
@@ -223,14 +223,22 @@ fn main() {
 
 	// Graceful shutdown: SIGTERM/SIGINT (docker stop / k8s / Ctrl-C) stop new
 	// accepts and drain in-flight requests before exit, so deploys drop no work.
-	os.signal_opt(.term, fn [srv] (_ os.Signal) {
+	// The handler runs in async-signal context, on whichever thread the kernel
+	// interrupts, so it only write(2)s a byte to a pipe; the spawned thread
+	// below does the shutdown + exit in normal context.
+	wake := os.pipe()!
+	on_signal := fn [wake] (_ os.Signal) {
+		saved := C.errno
+		C.write(wake.write_fd, c'x', 1)
+		C.errno = saved
+	}
+	os.signal_opt(.term, on_signal)!
+	os.signal_opt(.int, on_signal)!
+	spawn fn [srv, wake] () {
+		os.fd_read(wake.read_fd, 1) // blocks until SIGTERM / SIGINT
 		srv.shutdown(2000)
 		exit(0)
-	}) or {}
-	os.signal_opt(.int, fn [srv] (_ os.Signal) {
-		srv.shutdown(2000)
-		exit(0)
-	}) or {}
+	}()
 
 	println('veb-like (production) on http://localhost:3000/')
 	srv.run()

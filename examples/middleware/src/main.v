@@ -47,15 +47,25 @@ fn main() {
 	})!
 
 	// The access log is buffered for throughput, so flush on shutdown or the
-	// tail is lost.
-	os.signal_opt(.int, fn [log] (_ os.Signal) {
+	// tail is lost. Not inside the signal handler: it runs in async-signal
+	// context, on whichever thread the kernel interrupts, possibly a worker in
+	// the middle of an fwrite to this very log, and neither fflush nor exit is
+	// async-signal-safe. The handler only write(2)s a byte to a pipe; the
+	// spawned thread drains, flushes and exits in normal context.
+	wake := os.pipe()!
+	on_signal := fn [wake] (_ os.Signal) {
+		saved := C.errno
+		C.write(wake.write_fd, c'x', 1)
+		C.errno = saved
+	}
+	os.signal_opt(.int, on_signal)!
+	os.signal_opt(.term, on_signal)!
+	spawn fn [srv, log, wake] () {
+		os.fd_read(wake.read_fd, 1) // blocks until SIGINT / SIGTERM
+		srv.shutdown(2000) // stop accepting, let in-flight requests log
 		log.flush()
 		exit(0)
-	}) or {}
-	os.signal_opt(.term, fn [log] (_ os.Signal) {
-		log.flush()
-		exit(0)
-	}) or {}
+	}()
 
 	println('Middleware demo on http://localhost:3000/  (access log -> ./access.log)')
 	println('  GET /        public  -> 200')

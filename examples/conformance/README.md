@@ -64,25 +64,40 @@ and
 ## Known limitations (tracked as core-vanilla issues)
 
 A handler can only decide a request the framer has already accepted as a complete
-message, so a few conformance gaps live in the `server` core, not this example.
-They are tracked as issues:
+message, so some conformance gaps live in the core framer
+(`http1_1.request_parser`, which every backend uses), not in this example. The
+ones still open are tracked as issues:
 
-- **`Content-Length` + `Transfer-Encoding` sent together**
-  ([#104](https://github.com/enghitalo/vanilla/issues/104)) is rejected only when
-  the bytes happen to form a complete chunked frame. When they don't, the framer
-  waits for more input instead of rejecting the ambiguous message up front. The
-  fix is to reject CL+TE at the framing layer (`frame_request_length_lim_idx`).
+- **Ambiguous framing resolved instead of rejected**
+  ([#184](https://github.com/enghitalo/vanilla/issues/184)): with duplicate
+  `Content-Length` the framer uses the last value while `content_length()`
+  returns the first, and a non-`chunked` or obfuscated `Transfer-Encoding` is
+  framed as bodyless or as chunked.
+- **Chunked framer**
+  ([#185](https://github.com/enghitalo/vanilla/issues/185)): a chunked body with
+  a trailer section is never framed, and the chunk-size line is parsed leniently
+  (empty or extension-only size, bare LF, junk after CR).
+- **Field-value whitespace**
+  ([#186](https://github.com/enghitalo/vanilla/issues/186)): trailing OWS and a
+  leading HTAB stay in field values (so `Content-Length: 5 ` gets `400`), and a
+  value can run past a bare LF into the next field line.
+
+These gaps used to be listed here and are now **fixed** in the core:
+
+- **`Content-Length` + `Transfer-Encoding` together**
+  ([#104](https://github.com/enghitalo/vanilla/issues/104)): the framer rejects
+  the message as soon as the header section ends, instead of waiting for more
+  input.
 - **Chunked body with a missing CRLF terminator**
-  ([#109](https://github.com/enghitalo/vanilla/issues/109)) is accepted on the
-  epoll backend (served `200` instead of `400`): `frame_chunked_total` assumes
-  the post-data CRLF is present without checking it.
+  ([#109](https://github.com/enghitalo/vanilla/issues/109)): `frame_chunked_total`
+  checks the CRLF after each chunk's data and rejects the request with `400`.
+- **Half-closed client**
+  ([#103](https://github.com/enghitalo/vanilla/issues/103)): a client that
+  `shutdown(SHUT_WR)`s after a complete request now receives its full reply on
+  both epoll and kqueue.
 
-The **half-closed-client** bug that used to drop the response
-([#103](https://github.com/enghitalo/vanilla/issues/103)) is **fixed** — a client
-that `shutdown(SHUT_WR)`s after a complete request now receives its full reply on
-both epoll and kqueue. The handler is still covered by `src/main_test.v` (the
-same decisions asserted without a socket), so the deterministic gate stays
-independent of backend I/O.
+The handler is still covered by `src/main_test.v` (the same decisions asserted
+without a socket), so the deterministic gate stays independent of backend I/O.
 
 The unit tests in [`src/main_test.v`](src/main_test.v) assert every row of the
 table above and always pass regardless of backend I/O behavior.

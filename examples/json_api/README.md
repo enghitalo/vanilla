@@ -16,7 +16,7 @@ Anything else answers `404 Not Found` with a JSON error body.
 ## Try it
 
 ```bash
-v -prod run examples/json_api
+v -prod run examples/json_api/src
 
 curl -d '{"name":"Ada","email":"ada@example.com"}' \
      -H 'Content-Type: application/json' localhost:3000/users

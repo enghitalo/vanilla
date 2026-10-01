@@ -1074,7 +1074,7 @@
   echo "<h1>Test</h1>" > examples/static_files/public/index.html
 
   # Run server
-  v run examples/static_files
+  v run examples/static_files/src
 
   # Test
   curl http://localhost:3000/
