@@ -80,9 +80,12 @@ fn main() {
 spawns the workers and blocks; `srv.shutdown(grace_ms int)` shuts the listeners
 and drains in-flight requests up to the grace period.
 
-On POSIX, `new_server` makes the whole process ignore SIGPIPE: a write to a
-peer that has closed or reset the connection fails with `EPIPE` instead of
-killing the process, and the server closes that connection.
+On POSIX, if SIGPIPE still has its default action, `new_server` makes the
+whole process ignore it: a write to a peer that has closed or reset the
+connection fails with `EPIPE` instead of killing the process, and the server
+closes that connection. A SIGPIPE handler the application installed before
+`new_server` is kept. An ignored signal is inherited across exec, so a child
+process that relies on SIGPIPE's default action should restore it.
 
 ## Request limits (`ServerConfig.limits`)
 
