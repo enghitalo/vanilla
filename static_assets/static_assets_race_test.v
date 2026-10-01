@@ -7,7 +7,8 @@ module static_assets
 // alternating a small version (A, kept in RAM) and one above the sendfile
 // threshold (B). With revalidate_ms 0 every request stats the file and several
 // readers race to rebuild each new version; with revalidate_ms 1 they also
-// race on the next_check CAS that elects each window's one checker. Every
+// race on the next_check CAS that elects each window's one checker, and the
+// test thread holds each version until a check has published it. Every
 // response must be a complete, consistent version: a body that is A or B,
 // with that body's Content-Length and ETag. A torn or unpublished snapshot
 // shows up as a wrong body, a framing mismatch or (under -race) a reported
@@ -23,8 +24,9 @@ import hash as wyhash
 const race_readers = 8
 const race_swaps = 300
 const race_threshold = 16 * 1024
-// Room for every snapshot a reader can be handed: at most one per change of
-// the file, plus slack so an orphan shows up as one, not as an overflow.
+// Room for every snapshot a reader can be handed: the whole cur/prev chain
+// (at most two snapshots per change of the file, see run_race), plus one so
+// an orphan shows up as one, not as an overflow.
 const race_max_snaps = 2 * race_swaps + 2
 
 struct RaceCase {
@@ -104,6 +106,17 @@ fn race_check(c &RaceCase, resp []u8) (string, bool) {
 		return '', true
 	}
 	return 'a body that is neither A nor B (${body.len} bytes)', false
+}
+
+// race_hold waits, for at most 2 s, until `rep` serves a snapshot of `size`
+// bytes (A and B differ in size). With one check per revalidate window, a
+// version replaced before any check saw it is never served, and the checks
+// could keep landing on the same version.
+fn race_hold(rep &Variant, size int) {
+	deadline := time.now().add(2 * time.second)
+	for rep.snap().body_len != size && time.now() < deadline {
+		time.sleep(50 * time.microsecond)
+	}
 }
 
 fn race_reader(c &RaceCase) RaceTally {
@@ -186,8 +199,13 @@ fn run_race(tag string, memory_fallback bool, revalidate_ms int) {
 		readers << spawn race_reader(c)
 	}
 	for i in 0 .. race_swaps {
-		race_replace(dir, if i % 2 == 0 { b } else { a })
-		time.sleep(200 * time.microsecond) // let the readers see each version
+		next := if i % 2 == 0 { b } else { a }
+		race_replace(dir, next)
+		if revalidate_ms == 0 {
+			time.sleep(200 * time.microsecond) // let the readers see each version
+		} else {
+			race_hold(c.rep, next.len)
+		}
 	}
 	stdatomic.store_u64(&c.stop, 1)
 	tallies := readers.wait()
@@ -211,15 +229,17 @@ fn run_race(tag string, memory_fallback bool, revalidate_ms int) {
 	s.respond_into('GET /f.bin HTTP/1.1\r\n\r\n'.bytes(), mut out) or { panic(err) }
 	why, is_b := race_check(c, out)
 	assert why == '' && !is_b
-	// Every published snapshot is retained (prev), never more than one per
-	// change of the file, and every snapshot a reader was served is one of them.
+	// Every published snapshot is retained (prev), about one and at most two
+	// per change of the file (a request can catch the outgoing version in the
+	// middle of the rename that replaces it, and republish its bytes), and
+	// every snapshot a reader was served is one of them.
 	mut chain := map[u64]bool{}
 	mut p := c.rep.snap()
 	for !isnil(p) {
 		chain[u64(voidptr(p))] = true
 		p = p.prev
 	}
-	assert chain.len >= 2 && chain.len <= race_swaps + 1
+	assert chain.len >= 2 && chain.len <= 2 * race_swaps + 1, '${chain.len} snapshots for ${race_swaps} changes'
 	mut served := 0
 	mut orphans := 0
 	for t in tallies {
