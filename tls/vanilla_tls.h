@@ -101,7 +101,8 @@ void vtls_mark_readable(void *sess);
 
 // After vtls_handshake() returns VTLS_OK, try to hand record encrypt/decrypt to the
 // kernel (TLS_TX + TLS_RX). Returns 1 if kTLS engaged — thereafter the caller does
-// PLAIN recv()/send() on the fd and the kernel does AES-128-GCM. Returns 0 to keep
+// PLAIN recv()/send() on the fd and the kernel does AES-128-GCM (decrypting straight
+// into the recv() buffer where the kernel supports TLS_RX_EXPECT_NO_PAD). Returns 0 to keep
 // using vtls_read/vtls_write (userspace mbedtls) — a safe fallback when the host
 // lacks the tls ULP. If it returns 0 AND vtls_ktls_failed() is 1, the socket is
 // half-converted and the caller MUST close the connection.
