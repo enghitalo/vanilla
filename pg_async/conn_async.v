@@ -4,7 +4,8 @@ module pg_async
 // socket to non-blocking once (after bring-up), submits a query, then drives it
 // from readiness events — async_flush() on writable, async_on_readable() on
 // readable. This is the exact mechanism the async HTTP worker uses via
-// ac.watch(conn_fd, ...); here it is split out so any event loop can drive it
+// event_loop.watch_fd_persistent(conn_fd, ...) (a pooled fd: never plain
+// watch_fd); here it is split out so any event loop can drive it
 // (and so it can be tested with a simple pump loop against a live server).
 //
 // The wire encoding, framing, binary decode and error handling are all the

@@ -276,9 +276,17 @@ consumers of this one primitive — see the
 
 For Postgres specifically, `pg_async` is a native (no-libpq) wire client with a
 per-worker pool and **cross-request pipelining** (`max_inflight` queries per
-connection). Pool connections are **persistent** (`watch_persistent`): a client
+connection). Pool connections are **persistent**: park on a pooled fd with
+`event_loop.watch_fd_persistent(...)`, never `watch_fd`. Then a client
 disconnecting mid-query tombstones the parked request rather than closing the
-connection, so the pooled conn (and its SCRAM handshake) survives client churn.
+connection. The continuation still runs when the reply arrives (its response is
+discarded), so it drains the reply and releases the slot, and the pooled conn
+(and its SCRAM handshake) survives client churn. With a plain `watch_fd` the
+runtime closes the pooled fd and the continuation never runs: the slot leaks,
+and once every slot has leaked the worker sheds every query with 503
+([vanilla#190](https://github.com/enghitalo/vanilla/issues/190)). Keep
+`watch_fd` for per-request fds (a timerfd, a pipe), which must be closed with
+their request.
 
 **Do**
 
