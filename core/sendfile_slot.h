@@ -12,11 +12,12 @@
  * only reader/writer — no locking, no cross-thread sharing.
  *
  * Two gates, both checked by vanilla_sf_queue(): `enabled` is set once by a
- * worker that can send files at all, and `allowed` narrows it per request for a
+ * worker that can send files at all, and `allowed` narrows it per call: for a
  * worker that can only do it on some connections (TLS: sendfile(2) writes
  * plaintext, so only a kernel-TLS socket can take it, never a userspace-TLS
- * one). vanilla_sf_enable() opens both, so a worker that never calls
- * vanilla_sf_set_allowed() keeps every request allowed.
+ * one), and around a call whose region the worker never takes (the epoll
+ * worker's watch continuations). vanilla_sf_enable() opens both, so a worker
+ * that never calls vanilla_sf_set_allowed() keeps every request allowed.
  *
  * Pure C11 _Thread_local (with an MSVC fallback) keeps this independent of V's
  * `-enable-globals`, and the whole thing is inert on backends/OSes that never
@@ -67,7 +68,7 @@ static inline bool vanilla_sf_take(int* out_fd, int64_t* out_off, int64_t* out_l
 
 typedef struct vanilla_sf_slot {
 	bool    enabled; // worker can consume a queued file (set once per capable worker)
-	bool    allowed; // ...for the request about to be handled (TLS: kernel-TLS connections only)
+	bool    allowed; // ...for the call about to run (TLS: kernel-TLS connections only)
 	bool    queued;  // a file region is waiting to be sent
 	int     file_fd; // borrowed (NOT owned/closed by the worker)
 	int64_t off;     // byte offset to start from
@@ -82,9 +83,9 @@ static inline void vanilla_sf_enable(void) {
 	vanilla_sf.allowed = true;
 }
 
-// Gates the hand-off for the request about to be handled. Only a worker that
-// can send files on some connections but not others calls it, before each
-// handler call.
+// Gates the hand-off for the call about to run: a worker that can send files
+// on some connections but not others calls it before each handler call, and
+// the epoll worker closes it around each watch continuation.
 static inline void vanilla_sf_set_allowed(bool allowed) {
 	vanilla_sf.allowed = allowed;
 }

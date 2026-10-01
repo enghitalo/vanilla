@@ -6,6 +6,10 @@ import sync.stdatomic
 import core
 import tls
 
+#include <signal.h>
+
+fn C.signal(sig int, handler voidptr) voidptr
+
 const max_thread_pool_size = core.max_thread_pool_size
 
 // Limits is re-exported from `core` so the public config API stays ergonomic
@@ -289,6 +293,15 @@ pub fn new_server(config ServerConfig) !Server {
 				listener_fds << socket.create_server_socket(port)
 			}
 		}
+	}
+
+	// sendfile(2) has no MSG_NOSIGNAL: a write to a peer that reset the
+	// connection raises SIGPIPE, whose default action kills the whole process.
+	// Ignore it process-wide, as nginx does: the write then fails with EPIPE and
+	// the worker closes that connection, as on any send error. Windows has no
+	// SIGPIPE.
+	$if !windows {
+		C.signal(C.SIGPIPE, C.SIG_IGN)
 	}
 
 	return Server{

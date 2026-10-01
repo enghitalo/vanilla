@@ -24,8 +24,8 @@ fn C.pread(fd int, buf voidptr, count usize, offset i64) isize
 // past max_int bytes, appends nothing and returns 0. The fd is never closed.
 //
 // Workers use it to emit a queued region as bytes when they cannot sendfile it
-// (a pipelined response must follow it in order, or the connection is
-// closing); handlers use it when queue_file returns false.
+// (a pipelined response must follow it in order); handlers use it when
+// queue_file returns false.
 @[manualfree]
 pub fn append_file_region(mut buf []u8, file_fd int, off i64, length i64) i64 {
 	if length <= 0 || length > i64(max_int) - i64(buf.len) {
