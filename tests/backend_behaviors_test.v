@@ -20,6 +20,7 @@
 // that module (no import cycle) and uses only public API.
 import os
 import strconv
+import sync.stdatomic
 import time
 import server
 import core
@@ -706,45 +707,86 @@ fn check_expect_100_continue(backend server.IOBackend) ! {
 const bb_file_data = 'skip-head|region handed off with core.queue_file|skip-tail'
 const bb_file_off = 10 // 'skip-head|'.len
 const bb_file_len = 38 // 'region handed off with core.queue_file'.len
+// /short promises (and queues) more than the file holds past bb_file_off: 48
+// bytes exist there, so its region always reads short.
+const bb_short_len = 60
 const bb_close_req = 'GET /close HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 const bb_suspend_req = 'GET /suspend HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const bb_short_req = 'GET /short HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 const bb_close_sep = '\r\nConnection: close\r\n\r\n'.bytes()
 
-// bb_target_is reports whether the request line's target is exactly `target`.
+// bb_target_is reports whether the request line's target is exactly `target`,
+// whatever the method.
 fn bb_target_is(req []u8, target string) bool {
-	if req.len < 5 + target.len {
+	mut sp := 0
+	for sp < req.len && req[sp] != ` ` {
+		sp++
+	}
+	start := sp + 1
+	if req.len < start + target.len + 1 {
 		return false
 	}
 	for i in 0 .. target.len {
-		if req[4 + i] != target[i] {
+		if req[start + i] != target[i] {
 			return false
 		}
 	}
-	return req[4 + target.len] == ` `
+	return req[start + target.len] == ` `
 }
 
-// bb_file_handler serves three routes over one borrowed file fd:
-//   /close   — headers, then the region handed off with core.queue_file, .close
-//   /suspend — queues the whole file and returns .suspend with no watch armed
-//              (a contract violation on purpose: the worker flushes the
-//              nothing appended and closes)
-//   other    — bb_ok_response, .done, nothing queued
-// Where queue_file returns false (no sendfile-capable worker; tcc builds
-// compile the slot inert) /close appends the region itself.
-fn bb_file_handler(file_fd int) core.Handler {
-	return fn [file_fd] (req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+// bb_file_head appends a 200 head promising `length` body bytes.
+fn bb_file_head(mut res []u8, length i64, sep []u8) {
+	res << bb_upload_resp_head
+	bb_wi(mut res, length)
+	res << sep
+}
+
+// bb_queue_region hands [off, off+length) of file_fd off with core.queue_file
+// and counts the accepted hand-off in `accepted`. Where queue_file refuses
+// (tcc builds compile the slot inert) it appends the bytes itself.
+fn bb_queue_region(mut res []u8, file_fd int, off i64, length i64, accepted &core.Counter) {
+	if core.queue_file(file_fd, off, length) {
+		stdatomic.add_i64(&accepted.n, 1)
+	} else {
+		core.append_file_region(mut res, file_fd, off, length)
+	}
+}
+
+// bb_file_handler serves these routes over one borrowed file fd, counting
+// every hand-off queue_file accepts in `accepted`:
+//   /close    — headers, then the region handed off, .close
+//   /suspend  — queues the whole file and returns .suspend with no watch armed
+//               (a contract violation on purpose: the worker flushes the
+//               nothing appended and closes)
+//   /big      — headers, then the region handed off, .done (sent as the head
+//               of a streamed large body)
+//   /bigclose — queues the whole file and returns .close (sent as the head of
+//               a streamed large body, where the worker answers 400 instead)
+//   /short    — headers promising bb_short_len bytes, and that region handed
+//               off, which the file cannot fill
+//   other     — bb_ok_response, .done, nothing queued
+fn bb_file_handler(file_fd int, accepted &core.Counter) core.Handler {
+	return fn [file_fd, accepted] (req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 		if bb_target_is(req, '/close') {
-			res << bb_upload_resp_head
-			bb_wi(mut res, bb_file_len)
-			res << bb_close_sep
-			if !core.queue_file(file_fd, bb_file_off, bb_file_len) {
-				unsafe { res.push_many(bb_file_data.str + bb_file_off, bb_file_len) }
-			}
+			bb_file_head(mut res, bb_file_len, bb_close_sep)
+			bb_queue_region(mut res, file_fd, bb_file_off, bb_file_len, accepted)
 			return .close
 		}
-		if bb_target_is(req, '/suspend') {
-			core.queue_file(file_fd, 0, bb_file_data.len)
-			return .suspend
+		if bb_target_is(req, '/big') {
+			bb_file_head(mut res, bb_file_len, bb_upload_resp_sep)
+			bb_queue_region(mut res, file_fd, bb_file_off, bb_file_len, accepted)
+			return .done
+		}
+		if bb_target_is(req, '/short') {
+			bb_file_head(mut res, bb_short_len, bb_upload_resp_sep)
+			bb_queue_region(mut res, file_fd, bb_file_off, bb_short_len, accepted)
+			return .done
+		}
+		if bb_target_is(req, '/suspend') || bb_target_is(req, '/bigclose') {
+			if core.queue_file(file_fd, 0, bb_file_data.len) {
+				stdatomic.add_i64(&accepted.n, 1)
+			}
+			return if bb_target_is(req, '/suspend') { core.Step.suspend } else { core.Step.close }
 		}
 		res << bb_ok_response
 		return .done
@@ -764,6 +806,24 @@ const bb_two_ok = vtest.Script{
 	]
 }
 
+// bb_file_fixture writes bb_file_data to a temp file and opens it.
+fn bb_file_fixture(tag string) !(string, os.File) {
+	path := os.join_path(os.temp_dir(), 'vanilla_bb_${tag}_${os.getpid()}.txt')
+	os.write_file(path, bb_file_data)!
+	f := os.open(path)!
+	return path, f
+}
+
+// bb_assert_handoffs: every route that queued so far must have had its
+// hand-off accepted, or the slot was never filled and the checks around it
+// passed without testing anything. Under tcc the slot is inert by design.
+fn bb_assert_handoffs(backend server.IOBackend, accepted &core.Counter, want i64) {
+	$if !tinyc {
+		got := stdatomic.load_i64(&accepted.n)
+		assert got == want, '${backend}: ${want} core.queue_file hand-offs expected, the worker accepted ${got}'
+	}
+}
+
 // check_queue_file_cleared_after_close: the sendfile hand-off slot
 // (core.queue_file) is thread-local, so the worker must drain it after EVERY
 // handler step, not only .done. One worker, so every connection below shares
@@ -777,25 +837,22 @@ const bb_two_ok = vtest.Script{
 //   3. GET /suspend queues a region and suspends with no watch: no bytes, EOF.
 //   4. Step 2 again: the region step 3 queued must have been dropped.
 fn check_queue_file_cleared_after_close(backend server.IOBackend) ! {
-	path := os.join_path(os.temp_dir(), 'vanilla_bb_queue_file_${os.getpid()}.txt')
-	os.write_file(path, bb_file_data)!
-	mut f := os.open(path)!
+	path, mut f := bb_file_fixture('queue_file')!
 	defer {
 		f.close()
 		os.rm(path) or {}
 	}
+	accepted := &core.Counter{}
 	mut h := vtest.start(server.ServerConfig{
 		io_multiplexing: backend
 		workers:         1
-		handler:         bb_file_handler(f.fd)
+		handler:         bb_file_handler(f.fd, accepted)
 	})!
 	defer {
 		h.stop()
 	}
 	mut want_close := []u8{}
-	want_close << bb_upload_resp_head
-	bb_wi(mut want_close, bb_file_len)
-	want_close << bb_close_sep
+	bb_file_head(mut want_close, bb_file_len, bb_close_sep)
 	want_close << bb_file_data[bb_file_off..bb_file_off + bb_file_len].bytes()
 	want_two_ok := bb_concat(bb_ok_response, bb_ok_response)
 
@@ -814,6 +871,7 @@ fn check_queue_file_cleared_after_close(backend server.IOBackend) ! {
 	assert !c.unmet, '${backend}: the .close response lost the body its handler queued (got ${c.raw.len} bytes)'
 	assert c.eof, '${backend}: .close must end the connection'
 	assert c.raw == want_close, '${backend}: .close response not byte-exact: ${c.raw.bytestr()}'
+	bb_assert_handoffs(backend, accepted, 1)
 
 	after_close := h.fire([bb_two_ok])!
 	a := after_close.conns[0]
@@ -835,11 +893,162 @@ fn check_queue_file_cleared_after_close(backend server.IOBackend) ! {
 	assert s.connect_err == '', s.connect_err
 	assert s.eof, '${backend}: .suspend with no watch armed must close'
 	assert s.raw.len == 0, '${backend}: .suspend with no watch armed sent bytes: ${s.raw.bytestr()}'
+	bb_assert_handoffs(backend, accepted, 2)
 
 	after_suspend := h.fire([bb_two_ok])!
 	b := after_suspend.conns[0]
 	assert b.connect_err == '', b.connect_err
 	assert b.raw == want_two_ok, '${backend}: a region queued by a .suspend step leaked into the next request: ${b.raw.bytestr()}'
+}
+
+// check_queue_file_streamed_head: the head of a body over the streaming
+// threshold (1 MiB) is the worker's other handler call (start_body_drain),
+// and must drain the slot too. One worker, as above:
+//   1. POST /big with a 2 MiB body (head and first chunk, then the rest),
+//      then GET / on the same connection: the upload's reply carries the
+//      region it queued, then exactly bb_ok_response.
+//   2. GET / twice on a fresh connection: exactly two bb_ok_response.
+//   3. POST /bigclose queues a region and returns .close: the worker answers
+//      400 and closes, without the region (the close may reset the
+//      connection before the 400 lands, so only a prefix of it is required).
+//   4. Step 2 again: the region step 3 queued must have been dropped.
+fn check_queue_file_streamed_head(backend server.IOBackend) ! {
+	path, mut f := bb_file_fixture('queue_file_streamed')!
+	defer {
+		f.close()
+		os.rm(path) or {}
+	}
+	accepted := &core.Counter{}
+	mut h := vtest.start(server.ServerConfig{
+		io_multiplexing: backend
+		workers:         1
+		handler:         bb_file_handler(f.fd, accepted)
+	})!
+	defer {
+		h.stop()
+	}
+	first_chunk := []u8{len: bb_upload_chunk_len, init: u8(0x61)}
+	rest := []u8{len: bb_upload_body_len - bb_upload_chunk_len, init: u8(0x61)}
+	big_head := 'POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: ${bb_upload_body_len}\r\n\r\n'.bytes()
+	bigclose_head :=
+		'POST /bigclose HTTP/1.1\r\nHost: x\r\nContent-Length: ${bb_upload_body_len}\r\n\r\n'.bytes()
+	mut want_big := []u8{}
+	bb_file_head(mut want_big, bb_file_len, bb_upload_resp_sep)
+	want_big << bb_file_data[bb_file_off..bb_file_off + bb_file_len].bytes()
+	want_two_ok := bb_concat(bb_ok_response, bb_ok_response)
+	want_big_then_ok := bb_concat(want_big, bb_ok_response)
+	// Wait for a byte count, not frames: a reply that lost its body would
+	// leave the frame count short forever (vtest has no client timeout), and a
+	// region that went to the next response instead adds up to the same count.
+	big_then_ok_len := want_big_then_ok.len
+
+	big := h.fire([
+		vtest.Script{
+			rounds: [
+				vtest.Round{
+					send: bb_concat(big_head, first_chunk)
+					want: 0
+				},
+				vtest.Round{
+					send: rest
+					want: 0
+				},
+				vtest.Round{
+					send:  bb_req
+					until: fn [big_then_ok_len] (acc []u8) bool {
+						return acc.len >= big_then_ok_len
+					}
+				},
+			]
+		},
+	])!
+	u := big.conns[0]
+	assert u.connect_err == '', u.connect_err
+	assert !u.unmet, '${backend}: the streamed upload or the request after it went unanswered'
+	assert u.raw == want_big_then_ok, '${backend}: the streamed head lost the region it queued, or it landed after the next response: ${u.raw.bytestr()}'
+	bb_assert_handoffs(backend, accepted, 1)
+
+	after_big := h.fire([bb_two_ok])!
+	a := after_big.conns[0]
+	assert a.connect_err == '', a.connect_err
+	assert a.raw == want_two_ok, '${backend}: a region queued by a streamed head leaked into the next connection: ${a.raw.bytestr()}'
+
+	rejected := h.fire([
+		vtest.Script{
+			rounds:   [
+				vtest.Round{
+					send: bb_concat(bigclose_head, first_chunk)
+					want: 0
+				},
+			]
+			then_eof: true
+		},
+	])!
+	r := rejected.conns[0]
+	assert r.connect_err == '', r.connect_err
+	assert r.eof, '${backend}: a streamed head that returns .close must end the connection'
+	assert response.tiny_bad_request_response.bytestr().starts_with(r.raw.bytestr()), '${backend}: a rejected streamed head must answer only 400, got: ${r.raw.bytestr()}'
+	bb_assert_handoffs(backend, accepted, 2)
+
+	after_rejected := h.fire([bb_two_ok])!
+	b := after_rejected.conns[0]
+	assert b.connect_err == '', b.connect_err
+	assert b.raw == want_two_ok, '${backend}: a region queued by a rejected streamed head leaked into the next connection: ${b.raw.bytestr()}'
+}
+
+// check_queue_file_short_read: a queued region the file cannot fill (it
+// shrank after the handler sized it) leaves its response short of the
+// Content-Length already sent. The worker must close rather than let the next
+// response be read as the rest of that body. GET /short and GET / go out in
+// one write, so the worker reads the region in with pread to keep the second
+// response in order (or, if they arrive apart, sendfile hits EOF): either way
+// the client gets the head and the 48 bytes that exist, then EOF, and never
+// the second response.
+fn check_queue_file_short_read(backend server.IOBackend) ! {
+	path, mut f := bb_file_fixture('queue_file_short')!
+	defer {
+		f.close()
+		os.rm(path) or {}
+	}
+	accepted := &core.Counter{}
+	mut h := vtest.start(server.ServerConfig{
+		io_multiplexing: backend
+		workers:         1
+		handler:         bb_file_handler(f.fd, accepted)
+	})!
+	defer {
+		h.stop()
+	}
+	mut want_short := []u8{}
+	bb_file_head(mut want_short, bb_short_len, bb_upload_resp_sep)
+	want_short << bb_file_data[bb_file_off..].bytes()
+
+	// Read until more than that arrives, or EOF: the fixed worker closes (so
+	// the round ends unmet, by design), a worker that keeps the connection
+	// sends the second response and ends the round instead of hanging it.
+	short_len := want_short.len
+	short := h.fire([
+		vtest.Script{
+			rounds: [
+				vtest.Round{
+					send:  bb_concat(bb_short_req, bb_req)
+					until: fn [short_len] (acc []u8) bool {
+						return acc.len > short_len
+					}
+				},
+			]
+		},
+	])!
+	s := short.conns[0]
+	assert s.connect_err == '', s.connect_err
+	assert s.eof, '${backend}: a short file region must end the connection, got: ${s.raw.bytestr()}'
+	assert s.raw == want_short, '${backend}: a short file region must end its response, not run into the next one: ${s.raw.bytestr()}'
+	bb_assert_handoffs(backend, accepted, 1)
+
+	after := h.fire([bb_two_ok])!
+	a := after.conns[0]
+	assert a.connect_err == '', a.connect_err
+	assert a.raw == bb_concat(bb_ok_response, bb_ok_response), '${backend}: ${a.raw.bytestr()}'
 }
 
 // check_graceful_shutdown (hybrid — lifecycle owned by the test, VTEST.md):
@@ -1239,6 +1448,21 @@ fn test_epoll_expect_100_continue() ! {
 fn test_epoll_queue_file_cleared_after_close() ! {
 	$if linux {
 		check_queue_file_cleared_after_close(.epoll)!
+	}
+}
+
+fn test_epoll_queue_file_streamed_head() ! {
+	$if linux {
+		check_queue_file_streamed_head(.epoll)!
+	}
+}
+
+// Under tcc queue_file is refused and the handler writes the short region
+// itself, so nothing on the worker side is exercised (and the keep-alive
+// connection would never close): only real compilers run it.
+fn test_epoll_queue_file_short_read() ! {
+	$if linux && !tinyc {
+		check_queue_file_short_read(.epoll)!
 	}
 }
 

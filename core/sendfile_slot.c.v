@@ -53,9 +53,12 @@ pub fn set_queue_file_allowed(allowed bool) {
 // not allowed on, a non-epoll backend, or a non-Linux OS) — the caller MUST
 // then write the body bytes itself (on POSIX, core.append_file_region reads
 // them into `out` without allocating). The epoll worker drains the slot after
-// every handler step, whatever the step: a region queued by a step that
-// returns .suspend is dropped, and one queued by a step that returns .close is
-// still written before the close. The fd must stay open and is
+// every core.Handler call (a pipelined request, or the head of a streamed
+// large body), whatever the step: a region queued by a step that returns
+// .suspend is dropped, and one queued by a step that returns .close is still
+// written before the close (a rejected streamed-body head drops it with its
+// reply). Watch continuations are not drained yet, so a continuation writes
+// its body itself instead of calling queue_file. The fd must stay open and is
 // never closed by the worker (assets keep one fd open for their whole life;
 // sendfile() with an explicit offset never touches the fd's own position, so
 // the same fd is safe to send concurrently from many connections/threads).

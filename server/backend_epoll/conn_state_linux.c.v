@@ -470,6 +470,23 @@ fn drain_file(fd int, mut cs ConnState) int {
 	return 1
 }
 
+// materialise_file reads the connection's deferred file region into write_buf
+// (core.append_file_region) and clears it, for when its bytes must go out
+// ahead of a response about to be appended. Returns false on a short read (the
+// file shrank after queue_file, or the read failed): the Content-Length
+// already in write_buf then promises bytes that do not exist, and anything
+// appended next would be read as the rest of that body, so the caller must
+// flush what is there and close, as flush_batch does when sendfile(2) hits an
+// early EOF (drain_file).
+@[inline]
+fn materialise_file(mut cs ConnState) bool {
+	want := cs.file_remaining
+	got := core.append_file_region(mut cs.write_buf, cs.file_fd, cs.file_off, want)
+	cs.file_fd = -1
+	cs.file_remaining = 0
+	return got == want
+}
+
 // flush_batch writes all pending response bytes then streams any deferred file
 // body with sendfile(2), or parks the remainder for EPOLLOUT. The write buffer
 // is reset (capacity kept) once everything is sent. Returns false if the
@@ -694,14 +711,16 @@ fn sweep_timeouts(epoll_fd int, active_conns &core.Counter, mut st PlainState) {
 			// streamed body, every earlier response out and the upload's own
 			// output (its held reply, after a 100 Continue not sent yet) not
 			// started: that request was never answered, and the 408 replaces
-			// its reply.
+			// its reply. A file region pending while a body streams is that held
+			// reply's own body (start_body_drain wrote out any earlier one), so
+			// the 408 replaces it too; otherwise it is a response mid-send.
 			at_boundary := if cs.body_drain > 0 {
 				cs.write_off == cs.drain_off
 			} else {
-				cs.write_off >= cs.write_buf.len
+				cs.write_off >= cs.write_buf.len && cs.file_remaining <= 0
 			}
 			if cs.takeover == unsafe { nil } && (cs.read_buf.len > 0 || cs.body_drain > 0)
-				&& at_boundary && cs.file_remaining <= 0 {
+				&& at_boundary {
 				response.send_status_408_response(fd) // couldn't finish the request in time
 			}
 			close_conn(epoll_fd, fd, active_conns, mut st)

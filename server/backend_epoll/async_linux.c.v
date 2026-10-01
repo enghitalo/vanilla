@@ -781,6 +781,16 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 		return 0 // head not complete in the buffer yet — grow/recv more
 	}
 	content_length := total - head_len
+	// A file region deferred by an earlier response of this burst must go out
+	// (as bytes) ahead of anything appended below: the same ordering rule as
+	// drain_requests. It also keeps drain_off honest, since everything before
+	// it answers earlier requests. A short read closes, as there.
+	if cs.file_remaining > 0 && !materialise_file(mut cs) {
+		if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
+			close_conn(epoll_fd, fd, active_conns, mut st)
+		}
+		return 2
+	}
 	// max_body_bytes must hold on the STREAMED path too: the framed path rejects
 	// an oversized declared body with 413 (frame_request_length_lim_idx), and a
 	// body large enough to stream must not BYPASS that limit just because it
@@ -825,6 +835,12 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 	if _ := core.take_queued_takeover() {
 		streamed_takeover = true
 	}
+	// The sendfile slot is thread-local too, and taken whatever the step (as
+	// in drain_requests): a region left queued would be taken by the next
+	// .done on this worker, for any connection, and streamed after that
+	// response. On the rejected path below it is dropped with the reply it
+	// belonged to.
+	qf := core.take_queued_file() or { core.QueuedFile{} }
 	if head_step != .done || streamed_takeover {
 		// suspend/close on a streamed-body request is unsupported in v1 — answer
 		// 400 and drop, rather than leave a half-drained connection parked. The
@@ -840,6 +856,14 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 			close_conn(epoll_fd, fd, active_conns, mut st)
 		}
 		return 2
+	}
+	if qf.len > 0 {
+		// The held reply's body, handed off with core.queue_file: flush_batch
+		// streams it after write_buf, from the same end-of-burst flush (gated on
+		// body_drain == 0) that sends the reply.
+		cs.file_fd = qf.file_fd
+		cs.file_off = qf.off
+		cs.file_remaining = qf.len
 	}
 	// DRAIN-THEN-RESPOND: the head response is buffered in write_buf but is NOT
 	// flushed here. The body is drained first (the cs.body_drain branch in
@@ -900,11 +924,15 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 		}
 		// A file deferred by an earlier request in this batch must be emitted (as
 		// bytes, in order) BEFORE this next response is appended — same ordering
-		// rule as the synchronous drain_requests.
-		if cs.file_remaining > 0 {
-			core.append_file_region(mut cs.write_buf, cs.file_fd, cs.file_off, cs.file_remaining)
-			cs.file_fd = -1
-			cs.file_remaining = 0
+		// rule as the synchronous drain_requests. A short read (the file shrank)
+		// would leave that body shorter than its Content-Length, with this
+		// response read as its tail: stop answering, flush and close.
+		if cs.file_remaining > 0 && !materialise_file(mut cs) {
+			compact_read_buf(mut cs, pos)
+			if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
+				close_conn(epoll_fd, fd, active_conns, mut st)
+			}
+			return false
 		}
 		req := buf_view(cs.read_buf, pos, total)
 		// Only last_watched can be dirtied between iterations (register_watch is
@@ -937,6 +965,8 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 				cs.file_off = qf.off
 				cs.file_remaining = qf.len
 			} else if step == .close {
+				// A short read needs no check: the close right after the flush
+				// ends the response, so the peer sees it cut short.
 				core.append_file_region(mut cs.write_buf, qf.file_fd, qf.off, qf.len)
 			}
 		}
