@@ -26,7 +26,18 @@ import server
 import core
 import http1_1.request_parser
 import http1_1.response
+import socket
+import transport
 import vtest
+
+#include <signal.h>
+
+struct C.linger {
+	l_onoff  int
+	l_linger int
+}
+
+fn C.signal(sig int, handler voidptr) voidptr
 
 const bb_req = 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 // A request head that stops mid-header: the tail of a split write, and the
@@ -1193,6 +1204,105 @@ fn check_queue_file_short_read(backend server.IOBackend) ! {
 	assert a.raw == bb_concat(bb_ok_response, bb_ok_response), '${backend}: ${a.raw.bytestr()}'
 }
 
+const bb_huge_req = 'GET /huge HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+// The region GET /huge hands off: far more than the socket buffers can absorb
+// (the tcp_wmem and tcp_rmem maxima are 4 and 6 MiB by default), so the worker
+// is still sending it when the client resets. A sparse file: no disk.
+const bb_huge_len = 64 * 1024 * 1024
+// How much of the answer a resetting client reads first: past the head, so
+// the reset lands while the worker streams the file with sendfile(2).
+const bb_reset_after = 1024 * 1024
+const bb_reset_clients = 32
+
+// bb_huge_handler answers GET /huge with a head promising `length` bytes and
+// [0, length) of file_fd handed off with bb_queue_region; anything else with
+// bb_ok_response.
+fn bb_huge_handler(file_fd int, length i64, accepted &core.Counter) core.Handler {
+	return fn [file_fd, length, accepted] (req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+		if bb_target_is(req, '/huge') {
+			bb_file_head(mut res, length, bb_upload_resp_sep)
+			bb_queue_region(mut res, file_fd, 0, length, accepted)
+			return .done
+		}
+		res << bb_ok_response
+		return .done
+	}
+}
+
+// bb_reset_mid_body sends GET /huge on a new connection, reads bb_reset_after
+// bytes of the answer, then resets the connection: SO_LINGER {1, 0} makes
+// close() send a RST instead of a FIN. Returns an error if the server ends the
+// connection first.
+fn bb_reset_mid_body(port int) ! {
+	fd := transport.dial_tcp('127.0.0.1', port)!
+	socket.set_blocking(fd, true)
+	if C.send(fd, bb_huge_req.data, usize(bb_huge_req.len), 0) != bb_huge_req.len {
+		transport.close_fd(fd)
+		return error('could not send GET /huge')
+	}
+	mut buf := []u8{len: 64 * 1024}
+	mut got := 0
+	for got < bb_reset_after {
+		n := C.recv(fd, buf.data, usize(buf.len), 0)
+		if n <= 0 {
+			transport.close_fd(fd)
+			return error('the server ended GET /huge after ${got} bytes')
+		}
+		got += n
+	}
+	linger := C.linger{
+		l_onoff:  1
+		l_linger: 0
+	}
+	C.setsockopt(fd, C.SOL_SOCKET, C.SO_LINGER, &linger, sizeof(linger))
+	transport.close_fd(fd)
+}
+
+// check_queue_file_peer_reset: a client that resets the connection while the
+// worker streams a queued file must not take the server down. sendfile(2) has
+// no MSG_NOSIGNAL: when one call sends part of a chunk and then meets the
+// reset, it returns the part and the next call fails with EPIPE, which raised
+// SIGPIPE, whose default action ends the whole process (exit 141): here, this
+// test binary. That depends on where the reset lands, so bb_reset_clients
+// clients each read part of a region larger than the socket buffers, then
+// reset while the worker is still sending it. One worker, so the resets are
+// handled before the next connection, which must then get exactly two
+// bb_ok_response. SIGPIPE goes back to its default action before the server
+// starts, so that only the server can ignore it, not a disposition inherited
+// from the test runner (an ignored signal stays ignored across exec) or left
+// by an earlier test.
+fn check_queue_file_peer_reset(backend server.IOBackend) ! {
+	path := os.join_path(os.temp_dir(), 'vanilla_bb_queue_file_reset_${os.getpid()}.bin')
+	os.write_file(path, '')!
+	os.truncate(path, u64(bb_huge_len))!
+	mut f := os.open(path)!
+	defer {
+		f.close()
+		os.rm(path) or {}
+	}
+	accepted := &core.Counter{}
+	$if !windows {
+		C.signal(C.SIGPIPE, C.SIG_DFL)
+	}
+	mut h := vtest.start(server.ServerConfig{
+		io_multiplexing: backend
+		workers:         1
+		handler:         bb_huge_handler(f.fd, bb_huge_len, accepted)
+	})!
+	defer {
+		h.stop()
+	}
+	for _ in 0 .. bb_reset_clients {
+		bb_reset_mid_body(h.port())!
+	}
+	bb_assert_handoffs(backend, accepted, bb_reset_clients)
+
+	after := h.fire([bb_two_ok])!
+	a := after.conns[0]
+	assert a.connect_err == '', a.connect_err
+	assert a.raw == bb_concat(bb_ok_response, bb_ok_response), '${backend}: the server must survive clients that reset mid-file: ${a.raw.bytestr()}'
+}
+
 // check_graceful_shutdown (hybrid — lifecycle owned by the test, VTEST.md):
 // serve one request, then call server_ref().shutdown(2000) from the test thread. The
 // stopwatch MEASURES the idle drain's promptness after it returned (the old
@@ -1617,6 +1727,15 @@ fn test_epoll_queue_file_refused_in_continuation() ! {
 fn test_epoll_queue_file_short_read() ! {
 	$if linux && !tinyc {
 		check_queue_file_short_read(.epoll)!
+	}
+}
+
+// Under tcc queue_file is refused and the handler copies the region through
+// the write buffer (send with MSG_NOSIGNAL), so sendfile(2) never runs: only
+// real compilers run it.
+fn test_epoll_queue_file_peer_reset() ! {
+	$if linux && !tinyc {
+		check_queue_file_peer_reset(.epoll)!
 	}
 }
 
