@@ -30,6 +30,7 @@ jobs:
           - examples/hexagonal/src
           - examples/http2_cleartext/src
           - examples/io_uring_demo/src
+          - examples/json_api/src
           - examples/mesh/src
           - examples/per_server_workers/src
           - examples/request_limits/src
