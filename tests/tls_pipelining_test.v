@@ -4,7 +4,8 @@
 // in several records that arrive together, with a partial one behind them —
 // and a response parked on WANT_WRITE is finished, byte-exact, before the
 // requests pipelined behind it are answered, whether they came with it or
-// while it was parked. A pipelined partial gets its own read deadline.
+// while it was parked. A pipelined partial gets its own read deadline. kTLS
+// sets TLS_RX_EXPECT_NO_PAD only when the config opts in.
 //
 // Only runs with `-d vanilla_tls` on Linux (see tls_timeouts_test.v, whose
 // client this follows: vlib net.openssl, not net.mbedtls, whose bundled Mbed
@@ -33,8 +34,8 @@ struct C.linger {
 
 fn C.signal(sig int, handler voidptr) voidptr
 
-// Every request path is 4 bytes: `/big`, or `/NNN`, which the handler echoes
-// as the body, so the client can check the order of the answers.
+// Every request path is 4 bytes: `/big`, `/pad`, or `/NNN`, which the handler
+// echoes as the body, so the client can check the order of the answers.
 const tp_ok_head = 'HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n'.bytes()
 // GET /big answers with a body larger than loopback can absorb while the
 // client is not reading (see tp_slow_reader), so the worker must park it and
@@ -42,6 +43,11 @@ const tp_ok_head = 'HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-ali
 const tp_big_req = 'GET /big HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 const tp_big_len = tp_unbufferable_len()
 const tp_big_head = 'HTTP/1.1 200 OK\r\nContent-Length: ${tp_big_len}\r\nConnection: keep-alive\r\n\r\n'.bytes()
+// GET /pad answers `/pa` and the server socket's TLS_RX_EXPECT_NO_PAD state
+// (see tp_no_pad_state). getsockopt(2) names from linux/tls.h (since 6.0).
+const tp_pad_req = 'GET /pad HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const tp_sol_tls = 282
+const tp_tls_rx_expect_no_pad = 4
 // Hang backstop for the openssl client only (see the header).
 const tp_backstop = time.Duration(5 * time.second)
 // Every exchange below completes in milliseconds on loopback (the big
@@ -65,7 +71,22 @@ fn tp_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut e
 	}
 	res << tp_ok_head
 	unsafe { res.push_many(&req[4], 4) } // the path
+	if req[5] == `p` { // GET /pad
+		res[res.len - 1] = tp_no_pad_state(client_fd)
+	}
 	return .done
+}
+
+// tp_no_pad_state is TLS_RX_EXPECT_NO_PAD as the server's socket reports it:
+// `1` set, `0` not set, `-` when getsockopt fails (the connection is not on
+// kTLS, or the kernel predates the option).
+fn tp_no_pad_state(fd int) u8 {
+	mut v := 0
+	mut l := u32(sizeof(v))
+	if C.getsockopt(fd, tp_sol_tls, tp_tls_rx_expect_no_pad, &v, &l) != 0 {
+		return `-`
+	}
+	return if v != 0 { `1` } else { `0` }
 }
 
 // tp_unbufferable_len is a body size the kernel cannot hold while a
@@ -80,12 +101,22 @@ fn tp_unbufferable_len() int {
 
 // tp_start serves tp_handler over HTTPS on one epoll TLS worker.
 fn tp_start(limits server.Limits) !&vtest.Harness {
+	return tp_start_no_pad(limits, false)
+}
+
+// tp_start_no_pad is tp_start, opting in to TLS_RX_EXPECT_NO_PAD when no_pad
+// is set (otherwise the config keeps its default).
+fn tp_start_no_pad(limits server.Limits, no_pad bool) !&vtest.Harness {
 	os.signal_ignore(.pipe) // see tt_start
 	$if linux {
+		cfg := tls.new_self_signed()!
+		if no_pad {
+			cfg.set_ktls_rx_no_pad(true)
+		}
 		return vtest.start(server.ServerConfig{
 			io_multiplexing: .epoll
 			workers:         1
-			tls_config:      tls.new_self_signed()!
+			tls_config:      cfg
 			handler:         tp_handler
 			limits:          limits
 		})
@@ -376,6 +407,40 @@ fn check_tls_client_reset_mid_response() ! {
 	assert tp_read_n(mut b, tp_resp(1).len) == tp_resp(1), 'the server must survive clients that reset mid-response'
 }
 
+// TLS_RX_EXPECT_NO_PAD is opt-in: kernels before commit 1c8629651cb5 corrupt
+// what recv() returns once a record turns out padded, so a default config must
+// leave the kTLS socket without it. Opted in, the socket has it, and records
+// pipelined in one burst (the kernel decrypts them straight into the request
+// buffer) are still answered in order. A `-` state (no kTLS: the tls module is
+// not loaded, or the kernel predates the option) passes either way.
+fn check_tls_ktls_rx_no_pad(enabled bool) ! {
+	mut h := tp_start_no_pad(server.Limits{}, enabled)!
+	defer {
+		h.stop()
+	}
+	mut c := tp_dial(h.port())!
+	defer {
+		tp_close(mut c)
+	}
+	tp_cork(c, true)
+	for i in 1 .. 11 {
+		c.write(tp_req(i))! // one record each
+	}
+	c.write(tp_pad_req)!
+	tp_cork(c, false)
+	mut want := tp_resps(1, 10)
+	want << tp_ok_head
+	want << '/pa'.bytes()
+	got := tp_read_n(mut c, want.len + 1)
+	assert got.len == want.len + 1 && got[..want.len] == want, 'every pipelined request must be answered in order: got ${got.len} of ${want.len + 1} bytes'
+	state := got[want.len]
+	if enabled {
+		assert state != `0`, 'set_ktls_rx_no_pad(true) must set TLS_RX_EXPECT_NO_PAD on the kTLS socket'
+	} else {
+		assert state != `1`, 'TLS_RX_EXPECT_NO_PAD must stay off unless the config opts in'
+	}
+}
+
 // --- tests -------------------------------------------------------------------
 
 fn test_tls_pipelined_in_one_record() ! {
@@ -426,6 +491,15 @@ fn test_tls_client_reset_mid_response() ! {
 	$if linux {
 		$if vanilla_tls ? {
 			check_tls_client_reset_mid_response()!
+		}
+	}
+}
+
+fn test_tls_ktls_rx_no_pad_is_opt_in() ! {
+	$if linux {
+		$if vanilla_tls ? {
+			check_tls_ktls_rx_no_pad(false)!
+			check_tls_ktls_rx_no_pad(true)!
 		}
 	}
 }
