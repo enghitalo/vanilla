@@ -31,6 +31,7 @@ on:
       - 'kqueue/**'
       - 'iocp/**'
       - 'tls/**'
+      - 'pg_async/**'
       - 'static_assets/**'
       - 'testkit/**'
       - 'vtest/**'

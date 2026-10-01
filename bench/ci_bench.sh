@@ -34,14 +34,18 @@ ISSUE_THRESHOLD="${BENCH_ISSUE_THRESHOLD:-10}" # a regression must clear THIS to
                                              # 5-10%) does not file issues on its own
 export BENCH_RUNS="${BENCH_RUNS:-5}"         # passed through to measure.sh
 
-# Hot-path micro-benches to A/B. name | source — each built with -prod -gc none.
-# All run on every invocation; BENCH_ITERS (below) keeps the full set to a few
-# minutes in CI.
+# Hot-path micro-benches to A/B. name | source [| extra V flags [| run args]] —
+# each built with -prod -gc none (plus its flags) and run with its args. All run
+# on every invocation; BENCH_ITERS (below) keeps the full set to a few minutes
+# in CI. The pg_async codec bench runs one phase per entry (see its header).
 BENCHES=(
 	"request_parser|bench/request_parser/request_parser_bench.v"
 	"middleware|bench/middleware/middleware_bench.v"
 	"etag_hash|bench/etag_hash/etag_hash.v"
 	"static_assets|bench/static_assets_bench/static_assets_bench.v"
+	"pg_async_submit|bench/pg_async/codec_bench.v|-d pg_async_bench|submit"
+	"pg_async_frame|bench/pg_async/codec_bench.v|-d pg_async_bench|frame"
+	"pg_async_rows|bench/pg_async/codec_bench.v|-d pg_async_bench|rows"
 )
 # Standardize the loop count for the A/B: the benches read BENCH_ITERS. 2M keeps
 # even the cheapest bench (request_parser, ~0.3s) comfortably above the runner's
@@ -71,14 +75,16 @@ v wipe-cache >/dev/null 2>&1 || true
 worktree_ok=1
 git worktree add --detach "$wt" "$BASE_REF" >/dev/null 2>&1 || worktree_ok=0
 
-# build_and_measure <checkout-dir> <bench-relpath> <out-bin> -> min seconds (or "")
+# build_and_measure <checkout-dir> <bench-relpath> <out-bin> [flags] [args] -> min seconds (or "")
 build_and_measure() {
-	local dir="$1" src="$2" bin="$3"
-	if ! ( cd "$dir" && v -prod -gc none -o "$bin" "$src" ) >/dev/null 2>&1; then
+	local dir="$1" src="$2" bin="$3" flags="${4:-}" args="${5:-}"
+	# shellcheck disable=SC2086 # flags and args are word lists
+	if ! ( cd "$dir" && v -prod -gc none $flags -o "$bin" "$src" ) >/dev/null 2>&1; then
 		echo ""   # bench absent at this ref, or build failed
 		return
 	fi
-	BENCH_PERF=0 "$MEASURE" "$bin" 2>/dev/null | awk '/^min/{print $3; exit}'
+	# shellcheck disable=SC2086
+	BENCH_PERF=0 "$MEASURE" "$bin" $args 2>/dev/null | awk '/^min/{print $3; exit}'
 }
 
 emit() {
@@ -106,9 +112,9 @@ emit '|---|--:|--:|--:|:--|'
 regressions=0         # > THRESHOLD       (flagged in the table)
 issue_regressions=0   # > ISSUE_THRESHOLD (confident enough to open an issue)
 for entry in "${BENCHES[@]}"; do
-	IFS='|' read -r name src <<< "$entry"
-	base_min="$(build_and_measure "$wt"   "$src" "$bins/base_$name")"
-	head_min="$(build_and_measure "$ROOT" "$src" "$bins/head_$name")"
+	IFS='|' read -r name src flags args <<< "$entry"
+	base_min="$(build_and_measure "$wt"   "$src" "$bins/base_$name" "$flags" "$args")"
+	head_min="$(build_and_measure "$ROOT" "$src" "$bins/head_$name" "$flags" "$args")"
 
 	if [ -z "$head_min" ] && [ -z "$base_min" ]; then
 		emit "| \`$name\` | — | — | — | ❌ build failed both sides |"
