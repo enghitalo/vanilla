@@ -7,8 +7,10 @@ import core
 import tls
 
 #include <signal.h>
+#include "@VMODROOT/server/sigpipe_shim.h"
 
 fn C.signal(sig int, handler voidptr) voidptr
+fn C.vanilla_ignore_default_sigpipe() int
 
 const max_thread_pool_size = core.max_thread_pool_size
 
@@ -187,6 +189,17 @@ pub:
 	workers int
 }
 
+// new_server validates `config` and opens the listeners; `run` starts serving.
+//
+// On POSIX, if SIGPIPE still has its default action, new_server sets it to
+// ignored, process-wide, as nginx does. sendfile(2) has no MSG_NOSIGNAL, so a
+// file sent to a peer that reset the connection would otherwise raise SIGPIPE
+// and end the whole process; ignored, the send fails with EPIPE and the
+// worker closes that connection. A SIGPIPE handler the application installed
+// before calling new_server is kept (it must not end the process). An ignored
+// signal stays ignored across exec, so child processes (os.execute, popen)
+// inherit it: one that relies on SIGPIPE's default action (`yes | head`)
+// should restore it.
 pub fn new_server(config ServerConfig) !Server {
 	if config.handler == unsafe { nil } {
 		return error('provide a handler')
@@ -297,12 +310,9 @@ pub fn new_server(config ServerConfig) !Server {
 
 	// sendfile(2) has no MSG_NOSIGNAL: a write to a peer that reset the
 	// connection raises SIGPIPE, whose default action kills the whole process.
-	// Ignore it process-wide, as nginx does: the write then fails with EPIPE and
-	// the worker closes that connection, as on any send error. Windows has no
-	// SIGPIPE.
-	$if !windows {
-		C.signal(C.SIGPIPE, C.SIG_IGN)
-	}
+	// Ignore it, unless the application set its own disposition (see the doc
+	// comment above). Windows has no SIGPIPE; the shim is a no-op there.
+	C.vanilla_ignore_default_sigpipe()
 
 	return Server{
 		port:               port

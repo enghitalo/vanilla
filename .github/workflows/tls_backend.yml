@@ -174,7 +174,7 @@ jobs:
       # bounding silent connects and the handshake; idle keep-alive; slots
       # freed for max_connections). This exercises userspace mbedTLS: kTLS
       # needs the `tls` kernel module, which the job loads only for the
-      # static-files steps below.
+      # kTLS steps further down.
       - name: TLS timeouts e2e
         shell: bash
         env:
@@ -219,8 +219,19 @@ jobs:
           if sudo modprobe tls && [ -e /proc/net/tls_stat ]; then
             echo 'kTLS available'
           else
-            echo '::warning title=kTLS not tested::sudo modprobe tls failed: the kTLS runs of tls_static_test.v fall back to userspace TLS, so sendfile(2) over kTLS goes untested'
+            echo '::warning title=kTLS not tested::sudo modprobe tls failed: the kTLS runs of tls_pipelining_test.v and tls_static_test.v fall back to userspace TLS, so kTLS RX, TLS_RX_EXPECT_NO_PAD and sendfile(2) over kTLS go untested'
           fi
+      # The pipelining suite again, now that kTLS engages: pipelined records on
+      # kTLS RX, and test_tls_ktls_rx_no_pad_is_opt_in, which reads
+      # TLS_RX_EXPECT_NO_PAD off the server socket (off by default, on with
+      # set_ktls_rx_no_pad). In the userspace run above that test has no kTLS
+      # socket to read and checks nothing.
+      - name: TLS pipelining e2e over kTLS
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+        run: |
+          v -cc gcc -no-parallel -d vanilla_tls test tests/tls_pipelining_test.v
       - name: TLS static files e2e
         shell: bash
         env:

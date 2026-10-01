@@ -54,3 +54,33 @@ fn test_after_server_start_fires_when_ready() ! {
 
 	srv.shutdown(500)
 }
+
+fn sigpipe_probe_handler(_ int) {}
+
+// new_server ignores SIGPIPE only while it still has its default action: a
+// handler the application installed first is kept (sendfile(2) to a reset peer
+// then runs it and fails with EPIPE), and the default becomes SIG_IGN. Each
+// C.signal call below returns the disposition it replaces, which is how the
+// test reads what new_server left.
+fn test_new_server_ignores_sigpipe_only_when_default() ! {
+	$if !windows {
+		C.signal(C.SIGPIPE, voidptr(sigpipe_probe_handler))
+		mut a := new_server(ServerConfig{
+			port:    0
+			workers: 1
+			handler: dummy_handler
+		})!
+		a.shutdown(0)
+		kept := C.signal(C.SIGPIPE, C.SIG_DFL)
+		assert kept == voidptr(sigpipe_probe_handler), 'new_server replaced the application SIGPIPE handler'
+
+		mut b := new_server(ServerConfig{
+			port:    0
+			workers: 1
+			handler: dummy_handler
+		})!
+		b.shutdown(0)
+		set := C.signal(C.SIGPIPE, C.SIG_IGN)
+		assert set == C.SIG_IGN, 'new_server left the default SIGPIPE action in place'
+	}
+}
