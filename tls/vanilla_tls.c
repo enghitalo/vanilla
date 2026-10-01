@@ -26,6 +26,9 @@
 
 /* kTLS: hand record crypto to the kernel after the userspace handshake. */
 #include <linux/tls.h>
+#ifndef TLS_RX_EXPECT_NO_PAD
+#define TLS_RX_EXPECT_NO_PAD 4 /* linux/tls.h since 6.0; older headers lack it */
+#endif
 #include <netinet/tcp.h> /* TCP_ULP, SOL_TCP */
 #include <sys/socket.h>  /* setsockopt, SOL_TLS (via bits/socket.h) */
 #include <arpa/inet.h>   /* inet_pton for IP: SAN entries */
@@ -703,9 +706,22 @@ static int enable_ktls(vtls_session *s, int fd) {
         goto done;
     }
     s->ktls = 1; // keys now live in the kernel
+    // TLS 1.3 hides a record's real content type at the end of its plaintext,
+    // after optional zero padding, so by default the kernel decrypts every record
+    // into a clear-text skb of its own, finds the type, then copies the data out:
+    // one page allocation and one full copy per record. Peers do not pad (Mbed
+    // TLS, OpenSSL, BoringSSL, rustls, Go and NSS all send unpadded records), so
+    // expect none: the kernel then decrypts straight into the recv() buffer. A
+    // padded or non-data record (KeyUpdate, alert) is detected and decrypted
+    // again the default way (counted in TlsRxNoPadViolation in
+    // /proc/net/tls_stat), so this costs a re-decryption, never correctness.
+    // Linux >= 6.0; older kernels reject the option and keep the default path.
+    int one = 1;
+    int rx_no_pad = setsockopt(fd, SOL_TLS, TLS_RX_EXPECT_NO_PAD, &one, sizeof(one)) == 0;
     if (!ktls_logged_ok) {
         ktls_logged_ok = 1;
-        fprintf(stderr, "[ktls] engaged: kernel TLS TX+RX (TLS 1.3, AES-128-GCM)\n");
+        fprintf(stderr, "[ktls] engaged: kernel TLS TX+RX (TLS 1.3, AES-128-GCM%s)\n",
+                rx_no_pad ? ", RX no-pad" : "");
     }
 
 done:
