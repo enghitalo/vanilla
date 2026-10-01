@@ -59,7 +59,7 @@ fn main() {
 		dbname:   'example'
 	}, 5) or { panic('Failed to create pg pool: ${err}') }
 
-	db := pool.acquire() or { panic(err) }
+	mut db := pool.acquire() or { panic(err) }
 	db.exec('create table if not exists users (id serial primary key, name text not null)') or {
 		panic('Failed to create table users: ${err}')
 	}
