@@ -11,10 +11,17 @@
  * local, so the single-threaded worker that owns the current connection is the
  * only reader/writer — no locking, no cross-thread sharing.
  *
+ * Two gates, both checked by vanilla_sf_queue(): `enabled` is set once by a
+ * worker that can send files at all, and `allowed` narrows it per request for a
+ * worker that can only do it on some connections (TLS: sendfile(2) writes
+ * plaintext, so only a kernel-TLS socket can take it, never a userspace-TLS
+ * one). vanilla_sf_enable() opens both, so a worker that never calls
+ * vanilla_sf_set_allowed() keeps every request allowed.
+ *
  * Pure C11 _Thread_local (with an MSVC fallback) keeps this independent of V's
  * `-enable-globals`, and the whole thing is inert on backends/OSes that never
- * call va_sf_enable(): va_sf_queue() then reports "not taken" and the handler
- * falls back to writing the body bytes itself.
+ * call vanilla_sf_enable(): vanilla_sf_queue() then reports "not taken" and the
+ * handler falls back to writing the body bytes itself.
  */
 
 #include <stdbool.h>
@@ -24,13 +31,18 @@
 // tcc cannot codegen thread-local storage: "_Thread_local is not implemented"
 // (and `__thread` is rejected too) — verified with V's bundled tccbin
 // (thirdparty-linux-amd64) on both Linux and macOS. tcc is a dev-only fast
-// compiler, so under it the whole slot is compiled INERT: enable is a no-op,
-// queue/take report "not taken", and every caller falls back to writing the
-// body bytes itself (correct, just without the sendfile(2) optimization).
+// compiler, so under it the whole slot is compiled INERT: enable and
+// set_allowed are no-ops, queue/take report "not taken", and every caller
+// falls back to writing the body bytes itself (correct, just without the
+// sendfile(2) optimization).
 // The static is not even declared — a plain non-TLS static would be SHARED
 // across worker threads, a data race. -prod (clang/gcc) keeps the real
 // _Thread_local fast path everywhere.
 static inline void vanilla_sf_enable(void) {}
+
+static inline void vanilla_sf_set_allowed(bool allowed) {
+	(void)allowed;
+}
 
 static inline bool vanilla_sf_queue(int file_fd, int64_t off, int64_t len) {
 	(void)file_fd;
@@ -55,6 +67,7 @@ static inline bool vanilla_sf_take(int* out_fd, int64_t* out_off, int64_t* out_l
 
 typedef struct vanilla_sf_slot {
 	bool    enabled; // worker can consume a queued file (set once per capable worker)
+	bool    allowed; // ...for the request about to be handled (TLS: kernel-TLS connections only)
 	bool    queued;  // a file region is waiting to be sent
 	int     file_fd; // borrowed (NOT owned/closed by the worker)
 	int64_t off;     // byte offset to start from
@@ -63,12 +76,21 @@ typedef struct vanilla_sf_slot {
 
 static VANILLA_THREAD_LOCAL vanilla_sf_slot vanilla_sf = {0};
 
+// Opens both gates: a worker that never narrows per request stays allowed.
 static inline void vanilla_sf_enable(void) {
 	vanilla_sf.enabled = true;
+	vanilla_sf.allowed = true;
+}
+
+// Gates the hand-off for the request about to be handled. Only a worker that
+// can send files on some connections but not others calls it, before each
+// handler call.
+static inline void vanilla_sf_set_allowed(bool allowed) {
+	vanilla_sf.allowed = allowed;
 }
 
 static inline bool vanilla_sf_queue(int file_fd, int64_t off, int64_t len) {
-	if (!vanilla_sf.enabled) {
+	if (!vanilla_sf.enabled || !vanilla_sf.allowed) {
 		return false;
 	}
 	vanilla_sf.file_fd = file_fd;

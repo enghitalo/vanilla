@@ -18,6 +18,7 @@
 //
 // Standalone on purpose: vtest imports server, so this file lives outside
 // that module (no import cycle) and uses only public API.
+import os
 import strconv
 import time
 import server
@@ -698,6 +699,149 @@ fn check_expect_100_continue(backend server.IOBackend) ! {
 	assert out.inflight_after == 0
 }
 
+// --- sendfile hand-off slot hygiene ------------------------------------------
+
+// The file behind the region the bb_file_handler routes hand off: only the
+// middle part (bb_file_off, bb_file_len) is queued, so a wrong offset shows.
+const bb_file_data = 'skip-head|region handed off with core.queue_file|skip-tail'
+const bb_file_off = 10 // 'skip-head|'.len
+const bb_file_len = 38 // 'region handed off with core.queue_file'.len
+const bb_close_req = 'GET /close HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const bb_suspend_req = 'GET /suspend HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const bb_close_sep = '\r\nConnection: close\r\n\r\n'.bytes()
+
+// bb_target_is reports whether the request line's target is exactly `target`.
+fn bb_target_is(req []u8, target string) bool {
+	if req.len < 5 + target.len {
+		return false
+	}
+	for i in 0 .. target.len {
+		if req[4 + i] != target[i] {
+			return false
+		}
+	}
+	return req[4 + target.len] == ` `
+}
+
+// bb_file_handler serves three routes over one borrowed file fd:
+//   /close   — headers, then the region handed off with core.queue_file, .close
+//   /suspend — queues the whole file and returns .suspend with no watch armed
+//              (a contract violation on purpose: the worker flushes the
+//              nothing appended and closes)
+//   other    — bb_ok_response, .done, nothing queued
+// Where queue_file returns false (no sendfile-capable worker; tcc builds
+// compile the slot inert) /close appends the region itself.
+fn bb_file_handler(file_fd int) core.Handler {
+	return fn [file_fd] (req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+		if bb_target_is(req, '/close') {
+			res << bb_upload_resp_head
+			bb_wi(mut res, bb_file_len)
+			res << bb_close_sep
+			if !core.queue_file(file_fd, bb_file_off, bb_file_len) {
+				unsafe { res.push_many(bb_file_data.str + bb_file_off, bb_file_len) }
+			}
+			return .close
+		}
+		if bb_target_is(req, '/suspend') {
+			core.queue_file(file_fd, 0, bb_file_data.len)
+			return .suspend
+		}
+		res << bb_ok_response
+		return .done
+	}
+}
+
+// bb_two_ok is one keep-alive connection asking twice: both answers must be
+// exactly bb_ok_response with nothing in between (checked on raw).
+const bb_two_ok = vtest.Script{
+	rounds: [
+		vtest.Round{
+			send: bb_req
+		},
+		vtest.Round{
+			send: bb_req
+		},
+	]
+}
+
+// check_queue_file_cleared_after_close: the sendfile hand-off slot
+// (core.queue_file) is thread-local, so the worker must drain it after EVERY
+// handler step, not only .done. One worker, so every connection below shares
+// that thread's slot, and each fire() completes before the next starts:
+//   1. GET /close queues a region and returns .close: the response must still
+//      carry that body (materialised into the write buffer before the close),
+//      byte-exact, then EOF.
+//   2. GET / twice on a fresh connection: exactly two bb_ok_response. A region
+//      left queued by step 1 would be taken by the first .done and streamed
+//      after its response.
+//   3. GET /suspend queues a region and suspends with no watch: no bytes, EOF.
+//   4. Step 2 again: the region step 3 queued must have been dropped.
+fn check_queue_file_cleared_after_close(backend server.IOBackend) ! {
+	path := os.join_path(os.temp_dir(), 'vanilla_bb_queue_file_${os.getpid()}.txt')
+	os.write_file(path, bb_file_data)!
+	mut f := os.open(path)!
+	defer {
+		f.close()
+		os.rm(path) or {}
+	}
+	mut h := vtest.start(server.ServerConfig{
+		io_multiplexing: backend
+		workers:         1
+		handler:         bb_file_handler(f.fd)
+	})!
+	defer {
+		h.stop()
+	}
+	mut want_close := []u8{}
+	want_close << bb_upload_resp_head
+	bb_wi(mut want_close, bb_file_len)
+	want_close << bb_close_sep
+	want_close << bb_file_data[bb_file_off..bb_file_off + bb_file_len].bytes()
+	want_two_ok := bb_concat(bb_ok_response, bb_ok_response)
+
+	closed := h.fire([
+		vtest.Script{
+			rounds:   [
+				vtest.Round{
+					send: bb_close_req
+				},
+			]
+			then_eof: true
+		},
+	])!
+	c := closed.conns[0]
+	assert c.connect_err == '', c.connect_err
+	assert !c.unmet, '${backend}: the .close response lost the body its handler queued (got ${c.raw.len} bytes)'
+	assert c.eof, '${backend}: .close must end the connection'
+	assert c.raw == want_close, '${backend}: .close response not byte-exact: ${c.raw.bytestr()}'
+
+	after_close := h.fire([bb_two_ok])!
+	a := after_close.conns[0]
+	assert a.connect_err == '', a.connect_err
+	assert a.raw == want_two_ok, '${backend}: a region queued by a .close step leaked into the next request: ${a.raw.bytestr()}'
+
+	suspended := h.fire([
+		vtest.Script{
+			rounds:   [
+				vtest.Round{
+					send: bb_suspend_req
+					want: 0
+				},
+			]
+			then_eof: true
+		},
+	])!
+	s := suspended.conns[0]
+	assert s.connect_err == '', s.connect_err
+	assert s.eof, '${backend}: .suspend with no watch armed must close'
+	assert s.raw.len == 0, '${backend}: .suspend with no watch armed sent bytes: ${s.raw.bytestr()}'
+
+	after_suspend := h.fire([bb_two_ok])!
+	b := after_suspend.conns[0]
+	assert b.connect_err == '', b.connect_err
+	assert b.raw == want_two_ok, '${backend}: a region queued by a .suspend step leaked into the next request: ${b.raw.bytestr()}'
+}
+
 // check_graceful_shutdown (hybrid — lifecycle owned by the test, VTEST.md):
 // serve one request, then call server_ref().shutdown(2000) from the test thread. The
 // stopwatch MEASURES the idle drain's promptness after it returned (the old
@@ -1088,6 +1232,13 @@ fn test_epoll_half_close_after_request() ! {
 fn test_epoll_expect_100_continue() ! {
 	$if linux {
 		check_expect_100_continue(.epoll)!
+	}
+}
+
+// The plain epoll worker is the backend that consumes core.queue_file.
+fn test_epoll_queue_file_cleared_after_close() ! {
+	$if linux {
+		check_queue_file_cleared_after_close(.epoll)!
 	}
 }
 

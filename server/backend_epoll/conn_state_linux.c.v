@@ -41,10 +41,10 @@ fn C.memmove(__dest voidptr, __src voidptr, __n usize) voidptr
 // sendfile(2): copy bytes from a file fd straight to the socket inside the
 // kernel (no userspace bounce). With a non-NULL offset the kernel advances it
 // and leaves the file's own position untouched, so ONE shared fd is safe to
-// send from many connections/threads at once. pread is the userspace fallback
-// used when a pipelined response must follow the file body in byte order.
+// send from many connections/threads at once. core.append_file_region (pread)
+// is the userspace fallback, used when the file body must go out as bytes: a
+// pipelined response must follow it in order, or the connection is closing.
 fn C.sendfile(out_fd int, in_fd int, offset &i64, count usize) isize
-fn C.pread(fd int, buf voidptr, count usize, offset i64) isize
 
 const sm_max_request_bytes = 8 * 1024 * 1024
 // Bound a single sendfile(2) call so one connection can't monopolize the worker;
@@ -442,34 +442,6 @@ fn park_write(epoll_fd int, fd int, limits core.Limits, mut st PlainState, mut c
 		st.parked++
 	}
 	epoll.mod_fd_in_epoll(epoll_fd, fd, (u32(C.EPOLLIN) | u32(C.EPOLLOUT) | u32(C.EPOLLET)))
-}
-
-// append_file_region reads [off, off+len) from a borrowed file fd into `buf`.
-// Used to materialize a deferred sendfile body into the response buffer when a
-// pipelined response must follow it in order, and as the userspace fallback on
-// backends/OSes that can't sendfile.
-@[manualfree]
-fn append_file_region(mut buf []u8, file_fd int, off i64, length i64) {
-	if length <= 0 {
-		return
-	}
-	start := buf.len
-	unsafe { buf.grow_len(int(length)) }
-	mut got := i64(0)
-	for got < length {
-		n := C.pread(file_fd, unsafe { &u8(buf.data) + start + int(got) }, usize(length - got),
-
-			off + got)
-		if n <= 0 {
-			break // short read (file truncated mid-flight) — send what we got
-		}
-		got += i64(n)
-	}
-	if got < length {
-		unsafe {
-			buf.len = start + int(got)
-		}
-	}
 }
 
 // drain_file streams the connection's deferred file body to the socket with

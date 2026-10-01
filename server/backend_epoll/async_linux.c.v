@@ -902,7 +902,7 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 		// bytes, in order) BEFORE this next response is appended — same ordering
 		// rule as the synchronous drain_requests.
 		if cs.file_remaining > 0 {
-			append_file_region(mut cs.write_buf, cs.file_fd, cs.file_off, cs.file_remaining)
+			core.append_file_region(mut cs.write_buf, cs.file_fd, cs.file_off, cs.file_remaining)
 			cs.file_fd = -1
 			cs.file_remaining = 0
 		}
@@ -923,19 +923,30 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 		// (a contract violation) must not leak its takeover into the next
 		// request this worker serves. nil cont = nothing was queued.
 		qt := core.take_queued_takeover() or { core.QueuedTakeover{} }
+		// The sendfile slot is thread-local too, and drained on every step for
+		// the same reason. A handler may have appended headers and handed its
+		// body off with core.queue_file: on .done the region streams after
+		// write_buf drains (flush_batch); on .close it is read into write_buf
+		// here, so the last response stays whole when the connection closes
+		// right after one best-effort flush; on .suspend it is dropped (a
+		// parked request has not answered yet: its continuation writes the
+		// response).
+		if qf := core.take_queued_file() {
+			if step == .done {
+				cs.file_fd = qf.file_fd
+				cs.file_off = qf.off
+				cs.file_remaining = qf.len
+			} else if step == .close {
+				core.append_file_region(mut cs.write_buf, qf.file_fd, qf.off, qf.len)
+			}
+		}
 		match step {
 			.done {
-				// Handler may have appended headers + handed its body off for
-				// sendfile(2); it streams after write_buf drains (flush_batch).
-				if qf := core.take_queued_file() {
-					cs.file_fd = qf.file_fd
-					cs.file_off = qf.off
-					cs.file_remaining = qf.len
-				}
-				// ...or handed the CONNECTION off (issue #136): from here on the
-				// bytes are no longer HTTP — stop parsing this burst as requests.
-				// The leftover stays buffered (compacted below) for the takeover
-				// drain, which runs after the switching response flushes.
+				// The handler may have handed the CONNECTION off (issue #136):
+				// from here on the bytes are no longer HTTP — stop parsing this
+				// burst as requests. The leftover stays buffered (compacted
+				// below) for the takeover drain, which runs after the switching
+				// response flushes.
 				if qt.cont != unsafe { nil } {
 					cs.takeover = qt.cont
 					cs.takeover_state = qt.state
