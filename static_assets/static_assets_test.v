@@ -5,6 +5,9 @@ module static_assets
 // acceptance criteria (application/wasm MIME, precompressed negotiation,
 // immutable caching, SPA fallback, traversal safety, conditional GET).
 import os
+import time
+import sync.stdatomic
+import core
 
 // A small built bundle written to a temp dir for the suite to serve.
 const fixture_root = os.join_path(os.temp_dir(), 'vanilla_static_assets_fixture')
@@ -375,4 +378,838 @@ fn test_no_prefix_default_still_serves_at_root() {
 	// Regression: default (no url_prefix) serves at the root exactly as before.
 	resp := server().respond(req('GET /app.abc123.js HTTP/1.1'))!.bytestr()
 	assert resp.starts_with('HTTP/1.1 200')
+}
+
+// --- per-representation ETags, 304 with Vary, exact 206 ---------------------
+
+fn header_value(resp []u8, name string) string {
+	head, _ := full_response(resp)
+	for line in head.split('\r\n') {
+		if line.to_lower().starts_with(name.to_lower() + ': ') {
+			return line[name.len + 2..]
+		}
+	}
+	return ''
+}
+
+fn test_each_representation_has_its_own_etag() {
+	s := server()
+	ident := s.respond(req('GET /app.abc123.js HTTP/1.1'))!
+	br := s.respond(req('GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: br'))!
+	gz := s.respond(req('GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: gzip'))!
+	e_id := header_value(ident, 'ETag')
+	e_br := header_value(br, 'ETag')
+	e_gz := header_value(gz, 'ETag')
+	assert e_id.len == 18 && e_br.len == 18 && e_gz.len == 18
+	assert e_id != e_br && e_id != e_gz && e_br != e_gz
+	assert e_id == s.etag_for('app.abc123.js')!
+}
+
+fn test_304_uses_the_negotiated_representation_and_carries_vary() {
+	s := server()
+	br := s.respond(req('GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: br'))!
+	e_br := header_value(br, 'ETag')
+	nm := s.respond(req('GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: br\r\nIf-None-Match: ' +
+		e_br))!.bytestr()
+	assert nm == 'HTTP/1.1 304 Not Modified\r\nETag: ${e_br}\r\nCache-Control: public, max-age=31536000, immutable\r\nVary: Accept-Encoding\r\nConnection: keep-alive\r\n\r\n'
+	// The identity ETag does not validate the br representation.
+	e_id := s.etag_for('app.abc123.js')!
+	full := s.respond(req('GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: br\r\nIf-None-Match: ' +
+		e_id))!.bytestr()
+	assert full.starts_with('HTTP/1.1 200')
+	assert full.contains('Content-Encoding: br')
+	// A non-negotiable asset's 304 has no Vary; respond_into gives the same bytes.
+	e_css := s.etag_for('styles.7f7f7f.css')!
+	mut out := []u8{}
+	s.respond_into(req('GET /styles.7f7f7f.css HTTP/1.1\r\nIf-None-Match: ' + e_css), mut out)!
+	assert out.bytestr() == 'HTTP/1.1 304 Not Modified\r\nETag: ${e_css}\r\nCache-Control: public, max-age=31536000, immutable\r\nConnection: keep-alive\r\n\r\n'
+}
+
+fn test_206_bytes_are_exact() {
+	s := server()
+	// Small (in RAM) and large (disk-backed on Linux) identity bodies.
+	e_small := s.etag_for('app.abc123.js')!
+	// RFC 9110 §15.3.7: the Cache-Control and Vary a 200 would carry.
+	small_want := 'HTTP/1.1 206 Partial Content\r\nContent-Type: text/javascript; charset=utf-8\r\nContent-Range: bytes 7-11/18\r\nContent-Length: 5\r\nAccept-Ranges: bytes\r\nETag: ${e_small}\r\nCache-Control: public, max-age=31536000, immutable\r\nVary: Accept-Encoding\r\nConnection: keep-alive\r\n\r\nconst'
+	// A Range ignores Accept-Encoding: it is always a range of the identity bytes.
+	small_req := req('GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: br\r\nRange: bytes=7-11')
+	assert s.respond(small_req)!.bytestr() == small_want
+	mut out := []u8{}
+	s.respond_into(small_req, mut out)!
+	assert out.bytestr() == small_want
+
+	e_big := s.etag_for('big.0a1b2c.wasm')!
+	big_req := req('GET /big.0a1b2c.wasm HTTP/1.1\r\nRange: bytes=1000-1999')
+	big_head := 'HTTP/1.1 206 Partial Content\r\nContent-Type: application/wasm\r\nContent-Range: bytes 1000-1999/${big_size}\r\nContent-Length: 1000\r\nAccept-Ranges: bytes\r\nETag: ${e_big}\r\nCache-Control: public, max-age=31536000, immutable\r\nConnection: keep-alive\r\n\r\n'
+	mut want := big_head.bytes()
+	for i in 1000 .. 2000 {
+		want << u8(i & 0xff)
+	}
+	assert s.respond(big_req)! == want
+	out.clear()
+	s.respond_into(big_req, mut out)!
+	assert out == want
+
+	// The entrypoint's policy, and no Vary: index.html has no encoded sibling.
+	idx := s.respond(req('GET /index.html HTTP/1.1\r\nRange: bytes=0-8'))!
+	assert idx.bytestr().starts_with('HTTP/1.1 206')
+	assert header_value(idx, 'Cache-Control') == 'no-cache'
+	assert header_value(idx, 'Vary') == ''
+}
+
+fn test_if_range() {
+	s := server()
+	e_id := s.etag_for('app.abc123.js')!
+	e_br := header_value(s.respond(req('GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: br'))!,
+		'ETag')
+	ranged := 'GET /app.abc123.js HTTP/1.1\r\nRange: bytes=0-5\r\nIf-Range: '
+	// The identity ETag, exactly: the Range is served.
+	for tag in [e_id, e_id + ' \t'] {
+		part := s.respond(req(ranged + tag))!
+		assert part.bytestr().starts_with('HTTP/1.1 206')
+		assert body_of(part).bytestr() == 'export'
+	}
+	// RFC 9110 §13.1.5: anything else ignores the Range and serves the whole
+	// representation: a stale ETag, the right one made weak (strong comparison),
+	// another representation's ETag, an HTTP-date (no Last-Modified is sent).
+	for tag in ['"deadbeefdeadbeef"', 'W/' + e_id, e_br, 'Wed, 21 Oct 2015 07:28:00 GMT'] {
+		full := s.respond(req(ranged + tag))!
+		assert full.bytestr().starts_with('HTTP/1.1 200'), tag
+		assert body_of(full).bytestr() == 'export const x = 1'
+		mut out := []u8{}
+		s.respond_into(req(ranged + tag), mut out)!
+		assert out == full
+	}
+	// An ignored Range leaves the request as it would be without one: the
+	// representation is negotiated, and If-None-Match validates it.
+	enc := 'GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: br\r\nRange: bytes=0-5\r\nIf-Range: "deadbeefdeadbeef"'
+	r := s.respond(req(enc))!
+	assert r.bytestr().starts_with('HTTP/1.1 200')
+	assert header_value(r, 'Content-Encoding') == 'br'
+	assert body_of(r).bytestr() == 'BROTLI-APP-JS'
+	assert s.respond(req(enc + '\r\nIf-None-Match: ' + e_br))!.bytestr().starts_with('HTTP/1.1 304')
+	// If-None-Match comes first (RFC 9110 §13.2.2): a matching one is a 304.
+	nm := s.respond(req(ranged + e_id + '\r\nIf-None-Match: ' + e_id))!
+	assert nm.bytestr().starts_with('HTTP/1.1 304')
+	// Without a Range, If-Range is ignored.
+	assert s.respond(req('GET /app.abc123.js HTTP/1.1\r\nIf-Range: "deadbeefdeadbeef"'))! == s.respond(req('GET /app.abc123.js HTTP/1.1'))!
+	// The same for a disk-backed body (on Linux).
+	e_big := s.etag_for('big.0a1b2c.wasm')!
+	big := 'GET /big.0a1b2c.wasm HTTP/1.1\r\nRange: bytes=10-13\r\nIf-Range: '
+	big_part := s.respond(req(big + e_big))!
+	assert big_part.bytestr().starts_with('HTTP/1.1 206')
+	assert body_of(big_part).len == 4
+	big_full := s.respond(req(big + '"deadbeefdeadbeef"'))!
+	assert big_full.bytestr().starts_with('HTTP/1.1 200')
+	assert body_of(big_full).len == big_size
+}
+
+fn test_range_if_none_match_uses_the_identity_etag() {
+	s := server()
+	e_id := s.etag_for('app.abc123.js')!
+	e_br := header_value(s.respond(req('GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: br'))!,
+		'ETag')
+	// A Range selects the identity bytes whatever Accept-Encoding says, and RFC
+	// 9110 evaluates If-None-Match before Range: against the identity ETag.
+	ranged := 'GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: br\r\nRange: bytes=0-5\r\nIf-None-Match: '
+	nm := s.respond(req(ranged + e_id))!.bytestr()
+	assert nm == 'HTTP/1.1 304 Not Modified\r\nETag: ${e_id}\r\nCache-Control: public, max-age=31536000, immutable\r\nVary: Accept-Encoding\r\nConnection: keep-alive\r\n\r\n'
+	mut out := []u8{}
+	s.respond_into(req(ranged + e_id), mut out)!
+	assert out.bytestr() == nm
+	// The br ETag does not validate a range of the identity bytes.
+	part := s.respond(req(ranged + e_br))!
+	assert part.bytestr().starts_with('HTTP/1.1 206')
+	assert header_value(part, 'ETag') == e_id
+	assert body_of(part).bytestr() == 'export'
+	// A Range that does not apply is ignored: the negotiated representation is
+	// validated and served as without one.
+	unsat := 'GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: br\r\nRange: bytes=900-1000\r\nIf-None-Match: '
+	assert s.respond(req(unsat + e_br))!.bytestr().starts_with('HTTP/1.1 304')
+	full := s.respond(req(unsat + e_id))!
+	assert full.bytestr().starts_with('HTTP/1.1 200')
+	assert header_value(full, 'Content-Encoding') == 'br'
+}
+
+fn test_disk_backed_etag_is_stable_across_replicas() {
+	// Two copies of one file, as two replicas (or a restart over another
+	// overlay mount) see it: the same bytes and mtime, another inode and ctime.
+	a_dir := fd_dir('replica_a')
+	b_dir := fd_dir('replica_b')
+	defer {
+		os.rmdir_all(a_dir) or {}
+		os.rmdir_all(b_dir) or {}
+	}
+	big := pattern(40 * 1024, 19)
+	mtime := i64(1_700_000_000)
+	for dir in [a_dir, b_dir] {
+		path := os.join_path(dir, 'f.bin')
+		os.write_file_array(path, big) or { panic(err) }
+		os.utime(path, mtime, mtime) or { panic(err) }
+	}
+	$if !windows {
+		assert os.stat(os.join_path(a_dir, 'f.bin'))!.inode != os.stat(os.join_path(b_dir,
+			'f.bin'))!.inode
+	}
+	a := new(Config{ root: a_dir, sendfile_min_bytes: fd_threshold })!
+	b := new(Config{ root: b_dir, sendfile_min_bytes: fd_threshold })!
+	$if linux {
+		assert !snap_of(a, 'f.bin', slot_identity).in_memory // disk-backed: not hashed from the bytes
+	}
+	assert a.etag_for('f.bin')! == b.etag_for('f.bin')!
+	$if linux {
+		// ... but from size and mtime, so another mtime is another ETag.
+		os.utime(os.join_path(b_dir, 'f.bin'), mtime + 1, mtime + 1)!
+		b2 := new(Config{ root: b_dir, sendfile_min_bytes: fd_threshold })!
+		assert b2.etag_for('f.bin')! != a.etag_for('f.bin')!
+	}
+}
+
+fn test_disk_backed_file_truncated_in_place_stays_framed() {
+	$if windows {
+		return // every body is in RAM on Windows
+	}
+	dir := fd_dir('truncated')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	path := os.join_path(dir, 'f.bin')
+	a := pattern(40 * 1024, 20)
+	os.write_file_array(path, a) or { panic(err) }
+	s := new(Config{ root: dir, sendfile_min_bytes: fd_threshold })!
+	// Truncated in place (same inode) under a snapshot that does not follow the
+	// disk: the Content-Length it promises stays true, the lost tail is zeros.
+	os.write_file_array(path, a[..1000]) or { panic(err) }
+	r := get(s, '/f.bin')
+	assert header_value(r, 'Content-Length') == '${a.len}'
+	body := body_of(r)
+	assert body.len == a.len
+	$if linux {
+		assert body[..1000] == a[..1000]
+		assert body[1000..].all(it == 0)
+	} $else {
+		assert body == a // kept in RAM since new()
+	}
+	mut out := []u8{}
+	s.respond_into(req('GET /f.bin HTTP/1.1\r\nRange: bytes=30000-30999'), mut out)!
+	assert header_value(out, 'Content-Length') == '1000'
+	assert body_of(out).len == 1000
+}
+
+// --- follow_disk -------------------------------------------------------------
+//
+// Each test serves its own temp dir. revalidate_ms: 0 (a stat on every request)
+// unless noted, so every request sees the file as it is on disk.
+
+const fd_threshold = 16 * 1024
+
+fn fd_dir(tag string) string {
+	dir := os.join_path(os.temp_dir(), 'vanilla_sa_follow_${tag}_${os.getpid()}')
+	os.rmdir_all(dir) or {}
+	os.mkdir_all(dir) or { panic(err) }
+	return dir
+}
+
+// pattern returns `n` recognisable bytes; a different `seed` gives different bytes.
+fn pattern(n int, seed int) []u8 {
+	mut b := []u8{len: n}
+	for i in 0 .. n {
+		b[i] = u8((i * 7 + seed * 31 + i / 251) & 0xff)
+	}
+	return b
+}
+
+// replace writes `content` to a temporary file in `dir` and renames it over
+// `name`, the way a deploy replaces a file: a new inode under the same name.
+fn replace(dir string, name string, content []u8) {
+	tmp := os.join_path(dir, '.tmp-' + name)
+	os.write_file_array(tmp, content) or { panic(err) }
+	os.rename(tmp, os.join_path(dir, name)) or { panic(err) }
+}
+
+fn follow_server(dir string, memory_fallback bool) AssetServer {
+	return new(Config{
+		root:               dir
+		follow_disk:        true
+		revalidate_ms:      0
+		sendfile_min_bytes: fd_threshold
+		memory_fallback:    memory_fallback
+	}) or { panic(err) }
+}
+
+// get serves `path` through respond_into (no sendfile-capable worker on a test
+// thread, so the body is appended) and checks respond() gives the same bytes.
+fn get(s &AssetServer, path string) []u8 {
+	r := req('GET ${path} HTTP/1.1')
+	mut out := []u8{}
+	s.respond_into(r, mut out) or { panic(err) }
+	assert s.respond(r) or { panic(err) } == out
+	return out
+}
+
+fn body_of(resp []u8) []u8 {
+	_, body := full_response(resp)
+	return body
+}
+
+fn snap_of(s &AssetServer, rel string, slot int) &Snap {
+	return s.assets[rel] or { panic('no asset ${rel}') }.reps[slot].snap()
+}
+
+fn check_same_length_rename(tag string, size int, memory_fallback bool) {
+	dir := fd_dir(tag)
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	a := pattern(size, 1)
+	b := pattern(size, 2)
+	os.write_file_array(os.join_path(dir, 'f.bin'), a) or { panic(err) }
+	s := follow_server(dir, memory_fallback)
+	r1 := get(s, '/f.bin')
+	assert body_of(r1) == a
+	$if linux {
+		snap := snap_of(s, 'f.bin', slot_identity)
+		assert snap.in_memory == (size < fd_threshold || memory_fallback)
+		assert (snap.file_fd >= 0) == (size >= fd_threshold)
+	}
+	replace(dir, 'f.bin', b)
+	r2 := get(s, '/f.bin')
+	assert body_of(r2) == b
+	assert header_value(r2, 'Content-Length') == header_value(r1, 'Content-Length')
+	assert header_value(r2, 'ETag') != header_value(r1, 'ETag')
+	assert header_value(r2, 'ETag') == s.etag_for('f.bin') or { panic(err) }
+}
+
+fn test_follow_same_length_rename() {
+	$if windows {
+		return // no follow_disk on Windows
+	}
+	check_same_length_rename('small', 1000, false)
+	check_same_length_rename('large', 40 * 1024, false)
+	check_same_length_rename('large_mem', 40 * 1024, true)
+}
+
+fn check_restore_with_older_mtime(tag string, size int) {
+	dir := fd_dir(tag)
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	path := os.join_path(dir, 'f.bin')
+	a := pattern(size, 3)
+	b := pattern(size, 4)
+	os.write_file_array(path, a) or { panic(err) }
+	old_mtime := os.file_last_mod_unix(path) - 3600 // well before anything below
+	os.utime(path, old_mtime, old_mtime) or { panic(err) }
+	s := follow_server(dir, false)
+	assert body_of(get(s, '/f.bin')) == a
+	replace(dir, 'f.bin', b)
+	assert body_of(get(s, '/f.bin')) == b
+	// Restore A the way `cp -p` would: same bytes, the OLD mtime. A "newer
+	// mtime" rule would keep serving B; signature inequality does not.
+	tmp := os.join_path(dir, '.restore')
+	os.write_file_array(tmp, a) or { panic(err) }
+	os.utime(tmp, old_mtime, old_mtime) or { panic(err) }
+	os.rename(tmp, path) or { panic(err) }
+	assert body_of(get(s, '/f.bin')) == a
+}
+
+fn test_follow_restore_with_older_mtime() {
+	$if windows {
+		return // no follow_disk on Windows
+	}
+	check_restore_with_older_mtime('restore_small', 1000)
+	check_restore_with_older_mtime('restore_large', 40 * 1024)
+}
+
+fn test_follow_in_place_same_size() {
+	$if windows {
+		return // no follow_disk on Windows
+	}
+	dir := fd_dir('inplace')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	path := os.join_path(dir, 'f.txt')
+	a := pattern(800, 5)
+	b := pattern(800, 6)
+	os.write_file_array(path, a) or { panic(err) }
+	ino := os.stat(path) or { panic(err) }.inode
+	s := follow_server(dir, false)
+	assert body_of(get(s, '/f.txt')) == a
+	// Same inode, same size: only mtime_ns/ctime_ns change. Kernel timestamps
+	// are coarse (a tick is 1-4 ms), so the writes are 20 ms apart.
+	time.sleep(20 * time.millisecond)
+	os.write_file_array(path, b) or { panic(err) }
+	assert os.stat(path) or { panic(err) }.inode == ino
+	assert body_of(get(s, '/f.txt')) == b
+	time.sleep(20 * time.millisecond)
+	os.write_file_array(path, a) or { panic(err) }
+	assert body_of(get(s, '/f.txt')) == a
+}
+
+fn check_same_size_same_mtime(tag string, size int) {
+	dir := fd_dir(tag)
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	path := os.join_path(dir, 'f.bin')
+	a := pattern(size, 17)
+	b := pattern(size, 18)
+	mtime := i64(1_700_000_000) // whole seconds: os.utime sets no nanoseconds
+	os.write_file_array(path, a) or { panic(err) }
+	os.utime(path, mtime, mtime) or { panic(err) }
+	s := follow_server(dir, false)
+	r1 := get(s, '/f.bin')
+	assert body_of(r1) == a
+	tmp := os.join_path(dir, '.same')
+	os.write_file_array(tmp, b) or { panic(err) }
+	os.utime(tmp, mtime, mtime) or { panic(err) }
+	os.rename(tmp, path) or { panic(err) }
+	// Only the inode and ctime tell the two versions apart.
+	mut st := C.vanilla_sa_sig{}
+	rc := C.vanilla_sa_stat(&char(path.str), &st)
+	assert rc == 0
+	old := snap_of(s, 'f.bin', slot_identity).sig
+	assert st.size == old.size && st.mtime_ns == old.mtime_ns && st.ino != old.ino
+	r2 := get(s, '/f.bin')
+	assert body_of(r2) == b
+	assert header_value(r2, 'Content-Length') == header_value(r1, 'Content-Length')
+	// A body in RAM gets a new ETag (a hash of the bytes). A disk-backed one
+	// keeps it (a hash of size and mtime_ns, both unchanged here), but its body
+	// is read from the new inode all the same.
+	if snap_of(s, 'f.bin', slot_identity).in_memory {
+		assert header_value(r2, 'ETag') != header_value(r1, 'ETag')
+	}
+}
+
+fn test_follow_same_size_same_mtime_new_inode() {
+	$if windows {
+		return // no follow_disk on Windows
+	}
+	check_same_size_same_mtime('same_mtime_small', 1000)
+	check_same_size_same_mtime('same_mtime_large', 40 * 1024)
+}
+
+fn check_sibling_only(ext string, token string) {
+	dir := fd_dir('sibling' + ext)
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	os.write_file(os.join_path(dir, 'f.css'), 'body{margin:0}') or { panic(err) }
+	os.write_file(os.join_path(dir, 'f.css' + ext), 'COMPRESSED-ONE') or { panic(err) }
+	s := follow_server(dir, false)
+	enc_req := req('GET /f.css HTTP/1.1\r\nAccept-Encoding: ' + token)
+	ident_before := get(s, '/f.css')
+	first := s.respond(enc_req) or { panic(err) }
+	assert body_of(first).bytestr() == 'COMPRESSED-ONE'
+	replace(dir, 'f.css' + ext, 'COMPRESSED-TWO!'.bytes())
+	second := s.respond(enc_req) or { panic(err) }
+	assert body_of(second).bytestr() == 'COMPRESSED-TWO!'
+	assert header_value(second, 'Content-Encoding') == token
+	assert header_value(second, 'Content-Length') == '15'
+	assert header_value(second, 'ETag') != header_value(first, 'ETag')
+	// The identity representation did not change: byte-identical, same ETag.
+	assert get(s, '/f.css') == ident_before
+}
+
+fn test_follow_sibling_only() {
+	$if windows {
+		return // no follow_disk on Windows
+	}
+	check_sibling_only('.br', 'br')
+	check_sibling_only('.gz', 'gzip')
+}
+
+fn test_follow_range_does_not_revalidate_encoded_representations() {
+	$if windows {
+		return // no follow_disk on Windows
+	}
+	dir := fd_dir('range_enc')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	os.write_file(os.join_path(dir, 'f.css'), 'body{margin:0}') or { panic(err) }
+	os.write_file(os.join_path(dir, 'f.css.br'), 'COMPRESSED-ONE') or { panic(err) }
+	s := follow_server(dir, false)
+	br_boot := snap_of(s, 'f.css', slot_br)
+	replace(dir, 'f.css.br', 'COMPRESSED-TWO!'.bytes())
+	// A Range is served from the identity representation alone: the br one is
+	// neither negotiated nor stat'ed, so it is still the boot snapshot.
+	r := s.respond(req('GET /f.css HTTP/1.1\r\nAccept-Encoding: br\r\nRange: bytes=0-3')) or {
+		panic(err)
+	}
+	assert body_of(r).bytestr() == 'body'
+	assert voidptr(snap_of(s, 'f.css', slot_br)) == voidptr(br_boot)
+	// The next request that negotiates br picks the new version up.
+	r2 := s.respond(req('GET /f.css HTTP/1.1\r\nAccept-Encoding: br')) or { panic(err) }
+	assert body_of(r2).bytestr() == 'COMPRESSED-TWO!'
+	assert voidptr(snap_of(s, 'f.css', slot_br)) != voidptr(br_boot)
+}
+
+fn test_follow_size_change_and_threshold_crossing() {
+	$if windows {
+		return // no follow_disk on Windows
+	}
+	dir := fd_dir('cross')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	small := pattern(1000, 7)
+	large := pattern(40 * 1024, 8)
+	smaller := pattern(500, 9)
+	os.write_file_array(os.join_path(dir, 'f.bin'), small) or { panic(err) }
+	s := follow_server(dir, false)
+	r1 := get(s, '/f.bin')
+	assert body_of(r1) == small
+	assert header_value(r1, 'Content-Length') == '1000'
+	replace(dir, 'f.bin', large)
+	r2 := get(s, '/f.bin')
+	assert body_of(r2) == large
+	assert header_value(r2, 'Content-Length') == '${40 * 1024}'
+	$if linux {
+		assert !snap_of(s, 'f.bin', slot_identity).in_memory // now disk-backed
+	}
+	replace(dir, 'f.bin', smaller)
+	r3 := get(s, '/f.bin')
+	assert body_of(r3) == smaller
+	assert header_value(r3, 'Content-Length') == '500'
+	assert snap_of(s, 'f.bin', slot_identity).in_memory
+	// HEAD and Range follow the new version too.
+	mut out := []u8{}
+	s.respond_into(req('HEAD /f.bin HTTP/1.1'), mut out) or { panic(err) }
+	assert header_value(out, 'Content-Length') == '500'
+	assert body_of(out).len == 0
+	out.clear()
+	s.respond_into(req('GET /f.bin HTTP/1.1\r\nRange: bytes=-10'), mut out) or { panic(err) }
+	assert header_value(out, 'Content-Range') == 'bytes 490-499/500'
+	assert body_of(out) == smaller[490..]
+}
+
+fn test_follow_deleted_file_keeps_serving() {
+	$if windows {
+		return // no follow_disk on Windows
+	}
+	dir := fd_dir('deleted')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	a := pattern(1000, 10)
+	os.write_file_array(os.join_path(dir, 'f.bin'), a) or { panic(err) }
+	s := follow_server(dir, false)
+	r1 := get(s, '/f.bin')
+	os.rm(os.join_path(dir, 'f.bin')) or { panic(err) }
+	assert get(s, '/f.bin') == r1
+	// A file added after new() is not followed (the key set is fixed).
+	os.write_file(os.join_path(dir, 'new.txt'), 'late') or { panic(err) }
+	assert get(s, '/new.txt').bytestr().starts_with('HTTP/1.1 404')
+}
+
+fn test_follow_replaced_file_is_not_a_version() {
+	$if windows {
+		return // no follow_disk on Windows
+	}
+	dir := fd_dir('unlinked')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	path := os.join_path(dir, 'f.bin')
+	os.write_file_array(path, pattern(1000, 25)) or { panic(err) }
+	fd := C.vanilla_sa_open(&char(path.str))
+	assert fd >= 0
+	defer {
+		C.vanilla_sa_close(fd)
+	}
+	mut st := C.vanilla_sa_sig{}
+	linked := C.vanilla_sa_fstat(fd, &st)
+	assert linked == 0
+	// Renamed over, the open file is the outgoing version: no link left. It
+	// is refused, the way a request that stats it in the middle of the rename
+	// refuses it, instead of being republished as a new snapshot.
+	replace(dir, 'f.bin', pattern(1000, 26))
+	replaced := C.vanilla_sa_fstat(fd, &st)
+	assert replaced == -1
+	by_path := C.vanilla_sa_stat(&char(path.str), &st)
+	assert by_path == 0
+}
+
+fn C.mkfifo(path &char, mode u32) int
+
+fn make_fifo(path string) {
+	$if !windows {
+		// Not inside the assert: -prod builds drop asserts, call included.
+		rc := C.mkfifo(&char(path.str), 0o644)
+		assert rc == 0
+	}
+}
+
+fn test_follow_non_regular_file_keeps_serving() {
+	$if windows {
+		return // no follow_disk on Windows
+	}
+	dir := fd_dir('fifo')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	a := pattern(1000, 21)
+	os.write_file_array(os.join_path(dir, 'f.bin'), a) or { panic(err) }
+	// A FIFO with no writer present at boot: new() does not block opening it,
+	// and it is not served.
+	make_fifo(os.join_path(dir, 'boot.bin'))
+	s := follow_server(dir, false)
+	assert get(s, '/boot.bin').bytestr().starts_with('HTTP/1.1 404')
+	r1 := get(s, '/f.bin')
+	assert body_of(r1) == a
+	// A FIFO renamed over the file: no request blocks on it, and the last good
+	// version keeps being served.
+	make_fifo(os.join_path(dir, '.fifo'))
+	os.rename(os.join_path(dir, '.fifo'), os.join_path(dir, 'f.bin')) or { panic(err) }
+	assert get(s, '/f.bin') == r1
+	// A regular file in its place again is followed.
+	b := pattern(1000, 22)
+	replace(dir, 'f.bin', b)
+	assert body_of(get(s, '/f.bin')) == b
+}
+
+fn test_follow_disk_off_stays_immutable() {
+	$if windows {
+		return // replace() renames over an existing file, which Windows refuses
+	}
+	dir := fd_dir('immutable')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	a := pattern(1000, 11)
+	os.write_file_array(os.join_path(dir, 'f.bin'), a) or { panic(err) }
+	s := new(Config{ root: dir, revalidate_ms: 0 }) or { panic(err) }
+	r1 := get(s, '/f.bin')
+	assert body_of(r1) == a
+	replace(dir, 'f.bin', pattern(1000, 12))
+	assert get(s, '/f.bin') == r1
+	assert isnil(snap_of(s, 'f.bin', slot_identity).prev)
+}
+
+fn test_follow_disk_is_refused_on_windows() {
+	$if windows {
+		dir := fd_dir('windows')
+		defer {
+			os.rmdir_all(dir) or {}
+		}
+		if _ := new(Config{ root: dir, follow_disk: true }) {
+			assert false, 'follow_disk must be refused on Windows'
+		}
+	}
+}
+
+fn test_follow_revalidate_window() {
+	$if windows {
+		return // no follow_disk on Windows
+	}
+	dir := fd_dir('window')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	a := pattern(1000, 13)
+	b := pattern(1000, 14)
+	os.write_file_array(os.join_path(dir, 'f.bin'), a) or { panic(err) }
+	s := new(Config{
+		root:          dir
+		follow_disk:   true
+		revalidate_ms: 200
+	}) or { panic(err) }
+	assert body_of(get(s, '/f.bin')) == a
+	replace(dir, 'f.bin', b)
+	// Inside the window nothing stats: this one may still be A.
+	early := body_of(get(s, '/f.bin'))
+	assert early == a || early == b
+	time.sleep(250 * time.millisecond)
+	assert body_of(get(s, '/f.bin')) == b
+}
+
+fn test_follow_revalidate_window_serves_the_old_version_until_it_ends() {
+	$if windows {
+		return // no follow_disk on Windows
+	}
+	dir := fd_dir('long_window')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	a := pattern(1000, 23)
+	b := pattern(1000, 24)
+	os.write_file_array(os.join_path(dir, 'f.bin'), a) or { panic(err) }
+	s := new(Config{
+		root:          dir
+		follow_disk:   true
+		revalidate_ms: 10_000
+	}) or { panic(err) }
+	rep := s.assets['f.bin'] or { panic('no asset') }.reps[slot_identity]
+	r1 := get(s, '/f.bin')
+	assert body_of(r1) == a
+	replace(dir, 'f.bin', b)
+	// The window opened at new() and lasts 10 s: no request stats the file, so
+	// A is still served, byte for byte, and its ETag still validates.
+	assert get(s, '/f.bin') == r1
+	e_a := header_value(r1, 'ETag')
+	nm := s.respond(req('GET /f.bin HTTP/1.1\r\nIf-None-Match: ' + e_a)) or { panic(err) }
+	assert nm.bytestr().starts_with('HTTP/1.1 304')
+	assert isnil(rep.snap().prev) // nothing was rebuilt
+	// End the window, as the clock would 10 s later: the next request stats the
+	// file and serves B, and opens the next window.
+	stdatomic.store_u64(&rep.next_check, 0)
+	r2 := get(s, '/f.bin')
+	assert body_of(r2) == b
+	assert header_value(r2, 'ETag') != e_a
+	replace(dir, 'f.bin', a)
+	assert get(s, '/f.bin') == r2
+}
+
+// --- the sendfile hand-off follows the disk ----------------------------------
+//
+// The hand-off slot is thread-local, so the probe acts as a sendfile-capable
+// worker on a thread of its own (a fresh slot) and only records what it saw;
+// the asserts run on the test thread. Under tcc the slot is inert.
+
+struct HandoffProbe {
+	queued         bool
+	head_only      bool // `out` held the headers only
+	file_fd        int
+	off            i64
+	len            i64
+	file_bytes     []u8 // pread of the queued region
+	refused_queued bool // queued although the gate was closed
+	refused_full   []u8 // the response with the gate closed
+}
+
+fn handoff_probe(s &AssetServer) HandoffProbe {
+	core.enable_sendfile()
+	mut out := []u8{}
+	s.respond_into(req('GET /f.bin HTTP/1.1'), mut out) or { panic(err) }
+	mut p := HandoffProbe{
+		head_only: body_of(out).len == 0 && out.bytestr().ends_with('\r\n\r\n')
+	}
+	if qf := core.take_queued_file() {
+		mut bytes := []u8{}
+		$if !windows {
+			core.append_file_region(mut bytes, qf.file_fd, qf.off, qf.len)
+		}
+		p = HandoffProbe{
+			...p
+			queued:     true
+			file_fd:    qf.file_fd
+			off:        qf.off
+			len:        qf.len
+			file_bytes: bytes
+		}
+	}
+	core.set_queue_file_allowed(false)
+	mut closed := []u8{}
+	s.respond_into(req('GET /f.bin HTTP/1.1'), mut closed) or { panic(err) }
+	mut refused_queued := false
+	if _ := core.take_queued_file() {
+		refused_queued = true
+	}
+	return HandoffProbe{
+		...p
+		refused_queued: refused_queued
+		refused_full:   closed
+	}
+}
+
+fn check_handoff(tag string, memory_fallback bool) {
+	dir := fd_dir(tag)
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	a := pattern(40 * 1024, 15)
+	b := pattern(40 * 1024, 16)
+	os.write_file_array(os.join_path(dir, 'f.bin'), a) or { panic(err) }
+	s := follow_server(dir, memory_fallback)
+	boot := snap_of(s, 'f.bin', slot_identity)
+	replace(dir, 'f.bin', b)
+	p := spawn handoff_probe(&s)
+	probe := p.wait()
+	// With the gate closed, the body is appended: from RAM with memory_fallback,
+	// by pread without it. Either way it is B, complete.
+	assert !probe.refused_queued
+	assert body_of(probe.refused_full) == b
+	$if linux && !tinyc {
+		assert probe.queued
+		assert probe.head_only
+		assert probe.file_fd >= 0 && probe.file_fd != boot.file_fd
+		assert probe.off == 0 && probe.len == b.len
+		assert probe.file_bytes == b
+	} $else {
+		assert !probe.queued
+	}
+	$if linux {
+		assert snap_of(s, 'f.bin', slot_identity).in_memory == memory_fallback
+	}
+}
+
+fn test_follow_sendfile_handoff() {
+	$if windows {
+		return // no follow_disk on Windows
+	}
+	check_handoff('handoff', false)
+	check_handoff('handoff_mem', true)
+}
+
+// --- no allocation per request -----------------------------------------------
+
+fn test_respond_into_does_not_allocate() {
+	s := server()
+	e_js := s.etag_for('app.abc123.js')!
+	reqs := [
+		req('GET /app.abc123.js HTTP/1.1'),
+		req('GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: gzip, br'),
+		req('GET /app.abc123.js HTTP/1.1\r\nIf-None-Match: ' + e_js),
+		req('HEAD /core.9f3a1c.wasm HTTP/1.1'),
+		req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=2-5'),
+		req('GET /app.abc123.js HTTP/1.1\r\nRange: bytes=0-5\r\nIf-Range: ' + e_js),
+		req('GET /app.abc123.js HTTP/1.1\r\nRange: bytes=0-5\r\nIf-Range: "deadbeefdeadbeef"'),
+		req('GET /big.0a1b2c.wasm HTTP/1.1'), // disk-backed on Linux: pread into out
+		req('GET /big.0a1b2c.wasm HTTP/1.1\r\nRange: bytes=100-50000'),
+		req('GET /users/42 HTTP/1.1'),
+		req('GET /nope.9f3a1c.wasm HTTP/1.1'),
+	]
+	mut out := []u8{cap: 2 * big_size}
+	// Warm up, then count what the GC hands out (0 on -gc none / -race builds).
+	for r in reqs {
+		out.clear()
+		s.respond_into(r, mut out)!
+	}
+	before := gc_heap_usage().total_bytes
+	for i in 0 .. 10_000 {
+		out.clear()
+		s.respond_into(reqs[i % reqs.len], mut out)!
+	}
+	grown := gc_heap_usage().total_bytes - before
+	assert grown < 16 * 1024, 'respond_into allocated ${grown} bytes over 10k requests'
+}
+
+fn test_respond_does_not_allocate_for_in_memory_replies() {
+	s := server()
+	e_js := s.etag_for('app.abc123.js')!
+	// A 200, HEAD or 304 of a snapshot is a view of its bytes and a 404 or 405
+	// a constant: respond() has nothing to allocate for them.
+	reqs := [
+		req('GET /app.abc123.js HTTP/1.1'),
+		req('GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: gzip, br'),
+		req('GET /app.abc123.js HTTP/1.1\r\nIf-None-Match: ' + e_js),
+		req('GET /app.abc123.js HTTP/1.1\r\nRange: bytes=0-5\r\nIf-Range: "deadbeefdeadbeef"'),
+		req('HEAD /big.0a1b2c.wasm HTTP/1.1'),
+		req('GET /users/42 HTTP/1.1'),
+		req('GET /nope.9f3a1c.wasm HTTP/1.1'),
+		req('POST / HTTP/1.1'),
+	]
+	mut total := 0
+	for r in reqs {
+		total += s.respond(r)!.len
+	}
+	before := gc_heap_usage().total_bytes
+	for i in 0 .. 10_000 {
+		total += s.respond(reqs[i % reqs.len])!.len
+	}
+	grown := gc_heap_usage().total_bytes - before
+	assert total > 0
+	assert grown < 16 * 1024, 'respond allocated ${grown} bytes over 10k requests'
 }

@@ -20,18 +20,68 @@ module static_assets
 //      no file on disk; serve `index.html` so the client router takes over.
 //      Asset-looking 404s (`/nope.[hash].wasm`) are NOT masked by the fallback.
 //
-// DESIGN: an `AssetServer` is built ONCE at boot from a directory. Every file is
-// read into memory and its complete HTTP response (status line + headers + body)
-// is precomputed for each representation (identity / br / gzip). The server is
-// then immutable, so `respond()` is a lock-free read shared across all worker
-// threads, and the hot 200 path returns precomputed bytes with zero allocation.
-// `respond()` is a pure function of the request bytes — socket-free and
-// E2E-testable exactly like the rest of vanilla.
+// DESIGN: an `AssetServer` is built ONCE at boot from a directory, and its set
+// of files is fixed from then on: the URL -> asset map is never modified, so
+// workers read it without locking. Each asset has up to three representations
+// (identity, br, gzip), and each representation points at a snapshot (`Snap`)
+// of one version of its file: the complete precomputed HTTP response for it
+// (status line + headers, plus the body when the body is kept in RAM), its
+// strong ETag (one per representation) and its precomputed 304. A snapshot is
+// never modified after it is published, so `respond()` is a lock-free read
+// shared across all worker threads and every response path, 200, HEAD, 304
+// and 206, appends precomputed or computed-in-place bytes with zero
+// allocation. `respond()` is a pure function of the request bytes —
+// socket-free and E2E-testable exactly like the rest of vanilla.
+//
+// FOLLOWING THE DISK (`Config.follow_disk`, off by default): a representation
+// re-checks its file with one stat(2) per `revalidate_ms` window, made by the
+// first request after the window opens (0 = on every request). When the
+// file's (dev, ino, size, mtime_ns, ctime_ns) differs from the snapshot's,
+// that request builds a new snapshot and publishes it with one atomic pointer
+// store; requests already running keep the snapshot they loaded. Old snapshots
+// stay reachable through `prev` and are NEVER freed, so a body a worker still
+// sends (a borrowed queue_buf send, or a sendfile(2) region of its fd) can
+// never dangle, and no fd number is ever reused under it. That costs memory,
+// and an fd per snapshot of a disk-backed file, with about one snapshot per
+// change and at most two (a request can catch the outgoing version in the
+// middle of the rename that replaces it): it suits deploy-style changes, not
+// files that are rewritten continuously. Files added or deleted after new()
+// are not followed; a deleted file, or one replaced by something that is not
+// a regular file (a FIFO, a directory), keeps serving its last version.
+// Replace files atomically (write a temporary file in the same directory,
+// then rename it over the old one): an in-place rewrite can be caught half
+// written, and two same-size in-place writes within one kernel timestamp tick
+// look identical to stat(2).
+//
+// ETAGS: a body kept in RAM is hashed by content. A representation served
+// from disk only (sendfile, without memory_fallback) hashes its size and
+// mtime_ns instead, so a replacement with the same size and the same mtime
+// keeps its ETag: the new bytes are served, but a cache that revalidates with
+// If-None-Match gets a 304 and keeps the old ones.
 import os
-import strings
+import strconv
 import hash as wyhash
+import sync.stdatomic
 import core
 import http1_1.request_parser
+
+#include "@VMODROOT/static_assets/file_sig.h"
+
+@[typedef]
+struct C.vanilla_sa_sig {
+mut:
+	dev      u64
+	ino      u64
+	size     i64
+	mtime_ns i64
+	ctime_ns i64
+}
+
+fn C.vanilla_sa_open(path &char) int
+fn C.vanilla_sa_close(fd int)
+fn C.vanilla_sa_stat(path &char, out &C.vanilla_sa_sig) int
+fn C.vanilla_sa_fstat(fd int, out &C.vanilla_sa_sig) int
+fn C.vanilla_sa_now_ms() u64
 
 // Encoding is a precompressed representation negotiated via `Accept-Encoding`.
 pub enum Encoding {
@@ -67,48 +117,73 @@ pub:
 	// the root. The SPA fallback (when enabled) only triggers for paths under the
 	// prefix; paths outside it are a 404 (the asset server does not own them).
 	url_prefix string
+	// follow_disk: re-check each served representation against its file and
+	// rebuild it when (dev, ino, size, mtime_ns, ctime_ns) differs, so a
+	// replaced file is served without a restart. Off (default): every
+	// representation is immutable after new(). Not supported on Windows.
+	follow_disk bool
+	// revalidate_ms: with follow_disk, one stat(2) per representation per
+	// window, made by the first request after the window opens; requests
+	// inside the window pay a coarse clock read and a compare. 0 = stat on
+	// every request (strict freshness).
+	revalidate_ms int = 100
+	// memory_fallback: representations of at least sendfile_min_bytes keep
+	// their bytes in RAM as well as an fd, so a worker that cannot sendfile
+	// them (io_uring's borrowed queue_buf send, a userspace-TLS connection)
+	// sends them from memory instead of reading the file on every request.
+	memory_fallback bool
 }
 
-// Variant is one representation (identity / br / gzip) of an asset.
-//
-// Small assets (preloaded): `response` is the full precomputed HTTP response
-// (headers + body), `header_len` marks the body offset, and `path`/`file_fd`
-// are unset — the hot path returns `response` directly with zero allocation.
-//
-// Large assets (Linux, >= sendfile_min_bytes): `response` holds ONLY the headers
-// (header_len == response.len), the body lives on disk at `path`, and `file_fd`
-// is an open O_RDONLY fd streamed with sendfile(2) (the fd is borrowed for the
-// server's lifetime; sendfile's explicit offset keeps it safe to share).
+// Snap is one immutable version of a representation's file. Every field is
+// written before the snapshot is published (an atomic pointer store) and
+// never again, and a snapshot is never freed: a worker may keep sending from
+// it after a newer one replaced it.
+@[heap]
+struct Snap {
+	sig          C.vanilla_sa_sig // the file's signature, from fstat on the fd the body was read from
+	response     []u8             // headers (+ body when in_memory), ready to send; one allocation
+	header_len   int              // index in `response` where the body starts
+	body_len     i64              // body length in bytes (Content-Length)
+	in_memory    bool             // the body is in `response`
+	file_fd      int = -1 // O_RDONLY fd of the body (disk-backed or large); never closed
+	etag         string // the quoted strong validator: a view into `response`
+	not_modified []u8   // the precomputed 304
+	prev         &Snap = unsafe { nil } // the version this one replaced: keeps it alive
+}
+
+// Variant is one representation (identity / br / gzip) of an asset: what it
+// was built from and how, and its current snapshot. Only `cur`, `next_check`
+// and `busy` change after new(), and only through C11 atomics.
+@[heap]
 struct Variant {
-	response   []u8   // headers (+ body, for small assets), ready to send
-	header_len int    // index in `response` where the body starts
-	path       string // body file on disk (large assets only; '' for small)
-	file_fd    int = -1 // O_RDONLY fd for sendfile (Linux large assets; -1 otherwise)
-	body_len   i64 // body length in bytes
+	path        string // absolute path of the file (NUL-terminated: passed to stat/open)
+	encoding    string // Content-Encoding token; '' for identity
+	ctype       string
+	cache       string
+	vary        bool // the asset is negotiable: emit Vary: Accept-Encoding
+	threshold   i64  // Config.sendfile_min_bytes
+	keep_memory bool // Config.memory_fallback
+	follow      bool // Config.follow_disk
+	window_ms   u64  // Config.revalidate_ms
+mut:
+	cur        &Snap = unsafe { nil } // only through C.atomic_load_ptr / C.atomic_store_ptr
+	next_check u64 // coarse-clock ms of the next stat; a CAS elects one checker per window
+	busy       u32 // 1 while one thread builds a new snapshot
 }
 
-@[inline]
-fn (v &Variant) is_large() bool {
-	return v.path != ''
-}
-
-// Asset is one served file: its metadata plus a precomputed response per
-// representation. `body` is the identity (uncompressed) payload, kept for Range
-// requests. Immutable after construction.
+// Asset is one served file: its metadata plus up to three representations.
 pub struct Asset {
 pub:
 	rel           string // path relative to root, '/'-separated (the URL key)
 	content_type  string
 	cache_control string
-	etag          string             // strong validator, already quoted: `"<hex>"`
-	negotiable    bool               // true when a precompressed sibling exists -> emit Vary
-	body          []u8               // identity bytes for Range (small assets; empty when disk-backed)
-	body_len      i64                // identity length in bytes (the Content-Range total)
-	variants      map[string]Variant // keys: 'identity', 'br', 'gzip'
+	negotiable    bool // true when a precompressed sibling exists -> emit Vary
+mut:
+	reps [3]&Variant // slot_identity, slot_br, slot_gzip; nil when absent
 }
 
-// AssetServer holds the loaded bundle. Built once, read-only thereafter, so it
-// is safe to share across worker threads without locking.
+// AssetServer holds the loaded bundle. Its asset map is built once and never
+// modified, so it is safe to share across worker threads without locking.
 pub struct AssetServer {
 pub:
 	spa_fallback  string
@@ -121,18 +196,43 @@ const status_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nConte
 
 const status_404 = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 
+// A cached error, so a malformed request costs no allocation (-gc none).
+const err_malformed = error('static_assets: malformed request head')
+
+const slot_identity = 0
+const slot_br = 1
+const slot_gzip = 2
+
+// The ETag is written as a fixed-width placeholder (a quote, 16 hex digits, a
+// quote) before the body is read, then overwritten with the hash.
+const etag_placeholder = '"0000000000000000"'
+
+// Room for the status line and the fixed header names and values of a 200,
+// 206 or 304, on top of the content type and cache policy.
+const head_room = 288
+
+// A body larger than this is never kept in RAM (its length must fit an array).
+const max_ram_body = i64(max_int) - 65536
+
 // new loads every file under `config.root`, computes its content type, cache
 // policy, ETag and precompressed variants, and precomputes a ready-to-send HTTP
-// response for each. Errors if the root does not exist or is not a directory.
+// response for each. Errors if the root does not exist or is not a directory,
+// or if follow_disk is set on Windows.
 pub fn new(config Config) !AssetServer {
 	root_abs := os.abs_path(config.root)
 	if !os.is_dir(root_abs) {
 		return error('static_assets: root is not a directory: ${config.root}')
 	}
+	$if windows {
+		if config.follow_disk {
+			return error('static_assets: follow_disk is not supported on Windows')
+		}
+	}
 	mut formats := config.precompressed.clone()
 	if formats.len == 0 {
 		formats = [Encoding.br, Encoding.gzip]
 	}
+	window := if config.revalidate_ms > 0 { u64(config.revalidate_ms) } else { u64(0) }
 
 	mut files := []string{}
 	collect_files(root_abs, mut files)
@@ -143,7 +243,6 @@ pub fn new(config Config) !AssetServer {
 		present[to_rel(root_abs, f)] = true
 	}
 
-	threshold := config.sendfile_min_bytes
 	mut assets := map[string]&Asset{}
 	for f in files {
 		rel := to_rel(root_abs, f)
@@ -156,57 +255,52 @@ pub fn new(config Config) !AssetServer {
 		cache := cache_control(rel, config.spa_fallback, config.immutable_glob)
 
 		// Discover precompressed siblings for the requested formats.
-		mut sib_present := map[string]string{} // token -> sibling absolute path
+		mut paths := ['', '', '']!
+		paths[slot_identity] = f
+		mut negotiable := false
 		for enc in formats {
 			sib_rel := rel + enc_ext(enc)
 			if sib_rel in present {
-				sib_present[enc_token(enc)] = os.join_path(root_abs, sib_rel)
-			}
-		}
-		negotiable := sib_present.len > 0
-
-		// Identity representation. Large files (Linux) stay on disk for
-		// sendfile(2); small files are preloaded and fully precomputed.
-		ident_size := os.file_size(f)
-		ident_large := is_large(threshold, ident_size)
-		mut ident_body := []u8{}
-		etag := if ident_large {
-			// Avoid reading a large file just to hash it: a strong size+mtime
-			// validator is stable across restarts and changes when the file does.
-			etag_from_stat(f, ident_size)
-		} else {
-			ident_body = os.read_bytes(f) or { continue }
-			// 64-bit wyhash: a cheap, strong opaque validator (boot-time only).
-			'"' + wyhash.wyhash_c(ident_body.data, u64(ident_body.len), 0).hex() + '"'
-		}
-
-		mut variants := map[string]Variant{}
-		variants['identity'] = if ident_large {
-			build_variant_file(ctype, cache, etag, '', negotiable, f, i64(ident_size))
-		} else {
-			build_variant_inline(ctype, cache, etag, '', negotiable, ident_body)
-		}
-		// Precompressed siblings share the identity ETag (Vary already set).
-		for tok, spath in sib_present {
-			ssize := os.file_size(spath)
-			if is_large(threshold, ssize) {
-				variants[tok] = build_variant_file(ctype, cache, etag, tok, true, spath, i64(ssize))
-			} else {
-				sbody := os.read_bytes(spath) or { continue }
-				variants[tok] = build_variant_inline(ctype, cache, etag, tok, true, sbody)
+				paths[enc_slot(enc)] = os.join_path(root_abs, sib_rel)
+				negotiable = true
 			}
 		}
 
-		assets[rel] = &Asset{
+		mut asset := &Asset{
 			rel:           rel
 			content_type:  ctype
 			cache_control: cache
-			etag:          etag
 			negotiable:    negotiable
-			body:          ident_body // empty for large (served from disk)
-			body_len:      i64(ident_size)
-			variants:      variants
 		}
+		for slot in 0 .. 3 {
+			if paths[slot] == '' {
+				continue
+			}
+			mut v := &Variant{
+				path:        paths[slot].clone() // clone: a NUL-terminated copy for the C calls
+				encoding:    slot_token(slot)
+				ctype:       ctype
+				cache:       cache
+				vary:        negotiable
+				threshold:   config.sendfile_min_bytes
+				keep_memory: config.memory_fallback
+				follow:      config.follow_disk
+				window_ms:   window
+			}
+			// Plain stores: workers only see the server after new() returns.
+			v.cur = load_snap(v, unsafe { nil }) or {
+				if slot == slot_identity {
+					break // the file itself could not be read: skip its siblings
+				}
+				continue
+			}
+			v.next_check = C.vanilla_sa_now_ms() + window
+			asset.reps[slot] = v
+		}
+		if isnil(asset.reps[slot_identity]) {
+			continue // the file itself could not be read: not served
+		}
+		assets[rel] = asset
 	}
 
 	return AssetServer{
@@ -217,11 +311,6 @@ pub fn new(config Config) !AssetServer {
 	}
 }
 
-// respond turns raw request bytes into a complete raw HTTP response. It never
-// touches a socket, so it is unit-testable by feeding a request and asserting
-// the returned headers/status. Returns an error only when the request bytes
-// cannot be parsed (map to 400); every other case (404, 405, ...) is a normal
-// response.
 // route resolves a request to a served asset. It returns either a canned
 // response (non-empty []u8, for 405 / 404) or a matched asset, with `head`
 // telling GET from HEAD. All parsing is byte-level and allocation-free, and the
@@ -316,27 +405,67 @@ fn (s &AssetServer) route(req &request_parser.HttpRequest) ([]u8, &Asset, bool) 
 }
 
 // respond turns raw request bytes into a complete raw HTTP response. Pure and
-// socket-free — the testable contract. For a disk-backed (large) asset it reads
-// the body from disk to assemble the bytes; handlers that want zero-copy
-// sendfile(2) should call respond_into() with the socket fd instead.
+// socket-free — the testable contract. It never touches a socket, so it is
+// unit-testable by feeding a request and asserting the returned bytes. Returns
+// an error only when the request bytes cannot be parsed (map to 400); every
+// other case (404, 405, ...) is a normal response. A plain 200, HEAD or 304 of
+// a snapshot is returned zero-copy (a read-only view: snapshots are never
+// modified or freed); a disk-backed body or a 206 is assembled into a new
+// buffer. Handlers that want sendfile(2) and no allocation should call
+// respond_into() or respond_req_into() instead.
 pub fn (s &AssetServer) respond(req_buffer []u8) ![]u8 {
-	req := request_parser.decode_http_request(req_buffer)!
-	canned, asset, head := s.route(&req)
-	if isnil(asset) {
-		return canned
+	mut hr := request_parser.HttpRequest{
+		buffer: req_buffer
 	}
-	return s.build_bytes(asset, req, head)
+	if !request_parser.decode_into(mut hr) {
+		return err_malformed
+	}
+	// The response is set through `resp` by a method that returns nothing, as
+	// respond_into does. Since V 04fc6a97, passing `&hr` to route and
+	// build_bytes here moved `hr` to the heap (one allocation per call), even
+	// under unsafe; this shape keeps it on the stack.
+	mut resp := []u8{}
+	s.respond_view(&hr, mut resp)
+	return resp
 }
 
-// respond_into appends the response for `req` to `out` and, for a large asset
-// body on a sendfile-capable worker, hands that body off to be streamed with
-// sendfile(2) (no userspace copy) instead of appending it. On any other backend
-// or OS it appends the body bytes, so the result is always a complete response.
-// This is what a vanilla handler should call (the worker pairs the handed-off
-// file with the current connection, so no socket fd is needed here).
+// respond_view sets `resp` to the response for a decoded request: a view of a
+// snapshot's bytes, or a constant. It copies and allocates nothing.
+fn (s &AssetServer) respond_view(req &request_parser.HttpRequest, mut resp []u8) {
+	canned, asset, head := s.route(req)
+	if isnil(asset) {
+		unsafe {
+			resp = canned // a view of a constant, as respond returned it
+		}
+		return
+	}
+	resp = s.build_bytes(asset, req, head)
+}
+
+// respond_into decodes `req_buffer` and appends the response to `out`; see
+// respond_req_into. Errors (map to 400) only when the request bytes cannot be
+// parsed, without allocating.
 pub fn (s &AssetServer) respond_into(req_buffer []u8, mut out []u8) ! {
-	req := request_parser.decode_http_request(req_buffer)!
-	canned, asset, head := s.route(&req)
+	mut hr := request_parser.HttpRequest{
+		buffer: req_buffer
+	}
+	if !request_parser.decode_into(mut hr) {
+		return err_malformed
+	}
+	s.respond_req_into(&hr, mut out)
+}
+
+// respond_req_into appends the response for an already decoded request to
+// `out`, so a handler that parsed the request to route it does not parse it
+// twice. For a disk-backed body on a sendfile-capable worker it hands the body
+// off to be streamed with sendfile(2) (no userspace copy) instead of appending
+// it; on io_uring an in-memory response is handed off as a borrowed buffer.
+// Everywhere else it appends the bytes, so the result is always a complete
+// response. No allocation once `out` has grown to its high-water mark. This is
+// what a vanilla handler should call (the worker pairs a handed-off body with
+// the current connection, so no socket fd is needed here).
+pub fn (s &AssetServer) respond_req_into(req &request_parser.HttpRequest, mut out []u8) {
+	canned, asset, head := s.route(req)
 	if isnil(asset) {
 		out << canned
 		return
@@ -345,248 +474,438 @@ pub fn (s &AssetServer) respond_into(req_buffer []u8, mut out []u8) ! {
 }
 
 // etag_for returns the strong validator a client should echo in If-None-Match
-// to revalidate the asset (the same quoted value sent in the ETag header).
+// to revalidate the asset's identity representation (the same quoted value
+// sent in its ETag header; each precompressed representation has its own).
 pub fn (s &AssetServer) etag_for(path string) !string {
 	rel := path.trim_left('/')
 	if asset := s.assets[rel] {
-		return asset.etag
+		return asset.reps[slot_identity].current().etag
 	}
 	return error('static_assets: no such asset: ${path}')
 }
 
 // choose_variant negotiates the representation to serve. Byte-level, no alloc.
-fn (s &AssetServer) choose_variant(asset &Asset, req &request_parser.HttpRequest) Variant {
+@[direct_array_access]
+fn (s &AssetServer) choose_variant(asset &Asset, req &request_parser.HttpRequest) &Variant {
 	if asset.negotiable {
 		if ae := req.get_header_value_slice('Accept-Encoding') {
 			for enc in s.precompressed {
-				tok := enc_token(enc)
-				if v := asset.variants[tok] {
-					if slice_accepts_token(req.buffer, ae, tok) {
-						return v
-					}
+				v := asset.reps[enc_slot(enc)]
+				if !isnil(v) && slice_accepts_token(req.buffer, ae, enc_token(enc)) {
+					return v
 				}
 			}
 		}
 	}
-	return asset.variants['identity'] or { Variant{} }
+	return asset.reps[slot_identity]
 }
 
-// build_bytes returns the full response bytes for a matched asset (conditional
-// GET, Range, negotiation). For a small asset the chosen variant's precomputed
-// response is returned as-is (zero copy); a large asset's body is read from disk.
-fn (s &AssetServer) build_bytes(asset &Asset, req request_parser.HttpRequest, head bool) []u8 {
+// Reply is what a matched request gets.
+enum Reply {
+	full         // 200 with the body
+	head         // 200 headers only
+	not_modified // 304
+	partial      // 206 of the identity representation
+}
+
+// decide picks the reply and the snapshot it is built from, loading each
+// representation's snapshot once (`current` may revalidate it against the
+// disk). For .partial it also returns the inclusive byte range.
+fn (s &AssetServer) decide(asset &Asset, req &request_parser.HttpRequest, head bool) (Reply, &Snap, i64, i64) {
 	buf := req.buffer
-	if inm := req.get_header_value_slice('If-None-Match') {
-		if etag_matches_slice(buf, inm, asset.etag) {
-			return build_304(asset.etag, asset.cache_control)
-		}
-	}
+	// A Range is always a range of the identity bytes, so a GET whose Range
+	// applies selects the identity representation: If-None-Match, which RFC
+	// 9110 §13.2.2 evaluates before Range, is compared against its ETag, and
+	// the encoded representations are neither negotiated nor stat'ed. A Range
+	// applies when it is satisfiable and its If-Range, if any, matches the
+	// identity ETag; otherwise it is ignored and the full response is served.
 	if !head {
 		if rng := req.get_header_value_slice('Range') {
-			if start, end := parse_range_slice(buf, rng, int(asset.body_len)) {
-				mut b := build_206_headers(asset, start, end)
-				append_identity_region(asset, start, end - start + 1, mut b)
-				return b
+			isnap := asset.reps[slot_identity].current()
+			if start, end := parse_range_slice(buf, rng, isnap.body_len) {
+				if if_range_allows(req, isnap.etag) {
+					if inm := req.get_header_value_slice('If-None-Match') {
+						if etag_matches_slice(buf, inm, isnap.etag) {
+							return .not_modified, isnap, 0, 0
+						}
+					}
+					return .partial, isnap, start, end
+				}
 			}
 		}
 	}
-	v := s.choose_variant(asset, &req)
+	snap := s.choose_variant(asset, req).current()
+	if inm := req.get_header_value_slice('If-None-Match') {
+		if etag_matches_slice(buf, inm, snap.etag) {
+			return .not_modified, snap, 0, 0
+		}
+	}
 	if head {
-		return v.response[..v.header_len]
+		return .head, snap, 0, 0
 	}
-	if !v.is_large() {
-		return v.response
+	return .full, snap, 0, 0
+}
+
+// emit_into appends the response for a matched asset to `out`, handing a
+// disk-backed body to the worker's sendfile(2) (core.queue_file) or an
+// in-memory response to its borrowed send (core.queue_buf) when it can.
+fn (s &AssetServer) emit_into(asset &Asset, req &request_parser.HttpRequest, head bool, mut out []u8) {
+	reply, snap, start, end := s.decide(asset, req, head)
+	match reply {
+		.full {
+			if snap.file_fd >= 0 && core.queue_file(snap.file_fd, 0, snap.body_len) {
+				// Headers now; the worker streams the body after them.
+				unsafe { out.push_many(snap.response.data, snap.header_len) }
+			} else if snap.in_memory {
+				// The snapshot is never modified or freed, so the worker can send it
+				// DIRECTLY (borrowed) when the backend can (io_uring core.queue_buf):
+				// no copy through the per-connection write buffer. queue_buf returns
+				// false on any backend that can't borrow-send (epoll, TLS, non-Linux),
+				// where the copy stays the path.
+				if !core.queue_buf(snap.response.data, snap.response.len) {
+					out << snap.response
+				}
+			} else {
+				unsafe { out.push_many(snap.response.data, snap.header_len) }
+				append_body(mut out, snap, 0, snap.body_len)
+			}
+		}
+		.head {
+			unsafe { out.push_many(snap.response.data, snap.header_len) }
+		}
+		.not_modified {
+			out << snap.not_modified
+		}
+		.partial {
+			length := end - start + 1
+			write_206_head(mut out, asset, snap, start, end)
+			if snap.in_memory {
+				unsafe { out.push_many(&u8(snap.response.data) + snap.header_len + int(start), int(length)) }
+			} else if !(snap.file_fd >= 0 && core.queue_file(snap.file_fd, start, length)) {
+				append_body(mut out, snap, start, length)
+			}
+		}
 	}
-	mut b := []u8{cap: v.response.len + int(v.body_len)}
-	b << v.response
-	append_file_bytes(mut b, v.path, 0, v.body_len)
+}
+
+// build_bytes returns the full response bytes for a matched asset, without the
+// worker hand-offs: a snapshot's own bytes as a read-only view when they are
+// the whole response, else a new buffer.
+fn (s &AssetServer) build_bytes(asset &Asset, req &request_parser.HttpRequest, head bool) []u8 {
+	reply, snap, start, end := s.decide(asset, req, head)
+	match reply {
+		.full {
+			if snap.in_memory {
+				return unsafe { (&u8(snap.response.data)).vbytes(snap.response.len) }
+			}
+			mut b := []u8{cap: snap.header_len + int(snap.body_len)}
+			unsafe { b.push_many(snap.response.data, snap.header_len) }
+			append_body(mut b, snap, 0, snap.body_len)
+			return b
+		}
+		.head {
+			return unsafe { (&u8(snap.response.data)).vbytes(snap.header_len) }
+		}
+		.not_modified {
+			return unsafe { (&u8(snap.not_modified.data)).vbytes(snap.not_modified.len) }
+		}
+		.partial {
+			length := end - start + 1
+			mut b := []u8{cap: head_room + asset.content_type.len + asset.cache_control.len +
+				int(length)}
+			write_206_head(mut b, asset, snap, start, end)
+			if snap.in_memory {
+				unsafe { b.push_many(&u8(snap.response.data) + snap.header_len + int(start), int(length)) }
+			} else {
+				append_body(mut b, snap, start, length)
+			}
+			return b
+		}
+	}
+}
+
+// ---- snapshots: loading, revalidation, publication --------------------------
+
+// snap returns the representation's current snapshot.
+@[inline]
+fn (v &Variant) snap() &Snap {
+	return unsafe { &Snap(C.atomic_load_ptr(voidptr(&v.cur))) }
+}
+
+// current returns the snapshot to serve. Without follow_disk it is one atomic
+// load. With it, once per window the first request to win the CAS on
+// next_check (every request when revalidate_ms is 0) stats the file and, when
+// the file changed, rebuilds the snapshot. No allocation unless it rebuilds.
+@[inline]
+fn (v &Variant) current() &Snap {
+	s := v.snap()
+	if !v.follow {
+		return s
+	}
+	if v.window_ms > 0 {
+		now := C.vanilla_sa_now_ms()
+		mut due := stdatomic.load_u64(&v.next_check)
+		if now < due {
+			return s
+		}
+		if !C.atomic_compare_exchange_strong_u64(voidptr(&v.next_check), &due, now + v.window_ms) {
+			return s // another request checks this window
+		}
+	}
+	return v.revalidate(s)
+}
+
+// revalidate stats the file and rebuilds the snapshot when its signature
+// differs from `s`'s. A failed stat (ENOENT while the file is being replaced,
+// a deleted file, or no longer a regular file) keeps serving the last good
+// snapshot.
+@[noinline]
+fn (v &Variant) revalidate(s &Snap) &Snap {
+	mut st := C.vanilla_sa_sig{}
+	if C.vanilla_sa_stat(&char(v.path.str), &st) != 0 || sig_eq(st, s.sig) {
+		return s
+	}
+	return v.refresh(s)
+}
+
+// refresh builds and publishes the snapshot of the file's new version. One
+// thread at a time (`busy`): the others keep serving `seen` meanwhile, so a
+// change is not rebuilt once per racing request, and `prev` always chains to
+// the snapshot that was published before it (a snapshot built by a losing
+// thread would be reachable from nothing while a borrowed send might still
+// point into it). A failed build (the file is still changing, is being
+// replaced, or is no longer a regular file) keeps `seen`; the next check
+// retries.
+@[noinline]
+fn (v &Variant) refresh(seen &Snap) &Snap {
+	mut idle := u32(0)
+	if !C.atomic_compare_exchange_strong_u32(voidptr(&v.busy), &idle, 1) {
+		return seen
+	}
+	defer {
+		C.atomic_store_u32(voidptr(&v.busy), 0)
+	}
+	cur := v.snap()
+	if voidptr(cur) != voidptr(seen) {
+		return cur // already republished by another thread
+	}
+	n := load_snap(v, seen) or { return seen }
+	C.atomic_store_ptr(voidptr(&v.cur), voidptr(n)) // seq_cst: publishes every field of n
+	return n
+}
+
+@[inline]
+fn sig_eq(a C.vanilla_sa_sig, b C.vanilla_sa_sig) bool {
+	return a.ino == b.ino && a.size == b.size && a.mtime_ns == b.mtime_ns
+		&& a.ctime_ns == b.ctime_ns && a.dev == b.dev
+}
+
+// load_snap builds a snapshot of the version of `v`'s file that is on disk
+// now, chained to `prev` (nil at boot). The signature comes from fstat on the
+// opened fd, so Content-Length always matches the bytes behind that fd. A body
+// kept in RAM must read in full and the file must fstat the same afterwards,
+// or the half-written version is refused (none) and the caller keeps the one
+// it has. A disk-backed snapshot keeps its fd open forever; any other closes it.
+fn load_snap(v &Variant, prev &Snap) ?&Snap {
+	mut sig := C.vanilla_sa_sig{}
+	$if windows {
+		// No follow_disk on Windows (new() refuses it): the file is read once.
+		body := os.read_bytes(v.path) or { return none }
+		sig.size = body.len
+		mut resp := []u8{cap: head_room + v.ctype.len + v.cache.len + body.len}
+		tag_at := write_200_head(mut resp, v, sig.size)
+		header_len := resp.len
+		resp << body
+		return finish_snap(v, prev, sig, mut resp, tag_at, header_len, true, -1)
+	} $else {
+		fd := C.vanilla_sa_open(&char(v.path.str))
+		if fd < 0 {
+			return none
+		}
+		if C.vanilla_sa_fstat(fd, &sig) != 0 {
+			C.vanilla_sa_close(fd)
+			return none
+		}
+		large := is_large(v.threshold, sig.size)
+		in_memory := (!large || v.keep_memory) && sig.size <= max_ram_body
+		mut resp := []u8{cap: head_room + v.ctype.len + v.cache.len + if in_memory {
+			int(sig.size)
+		} else {
+			0
+		}}
+		tag_at := write_200_head(mut resp, v, sig.size)
+		header_len := resp.len
+		if in_memory {
+			got := core.append_file_region(mut resp, fd, 0, sig.size)
+			mut again := C.vanilla_sa_sig{}
+			if got != sig.size || C.vanilla_sa_fstat(fd, &again) != 0 || !sig_eq(sig, again) {
+				C.vanilla_sa_close(fd)
+				unsafe { resp.free() }
+				return none
+			}
+		}
+		mut keep_fd := fd
+		if in_memory && !large {
+			C.vanilla_sa_close(fd)
+			keep_fd = -1
+		}
+		return finish_snap(v, prev, sig, mut resp, tag_at, header_len, in_memory, keep_fd)
+	}
+}
+
+// finish_snap writes the ETag into its placeholder and wraps `resp`. The ETag
+// is the wyhash of the body when the body is in RAM, else of the file's size
+// and mtime_ns, so a disk-backed file is never read just to hash it. Either
+// way it is stable across restarts and replicas: dev, ino and ctime, which
+// differ between copies of one file (overlay mounts, a restore), only decide
+// when to rebuild.
+fn finish_snap(v &Variant, prev &Snap, sig C.vanilla_sa_sig, mut resp []u8, tag_at int, header_len int, in_memory bool, file_fd int) &Snap {
+	tag := if in_memory {
+		wyhash.wyhash_c(unsafe { &u8(resp.data) + header_len }, u64(resp.len - header_len),
+			0)
+	} else {
+		wyhash.wyhash64_c(u64(sig.size), u64(sig.mtime_ns))
+	}
+	put_hex16(mut resp, tag_at + 1, tag)
+	etag := unsafe { tos(&u8(resp.data) + tag_at, etag_placeholder.len) }
+	return &Snap{
+		sig:          sig
+		response:     resp
+		header_len:   header_len
+		body_len:     sig.size
+		in_memory:    in_memory
+		file_fd:      file_fd
+		etag:         etag
+		not_modified: build_304(etag, v.cache, v.vary)
+		prev:         prev
+	}
+}
+
+// ---- response construction (no Builder, no interpolation) -------------------
+
+// put appends a string's bytes.
+@[inline]
+fn put(mut out []u8, s string) {
+	unsafe { out.push_many(s.str, s.len) }
+}
+
+// put_dec appends the decimal digits of `n`, written in place (no allocation
+// once `out` has the room).
+@[inline]
+fn put_dec(mut out []u8, n i64) {
+	start := out.len
+	unsafe { out.grow_len(20) }
+	mut digits := unsafe { (&u8(out.data) + start).vbytes(20) }
+	w := strconv.write_dec(n, mut digits)
+	unsafe {
+		out.len = start + w
+	}
+}
+
+const hex_digits = '0123456789abcdef'
+
+// put_hex16 overwrites b[at..at+16] with the 16 lowercase hex digits of `x`.
+@[direct_array_access]
+fn put_hex16(mut b []u8, at int, x u64) {
+	for i in 0 .. 16 {
+		b[at + i] = hex_digits[int((x >> u64(60 - 4 * i)) & 0xf)]
+	}
+}
+
+// write_200_head writes a representation's 200 header block for a body of
+// `size` bytes, with an ETag placeholder, and returns the placeholder's offset.
+fn write_200_head(mut b []u8, v &Variant, size i64) int {
+	put(mut b, 'HTTP/1.1 200 OK\r\nContent-Type: ')
+	put(mut b, v.ctype)
+	put(mut b, '\r\nContent-Length: ')
+	put_dec(mut b, size)
+	put(mut b, '\r\n')
+	if v.encoding != '' {
+		put(mut b, 'Content-Encoding: ')
+		put(mut b, v.encoding)
+		put(mut b, '\r\n')
+	}
+	if v.vary {
+		put(mut b, 'Vary: Accept-Encoding\r\n')
+	}
+	put(mut b, 'Cache-Control: ')
+	put(mut b, v.cache)
+	put(mut b, '\r\nETag: ')
+	tag_at := b.len
+	put(mut b, etag_placeholder)
+	put(mut b, '\r\nAccept-Ranges: bytes\r\nConnection: keep-alive\r\n\r\n')
+	return tag_at
+}
+
+// build_304 precomputes a representation's 304. RFC 9110 §15.4.5: it carries
+// the ETag, Cache-Control and Vary the 200 would have carried.
+fn build_304(etag string, cache string, vary bool) []u8 {
+	mut b := []u8{cap: head_room + cache.len}
+	put(mut b, 'HTTP/1.1 304 Not Modified\r\nETag: ')
+	put(mut b, etag)
+	put(mut b, '\r\nCache-Control: ')
+	put(mut b, cache)
+	put(mut b, '\r\n')
+	if vary {
+		put(mut b, 'Vary: Accept-Encoding\r\n')
+	}
+	put(mut b, 'Connection: keep-alive\r\n\r\n')
 	return b
 }
 
-// emit_into appends the response for a matched asset to `out`, using sendfile(2)
-// for a large body when the worker can (core.queue_file), else reading the body.
-fn (s &AssetServer) emit_into(asset &Asset, req request_parser.HttpRequest, head bool, mut out []u8) {
-	buf := req.buffer
-	if inm := req.get_header_value_slice('If-None-Match') {
-		if etag_matches_slice(buf, inm, asset.etag) {
-			out << build_304(asset.etag, asset.cache_control)
-			return
-		}
+// write_206_head appends the 206 Partial Content header block (no body) for
+// bytes [start, end] of an identity snapshot, straight into `out`. RFC 9110
+// §15.3.7: it carries the ETag, Cache-Control and Vary the 200 would have
+// carried.
+fn write_206_head(mut out []u8, asset &Asset, snap &Snap, start i64, end i64) {
+	put(mut out, 'HTTP/1.1 206 Partial Content\r\nContent-Type: ')
+	put(mut out, asset.content_type)
+	put(mut out, '\r\nContent-Range: bytes ')
+	put_dec(mut out, start)
+	out << `-`
+	put_dec(mut out, end)
+	out << `/`
+	put_dec(mut out, snap.body_len)
+	put(mut out, '\r\nContent-Length: ')
+	put_dec(mut out, end - start + 1)
+	put(mut out, '\r\nAccept-Ranges: bytes\r\nETag: ')
+	put(mut out, snap.etag)
+	put(mut out, '\r\nCache-Control: ')
+	put(mut out, asset.cache_control)
+	put(mut out, '\r\n')
+	if asset.negotiable {
+		put(mut out, 'Vary: Accept-Encoding\r\n')
 	}
-	if !head {
-		if rng := req.get_header_value_slice('Range') {
-			if start, end := parse_range_slice(buf, rng, int(asset.body_len)) {
-				length := end - start + 1
-				out << build_206_headers(asset, start, end)
-				iv := asset.variants['identity'] or { return }
-				if !(iv.file_fd >= 0 && core.queue_file(iv.file_fd, start, length)) {
-					append_identity_region(asset, start, length, mut out)
-				}
-				return
+	put(mut out, 'Connection: keep-alive\r\n\r\n')
+}
+
+// append_body appends bytes [off, off+length) of a disk-backed snapshot's body
+// to `out`, read from its fd with no allocation once `out` has the room. A
+// short read (the file shrank under a Content-Length already written) is
+// zero-filled so the response stays framed. Never reached on Windows, where
+// every body is in RAM.
+fn append_body(mut out []u8, snap &Snap, off i64, length i64) {
+	$if !windows {
+		got := core.append_file_region(mut out, snap.file_fd, off, length)
+		missing := length - got
+		if missing > 0 && missing <= i64(max_int) - i64(out.len) {
+			start := out.len
+			unsafe {
+				out.grow_len(int(missing))
+				vmemset(&u8(out.data) + start, 0, int(missing))
 			}
 		}
 	}
-	v := s.choose_variant(asset, &req)
-	if head {
-		out << v.response[..v.header_len]
-		return
-	}
-	if !v.is_large() {
-		// Small (preloaded): the precomputed response (headers + body) is immutable
-		// for the server's lifetime, so hand it to the worker to send DIRECTLY
-		// (borrowed) when the backend can (io_uring core.queue_buf) — no copy through
-		// the per-connection write buffer. queue_buf returns false on any backend that
-		// can't borrow-send (epoll, TLS, non-Linux), where the copy stays the path.
-		if !core.queue_buf(v.response.data, v.response.len) {
-			out << v.response
-		}
-		return
-	}
-	out << v.response // large: headers only; body streamed below
-	// Large body: stream it from the page cache with sendfile(2); if the backend
-	// can't (TLS / non-epoll / non-Linux), read it into `out` as a fallback.
-	if !(v.file_fd >= 0 && core.queue_file(v.file_fd, i64(0), v.body_len)) {
-		append_file_bytes(mut out, v.path, 0, v.body_len)
-	}
-}
-
-// ---- response construction (load time, off the hot path) -------------------
-
-// write_response_headers writes the shared 200 header block into `sb`.
-fn write_response_headers(mut sb strings.Builder, ctype string, cache string, etag string, encoding string, vary bool, content_length i64) {
-	sb.write_string('HTTP/1.1 200 OK\r\nContent-Type: ')
-	sb.write_string(ctype)
-	sb.write_string('\r\nContent-Length: ')
-	sb.write_decimal(int(content_length))
-	sb.write_string('\r\n')
-	if encoding != '' {
-		sb.write_string('Content-Encoding: ')
-		sb.write_string(encoding)
-		sb.write_string('\r\n')
-	}
-	if vary {
-		sb.write_string('Vary: Accept-Encoding\r\n')
-	}
-	sb.write_string('Cache-Control: ')
-	sb.write_string(cache)
-	sb.write_string('\r\nETag: ')
-	sb.write_string(etag)
-	sb.write_string('\r\nAccept-Ranges: bytes\r\nConnection: keep-alive\r\n\r\n')
-}
-
-// build_variant_inline precomputes the COMPLETE response (headers + body) for a
-// preloaded (small) representation — the zero-copy hot path.
-fn build_variant_inline(ctype string, cache string, etag string, encoding string, vary bool, body []u8) Variant {
-	mut sb := strings.new_builder(220 + body.len)
-	write_response_headers(mut sb, ctype, cache, etag, encoding, vary, i64(body.len))
-	header_len := sb.len
-	sb.write(body) or {}
-	return Variant{
-		response:   sb
-		header_len: header_len
-		body_len:   i64(body.len)
-	}
-}
-
-// build_variant_file precomputes ONLY the headers for a disk-backed (large)
-// representation; the body is streamed from `path` with sendfile(2) at runtime.
-fn build_variant_file(ctype string, cache string, etag string, encoding string, vary bool, path string, body_len i64) Variant {
-	mut sb := strings.new_builder(220)
-	write_response_headers(mut sb, ctype, cache, etag, encoding, vary, body_len)
-	header_len := sb.len
-	return Variant{
-		response:   sb
-		header_len: header_len
-		path:       path
-		file_fd:    open_ro_fd(path)
-		body_len:   body_len
-	}
-}
-
-fn build_304(etag string, cache string) []u8 {
-	mut sb := strings.new_builder(96)
-	sb.write_string('HTTP/1.1 304 Not Modified\r\nETag: ')
-	sb.write_string(etag)
-	sb.write_string('\r\nCache-Control: ')
-	sb.write_string(cache)
-	sb.write_string('\r\nConnection: keep-alive\r\n\r\n')
-	return sb
-}
-
-// build_206_headers builds the 206 Partial Content header block (no body).
-fn build_206_headers(asset &Asset, start i64, end i64) []u8 {
-	mut sb := strings.new_builder(256)
-	sb.write_string('HTTP/1.1 206 Partial Content\r\nContent-Type: ')
-	sb.write_string(asset.content_type)
-	sb.write_string('\r\nContent-Range: bytes ')
-	sb.write_decimal(int(start))
-	sb.write_u8(`-`)
-	sb.write_decimal(int(end))
-	sb.write_u8(`/`)
-	sb.write_decimal(int(asset.body_len))
-	sb.write_string('\r\nContent-Length: ')
-	sb.write_decimal(int(end - start + 1))
-	sb.write_string('\r\nAccept-Ranges: bytes\r\nETag: ')
-	sb.write_string(asset.etag)
-	sb.write_string('\r\nConnection: keep-alive\r\n\r\n')
-	return sb
-}
-
-// append_identity_region appends `length` identity bytes from `start` to `out`:
-// a slice of the in-RAM body for a small asset, or a disk read for a large one.
-fn append_identity_region(asset &Asset, start i64, length i64, mut out []u8) {
-	if length <= 0 {
-		return
-	}
-	if asset.body.len > 0 { // small: identity body is in RAM
-		out << asset.body[int(start)..int(start + length)]
-		return
-	}
-	if iv := asset.variants['identity'] {
-		append_file_bytes(mut out, iv.path, start, length)
-	}
-}
-
-// append_file_bytes reads [off, off+length) from `path` into `out`. The
-// cross-platform userspace fallback when sendfile(2) isn't used.
-fn append_file_bytes(mut out []u8, path string, off i64, length i64) {
-	if length <= 0 {
-		return
-	}
-	mut f := os.open(path) or { return }
-	defer {
-		f.close()
-	}
-	out << f.read_bytes_at(int(length), u64(off))
-}
-
-// open_ro_fd opens `path` read-only and returns its fd for sendfile(2). The fd
-// is intentionally kept open for the server's lifetime (the File handle is
-// dropped but V never auto-closes it). Linux only — returns -1 elsewhere, where
-// assets are never disk-backed (see is_large).
-fn open_ro_fd(path string) int {
-	$if linux {
-		f := os.open(path) or { return -1 }
-		return f.fd
-	}
-	return -1
 }
 
 // is_large reports whether a file of `size` bytes should be served from disk
 // with sendfile(2). Only Linux is disk-backed; other OSes always preload, so
 // their behavior is unchanged regardless of the threshold.
-fn is_large(threshold i64, size u64) bool {
+fn is_large(threshold i64, size i64) bool {
 	$if linux {
-		return threshold > 0 && i64(size) >= threshold
+		return threshold > 0 && size >= threshold
 	}
 	return false
-}
-
-// etag_from_stat builds a strong size+mtime validator for a disk-backed asset
-// without reading it (stable across restarts, changes when the file changes).
-fn etag_from_stat(path string, size u64) string {
-	mtime := os.file_last_mod_unix(path)
-	return '"' + size.hex() + '-' + u64(mtime).hex() + '"'
 }
 
 // ---- policy & negotiation helpers ------------------------------------------
@@ -771,6 +1090,34 @@ fn etag_matches_slice(buf []u8, sl request_parser.Slice, etag string) bool {
 	return false
 }
 
+// if_range_allows reports whether a satisfiable Range may be served as a 206:
+// the request has no If-Range, or its If-Range is `etag` (the identity ETag)
+// exactly. RFC 9110 §13.1.5: entity tags are compared strongly, so a weak
+// `W/` tag never matches, and neither does an HTTP-date (it would be compared
+// with a Last-Modified this module never sends). Byte-level, no allocation.
+@[direct_array_access]
+fn if_range_allows(req &request_parser.HttpRequest, etag string) bool {
+	sl := req.get_header_value_slice('If-Range') or { return true }
+	buf := req.buffer
+	mut s := sl.start
+	mut e := sl.start + sl.len
+	for s < e && (buf[s] == ` ` || buf[s] == `\t`) {
+		s++
+	}
+	for e > s && (buf[e - 1] == ` ` || buf[e - 1] == `\t`) {
+		e--
+	}
+	if e - s != etag.len {
+		return false
+	}
+	for k in 0 .. etag.len {
+		if buf[s + k] != etag[k] {
+			return false
+		}
+	}
+	return true
+}
+
 // looks_like_asset_slice reports whether the last path segment in `buf[start..end]`
 // carries a file extension (e.g. `app.js`, `nope.[hash].wasm`). Such a path that
 // is missing is a genuine 404 — it must not be masked by the SPA fallback.
@@ -791,7 +1138,7 @@ fn looks_like_asset_slice(buf []u8, start int, end int) bool {
 // clamped range. Single range only (more than one `-` is rejected, matching the
 // old `split('-')` arity check). Parsed in place — no allocation, no split.
 @[direct_array_access]
-fn parse_range_slice(buf []u8, sl request_parser.Slice, size int) ?(i64, i64) {
+fn parse_range_slice(buf []u8, sl request_parser.Slice, size i64) ?(i64, i64) {
 	prefix := 'bytes='
 	if sl.len < prefix.len {
 		return none
@@ -816,7 +1163,7 @@ fn parse_range_slice(buf []u8, sl request_parser.Slice, size int) ?(i64, i64) {
 	if dash < 0 {
 		return none
 	}
-	sz := i64(size)
+	sz := size
 	mut start := i64(0)
 	mut end := sz - 1
 	if dash == start0 + prefix.len {
@@ -837,8 +1184,8 @@ fn parse_range_slice(buf []u8, sl request_parser.Slice, size int) ?(i64, i64) {
 // parse_u64_window reads the leading run of ASCII digits in `buf[lo..hi]` as a
 // non-negative i64 (empty / non-digit → 0). It saturates at `range_num_ceiling`
 // rather than wrapping, so an absurd value (e.g. 2^64) fails the `end >= size`
-// bounds check in the caller instead of aliasing a valid offset. `size` is an
-// `int`, so the ceiling is far above any real asset and clear of i64 overflow.
+// bounds check in the caller instead of aliasing a valid offset. The ceiling is
+// far above any real asset and clear of i64 overflow.
 @[direct_array_access; inline]
 fn parse_u64_window(buf []u8, lo int, hi int) i64 {
 	mut v := i64(0)
@@ -855,9 +1202,9 @@ fn parse_u64_window(buf []u8, lo int, hi int) i64 {
 	return v
 }
 
-// Above any int-sized asset (`size` is an `int`, < 2^31) yet far below i64 max,
-// so accumulation never wraps.
-const range_num_ceiling = i64(u64(1) << 40)
+// Above any real asset (64 PiB) yet far enough below i64 max that one more
+// `v * 10 + digit` step never wraps.
+const range_num_ceiling = i64(u64(1) << 56)
 
 // glob_match matches `name` against a pattern where `*` matches any run of
 // characters and `[hash]` matches a content-hash segment (>=6 hex chars). All
@@ -922,6 +1269,24 @@ fn enc_ext(e Encoding) string {
 	return match e {
 		.br { '.br' }
 		.gzip { '.gz' }
+	}
+}
+
+// enc_slot is the index of an encoding's representation in Asset.reps.
+@[inline]
+fn enc_slot(e Encoding) int {
+	return match e {
+		.br { slot_br }
+		.gzip { slot_gzip }
+	}
+}
+
+// slot_token is the Content-Encoding token of a representation slot.
+fn slot_token(slot int) string {
+	return match slot {
+		slot_br { 'br' }
+		slot_gzip { 'gzip' }
+		else { '' }
 	}
 }
 

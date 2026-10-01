@@ -76,7 +76,7 @@ Reach for the bytes you already have before allocating new ones.
 - Defer `.clone()` / `.to_string()` until the byte data must outlive the buffer.
 - Build a map lookup key as a non-owning view — `unsafe { tos(ptr, len) }` —
   when the map never retains it (it only hashes the key bytes). The
-  [static_assets module](../static_assets/static_assets.v#L273-L281)
+  [static_assets module](../static_assets/static_assets.v#L388-L396)
   is the canonical example: `key := tos(&buf[rs], rel_len)`, a view straight into
   the request buffer, so routing costs no allocation.
 - **Whenever a view suffices, use a view.** `unsafe { (&buf[start]).vbytes(len) }`

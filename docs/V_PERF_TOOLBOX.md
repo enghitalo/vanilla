@@ -93,7 +93,7 @@ Already used here for the per-worker epoll fd arrays
   `route[8..]` → **+625 MiB** (monotonic, never plateaus) vs `tos(route.str+8,
   route.len-8)` → **+28 KiB** flat — a ~22,000x gap for the same work. The vanilla
   LIBRARY is already the reference (the substr leak lived in an HttpArena benchmark
-  handler, not here): [`static_assets/static_assets.v:273-281`](../static_assets/static_assets.v)
+  handler, not here): [`static_assets/static_assets.v:388-396`](../static_assets/static_assets.v)
   builds the key as `key := tos(&buf[rs], rel_len)`, a view straight into the
   request buffer, "never retained, so routing costs no allocation."
 - **Zero-copy views, the pair to reach for:** `unsafe { (&buf[start]).vbytes(len) }`
