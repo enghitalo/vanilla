@@ -42,14 +42,22 @@ module static_assets
 // stay reachable through `prev` and are NEVER freed, so a body a worker still
 // sends (a borrowed queue_buf send, or a sendfile(2) region of its fd) can
 // never dangle, and no fd number is ever reused under it. That costs memory,
-// and one fd per change of a disk-backed file: it suits deploy-style changes,
-// not files that are rewritten continuously. Files added or deleted after
-// new() are not followed; a deleted file, or one replaced by something that
-// is not a regular file (a FIFO, a directory), keeps serving its last version.
+// and an fd per snapshot of a disk-backed file, with about one snapshot per
+// change and at most two (a request can catch the outgoing version in the
+// middle of the rename that replaces it): it suits deploy-style changes, not
+// files that are rewritten continuously. Files added or deleted after new()
+// are not followed; a deleted file, or one replaced by something that is not
+// a regular file (a FIFO, a directory), keeps serving its last version.
 // Replace files atomically (write a temporary file in the same directory,
 // then rename it over the old one): an in-place rewrite can be caught half
 // written, and two same-size in-place writes within one kernel timestamp tick
 // look identical to stat(2).
+//
+// ETAGS: a body kept in RAM is hashed by content. A representation served
+// from disk only (sendfile, without memory_fallback) hashes its size and
+// mtime_ns instead, so a replacement with the same size and the same mtime
+// keeps its ETag: the new bytes are served, but a cache that revalidates with
+// If-None-Match gets a 304 and keeps the old ones.
 import os
 import strconv
 import hash as wyhash
@@ -201,7 +209,7 @@ const etag_placeholder = '"0000000000000000"'
 
 // Room for the status line and the fixed header names and values of a 200,
 // 206 or 304, on top of the content type and cache policy.
-const head_room = 256
+const head_room = 288
 
 // A body larger than this is never kept in RAM (its length must fit an array).
 const max_ram_body = i64(max_int) - 65536
@@ -495,17 +503,21 @@ fn (s &AssetServer) decide(asset &Asset, req &request_parser.HttpRequest, head b
 	// A Range is always a range of the identity bytes, so a GET whose Range
 	// applies selects the identity representation: If-None-Match, which RFC
 	// 9110 §13.2.2 evaluates before Range, is compared against its ETag, and
-	// the encoded representations are neither negotiated nor stat'ed.
+	// the encoded representations are neither negotiated nor stat'ed. A Range
+	// applies when it is satisfiable and its If-Range, if any, matches the
+	// identity ETag; otherwise it is ignored and the full response is served.
 	if !head {
 		if rng := req.get_header_value_slice('Range') {
 			isnap := asset.reps[slot_identity].current()
 			if start, end := parse_range_slice(buf, rng, isnap.body_len) {
-				if inm := req.get_header_value_slice('If-None-Match') {
-					if etag_matches_slice(buf, inm, isnap.etag) {
-						return .not_modified, isnap, 0, 0
+				if if_range_allows(req, isnap.etag) {
+					if inm := req.get_header_value_slice('If-None-Match') {
+						if etag_matches_slice(buf, inm, isnap.etag) {
+							return .not_modified, isnap, 0, 0
+						}
 					}
+					return .partial, isnap, start, end
 				}
-				return .partial, isnap, start, end
 			}
 		}
 	}
@@ -553,7 +565,7 @@ fn (s &AssetServer) emit_into(asset &Asset, req &request_parser.HttpRequest, hea
 		}
 		.partial {
 			length := end - start + 1
-			write_206_head(mut out, asset.content_type, snap, start, end)
+			write_206_head(mut out, asset, snap, start, end)
 			if snap.in_memory {
 				unsafe { out.push_many(&u8(snap.response.data) + snap.header_len + int(start), int(length)) }
 			} else if !(snap.file_fd >= 0 && core.queue_file(snap.file_fd, start, length)) {
@@ -586,8 +598,9 @@ fn (s &AssetServer) build_bytes(asset &Asset, req &request_parser.HttpRequest, h
 		}
 		.partial {
 			length := end - start + 1
-			mut b := []u8{cap: head_room + asset.content_type.len + int(length)}
-			write_206_head(mut b, asset.content_type, snap, start, end)
+			mut b := []u8{cap: head_room + asset.content_type.len + asset.cache_control.len +
+				int(length)}
+			write_206_head(mut b, asset, snap, start, end)
 			if snap.in_memory {
 				unsafe { b.push_many(&u8(snap.response.data) + snap.header_len + int(start), int(length)) }
 			} else {
@@ -643,12 +656,13 @@ fn (v &Variant) revalidate(s &Snap) &Snap {
 }
 
 // refresh builds and publishes the snapshot of the file's new version. One
-// thread at a time (`busy`): the others keep serving `seen` meanwhile, so only
-// one snapshot is published per change, and `prev` always chains to the
-// snapshot that was published before it (a snapshot built by a losing thread
-// would be reachable from nothing while a borrowed send might still point
-// into it). A failed build (the file is still changing, or is no longer a
-// regular file) keeps `seen`; the next check retries.
+// thread at a time (`busy`): the others keep serving `seen` meanwhile, so a
+// change is not rebuilt once per racing request, and `prev` always chains to
+// the snapshot that was published before it (a snapshot built by a losing
+// thread would be reachable from nothing while a borrowed send might still
+// point into it). A failed build (the file is still changing, is being
+// replaced, or is no longer a regular file) keeps `seen`; the next check
+// retries.
 @[noinline]
 fn (v &Variant) refresh(seen &Snap) &Snap {
 	mut idle := u32(0)
@@ -827,10 +841,12 @@ fn build_304(etag string, cache string, vary bool) []u8 {
 }
 
 // write_206_head appends the 206 Partial Content header block (no body) for
-// bytes [start, end] of an identity snapshot, straight into `out`.
-fn write_206_head(mut out []u8, ctype string, snap &Snap, start i64, end i64) {
+// bytes [start, end] of an identity snapshot, straight into `out`. RFC 9110
+// §15.3.7: it carries the ETag, Cache-Control and Vary the 200 would have
+// carried.
+fn write_206_head(mut out []u8, asset &Asset, snap &Snap, start i64, end i64) {
 	put(mut out, 'HTTP/1.1 206 Partial Content\r\nContent-Type: ')
-	put(mut out, ctype)
+	put(mut out, asset.content_type)
 	put(mut out, '\r\nContent-Range: bytes ')
 	put_dec(mut out, start)
 	out << `-`
@@ -841,7 +857,13 @@ fn write_206_head(mut out []u8, ctype string, snap &Snap, start i64, end i64) {
 	put_dec(mut out, end - start + 1)
 	put(mut out, '\r\nAccept-Ranges: bytes\r\nETag: ')
 	put(mut out, snap.etag)
-	put(mut out, '\r\nConnection: keep-alive\r\n\r\n')
+	put(mut out, '\r\nCache-Control: ')
+	put(mut out, asset.cache_control)
+	put(mut out, '\r\n')
+	if asset.negotiable {
+		put(mut out, 'Vary: Accept-Encoding\r\n')
+	}
+	put(mut out, 'Connection: keep-alive\r\n\r\n')
 }
 
 // append_body appends bytes [off, off+length) of a disk-backed snapshot's body
@@ -1053,6 +1075,34 @@ fn etag_matches_slice(buf []u8, sl request_parser.Slice, etag string) bool {
 		i = e + 1
 	}
 	return false
+}
+
+// if_range_allows reports whether a satisfiable Range may be served as a 206:
+// the request has no If-Range, or its If-Range is `etag` (the identity ETag)
+// exactly. RFC 9110 §13.1.5: entity tags are compared strongly, so a weak
+// `W/` tag never matches, and neither does an HTTP-date (it would be compared
+// with a Last-Modified this module never sends). Byte-level, no allocation.
+@[direct_array_access]
+fn if_range_allows(req &request_parser.HttpRequest, etag string) bool {
+	sl := req.get_header_value_slice('If-Range') or { return true }
+	buf := req.buffer
+	mut s := sl.start
+	mut e := sl.start + sl.len
+	for s < e && (buf[s] == ` ` || buf[s] == `\t`) {
+		s++
+	}
+	for e > s && (buf[e - 1] == ` ` || buf[e - 1] == `\t`) {
+		e--
+	}
+	if e - s != etag.len {
+		return false
+	}
+	for k in 0 .. etag.len {
+		if buf[s + k] != etag[k] {
+			return false
+		}
+	}
+	return true
 }
 
 // looks_like_asset_slice reports whether the last path segment in `buf[start..end]`

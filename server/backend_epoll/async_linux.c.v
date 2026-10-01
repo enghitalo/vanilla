@@ -838,8 +838,8 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 	// The sendfile slot is thread-local too, and taken whatever the step (as
 	// in drain_requests): a region left queued would be taken by the next
 	// .done on this worker, for any connection, and streamed after that
-	// response. On the rejected path below it is dropped with the reply it
-	// belonged to.
+	// response. On the rejected path below the region is dropped; whatever
+	// the handler appended stays, and the 400 follows it.
 	qf := core.take_queued_file() or { core.QueuedFile{} }
 	if head_step != .done || streamed_takeover {
 		// suspend/close on a streamed-body request is unsupported in v1 — answer
@@ -953,21 +953,18 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 		qt := core.take_queued_takeover() or { core.QueuedTakeover{} }
 		// The sendfile slot is thread-local too, and drained on every step for
 		// the same reason. A handler may have appended headers and handed its
-		// body off with core.queue_file: on .done the region streams after
-		// write_buf drains (flush_batch); on .close it is read into write_buf
-		// here, so the last response stays whole when the connection closes
-		// right after one best-effort flush; on .suspend it is dropped (a
-		// parked request has not answered yet: its continuation writes the
-		// response).
+		// body off with core.queue_file: on .done and .close the region streams
+		// after write_buf drains (flush_batch). A .close response gets that one
+		// flush and then the close, parked or not, so its body is best-effort,
+		// bounded by the socket send buffer like the rest of that response (a
+		// short file is cut short by the same close). On .suspend it is dropped:
+		// a parked request has not answered yet, its continuation writes the
+		// response.
 		if qf := core.take_queued_file() {
-			if step == .done {
+			if step != .suspend {
 				cs.file_fd = qf.file_fd
 				cs.file_off = qf.off
 				cs.file_remaining = qf.len
-			} else if step == .close {
-				// A short read needs no check: the close right after the flush
-				// ends the response, so the peer sees it cut short.
-				core.append_file_region(mut cs.write_buf, qf.file_fd, qf.off, qf.len)
 			}
 		}
 		match step {
@@ -1102,7 +1099,15 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 			reactor:   unsafe { voidptr(&reactor) }
 			register:  register_watch
 		}
+		// Every continuation runs with the sendfile gate closed: nothing takes
+		// the slot after one, so a region it queued would be taken by the next
+		// .done on this worker and streamed after that response, another
+		// client's. queue_file refuses instead and the continuation writes its
+		// body itself. The plain worker never narrows the gate otherwise, so it
+		// reopens right after the call.
+		core.set_queue_file_allowed(false)
 		step := cont(mut scratch, ext_fd, ready_err, entry_udata, state, mut bg_loop)
+		core.set_queue_file_allowed(true)
 		// A clientless watch has no connection to take over — drain the
 		// thread-local slot so a misbehaving continuation can't leak one.
 		if _ := core.take_queued_takeover() {
@@ -1135,7 +1140,9 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 		reactor:   unsafe { voidptr(&reactor) }
 		register:  register_watch
 	}
+	core.set_queue_file_allowed(false) // no file from a continuation (see above)
 	cont_step := cont(mut cs.write_buf, ext_fd, ready_err, entry_udata, state, mut event_loop)
+	core.set_queue_file_allowed(true)
 	if cont_step != .suspend && event_loop.last_watched >= 0 {
 		// Continuation re-watched but did not park (.done/.close after watch_fd):
 		// tear the stray watch down before the connection moves on / is closed.
@@ -1272,7 +1279,10 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 			// would refresh it, and a dedup that SKIPS dead slots would append a
 			// duplicate instead.
 			reactor.rearming_dead = true
+			// No file from a continuation (on_watch_ready).
+			core.set_queue_file_allowed(false)
 			dead_step := slot.cont(mut scratch, ext_fd, ready_err, slot.udata, state, mut dead_loop)
+			core.set_queue_file_allowed(true)
 			reactor.rearming_dead = false
 			// A dead client cannot be taken over — drain the thread-local slot.
 			if _ := core.take_queued_takeover() {
@@ -1292,8 +1302,10 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 			reactor:   unsafe { voidptr(&reactor) }
 			register:  register_watch
 		}
+		core.set_queue_file_allowed(false) // no file from a continuation (on_watch_ready)
 		pipelined_step := slot.cont(mut cs.write_buf, ext_fd, ready_err, slot.udata, state, mut
 			event_loop)
+		core.set_queue_file_allowed(true)
 		if pipelined_step != .suspend && event_loop.last_watched >= 0
 			&& event_loop.last_watched != ext_fd {
 			// Continuation watched a DIFFERENT fd but did not park: stray watch —

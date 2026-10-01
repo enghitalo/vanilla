@@ -233,7 +233,7 @@ req/conn, at 1024 / 4096 / 6800 connections). rps / peak RSS:
    A ~22,000× difference for the same work. A map lookup only hashes the key
    bytes and never retains the key, so a non-owning view (`tos`) is safe as a
    lookup key. The vanilla **library is already the reference for this**:
-   [`static_assets/static_assets.v:380-388`](../static_assets/static_assets.v)
+   [`static_assets/static_assets.v:388-396`](../static_assets/static_assets.v)
    builds the key as `key := tos(&buf[rs], rel_len)` — a zero-copy view into the
    request buffer, documented as "never retained, so routing costs no
    allocation." Never imply the lib leaks; the fix belongs in the arena handler.

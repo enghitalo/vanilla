@@ -18,6 +18,14 @@
  * block the worker that opens it; O_NONBLOCK has no effect on reads (pread,
  * sendfile) of a regular file.
  *
+ * A regular file with no link left (st_nlink 0) fails too: it is the outgoing
+ * version of a file being replaced. rename(2) updates the ctime and link count
+ * of the file it replaces before the name points at the new one, so a stat in
+ * that gap sees the old file with a new signature; without this check it would
+ * be republished as a duplicate snapshot of the version on its way out. The
+ * two updates are not one atomic step, so such a duplicate stays possible,
+ * only much rarer.
+ *
  * vanilla_sa_now_ms() is the clock of the revalidate_ms window. On Linux it is
  * CLOCK_MONOTONIC_COARSE, served from the vDSO in a few nanoseconds, so a
  * request that is not due for a stat pays one clock read and one compare.
@@ -97,20 +105,22 @@ static inline void vanilla_sa_close(int fd) {
 	close(fd);
 }
 
-// 0 and `*out` filled, or -1 (ENOENT while a file is being replaced, not a
-// regular file, ...).
+// 0 and `*out` filled, or -1 (ENOENT while a file is being replaced, the old
+// file in the middle of its replacement, not a regular file, ...).
 static inline int vanilla_sa_stat(const char* path, vanilla_sa_sig* out) {
 	struct stat st;
-	if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+	if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_nlink == 0) {
 		return -1;
 	}
 	vanilla_sa_fill(&st, out);
 	return 0;
 }
 
+// Like vanilla_sa_stat, for an open file: -1 as well once it has been unlinked
+// or replaced, so a snapshot is never built from a version already gone.
 static inline int vanilla_sa_fstat(int fd, vanilla_sa_sig* out) {
 	struct stat st;
-	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_nlink == 0) {
 		return -1;
 	}
 	vanilla_sa_fill(&st, out);

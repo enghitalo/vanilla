@@ -12,7 +12,8 @@ module core
 // A worker that can sendfile on some connections but not others narrows the
 // hand-off per request with set_queue_file_allowed(): the epoll TLS worker,
 // where sendfile(2) writes plaintext that only a kernel-TLS socket encrypts,
-// passes false for a userspace-TLS connection. The plain worker never calls it.
+// passes false for a userspace-TLS connection. The plain worker only closes it
+// around a watch continuation, whose region it would never take.
 
 #include "@VMODROOT/core/sendfile_slot.h"
 
@@ -39,10 +40,12 @@ pub fn enable_sendfile() {
 	C.vanilla_sf_enable()
 }
 
-// set_queue_file_allowed gates queue_file for the request about to be handled,
-// on a worker that called enable_sendfile. Call it before every handler call,
-// with false for a connection the worker cannot sendfile to (a userspace-TLS
-// connection). A no-op on a worker that never enabled sendfile, and under tcc.
+// set_queue_file_allowed gates queue_file for the call about to run, on a
+// worker that called enable_sendfile. Call it before every handler call, with
+// false for a connection the worker cannot sendfile to (a userspace-TLS
+// connection), or false around a call whose queued region the worker never
+// takes (the epoll worker's watch continuations), then true again. A no-op on
+// a worker that never enabled sendfile, and under tcc.
 @[inline]
 pub fn set_queue_file_allowed(allowed bool) {
 	C.vanilla_sf_set_allowed(allowed)
@@ -57,12 +60,16 @@ pub fn set_queue_file_allowed(allowed bool) {
 // every core.Handler call (a pipelined request, or the head of a streamed
 // large body), whatever the step: a region queued by a step that returns
 // .suspend is dropped, and one queued by a step that returns .close is still
-// written before the close (a rejected streamed-body head drops it with its
-// reply). Watch continuations are not drained yet, so a continuation writes
-// its body itself instead of calling queue_file. The fd must stay open and is
-// never closed by the worker (assets keep one fd open for their whole life;
-// sendfile() with an explicit offset never touches the fd's own position, so
-// the same fd is safe to send concurrently from many connections/threads).
+// sent after the bytes appended to `out`, best-effort like the rest of that
+// response: one flush, then the close, so what goes out is bounded by the
+// socket send buffer. A streamed-body head the worker rejects (any step but
+// .done) has its region dropped, and the worker's 400 follows whatever the
+// handler appended. Watch continuations cannot queue a file: queue_file
+// returns false while one runs, so a continuation writes its body itself. The
+// fd must stay open and is never closed by the worker (assets keep one fd open
+// for their whole life; sendfile() with an explicit offset never touches the
+// fd's own position, so the same fd is safe to send concurrently from many
+// connections/threads).
 @[inline]
 pub fn queue_file(file_fd int, off i64, len i64) bool {
 	return C.vanilla_sf_queue(file_fd, off, len)

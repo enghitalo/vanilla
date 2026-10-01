@@ -6,6 +6,7 @@ module static_assets
 // immutable caching, SPA fallback, traversal safety, conditional GET).
 import os
 import time
+import sync.stdatomic
 import core
 
 // A small built bundle written to a temp dir for the suite to serve.
@@ -428,7 +429,8 @@ fn test_206_bytes_are_exact() {
 	s := server()
 	// Small (in RAM) and large (disk-backed on Linux) identity bodies.
 	e_small := s.etag_for('app.abc123.js')!
-	small_want := 'HTTP/1.1 206 Partial Content\r\nContent-Type: text/javascript; charset=utf-8\r\nContent-Range: bytes 7-11/18\r\nContent-Length: 5\r\nAccept-Ranges: bytes\r\nETag: ${e_small}\r\nConnection: keep-alive\r\n\r\nconst'
+	// RFC 9110 §15.3.7: the Cache-Control and Vary a 200 would carry.
+	small_want := 'HTTP/1.1 206 Partial Content\r\nContent-Type: text/javascript; charset=utf-8\r\nContent-Range: bytes 7-11/18\r\nContent-Length: 5\r\nAccept-Ranges: bytes\r\nETag: ${e_small}\r\nCache-Control: public, max-age=31536000, immutable\r\nVary: Accept-Encoding\r\nConnection: keep-alive\r\n\r\nconst'
 	// A Range ignores Accept-Encoding: it is always a range of the identity bytes.
 	small_req := req('GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: br\r\nRange: bytes=7-11')
 	assert s.respond(small_req)!.bytestr() == small_want
@@ -438,7 +440,7 @@ fn test_206_bytes_are_exact() {
 
 	e_big := s.etag_for('big.0a1b2c.wasm')!
 	big_req := req('GET /big.0a1b2c.wasm HTTP/1.1\r\nRange: bytes=1000-1999')
-	big_head := 'HTTP/1.1 206 Partial Content\r\nContent-Type: application/wasm\r\nContent-Range: bytes 1000-1999/${big_size}\r\nContent-Length: 1000\r\nAccept-Ranges: bytes\r\nETag: ${e_big}\r\nConnection: keep-alive\r\n\r\n'
+	big_head := 'HTTP/1.1 206 Partial Content\r\nContent-Type: application/wasm\r\nContent-Range: bytes 1000-1999/${big_size}\r\nContent-Length: 1000\r\nAccept-Ranges: bytes\r\nETag: ${e_big}\r\nCache-Control: public, max-age=31536000, immutable\r\nConnection: keep-alive\r\n\r\n'
 	mut want := big_head.bytes()
 	for i in 1000 .. 2000 {
 		want << u8(i & 0xff)
@@ -447,6 +449,59 @@ fn test_206_bytes_are_exact() {
 	out.clear()
 	s.respond_into(big_req, mut out)!
 	assert out == want
+
+	// The entrypoint's policy, and no Vary: index.html has no encoded sibling.
+	idx := s.respond(req('GET /index.html HTTP/1.1\r\nRange: bytes=0-8'))!
+	assert idx.bytestr().starts_with('HTTP/1.1 206')
+	assert header_value(idx, 'Cache-Control') == 'no-cache'
+	assert header_value(idx, 'Vary') == ''
+}
+
+fn test_if_range() {
+	s := server()
+	e_id := s.etag_for('app.abc123.js')!
+	e_br := header_value(s.respond(req('GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: br'))!,
+		'ETag')
+	ranged := 'GET /app.abc123.js HTTP/1.1\r\nRange: bytes=0-5\r\nIf-Range: '
+	// The identity ETag, exactly: the Range is served.
+	for tag in [e_id, e_id + ' \t'] {
+		part := s.respond(req(ranged + tag))!
+		assert part.bytestr().starts_with('HTTP/1.1 206')
+		assert body_of(part).bytestr() == 'export'
+	}
+	// RFC 9110 §13.1.5: anything else ignores the Range and serves the whole
+	// representation: a stale ETag, the right one made weak (strong comparison),
+	// another representation's ETag, an HTTP-date (no Last-Modified is sent).
+	for tag in ['"deadbeefdeadbeef"', 'W/' + e_id, e_br, 'Wed, 21 Oct 2015 07:28:00 GMT'] {
+		full := s.respond(req(ranged + tag))!
+		assert full.bytestr().starts_with('HTTP/1.1 200'), tag
+		assert body_of(full).bytestr() == 'export const x = 1'
+		mut out := []u8{}
+		s.respond_into(req(ranged + tag), mut out)!
+		assert out == full
+	}
+	// An ignored Range leaves the request as it would be without one: the
+	// representation is negotiated, and If-None-Match validates it.
+	enc := 'GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: br\r\nRange: bytes=0-5\r\nIf-Range: "deadbeefdeadbeef"'
+	r := s.respond(req(enc))!
+	assert r.bytestr().starts_with('HTTP/1.1 200')
+	assert header_value(r, 'Content-Encoding') == 'br'
+	assert body_of(r).bytestr() == 'BROTLI-APP-JS'
+	assert s.respond(req(enc + '\r\nIf-None-Match: ' + e_br))!.bytestr().starts_with('HTTP/1.1 304')
+	// If-None-Match comes first (RFC 9110 §13.2.2): a matching one is a 304.
+	nm := s.respond(req(ranged + e_id + '\r\nIf-None-Match: ' + e_id))!
+	assert nm.bytestr().starts_with('HTTP/1.1 304')
+	// Without a Range, If-Range is ignored.
+	assert s.respond(req('GET /app.abc123.js HTTP/1.1\r\nIf-Range: "deadbeefdeadbeef"'))! == s.respond(req('GET /app.abc123.js HTTP/1.1'))!
+	// The same for a disk-backed body (on Linux).
+	e_big := s.etag_for('big.0a1b2c.wasm')!
+	big := 'GET /big.0a1b2c.wasm HTTP/1.1\r\nRange: bytes=10-13\r\nIf-Range: '
+	big_part := s.respond(req(big + e_big))!
+	assert big_part.bytestr().starts_with('HTTP/1.1 206')
+	assert body_of(big_part).len == 4
+	big_full := s.respond(req(big + '"deadbeefdeadbeef"'))!
+	assert big_full.bytestr().starts_with('HTTP/1.1 200')
+	assert body_of(big_full).len == big_size
 }
 
 fn test_range_if_none_match_uses_the_identity_etag() {
@@ -712,7 +767,8 @@ fn check_same_size_same_mtime(tag string, size int) {
 	os.rename(tmp, path) or { panic(err) }
 	// Only the inode and ctime tell the two versions apart.
 	mut st := C.vanilla_sa_sig{}
-	assert C.vanilla_sa_stat(&char(path.str), &st) == 0
+	rc := C.vanilla_sa_stat(&char(path.str), &st)
+	assert rc == 0
 	old := snap_of(s, 'f.bin', slot_identity).sig
 	assert st.size == old.size && st.mtime_ns == old.mtime_ns && st.ino != old.ino
 	r2 := get(s, '/f.bin')
@@ -848,11 +904,41 @@ fn test_follow_deleted_file_keeps_serving() {
 	assert get(s, '/new.txt').bytestr().starts_with('HTTP/1.1 404')
 }
 
+fn test_follow_replaced_file_is_not_a_version() {
+	$if windows {
+		return // no follow_disk on Windows
+	}
+	dir := fd_dir('unlinked')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	path := os.join_path(dir, 'f.bin')
+	os.write_file_array(path, pattern(1000, 25)) or { panic(err) }
+	fd := C.vanilla_sa_open(&char(path.str))
+	assert fd >= 0
+	defer {
+		C.vanilla_sa_close(fd)
+	}
+	mut st := C.vanilla_sa_sig{}
+	linked := C.vanilla_sa_fstat(fd, &st)
+	assert linked == 0
+	// Renamed over, the open file is the outgoing version: no link left. It
+	// is refused, the way a request that stats it in the middle of the rename
+	// refuses it, instead of being republished as a new snapshot.
+	replace(dir, 'f.bin', pattern(1000, 26))
+	replaced := C.vanilla_sa_fstat(fd, &st)
+	assert replaced == -1
+	by_path := C.vanilla_sa_stat(&char(path.str), &st)
+	assert by_path == 0
+}
+
 fn C.mkfifo(path &char, mode u32) int
 
 fn make_fifo(path string) {
 	$if !windows {
-		assert C.mkfifo(&char(path.str), 0o644) == 0
+		// Not inside the assert: -prod builds drop asserts, call included.
+		rc := C.mkfifo(&char(path.str), 0o644)
+		assert rc == 0
 	}
 }
 
@@ -937,6 +1023,43 @@ fn test_follow_revalidate_window() {
 	assert early == a || early == b
 	time.sleep(250 * time.millisecond)
 	assert body_of(get(s, '/f.bin')) == b
+}
+
+fn test_follow_revalidate_window_serves_the_old_version_until_it_ends() {
+	$if windows {
+		return // no follow_disk on Windows
+	}
+	dir := fd_dir('long_window')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	a := pattern(1000, 23)
+	b := pattern(1000, 24)
+	os.write_file_array(os.join_path(dir, 'f.bin'), a) or { panic(err) }
+	s := new(Config{
+		root:          dir
+		follow_disk:   true
+		revalidate_ms: 10_000
+	}) or { panic(err) }
+	rep := s.assets['f.bin'] or { panic('no asset') }.reps[slot_identity]
+	r1 := get(s, '/f.bin')
+	assert body_of(r1) == a
+	replace(dir, 'f.bin', b)
+	// The window opened at new() and lasts 10 s: no request stats the file, so
+	// A is still served, byte for byte, and its ETag still validates.
+	assert get(s, '/f.bin') == r1
+	e_a := header_value(r1, 'ETag')
+	nm := s.respond(req('GET /f.bin HTTP/1.1\r\nIf-None-Match: ' + e_a)) or { panic(err) }
+	assert nm.bytestr().starts_with('HTTP/1.1 304')
+	assert isnil(rep.snap().prev) // nothing was rebuilt
+	// End the window, as the clock would 10 s later: the next request stats the
+	// file and serves B, and opens the next window.
+	stdatomic.store_u64(&rep.next_check, 0)
+	r2 := get(s, '/f.bin')
+	assert body_of(r2) == b
+	assert header_value(r2, 'ETag') != e_a
+	replace(dir, 'f.bin', a)
+	assert get(s, '/f.bin') == r2
 }
 
 // --- the sendfile hand-off follows the disk ----------------------------------
@@ -1041,6 +1164,8 @@ fn test_respond_into_does_not_allocate() {
 		req('GET /app.abc123.js HTTP/1.1\r\nIf-None-Match: ' + e_js),
 		req('HEAD /core.9f3a1c.wasm HTTP/1.1'),
 		req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=2-5'),
+		req('GET /app.abc123.js HTTP/1.1\r\nRange: bytes=0-5\r\nIf-Range: ' + e_js),
+		req('GET /app.abc123.js HTTP/1.1\r\nRange: bytes=0-5\r\nIf-Range: "deadbeefdeadbeef"'),
 		req('GET /big.0a1b2c.wasm HTTP/1.1'), // disk-backed on Linux: pread into out
 		req('GET /big.0a1b2c.wasm HTTP/1.1\r\nRange: bytes=100-50000'),
 		req('GET /users/42 HTTP/1.1'),
@@ -1070,6 +1195,7 @@ fn test_respond_does_not_allocate_for_in_memory_replies() {
 		req('GET /app.abc123.js HTTP/1.1'),
 		req('GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: gzip, br'),
 		req('GET /app.abc123.js HTTP/1.1\r\nIf-None-Match: ' + e_js),
+		req('GET /app.abc123.js HTTP/1.1\r\nRange: bytes=0-5\r\nIf-Range: "deadbeefdeadbeef"'),
 		req('HEAD /big.0a1b2c.wasm HTTP/1.1'),
 		req('GET /users/42 HTTP/1.1'),
 		req('GET /nope.9f3a1c.wasm HTTP/1.1'),
