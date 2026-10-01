@@ -44,7 +44,11 @@ per-request allocation.
   **`.suspend`**; the worker resumes the continuation (a `core.WakeFn`, which
   receives `ready_fd`/`ready_fd_error`/`watch_payload` as explicit parameters)
   when the fd is ready — DB sockets, upstreams, timers, write backpressure —
-  all in the worker's own event loop. Linux epoll + io_uring and macOS/kqueue;
+  all in the worker's own event loop. An fd the app owns and reuses across
+  requests (a pooled DB or upstream connection) parks with
+  `event_loop.watch_fd_persistent(...)` instead, so a client that disconnects
+  mid-wait does not close it (epoll and io_uring; the kqueue runtime does not
+  honor it yet). Linux epoll + io_uring and macOS/kqueue;
   on TLS and Windows/IOCP a `.suspend` closes the connection (no watch reactor
   there yet).
 - **Per-worker state** — set `make_state`: it runs once per worker thread, and

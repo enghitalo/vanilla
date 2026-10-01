@@ -13,8 +13,12 @@ the portable floor, composed from existing pieces — nothing new under
    per request would dominate; when the whole pool is in flight the route
    answers 503 (the pg_async idiom, sized small on purpose).
 2. `client.write_get` serializes into a reused scratch (zero-alloc).
-3. `send` → `event_loop.watch_fd(fd, .readable, ...)` → `.suspend` — the
-   worker keeps serving while the backend answers.
+3. `send` → `event_loop.watch_fd_persistent(fd, .readable, ...)` →
+   `.suspend` — the worker keeps serving while the backend answers. The
+   persistent watch is what a pooled fd needs: a client that disconnects
+   mid-call leaves the connection open, and the continuation still drains
+   the reply and frees the slot (a plain `watch_fd` closes the fd and leaks
+   the slot).
 4. The continuation accumulates, `client.frame_response` frames (re-arming
    while incomplete), and the edge reply wraps the backend body without
    `${}`/`+`.
