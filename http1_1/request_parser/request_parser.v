@@ -859,7 +859,7 @@ fn chunk_tchar(c u8) bool {
 @[direct_array_access; inline]
 fn chunk_skip_bws(buf []u8, i int, end int) int {
 	mut k := i
-	for k < end && (buf[k] == empty_space || buf[k] == 0x09) {
+	for k < end && (buf[k] == empty_space || buf[k] == htab_char) {
 		k++
 	}
 	return k
@@ -915,7 +915,7 @@ fn chunk_ext_ok(buf []u8, start int, end int) bool {
 					}
 					c = buf[i]
 				}
-				if (c < 0x20 && c != 0x09) || c == 0x7f {
+				if (c < 0x20 && c != htab_char) || c == 0x7f {
 					return false
 				}
 				i++
@@ -950,7 +950,7 @@ fn trailer_line_ok(buf []u8, start int, end int) bool {
 	i++
 	for i < end {
 		c := buf[i]
-		if (c < 0x20 && c != 0x09) || c == 0x7f {
+		if (c < 0x20 && c != htab_char) || c == 0x7f {
 			return false
 		}
 		i++
@@ -1059,7 +1059,7 @@ fn frame_chunked_total(buf []u8, body_start int, max_header int, max_body int) !
 		// memchr for its LF; a plain size line is checked in place.
 		mut line_end := j // index of the line's CR
 		if buf[j] != cr_char {
-			if buf[j] != `;` && buf[j] != empty_space && buf[j] != 0x09 {
+			if buf[j] != `;` && buf[j] != empty_space && buf[j] != htab_char {
 				return error_with_code('invalid chunk size', 400)
 			}
 			line_lf := find_byte_idx(&buf[j], buf.len - j, lf_char)
