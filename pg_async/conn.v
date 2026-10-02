@@ -1,7 +1,11 @@
 module pg_async
 
-// PgConn is a single PostgreSQL connection: the TCP socket plus the v3 startup /
-// SCRAM-SHA-256 handshake and extended-query execution.
+import tls
+import time
+
+// PgConn is a single PostgreSQL connection: the TCP socket (optionally TLS over
+// it, see SslMode) plus the v3 startup / SCRAM-SHA-256 handshake and
+// extended-query execution.
 //
 // This is the BLOCKING form. It is used for pool bring-up (connecting + auth
 // happen once, before the worker starts serving) and to validate the protocol
@@ -167,6 +171,18 @@ fn dial_addrs(addrs []Addr, cfg &ConnConfig, nonblocking bool, start int) !int {
 	return error('pg: connect to ${cfg.host}:${cfg.port} failed on all ${addrs.len} address(es): ${last}')
 }
 
+// SslMode is whether, and how strictly, a connection uses TLS — libpq's
+// sslmode values, minus `allow` and `prefer`: a mode that asks for TLS gets it
+// or fails, it never falls back to plaintext. TLS needs the `-d vanilla_tls`
+// build (Mbed TLS 4, the same library the HTTPS server links); without it
+// every mode but .disable fails to connect.
+pub enum SslMode {
+	disable     // plaintext (the default)
+	require     // TLS; the certificate is not checked, unless ssl_root_cert is set: then as .verify_ca (libpq's rule)
+	verify_ca   // TLS; the certificate chains to a trusted CA
+	verify_full // TLS; the certificate chains to a trusted CA and names `host` (SNI is sent): what managed databases need
+}
+
 pub struct ConnConfig {
 pub:
 	host     string = 'localhost'
@@ -174,8 +190,15 @@ pub:
 	user     string
 	password string
 	database string
+	// ssl_mode: see SslMode. TLS 1.3, negotiated with PostgreSQL's SSLRequest.
+	ssl_mode SslMode
+	// ssl_root_cert is the PEM file of trusted CA certificates for .verify_ca
+	// and .verify_full; '' = the system's bundle (tls.system_ca_file:
+	// $SSL_CERT_FILE, else /etc/ssl/certs/ca-certificates.crt and the like).
+	ssl_root_cert string
 	// connect_timeout_ms bounds the TCP connect to each resolved address on
-	// the blocking bring-up path, and one whole re-dial attempt (connect +
+	// the blocking bring-up path (over TLS, also the TLS handshake and the
+	// authentication after it), and one whole re-dial attempt (connect +
 	// handshake) on the non-blocking path. 0 = no bound on bring-up.
 	connect_timeout_ms int = 5000
 	// tcp_nodelay disables Nagle on the connection (what libpq does). Without
@@ -199,18 +222,20 @@ pub:
 }
 
 // LinkState is a connection's health. A live connection is .ready. It turns
-// .broken the moment it is known lost: EOF, a socket error, a FATAL/PANIC
-// ErrorResponse, or an exclusive borrower releasing it with a query still in
-// flight (its reply stream can no longer be matched to queries). A broken
-// connection takes no new query and fails what is still in flight — after
-// delivering every reply already buffered — and its pool then re-dials it
-// through .connecting and .starting back to .ready, without blocking
-// (redial.v).
+// .broken the moment it is known lost: EOF, a socket error (a TLS error
+// included), a FATAL/PANIC ErrorResponse, or an exclusive borrower releasing
+// it with a query still in flight (its reply stream can no longer be matched
+// to queries). A broken connection takes no new query and fails what is still
+// in flight — after delivering every reply already buffered — and its pool
+// then re-dials it through .connecting (over TLS, .ssl_request and
+// .tls_handshake) and .starting back to .ready, without blocking (redial.v).
 enum LinkState {
 	ready
 	broken
-	connecting // re-dial: non-blocking connect() in flight
-	starting   // re-dial: StartupMessage sent, authenticating until ReadyForQuery
+	connecting    // re-dial: non-blocking connect() in flight
+	ssl_request   // re-dial over TLS: SSLRequest sent, waiting for the server's one-byte answer
+	tls_handshake // re-dial over TLS: the TLS handshake under way
+	starting      // re-dial: StartupMessage sent, authenticating until ReadyForQuery
 }
 
 pub struct PgConn {
@@ -257,6 +282,24 @@ mut:
 	// connections so a bring-up derives once and a re-dial not at all; nil
 	// for a standalone connection.
 	scram_cache &ScramCache = unsafe { nil }
+	// tls is the TLS session over fd (ssl_mode != .disable), else the zero
+	// Session: the one field every send and recv branches on (transport.v).
+	// It and the rest of the TLS state sit after the plaintext path's fields,
+	// so adding them moved none of those.
+	tls tls.Session
+	// TLS bookkeeping (transport.v): the client config the session comes from
+	// (the pool's, or this connection's own when owns_tls), the readiness a
+	// blocked TLS call waits for (POLLIN / POLLOUT), the length a write Mbed
+	// TLS could not finish must be retried with, and whether a read is
+	// blocked until the socket takes a write (async_wants_write).
+	tls_cfg          &tls.Config = unsafe { nil }
+	owns_tls         bool
+	tls_wait         int
+	tls_wlen         int
+	tls_read_blocked bool
+	// io_deadline bounds the waits of the blocking bring-up over TLS
+	// (monotonic ns; 0 = wait as long as it takes).
+	io_deadline u64
 }
 
 struct Msg {
@@ -264,40 +307,78 @@ struct Msg {
 	payload []u8
 }
 
-// PgConn.connect opens a TCP connection and runs the startup + SCRAM-SHA-256
-// handshake, returning once the server reports ReadyForQuery.
+// PgConn.connect opens a TCP connection — TLS over it unless ssl_mode is
+// .disable — and runs the startup + SCRAM-SHA-256 handshake, returning once
+// the server reports ReadyForQuery.
 pub fn PgConn.connect(cfg ConnConfig) !PgConn {
-	return PgConn.connect_cached(cfg, unsafe { nil })
-}
-
-// connect_cached is connect with the SCRAM key derivation taken from (and
-// stored in) `cache` when it is set: the pool's bring-up path.
-fn PgConn.connect_cached(cfg ConnConfig, cache &ScramCache) !PgConn {
-	fd := dial(&cfg, false, 0)!
 	mut c := PgConn{
-		fd:          fd
-		recv_buf:    []u8{cap: 16 * 1024}
-		scram_cache: cache
+		recv_buf: []u8{cap: 16 * 1024}
 	}
-	c.handshake(cfg) or {
-		C.close(fd)
+	if cfg.ssl_mode != .disable {
+		c.tls_cfg = new_tls_config(&cfg)!
+		c.owns_tls = true
+	}
+	c.bring_up(&cfg) or {
+		c.teardown()
 		return err
 	}
 	return c
 }
 
-// close sends a best-effort Terminate and closes the socket.
-pub fn (mut c PgConn) close() {
-	if c.fd < 0 {
-		return // lost and not re-dialed: no socket left
+// bring_up dials and authenticates, blocking: the TCP connect, then over TLS
+// the SSLRequest and the TLS handshake (on a non-blocking socket, every wait
+// bounded by connect_timeout_ms), then the startup and authentication.
+fn (mut c PgConn) bring_up(cfg &ConnConfig) ! {
+	c.fd = dial(cfg, false, 0)!
+	if c.tls_cfg != unsafe { nil } {
+		if cfg.connect_timeout_ms > 0 {
+			c.io_deadline = time.sys_mono_now() + u64(cfg.connect_timeout_ms) * u64(time.millisecond)
+		}
+		c.set_nonblocking()!
+		for !c.send_ssl_request()! {
+			c.wait_io(C.POLLOUT)!
+		}
+		for !c.ssl_answer()! {
+			c.wait_io(C.POLLIN)!
+		}
+		c.tls_attach(cfg)!
+		for !c.tls_step(cfg)! {
+			c.wait_io(c.tls_wait)!
+		}
 	}
-	if c.state == .ready {
+	c.handshake(cfg)!
+	c.io_deadline = 0
+}
+
+// close sends a best-effort Terminate (and, over TLS, close_notify) and closes
+// the socket.
+pub fn (mut c PgConn) close() {
+	if c.fd >= 0 && c.state == .ready {
 		mut out := []u8{}
 		write_terminate(mut out)
-		c.send(out) or {}
+		c.send_some(out.data, out.len) // one attempt: never wait on a peer to close
 	}
-	C.close(c.fd)
-	c.fd = -1
+	c.teardown()
+}
+
+// teardown frees the TLS session (sending close_notify while the socket is
+// still open) and the connection's own TLS config, then closes the socket.
+// The connection is left broken; over TLS it also has no config left, so a
+// later re-dial fails before it dials (redial_start) instead of reaching
+// freed memory.
+fn (mut c PgConn) teardown() {
+	if c.tls.active() {
+		c.tls.free()
+		c.tls = tls.Session{}
+	}
+	if c.owns_tls && c.tls_cfg != unsafe { nil } {
+		c.tls_cfg.free()
+	}
+	c.tls_cfg = unsafe { nil }
+	if c.fd >= 0 {
+		C.close(c.fd)
+		c.fd = -1
+	}
 	c.state = .broken
 }
 
@@ -328,14 +409,22 @@ fn (c &PgConn) loss_error() IError {
 	return error('pg: ${c.loss}')
 }
 
+// send writes all of data, waiting while the socket is full — except during a
+// re-dial, which must never block the worker (its messages are small, on an
+// empty socket: a full one fails the attempt instead).
 fn (mut c PgConn) send(data []u8) ! {
 	mut sent := 0
 	for sent < data.len {
-		n := C.send(c.fd, unsafe { &u8(data.data) + sent }, usize(data.len - sent), C.MSG_NOSIGNAL)
-		if n <= 0 {
-			return error('pg: send failed')
+		n := c.send_some(unsafe { &u8(data.data) + sent }, data.len - sent)
+		if n > 0 {
+			sent += n
+			continue
 		}
-		sent += n
+		if n == io_again && c.state == .ready {
+			c.wait_io(c.io_wait(C.POLLOUT))!
+			continue
+		}
+		return error('pg: send failed')
 	}
 }
 
@@ -353,7 +442,14 @@ fn (mut c PgConn) read_msg() !Msg {
 			}
 		}
 		mut tmp := []u8{len: 16 * 1024}
-		n := C.recv(c.fd, tmp.data, usize(tmp.len), 0)
+		if c.tls.active() {
+			c.tls.mark_readable()
+		}
+		n := c.recv_some(tmp.data, tmp.len)
+		if n == io_again {
+			c.wait_io(c.io_wait(C.POLLIN))!
+			continue
+		}
 		if n <= 0 {
 			return error('pg: connection closed by server')
 		}

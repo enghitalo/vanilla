@@ -8,6 +8,7 @@
 #   bench/pg_async/e2e.sh                # both shapes: db (acquire) and dbp (acquire_pipelined)
 #   RUNS=7 DURATION=15 bench/pg_async/e2e.sh dbp
 #   GC=boehm bench/pg_async/e2e.sh       # the default-GC build instead of -gc none
+#   TLS=1 bench/pg_async/e2e.sh          # over TLS: -d vanilla_tls, verify-full
 #
 # Without PGHOST it starts pg_async/testdata/throwaway_pg.sh (and stops it at
 # exit). A/B a change: run on main, run on the branch, same machine state,
@@ -26,6 +27,8 @@
 #   DURATION [10] seconds measured per run, after a 2 s warm-up
 #   RUNS [5]      runs per shape
 #   GC [none]     none (-gc none, production) | boehm
+#   TLS [0]       1: build with -d vanilla_tls and talk TLS (PGSSLMODE /
+#                 PGSSLROOTCERT; a throwaway cluster is started TLS-only)
 #   SERVER_CPUS / LOAD_CPUS / PG_CPUS   taskset lists [0-1 / 2 / 3 on 4 cores]
 
 set -uo pipefail
@@ -64,13 +67,14 @@ cleanup() {
 trap cleanup EXIT
 
 if [ -z "${PGHOST:-}" ]; then
-	pg_env=$(PG_CPUS=$PG_CPUS pg_async/testdata/throwaway_pg.sh start) || exit 2
+	pg_env=$(PG_CPUS=$PG_CPUS PG_TLS="${TLS:-0}" pg_async/testdata/throwaway_pg.sh start) || exit 2
 	eval "$pg_env"
 	pg_started=1
 fi
 
 gcflag=(-gc none)
 [ "$GC" = boehm ] && gcflag=()
+[ "${TLS:-0}" = 1 ] && gcflag+=(-d vanilla_tls)
 echo "building bench/pg_async/e2e_server (-prod ${gcflag[*]})..."
 v -prod "${gcflag[@]}" -o "$work/server" bench/pg_async/e2e_server >"$work/build.log" 2>&1 || {
 	cat "$work/build.log"

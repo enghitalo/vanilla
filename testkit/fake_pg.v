@@ -85,8 +85,39 @@ pub fn (mut f FakePg) stop() {
 	os.rmdir_all(f.dir) or {}
 }
 
+// gen_test_ca_script is pg_async/testdata/gen_test_ca.sh: the throwaway test
+// CA and server certificates for TLS tests (openssl, at test time).
+pub const gen_test_ca_script = os.join_path(@VMODROOT, 'pg_async', 'testdata', 'gen_test_ca.sh')
+
+// test_certs_available reports whether test_certs can run here: openssl on
+// PATH. Like fake_pg_available, a missing openssl is a failure instead of a
+// skip when VANILLA_REQUIRE_FAKE_PG is set (CI).
+pub fn test_certs_available() bool {
+	if _ := os.find_abs_path_of_executable('openssl') {
+		return true
+	}
+	if os.getenv('VANILLA_REQUIRE_FAKE_PG') != '' {
+		panic('VANILLA_REQUIRE_FAKE_PG is set but openssl is not on PATH')
+	}
+	return false
+}
+
+// test_certs writes a fresh test CA and certificates (gen_test_ca.sh: ca.crt,
+// server.crt/.key for localhost, 127.0.0.1 and ::1, wronghost.crt/.key,
+// other_ca.crt) into a new temporary directory and returns it. The keys are
+// generated here, never committed; remove the directory when done.
+pub fn test_certs() !string {
+	dir := os.join_path(os.temp_dir(), 'vanilla_test_certs_${os.getpid()}_${time.sys_mono_now()}')
+	res := os.execute('${os.quoted_path(gen_test_ca_script)} ${os.quoted_path(dir)}')
+	if res.exit_code != 0 {
+		return error('gen_test_ca.sh failed: ${res.output}')
+	}
+	return dir
+}
+
 // stat returns one of the fake server's counters (accepted, authenticated,
-// queries, server_closes, ssl_requests, cancel_requests), 0 when not seen yet.
+// queries, server_closes, ssl_requests, tls_handshakes, tickets,
+// cancel_requests), 0 when not seen yet.
 pub fn (f &FakePg) stat(key string) int {
 	content := os.read_file(f.stats_path) or { return 0 }
 	for line in content.split_into_lines() {

@@ -27,6 +27,12 @@ bench/pg_async/callgrind.sh dbp errors
 pg_async/testdata/throwaway_pg.sh stop
 ```
 
+`TLS=1` runs `e2e.sh`, `leak.sh` and `callgrind.sh` over TLS: the server is
+built with `-d vanilla_tls` and talks `verify-full` to the database
+(`PGSSLMODE` / `PGSSLROOTCERT`; without `PGHOST` the throwaway cluster is
+started TLS-only, `PG_TLS=1`). Against a plaintext `PGHOST` it measures the
+TLS-capable build on the plaintext path.
+
 `codec_bench.v` reaches into the connection through
 `pg_async/bench_hooks_d_pg_async_bench.v`, which only compiles with
 `-d pg_async_bench`; a normal build carries none of it.

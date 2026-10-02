@@ -316,6 +316,17 @@ their request.
   without blocking, so `release` it on every path, error or not. Decide retries
   on the typed error — `err is pg_async.PgError && err.sqlstate == '40001'` —
   and on `conn.is_broken()` for a lost connection, never on the message text.
+- Talk TLS to any database that is not on the same host: `ssl_mode:
+  .verify_full` (with `ssl_root_cert` for a private CA; the system bundle
+  otherwise) is what managed PostgreSQL needs (Aurora DSQL, RDS with
+  `rds.force_ssl`, Cloud SQL, Azure, Supabase, Neon) and the only mode that
+  authenticates the server — `.require` encrypts against a passive eavesdropper
+  but accepts any certificate. Build with `-d vanilla_tls` (Mbed TLS 4, the
+  library the HTTPS server uses); without it every TLS mode fails to connect
+  rather than falling back to plaintext. The query path is unchanged: the same
+  pool, the same `watch_fd_persistent` parking, zero allocations per query;
+  the trusted CAs are parsed once per pool and each connection's TLS session
+  is allocated once and re-armed on every re-dial. TLS 1.3 only.
 
 **Don't**
 

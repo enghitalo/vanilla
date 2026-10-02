@@ -1,5 +1,6 @@
 /*
- * vanilla_tls — a thin C adapter over Mbed TLS 4 (TLS 1.3).
+ * vanilla_tls — a thin C adapter over Mbed TLS 4 (TLS 1.3): the HTTPS server,
+ * and the client side of pg_async's TLS (vtls_client_setup).
  *
  * Why a C shim (not direct V bindings): Mbed TLS exposes its config via macros
  * with arguments (PSA_ALG_ECDSA(...), PSA_KEY_TYPE_ECC_KEY_PAIR(...)) and a dozen
@@ -14,7 +15,7 @@
 
 #include <stddef.h>
 
-typedef struct vtls_ctx vtls_ctx; // server-wide TLS config (cert + key + ssl conf)
+typedef struct vtls_ctx vtls_ctx; // a TLS config: the server's (cert + key) or a client's (trusted CAs)
 
 // Process-wide one-time init (psa_crypto_init). Returns 0 on success.
 int vtls_global_init(void);
@@ -96,6 +97,51 @@ int vtls_write(void *sess, const unsigned char *buf, size_t len);
 // this is called again. That is the edge-triggered contract: a drained socket
 // raises a new edge for any byte that arrives later.
 void vtls_mark_readable(void *sess);
+
+// Read the TLS stream (handshake, read, write) the way the edge-triggered
+// workers need it: a "want" result means the socket really is drained (or
+// full), never that Mbed TLS stopped early with records still buffered — a
+// TLS 1.3 NewSessionTicket (MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET on a
+// client) or a skipped warning alert is read past, not reported.
+
+// 1 once the peer ended the TLS session (EOF, or a close_notify alert): a
+// VTLS_ERROR from vtls_read is then a clean close, not a failure.
+int vtls_peer_closed(void *sess);
+
+// ---- client (pg_async's TLS; the server side never calls these) -----------
+
+// How a client checks the server's certificate.
+#define VTLS_VERIFY_NONE 0 // not at all: encrypted, but the server is not authenticated
+#define VTLS_VERIFY_CA 1   // the certificate chains to a trusted CA
+#define VTLS_VERIFY_FULL 2 // ...and names the host dialed (a DNS or IP SAN)
+
+// Configure ctx (from vtls_ctx_new) as a TLS 1.3 client that accepts the
+// suites the server offers and verifies its certificate per `verify` against
+// the PEM bundle at ca_file (unused for VTLS_VERIFY_NONE). Returns 0, or a
+// negative Mbed TLS error (vtls_error_string): the file unreadable, or not one
+// certificate in it parsed.
+int vtls_client_setup(vtls_ctx *ctx, const char *ca_file, int verify);
+
+// A client session on a connected, NON-BLOCKING socket, for server `host`:
+// the SNI unless it is an IP address (RFC 6066 names hosts only), and under
+// VTLS_VERIFY_FULL the name the certificate must carry — then an IP address
+// is sent as SNI too, since Mbed TLS checks the name it sends. Non-blocking
+// because Mbed TLS must never wait in a recv holding the crypto lock (see
+// VTLS_LOCK in vanilla_tls.c). NULL on error.
+void *vtls_client_session_new(vtls_ctx *ctx, int fd, const char *host);
+
+// Re-arm a client session for a fresh handshake to the same host on a new
+// socket (a re-dial), keeping its buffers. fd -1 detaches it from a socket
+// that is being closed, so nothing (vtls_session_free's close_notify) writes
+// to the fd number after it is reused. Returns 0, or a negative Mbed TLS error.
+int vtls_session_reset(void *sess, int fd);
+
+// After vtls_handshake returned VTLS_ERROR: why, NUL-terminated in buf (the
+// certificate verification failure, or the Mbed TLS error).
+void vtls_handshake_error(void *sess, char *buf, size_t len);
+
+// The text of a negative Mbed TLS error code, NUL-terminated in buf.
+void vtls_error_string(int err, char *buf, size_t len);
 
 // ---- kTLS: kernel record-crypto offload ------------------------------------
 

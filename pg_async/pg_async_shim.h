@@ -11,6 +11,7 @@
 #include <poll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 
 // pg_async_wait polls one fd for `events` (POLLIN / POLLOUT) up to
@@ -71,6 +72,15 @@ static inline int pg_async_getsockopt_int(int fd, int level, int name) {
 	socklen_t len = sizeof(v);
 	if (getsockopt(fd, level, name, &v, &len) != 0) return -1;
 	return v;
+}
+
+// pg_async_pending_bytes is how many received bytes the socket holds unread
+// (FIONREAD): after the one-byte answer to SSLRequest there must be none.
+// -1 if it cannot be read.
+static inline int pg_async_pending_bytes(int fd) {
+	int n = 0;
+	if (ioctl(fd, FIONREAD, &n) != 0) return -1;
+	return n;
 }
 
 #endif

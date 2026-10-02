@@ -25,8 +25,10 @@
 #                report adds bytes per reconnect
 #
 # Environment: WORKERS [2], POOL [4], CONNS [32], WARMUP [5] s, WINDOW [20] s,
-# CHURN_MS [500], SERVER_CPUS / LOAD_CPUS / PG_CPUS (as in e2e.sh). Without
-# PGHOST a throwaway PostgreSQL is started (and stopped at exit).
+# CHURN_MS [500], SERVER_CPUS / LOAD_CPUS / PG_CPUS (as in e2e.sh), TLS [0]
+# (1: -d vanilla_tls builds talking TLS, as in e2e.sh; churn then re-dials
+# over TLS). Without PGHOST a throwaway PostgreSQL is started (and stopped at
+# exit).
 
 set -uo pipefail
 export LC_ALL=C
@@ -71,7 +73,7 @@ cleanup() {
 trap cleanup EXIT
 
 if [ -z "${PGHOST:-}" ]; then
-	pg_env=$(PG_CPUS=$PG_CPUS pg_async/testdata/throwaway_pg.sh start) || exit 2
+	pg_env=$(PG_CPUS=$PG_CPUS PG_TLS="${TLS:-0}" pg_async/testdata/throwaway_pg.sh start) || exit 2
 	eval "$pg_env"
 	pg_started=1
 fi
@@ -79,6 +81,7 @@ fi
 for gc in none boehm; do
 	flags=(-gc none)
 	[ "$gc" = boehm ] && flags=()
+	[ "${TLS:-0}" = 1 ] && flags+=(-d vanilla_tls)
 	echo "building bench/pg_async/e2e_server (-prod ${flags[*]})..."
 	v -prod "${flags[@]}" -o "$work/server_$gc" bench/pg_async/e2e_server >"$work/build.log" 2>&1 || {
 		cat "$work/build.log"
