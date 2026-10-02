@@ -289,7 +289,8 @@ pub mut:
 	// Limits.idle_ms(); 0 ⇒ no idle deadlines.
 	idle_ns u64
 	// Graceful-shutdown plumbing (set in io_uring_worker_main):
-	//   inflight — this worker's own in-flight-response counter; Server.shutdown()
+	//   inflight — this worker's own in-flight counter (requests being handled,
+	//     posted response sends, connections parked on a watch); Server.shutdown()
 	//     sums all workers' counters to drain precisely. nil ⇒ not tracked.
 	//   draining — shared flag set by Server.shutdown(); the accept handler stops
 	//     re-arming once it is non-zero, so the worker quits accepting. nil ⇒ off.

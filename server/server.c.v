@@ -43,6 +43,7 @@ pub mut:
 	after_server_start core.AfterStartFn = unsafe { nil }
 	// Per-worker in-flight request counters (one per worker, each on its own
 	// cache line — written only by its worker, so no contention/false sharing).
+	// A request counts while it runs and while it is parked on a watch.
 	// shutdown() sums them to drain precisely.
 	inflight []&core.Counter = []&core.Counter{len: max_thread_pool_size, init: &core.Counter{}}
 	// Global count of open connections (incremented at accept, decremented at
@@ -67,6 +68,13 @@ pub mut:
 // listener_fds). We set the shared `draining` flag — so io_uring accept handlers
 // stop re-arming — and shutdown(SHUT_RDWR) every listener (close() alone would
 // not cancel an io_uring multishot accept, which holds its own file reference).
+//
+// In flight includes a request PARKED on a watch (.suspend: an async DB query,
+// an upstream call, a timer) until its continuation answers it, so size
+// grace_ms for the slowest parked operation (DB or upstream timeout); a
+// request parked for good (an endless SSE stream) holds the drain for the
+// whole grace. A parked client that disconnects stops counting at once on
+// epoll and kqueue; io_uring notices only when its request resumes.
 //
 // The drain is PRECISE: it sums the per-worker in-flight counters and returns
 // the instant they all hit zero, so an idle server shuts down in ~milliseconds
