@@ -2,6 +2,7 @@ module main
 
 import core
 import http1_1.response
+import os
 import time
 
 // SOLUTION: pure crypto/round-trip + raw-request E2E (BEST_PRACTICES §9).
@@ -52,6 +53,15 @@ fn test_jwt_noncanonical_signature_rejected() {
 fn test_jwt_expiry_is_enforced() {
 	assert !jwt_verify(jwt_sign('{"sub":"user-42","exp":1}'.bytes())) // expired
 	assert !jwt_verify(jwt_sign('{"sub":"user-42"}'.bytes())) // no exp claim -> rejected
+}
+
+fn test_jwt_secret_is_never_a_hardcoded_value() {
+	assert jwt_secret.len >= jwt_secret_min_len
+	if os.getenv('JWT_SECRET').len < jwt_secret_min_len {
+		// No real key configured (main() would refuse to start): a fresh random
+		// key per process, never a constant anyone could mint tokens with.
+		assert load_jwt_secret() != load_jwt_secret()
+	}
 }
 
 fn test_jwt_garbage_rejected() {

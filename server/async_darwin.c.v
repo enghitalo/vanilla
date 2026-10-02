@@ -16,6 +16,7 @@ import kqueue
 import http1_1.request
 import http1_1.response
 import core
+import sync.stdatomic
 
 // KqConn holds a connection's response buffer across a suspend (the macOS sync
 // path allocates a fresh buffer per request; an async request must keep it while
@@ -36,12 +37,29 @@ struct KqWatch {
 }
 
 // KqReactor is the per-worker async state: response buffers per client + the
-// watch registry. One per worker thread, so no lock.
+// watch registry. One per worker thread, so no lock. inflight is this
+// worker's in-flight counter (one of Server.inflight), which shutdown() drains:
+// it is held while a request or continuation runs, and by every parked
+// connection (park), as on the epoll backend.
 @[heap]
 struct KqReactor {
 mut:
-	conns   map[int]&KqConn
-	watches map[int]KqWatch
+	conns    map[int]&KqConn
+	watches  map[int]KqWatch
+	inflight &core.Counter = unsafe { nil }
+}
+
+// park sets the ext fd conn waits on (-1: none) and keeps the in-flight count
+// in step: one count per parked connection, from the park until it resumes or
+// closes, so shutdown() waits for parked requests too. Every write of
+// awaiting_fd goes through here; only the transition counts, so a
+// continuation that re-parks is not counted twice.
+@[inline]
+fn (mut r KqReactor) park(mut conn KqConn, ext_fd int) {
+	if (conn.awaiting_fd >= 0) != (ext_fd >= 0) {
+		stdatomic.add_i64(&r.inflight.n, if ext_fd >= 0 { i64(1) } else { i64(-1) })
+	}
+	conn.awaiting_fd = ext_fd
 }
 
 // kqueue_async_register is installed into EventLoop.register on macOS: record
@@ -60,14 +78,15 @@ fn kqueue_async_register(mut w core.EventLoop, ext_fd int, interest core.WatchIn
 
 // process_kqueue_worker is the worker loop (one per worker thread). Client
 // fds (registered by the accept loop) and watched ext fds share this kqueue.
-fn process_kqueue_worker(kq int, handler core.Handler, make_state fn () voidptr, limits Limits) {
+fn process_kqueue_worker(kq int, handler core.Handler, make_state fn () voidptr, limits Limits, inflight &core.Counter) {
 	mut state := voidptr(unsafe { nil })
 	if make_state != unsafe { nil } {
 		state = make_state()
 	}
 	mut reactor := KqReactor{
-		conns:   map[int]&KqConn{}
-		watches: map[int]KqWatch{}
+		conns:    map[int]&KqConn{}
+		watches:  map[int]KqWatch{}
+		inflight: inflight
 	}
 	mut events := [1024]C.kevent{}
 	for {
@@ -121,6 +140,12 @@ fn process_kqueue_worker(kq int, handler core.Handler, make_state fn () voidptr,
 // kq_handle_request reads one request and dispatches the handler.
 @[manualfree]
 fn kq_handle_request(h core.Handler, mut reactor KqReactor, kq int, fd int, limits Limits, state voidptr) {
+	// In-flight window for the graceful-shutdown drain (per-worker counter, own
+	// cache line — uncontended), as on epoll.
+	stdatomic.add_i64(&reactor.inflight.n, 1)
+	defer {
+		stdatomic.add_i64(&reactor.inflight.n, -1)
+	}
 	request_buffer := request.read_request(fd, limits.max_header_bytes, limits.max_body_bytes) or {
 		match err.code() {
 			413 {
@@ -170,7 +195,7 @@ fn kq_handle_request(h core.Handler, mut reactor KqReactor, kq int, fd int, limi
 			// keep-alive: fd stays registered for the next request
 		}
 		.suspend {
-			conn.awaiting_fd = event_loop.last_watched // parked; resumed by kq_run_cont
+			reactor.park(mut conn, event_loop.last_watched) // parked; resumed by kq_run_cont
 		}
 		.close {
 			// Flush-then-close (the core.Step contract): the handler's error
@@ -186,7 +211,13 @@ fn kq_handle_request(h core.Handler, mut reactor KqReactor, kq int, fd int, limi
 // kq_run_cont resumes a parked request when its watched fd fires.
 fn kq_run_cont(mut reactor KqReactor, kq int, watch KqWatch, ext_fd int, ready_err bool, state voidptr) {
 	mut conn := reactor.conns[watch.client_fd] or { return } // client went away
-	conn.awaiting_fd = -1
+	// Resumes count toward the in-flight window too: this hold covers the
+	// continuation between the unpark below and its response being sent.
+	stdatomic.add_i64(&reactor.inflight.n, 1)
+	defer {
+		stdatomic.add_i64(&reactor.inflight.n, -1)
+	}
+	reactor.park(mut conn, -1)
 	mut event_loop := core.EventLoop{
 		client_fd: watch.client_fd
 		loop_fd:   kq
@@ -200,7 +231,7 @@ fn kq_run_cont(mut reactor KqReactor, kq int, watch KqWatch, ext_fd int, ready_e
 			}
 		}
 		.suspend {
-			conn.awaiting_fd = event_loop.last_watched // re-armed (multi-step); stay parked
+			reactor.park(mut conn, event_loop.last_watched) // re-armed (multi-step); stay parked
 		}
 		.close {
 			// Flush-then-close: send whatever the continuation appended first.
@@ -219,6 +250,7 @@ fn kq_close(mut reactor KqReactor, kq int, fd int) {
 		if conn.awaiting_fd >= 0 {
 			reactor.watches.delete(conn.awaiting_fd)
 			kqueue.remove_fd_from_kqueue(kq, conn.awaiting_fd) // EV_DELETE + close the ext fd
+			reactor.park(mut conn, -1) // its in-flight count goes with it
 		}
 		unsafe { conn.out.free() }
 		reactor.conns.delete(fd)

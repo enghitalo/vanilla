@@ -17,6 +17,12 @@ module main
 //   by spec for good reason. With credentials you must echo a SPECIFIC,
 //   allowlisted origin — never `*`, never blind reflection.
 //
+// CACHING: the response depends on `Origin`, so EVERY variant carries
+//   `Vary: Origin` — including the plain one sent without (or with a refused)
+//   Origin. Otherwise a shared cache (CDN, reverse proxy) can store the plain
+//   variant under no Vary key and serve it to an allowed origin, whose browser
+//   then blocks the read: intermittent, cache-dependent CORS failures.
+//
 // BYTE DISCIPLINE (docs/BEST_PRACTICES.md §2/§3, docs/V_PERF_TOOLBOX.md):
 //   - NEVER concatenate or interpolate — not even on the slow path. Every
 //     response is split into compile-time consts around the one dynamic part
@@ -45,12 +51,12 @@ fn origin_allowed(origin string) bool {
 // The echoed origin is the ONLY dynamic byte range; everything around it is a
 // compile-time const, so the `{"ok":true}` body's Content-Length is the known
 // constant 11 (keep the two in sync if you ever change the body).
-const resp_403 = 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'.bytes()
+const resp_403 = 'HTTP/1.1 403 Forbidden\r\nVary: Origin\r\nContent-Length: 0\r\n\r\n'.bytes()
 const preflight_head = 'HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: '.bytes()
 const preflight_tail = '\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-CSRF-Token\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Max-Age: 86400\r\nVary: Origin\r\nContent-Length: 0\r\n\r\n'.bytes()
 const ok_cors_head = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: '.bytes()
 const ok_cors_tail = '\r\nAccess-Control-Allow-Credentials: true\r\nVary: Origin\r\nContent-Length: 11\r\n\r\n{"ok":true}'.bytes()
-const resp_ok_plain = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{"ok":true}'.bytes()
+const resp_ok_plain = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nVary: Origin\r\nContent-Length: 11\r\n\r\n{"ok":true}'.bytes()
 
 // slice_eq compares a request Slice against a literal IN PLACE by offsets —
 // no `.to_string()`, no `buf[a..b]` (V array slicing marks the source buffer

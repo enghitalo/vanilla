@@ -43,6 +43,7 @@ pub mut:
 	after_server_start core.AfterStartFn = unsafe { nil }
 	// Per-worker in-flight request counters (one per worker, each on its own
 	// cache line — written only by its worker, so no contention/false sharing).
+	// A request counts while it runs and while it is parked on a watch.
 	// shutdown() sums them to drain precisely.
 	inflight []&core.Counter = []&core.Counter{len: max_thread_pool_size, init: &core.Counter{}}
 	// Global count of open connections (incremented at accept, decremented at
@@ -67,6 +68,13 @@ pub mut:
 // listener_fds). We set the shared `draining` flag — so io_uring accept handlers
 // stop re-arming — and shutdown(SHUT_RDWR) every listener (close() alone would
 // not cancel an io_uring multishot accept, which holds its own file reference).
+//
+// In flight includes a request PARKED on a watch (.suspend: an async DB query,
+// an upstream call, a timer) until its continuation answers it, so size
+// grace_ms for the slowest parked operation (DB or upstream timeout); a
+// request parked for good (an endless SSE stream) holds the drain for the
+// whole grace. A parked client that disconnects stops counting at once on
+// epoll and kqueue; io_uring notices only when its request resumes.
 //
 // The drain is PRECISE: it sums the per-worker in-flight counters and returns
 // the instant they all hit zero, so an idle server shuts down in ~milliseconds
@@ -190,6 +198,8 @@ pub:
 }
 
 // new_server validates `config` and opens the listeners; `run` starts serving.
+// A listener it cannot open (port in use, not permitted, out of fds) is
+// returned as an error whose code is the errno (WSAGetLastError() on Windows).
 //
 // On POSIX, if SIGPIPE still has its default action, new_server sets it to
 // ignored, process-wide, as nginx does. sendfile(2) has no MSG_NOSIGNAL, so a
@@ -225,31 +235,6 @@ pub fn new_server(config ServerConfig) !Server {
 		}
 		if config.tls_config != unsafe { nil } {
 			return error('TLS over a unix socket is not supported')
-		}
-	}
-
-	mut socket_fd := 0
-	$if !windows {
-		if config.unix_socket_path != '' {
-			socket_fd = socket.create_unix_server_socket(config.unix_socket_path)!
-		} else {
-			socket_fd = socket.create_server_socket(config.port)
-		}
-	} $else {
-		socket_fd = socket.create_server_socket(config.port)
-	}
-
-	// port: 0 = ephemeral. The kernel picked a free port at bind time; read it back
-	// ONCE so (a) the io_uring per-worker listeners below bind the SAME port and
-	// actually join the SO_REUSEPORT group (each create_server_socket(0) would pick
-	// a DIFFERENT port), and (b) Server.port tells every consumer — tests dialing
-	// back, co-hosted servers, the startup banners — the real port. A UDS
-	// listener has no port; the address is unix_socket_path.
-	mut port := config.port
-	if port == 0 && config.unix_socket_path == '' {
-		port = socket.local_port(socket_fd)
-		if port <= 0 {
-			return error('could not resolve ephemeral port for listener fd ${socket_fd}')
 		}
 	}
 
@@ -291,6 +276,37 @@ pub fn new_server(config ServerConfig) !Server {
 	// from threads.len, so two co-hosted servers can split the cores independently.
 	n_workers := if config.workers > 0 { config.workers } else { max_thread_pool_size }
 
+	// The listeners are opened only now, once the config is valid, so a rejected
+	// config leaves nothing bound. A listener failure (EADDRINUSE, EACCES,
+	// EMFILE…) is returned to the caller after closing every listener already
+	// opened: a leaked SO_REUSEPORT listener would take a share of the port's
+	// connections and never accept them.
+	mut socket_fd := 0
+	$if !windows {
+		if config.unix_socket_path != '' {
+			socket_fd = socket.create_unix_server_socket(config.unix_socket_path)!
+		} else {
+			socket_fd = socket.create_server_socket(config.port)!
+		}
+	} $else {
+		socket_fd = socket.create_server_socket(config.port)!
+	}
+
+	// port: 0 = ephemeral. The kernel picked a free port at bind time; read it back
+	// ONCE so (a) the io_uring per-worker listeners below bind the SAME port and
+	// actually join the SO_REUSEPORT group (each create_server_socket(0) would pick
+	// a DIFFERENT port), and (b) Server.port tells every consumer — tests dialing
+	// back, co-hosted servers, the startup banners — the real port. A UDS
+	// listener has no port; the address is unix_socket_path.
+	mut port := config.port
+	if port == 0 && config.unix_socket_path == '' {
+		port = socket.local_port(socket_fd)
+		if port <= 0 {
+			socket.close_socket(socket_fd)
+			return error('could not resolve ephemeral port for listener fd ${socket_fd}')
+		}
+	}
+
 	// Listeners the server will accept on. The first is always socket_fd. The
 	// io_uring backend is shared-nothing with one SO_REUSEPORT listener PER worker,
 	// so create the rest up front (worker 0 reuses socket_fd): then shutdown() can
@@ -303,7 +319,13 @@ pub fn new_server(config ServerConfig) !Server {
 	$if linux {
 		if io_multiplexing == .io_uring && config.unix_socket_path == '' {
 			for _ in 1 .. n_workers {
-				listener_fds << socket.create_server_socket(port)
+				fd := socket.create_server_socket(port) or {
+					for l in listener_fds {
+						socket.close_socket(l)
+					}
+					return err
+				}
+				listener_fds << fd
 			}
 		}
 	}

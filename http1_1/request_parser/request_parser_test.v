@@ -122,6 +122,61 @@ fn test_get_header_value_slice_empty_value() {
 	assert custom_slice.to_string(req.buffer) == ''
 }
 
+// issue #186: OWS (SP / HTAB) before and after a field value is not part of it
+// (RFC 9112 §5.1, RFC 9110 §5.6.3). Whitespace inside the value stays.
+fn test_get_header_value_slice_trims_ows() {
+	cases := [
+		['Authorization: Bearer x \r\n', 'Authorization', 'Bearer x'],
+		['Content-Type:\tapplication/json\t\r\n', 'Content-Type', 'application/json'],
+		['Origin: https://app.example \t\r\n', 'Origin', 'https://app.example'],
+		['X-List: \t a , b \t \r\n', 'X-List', 'a , b'],
+		['X-Tight:v\r\n', 'X-Tight', 'v'],
+	]
+	for c in cases {
+		req := decode_http_request('GET / HTTP/1.1\r\nHost: h\r\n${c[0]}\r\n'.bytes()) or {
+			panic(err)
+		}
+		v := req.get_header_value_slice(c[1]) or { panic('${c[1]} not found') }
+		assert v.to_string(req.buffer) == c[2], 'raw line ${c[0]}'
+	}
+}
+
+// issue #186: an empty value, with or without OWS, is a zero-length Slice, not none.
+fn test_get_header_value_slice_empty_value_with_ows() {
+	for line in ['X-Empty:\r\n', 'X-Empty: \t \r\n', 'X-Empty:\t\r\n'] {
+		req := decode_http_request('GET / HTTP/1.1\r\nHost: h\r\n${line}\r\n'.bytes()) or {
+			panic(err)
+		}
+		v := req.get_header_value_slice('X-Empty') or { panic('empty value must not be none') }
+		assert v.len == 0
+	}
+}
+
+// issue #186: content_length() reads the value through the same trimmed view.
+fn test_content_length_accessor_trims_ows() {
+	req := decode_http_request('POST / HTTP/1.1\r\nHost: h\r\nContent-Length:\t5 \r\n\r\nhello'.bytes()) or {
+		panic(err)
+	}
+	assert req.content_length() == 5
+}
+
+// issue #186: on bytes that never went through the framer, a value still ends at
+// its own LF: it never contains the LF or the next field line, and
+// get_header_value_slice and count_header walk the same lines. (The server never
+// gets here: the framer answers 400 to a bare LF, see test_frame_bare_lf_rejected.)
+fn test_get_header_value_slice_bounded_by_line() {
+	req :=
+		decode_http_request('GET / HTTP/1.1\r\nHost: a\r\nX-Foo: a\nX-Forwarded-For: 1.2.3.4\r\n\r\n'.bytes()) or {
+			panic(err)
+		}
+	foo := req.get_header_value_slice('X-Foo') or { panic('X-Foo') }
+	assert foo.to_string(req.buffer) == 'a'
+	xff := req.get_header_value_slice('X-Forwarded-For') or { panic('X-Forwarded-For') }
+	assert xff.to_string(req.buffer) == '1.2.3.4'
+	assert req.count_header('X-Forwarded-For') == 1
+	assert req.count_header('X-Foo') == 1
+}
+
 fn test_parse_http1_request_line_multiple_spaces_after_method() {
 	buffer := 'GET   /path HTTP/1.1\r\n'.bytes()
 	mut req := HttpRequest{
@@ -473,6 +528,50 @@ fn test_frame_malformed_content_length() {
 	if _ := frame_request_length(req) {
 		assert false, 'non-numeric Content-Length must error'
 	}
+}
+
+// issue #186: OWS around the Content-Length value is valid (RFC 9112 §5.1 +
+// §6.2) and must frame, not 400. Same for Transfer-Encoding.
+fn test_frame_content_length_with_ows() {
+	for cl in ['Content-Length: 5 ', 'Content-Length:\t5', 'Content-Length: \t5\t ', 'Content-Length:5'] {
+		req := 'POST /x HTTP/1.1\r\nHost: x\r\n${cl}\r\n\r\nhello'.bytes()
+		assert frame_request_length_lim(req, 0, 0)! == req.len, cl
+		assert frame_request_length_lim(req[..req.len - 1], 0, 0)! == -1, cl
+		assert frame_expected_total(req[..req.len - 2]) == req.len, cl
+	}
+	te := 'POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding:\tchunked \r\n\r\n5\r\nhello\r\n0\r\n\r\n'.bytes()
+	assert frame_request_length(te)! == te.len
+	// Only OWS is trimmed: a value that is all OWS is still an empty Content-Length.
+	empty := 'POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: \t \r\n\r\n'.bytes()
+	if _ := frame_request_length(empty) {
+		assert false, 'an all-OWS Content-Length must be rejected'
+	} else {
+		assert err.code() == 400
+	}
+}
+
+// issue #186: a bare LF in the head is answered 400 (RFC 9112 §2.2 lets a
+// recipient choose; rejecting keeps vanilla from seeing a field line that another
+// hop read as part of a value). Covers field lines, the request line and the
+// blank line, and rejects as soon as the bare LF is buffered: not -1 (wait).
+fn test_frame_bare_lf_rejected() {
+	heads := [
+		'GET / HTTP/1.1\r\nHost: a\r\nX-Foo: a\nX-Forwarded-For: 1.2.3.4\r\n\r\n',
+		'GET / HTTP/1.1\nHost: a\r\n\r\n',
+		'GET / HTTP/1.1\r\nHost: a\n\r\n',
+		'GET / HTTP/1.1\r\nHost: a\r\n\nX: b\r\n\r\n',
+		'GET / HTTP/1.1\r\nHost: a\r\nX-Foo: a\nX',
+		'\nGET / HTTP/1.1\r\nHost: a\r\n\r\n',
+		'POST / HTTP/1.1\r\nHost: a\r\nX-Foo: a\nContent-Length: 5\r\n\r\nhello',
+	]
+	for h in heads {
+		got := frame_request_length_lim_idx(h.bytes(), 0, 0)
+		assert got == frame_err_malformed, '${h.replace('\r', '\\r').replace('\n', '\\n')} framed to ${got}'
+	}
+	// frame_expected_total sizes the streamed-body path: it must not frame a
+	// head the framer refuses.
+	big := 'POST / HTTP/1.1\r\nHost: a\r\nX-Foo: a\nContent-Length: 100000\r\n\r\n'.bytes()
+	assert frame_expected_total(big) == -1
 }
 
 // head_expects_100_continue detects `Expect: 100-continue` in a buffered head so

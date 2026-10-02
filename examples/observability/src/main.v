@@ -96,6 +96,7 @@ const resp_healthz = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'.bytes()
 const resp_ready = 'HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nready'.bytes()
 const resp_not_ready_503 = 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n'.bytes()
 const resp_ok_empty = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'.bytes()
+const resp_internal_error_500 = 'HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 const metrics_head = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: '.bytes()
 
 // ---- zero-alloc append helpers (BEST_PRACTICES §3b) -------------------------
@@ -144,11 +145,18 @@ fn slice_eq(buf []u8, s request_parser.Slice, lit string) bool {
 	return true
 }
 
-fn app(req_buffer []u8, mut m Metrics, mut out []u8) ! {
-	req := request_parser.decode_http_request(req_buffer)!
+// app appends the response and returns the next Step. A malformed request is
+// the CLIENT's error: it gets the canned 400 and the connection closes, and
+// the wrapper records the 400 it reads from `out`. The `!` is for the SERVER's
+// failures (a dependency down, a bug), which the wrapper answers with 500.
+fn app(req_buffer []u8, mut m Metrics, mut out []u8) !core.Step {
+	req := request_parser.decode_http_request(req_buffer) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
 	if slice_eq(req.buffer, req.path, '/healthz') {
 		out << resp_healthz
-		return
+		return .done
 	}
 	if slice_eq(req.buffer, req.path, '/readyz') {
 		// Check dependencies here (db ping, etc). Fail -> 503. The not-ready
@@ -157,10 +165,10 @@ fn app(req_buffer []u8, mut m Metrics, mut out []u8) ! {
 		ready := true
 		if ready {
 			out << resp_ready
-			return
+			return .done
 		}
 		out << resp_not_ready_503
-		return
+		return .done
 	}
 	if slice_eq(req.buffer, req.path, '/metrics') {
 		// The one small allocation in this example, on the SCRAPE route only:
@@ -172,11 +180,12 @@ fn app(req_buffer []u8, mut m Metrics, mut out []u8) ! {
 		wi(mut out, i64(body.len))
 		ws(mut out, '\r\n\r\n')
 		out << body
-		return
+		return .done
 	}
 	// Unknown path: this demo answers an empty 200 (kept from day one — a real
 	// service would 404 here).
 	out << resp_ok_empty
+	return .done
 }
 
 // ---- the observability wrapper ----------------------------------------------
@@ -266,33 +275,35 @@ fn log_line(req_buffer []u8, status int, dur_us i64) {
 // observed wraps a handler: access log + metrics around every request. No
 // request decode here — the wrapped handler parses; the log only needs the
 // request-line prefix and the status digits already sitting in `out`. The
-// wrapped `next` stays fallible so the err value reaches the diagnostic log;
-// on failure the wrapper answers the canned 400 and closes (what the old
-// runtime did on a handler error).
-fn observed(next fn (req []u8, mut out []u8) !, mut m Metrics) core.Handler {
+// wrapped `next` stays fallible so the err value reaches the diagnostic log.
+// A failure is the server's fault: any partial response is dropped and the
+// client gets a canned 500 (Connection: close). The status is always read
+// back from the bytes in `out`, so the status the client receives, the one
+// the metrics count, and the one the access log prints are the same.
+fn observed(next fn (req []u8, mut out []u8) !core.Step, mut m Metrics) core.Handler {
 	return fn [next, mut m] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 		start := time.now()
 		start_len := out.len
-		next(req_buffer, mut out) or {
-			m.record(500)
+		step := next(req_buffer, mut out) or {
 			// `${}` is sanctioned off the hot path (BEST_PRACTICES §3):
 			// error diagnostics, not request serving.
 			eprintln('level=error err=${err}')
-			out << response.tiny_bad_request_response
-			return .close
+			out.trim(start_len)
+			out << resp_internal_error_500
+			core.Step.close
 		}
 		status := status_of(out, start_len)
 		m.record(status)
 		dur_us := time.since(start).microseconds()
 		log_line(req_buffer, status, dur_us)
-		return .done
+		return step
 	}
 }
 
 fn main() {
 	mut m := &Metrics{}
-	handler := observed(fn [mut m] (req_buffer []u8, mut out []u8) ! {
-		app(req_buffer, mut m, mut out)!
+	handler := observed(fn [mut m] (req_buffer []u8, mut out []u8) !core.Step {
+		return app(req_buffer, mut m, mut out)!
 	}, mut m)
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
 	mut backend := unsafe { server.IOBackend(0) }
