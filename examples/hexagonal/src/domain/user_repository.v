@@ -5,7 +5,9 @@ pub:
 	id       string
 	username string
 	email    string
-	password string // hashed
+	// argon2id PHC string (`$argon2id$v=19$m=...$<salt>$<hash>`), never the
+	// plaintext. `json: '-'` keeps it out of every response that encodes a User.
+	password_hash string @[json: '-']
 }
 
 pub interface UserRepository {
