@@ -6,6 +6,7 @@ const empty_space = u8(` `)
 // explicit numeric byte values for CR (13) and LF (10).
 const cr_char = u8(13)
 const lf_char = u8(10)
+const htab_char = u8(9)
 const crlf = [u8(13), 10]!
 const double_crlf = [u8(13), 10, 13, 10]!
 
@@ -303,9 +304,25 @@ fn ascii_ci_eq(a &u8, b &u8, len int) bool {
 	return true
 }
 
-// get_header_value_slice returns the value of `name` as a zero-copy Slice.
-// Header field names are CASE-INSENSITIVE (RFC 9110 §5.1), so `Content-Type`,
-// `content-type` and `CONTENT-TYPE` all match.
+// field_line_len returns the length of the field line at line_start whose LF is
+// `lf` bytes in: the bytes before the LF, minus the CR of the CRLF. Every walker
+// in this module splits lines on LF, and the framer answers 400 to a line whose
+// LF is not preceded by CR (bare LF, RFC 9112 §2.2), so on the server path the
+// CR is always there. Dropping it only when present keeps a buffer that never
+// went through the framer (decode_http_request on raw bytes) on the same line
+// boundaries: a value ends at its own LF and never runs into the next line.
+@[direct_array_access; inline]
+fn field_line_len(buf []u8, line_start int, lf int) int {
+	if lf > 0 && buf[line_start + lf - 1] == cr_char {
+		return lf - 1
+	}
+	return lf
+}
+
+// get_header_value_slice returns the value of `name` as a zero-copy Slice,
+// without its leading and trailing OWS (see line_header_value); an empty value
+// is a zero-length Slice, not none. Header field names are CASE-INSENSITIVE
+// (RFC 9110 §5.1), so `Content-Type`, `content-type` and `CONTENT-TYPE` all match.
 @[direct_array_access]
 pub fn (req HttpRequest) get_header_value_slice(name string) ?Slice {
 	if req.header_fields.len <= 0 {
@@ -315,41 +332,27 @@ pub fn (req HttpRequest) get_header_value_slice(name string) ?Slice {
 	mut pos := req.header_fields.start
 
 	for pos <= section_end - 2 {
-		line_start := pos
-		// line_len = bytes before CRLF (the `-1` drops the CR before the LF).
-		line_len := find_byte(&req.buffer[pos], section_end + 2 - pos, lf_char) or { return none } - 1
+		lf := find_byte_idx(&req.buffer[pos], section_end + 2 - pos, lf_char)
+		if lf < 0 {
+			return none
+		}
+		line_len := field_line_len(req.buffer, pos, lf)
 		if line_len <= 0 {
 			return none
 		}
-		next_line := line_start + line_len + 2
-
-		// Name must fit in the line and be followed immediately by ':'.
-		if name.len > line_len || !ascii_ci_eq(&req.buffer[line_start], name.str, name.len)
-			|| req.buffer[line_start + name.len] != colon_u8 {
-			pos = next_line
-			continue
+		if v := line_header_value(req.buffer, pos, line_len, name) {
+			return v
 		}
-
-		// Skip optional whitespace after the colon (RFC 9112 §5).
-		mut vpos := line_start + name.len + 1
-		for vpos < req.buffer.len && req.buffer[vpos] == empty_space {
-			vpos++
-		}
-		mut vend := vpos
-		for vend < req.buffer.len && req.buffer[vend] != cr_char {
-			vend++
-		}
-		return Slice{
-			start: vpos
-			len:   vend - vpos
-		}
+		pos += lf + 1
 	}
 
 	return none
 }
 
 // count_header counts header lines whose name case-insensitively equals `name`.
-// Used by validate_http1 to enforce "exactly one Host" (RFC 9112 §3.2).
+// Used by validate_http1 to enforce "exactly one Host" (RFC 9112 §3.2). Walks
+// the same lines as get_header_value_slice and matches the same ones as
+// line_header_value (name, then ':', inside the line), so the two agree.
 @[direct_array_access]
 pub fn (req HttpRequest) count_header(name string) int {
 	if req.header_fields.len <= 0 {
@@ -359,16 +362,19 @@ pub fn (req HttpRequest) count_header(name string) int {
 	mut pos := req.header_fields.start
 	mut count := 0
 	for pos <= section_end - 2 {
-		line_start := pos
-		line_len := find_byte(&req.buffer[pos], section_end + 2 - pos, lf_char) or { break } - 1
+		lf := find_byte_idx(&req.buffer[pos], section_end + 2 - pos, lf_char)
+		if lf < 0 {
+			break
+		}
+		line_len := field_line_len(req.buffer, pos, lf)
 		if line_len <= 0 {
 			break
 		}
-		if name.len <= line_len && ascii_ci_eq(&req.buffer[line_start], name.str, name.len)
-			&& req.buffer[line_start + name.len] == colon_u8 {
+		if name.len < line_len && ascii_ci_eq(&req.buffer[pos], name.str, name.len)
+			&& req.buffer[pos + name.len] == colon_u8 {
 			count++
 		}
-		pos = line_start + line_len + 2
+		pos += lf + 1
 	}
 	return count
 }
@@ -519,6 +525,16 @@ pub fn frame_request_length_lim_idx(buf []u8, max_header int, max_body int) int 
 	if rl < 0 {
 		return -1
 	}
+	// Bare LF (RFC 9112 §2.2): a recipient MAY take a lone LF as a line break,
+	// but only safely if every parser on the path agrees. The request-line parser
+	// scans to the CR, and a lenient front end may keep the LF inside a value, so
+	// a field line one of them hides inside a value (or the HTTP-version) would
+	// be a separate field here. Answer 400 instead: every LF of the head must be
+	// part of a CRLF. Checked as the walk finds each LF (one compare per line),
+	// so no head with a bare LF ever reaches a handler.
+	if rl == 0 || buf[rl - 1] != cr_char {
+		return frame_err_malformed
+	}
 	mut pos := rl + 1
 
 	// ONE pass over the header lines: locate the blank-line terminator AND
@@ -573,6 +589,11 @@ pub fn frame_request_length_lim_idx(buf []u8, max_header int, max_body int) int 
 		if line_lf < 0 {
 			return -1
 		}
+		// Bare LF, see the request line above. pos always follows an LF, so an
+		// empty line (line_lf == 0) reads that LF here and is rejected too.
+		if buf[pos + line_lf - 1] != cr_char {
+			return frame_err_malformed
+		}
 		line_start := pos
 		line_len := line_lf - 1 // bytes before the CR
 		pos = line_start + line_lf + 1
@@ -613,7 +634,9 @@ pub fn frame_expected_total(buf []u8) int {
 	// allocates a MessageError, which this per-request framer hits on every
 	// incomplete head (and leaks under -gc none). Mirrors frame_request_length_lim.
 	rl := find_byte_idx(&buf[0], buf.len, lf_char)
-	if rl < 0 {
+	// A bare LF is the framer's 400 (see frame_request_length_lim_idx); never
+	// size a streamed body from a head the framer refuses.
+	if rl <= 0 || buf[rl - 1] != cr_char {
 		return -1
 	}
 	mut pos := rl + 1
@@ -636,7 +659,7 @@ pub fn frame_expected_total(buf []u8) int {
 			}
 		}
 		line_lf := find_byte_idx(&buf[pos], buf.len - pos, lf_char)
-		if line_lf < 0 {
+		if line_lf < 0 || buf[pos + line_lf - 1] != cr_char {
 			return -1
 		}
 		line_start := pos
@@ -733,7 +756,12 @@ pub fn (req HttpRequest) content_length() int {
 
 // line_header_value returns the value Slice if a header line (line_len bytes
 // before CRLF, starting at line_start) has the case-insensitive name `name`
-// immediately followed by ':'. Used by the single-pass framer.
+// immediately followed by ':'. The one field-value view: the framer and
+// get_header_value_slice both read values through it.
+//
+// The value excludes the OWS (SP / HTAB, RFC 9110 §5.6.3) before its first and
+// after its last non-whitespace byte (RFC 9112 §5.1), and it is bounded by the
+// line: it can never reach past line_len into the next field line.
 @[direct_array_access; inline]
 fn line_header_value(buf []u8, line_start int, line_len int, name string) ?Slice {
 	if name.len + 1 > line_len {
@@ -742,14 +770,17 @@ fn line_header_value(buf []u8, line_start int, line_len int, name string) ?Slice
 	if !ascii_ci_eq(&buf[line_start], name.str, name.len) || buf[line_start + name.len] != colon_u8 {
 		return none
 	}
-	line_end := line_start + line_len
 	mut v := line_start + name.len + 1
-	for v < line_end && buf[v] == empty_space {
+	mut end := line_start + line_len
+	for v < end && (buf[v] == empty_space || buf[v] == htab_char) {
 		v++
+	}
+	for end > v && (buf[end - 1] == empty_space || buf[end - 1] == htab_char) {
+		end--
 	}
 	return Slice{
 		start: v
-		len:   line_end - v
+		len:   end - v
 	}
 }
 
