@@ -146,18 +146,24 @@ fn test_header_value_empty_with_ows() {
 	}
 }
 
-// On bytes that never went through frame_response, a value still ends at its
-// own LF: it never contains the LF or the next field line, and a lookup never
-// reads past a blank line.
+// A value ends at its own line: it never contains the CR or the next field
+// line. A head with a bare LF does not frame (head_len is err_malformed), so
+// no value is read from it: header_value never sees a field line that another
+// hop reads as part of a value.
 fn test_header_value_bounded_by_line() {
-	buf := 'HTTP/1.1 200 OK\r\nX-Foo: a\nX-Bar: b\r\n\r\n'.bytes()
+	buf := 'HTTP/1.1 200 OK\r\nX-Foo: a\r\nX-Bar: b\r\n\r\n'.bytes()
 	s, l := header_value(buf, 'x-foo')
 	assert buf[s..s + l].bytestr() == 'a'
 	b, bl := header_value(buf, 'x-bar')
 	assert buf[b..b + bl].bytestr() == 'b'
-	past := 'HTTP/1.1 200 OK\r\nX-Foo: a\n\nX-Bar: b\r\n\r\n'.bytes()
-	m, _ := header_value(past, 'x-bar')
-	assert m == -1
+	for bad in ['HTTP/1.1 200 OK\r\nX-Foo: a\nX-Bar: b\r\n\r\n',
+		'HTTP/1.1 200 OK\r\nX-Foo: a\n\nX-Bar: b\r\n\r\n'] {
+		for name in ['x-foo', 'x-bar'] {
+			m, _ := header_value(bad.bytes(), name)
+			assert m == -1, '${name} in ${bad.bytes()}'
+		}
+		assert !is_chunked(bad.bytes())
+	}
 }
 
 // OWS around the Content-Length value is valid (RFC 9112 §5.1 + §6.2) and must
@@ -323,4 +329,65 @@ fn test_chunk_tchar_table() {
 			|| specials.index_u8(b) >= 0
 		assert chunk_tchar(b) == want, 'byte ${c}'
 	}
+}
+
+// The final transfer coding must be chunked (RFC 9112 §6.3): a response whose
+// final coding is anything else is delimited by close, not by chunk frames.
+fn test_frame_te_final_coding() {
+	body := '5\r\nhello\r\n0\r\n\r\n'
+	for te in ['chunked', 'CHUNKED', 'gzip, chunked', 'gzip ,\tchunked', 'gzip,chunked'] {
+		buf := 'HTTP/1.1 200 OK\r\nTransfer-Encoding: ${te}\r\n\r\n${body}'.bytes()
+		assert frame_response(buf) == buf.len, te
+	}
+	for te in ['chunked, gzip', 'xchunked', 'gzip chunked', 'chunked,', 'gzip\r, chunked', 'chunked;q=1'] {
+		buf := 'HTTP/1.1 200 OK\r\nTransfer-Encoding: ${te}\r\n\r\n${body}'.bytes()
+		assert frame_response(buf) == err_malformed, te
+	}
+}
+
+// head_len (which frames HEAD exchanges, and backs body_bounds / append_body)
+// applies the bare-LF policy too, and agrees with frame_response on where the
+// head ends for every response frame_response accepts.
+fn test_head_len_matches_frame_response() {
+	assert head_len('HTTP/1.1 200 OK\r\nX: a\n\nHTTP/1.1 200 OK\r\n\r\n'.bytes()) == err_malformed
+	assert head_len('HTTP/1.1 200 OK\nX: a\r\n\r\n'.bytes()) == err_malformed
+	assert head_len('HTTP/1.1 200 OK\r\nX: a\r\n'.bytes()) == incomplete
+	responses := [
+		'HTTP/1.1 200 OK\r\nContent-Length: 5 \r\nX-A: b\r\r\n\r\nhello',
+		'HTTP/1.1 204 No Content\r\nX-A: b\r\n\r\n',
+		'${chunked_head}5;a=1\r\nhello\r\n0\r\nX-C: d\r\n\r\n',
+	]
+	for r in responses {
+		buf := r.bytes()
+		total := frame_response(buf)
+		assert total == buf.len, r
+		hl := head_len(buf)
+		assert hl == (r.index('\r\n\r\n') or { -1 }) + 4, r
+		start, len := body_bounds(buf, total)
+		if total > hl {
+			assert start == hl && start + len == total, r
+		}
+	}
+	// append_body refuses a head that does not frame.
+	mut out := []u8{}
+	assert !append_body(mut out, 'HTTP/1.1 200 OK\nContent-Length: 2\r\n\r\nok'.bytes(), 36)
+}
+
+// status-line = HTTP-version SP 3DIGIT SP reason-phrase (RFC 9112 §4).
+fn test_status_line_shape() {
+	assert status_code('HTTP/1.1 200 OK\r\n'.bytes()) == 200
+	assert status_code('HTTP/1.0 404 \r\n'.bytes()) == 404
+	assert status_code('HTTP/1.1 200\r\n'.bytes()) == 200
+	assert status_code('HTTP/1.\r 200 OK\r\n'.bytes()) == -1
+	assert status_code('HTTP/1.x 200 OK\r\n'.bytes()) == -1
+	assert status_code('HTTP/1.1 2000 OK\r\n'.bytes()) == -1
+	assert frame_response('HTTP/1.1 2000 OK\r\nContent-Length: 0\r\n\r\n'.bytes()) == err_malformed
+}
+
+// append_body on bytes it is handed without frame_response: junk after the
+// chunk-size is an error, not decoded.
+fn test_append_body_rejects_junk_size() {
+	buf := '${chunked_head}5zz\r\nhello\r\n0\r\n\r\n'.bytes()
+	mut out := []u8{}
+	assert !append_body(mut out, buf, buf.len)
 }

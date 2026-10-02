@@ -71,15 +71,28 @@ pub fn write_get(mut out []u8, target string, host string) {
 }
 
 // head_len returns the byte length of the response head INCLUDING the blank
-// line (i.e. the body offset), or -1 while the head is still incomplete.
+// line (i.e. the body offset), `incomplete` (-1) while the head is still
+// incomplete, or err_malformed for a bare LF. It walks the head LF to LF
+// under the same rules as frame_response (every LF closes a CRLF), so the
+// two always agree on where the head ends, including for a HEAD exchange
+// framed with head_len alone.
 @[direct_array_access]
 pub fn head_len(buf []u8) int {
-	for i := 0; i + 3 < buf.len; i++ {
-		if buf[i] == `\r` && buf[i + 1] == `\n` && buf[i + 2] == `\r` && buf[i + 3] == `\n` {
-			return i + 4
+	mut pos := 0
+	for {
+		lf := lf_idx(buf, pos)
+		if lf < 0 {
+			return incomplete
 		}
+		if lf == 0 || buf[lf - 1] != `\r` {
+			return err_malformed
+		}
+		if lf - 1 == pos && pos > 0 {
+			return lf + 1 // the blank line
+		}
+		pos = lf + 1
 	}
-	return -1
+	return incomplete
 }
 
 // status_code parses the status line ('HTTP/1.x NNN ...') and returns the
@@ -91,11 +104,16 @@ pub fn status_code(buf []u8) int {
 		return -1
 	}
 	if buf[0] != `H` || buf[1] != `T` || buf[2] != `T` || buf[3] != `P` || buf[4] != `/`
-		|| buf[5] != `1` || buf[6] != `.` || buf[8] != ` ` {
+		|| buf[5] != `1` || buf[6] != `.` || buf[7] < `0` || buf[7] > `9` || buf[8] != ` ` {
 		return -1
 	}
 	d0, d1, d2 := buf[9], buf[10], buf[11]
 	if d0 < `1` || d0 > `9` || d1 < `0` || d1 > `9` || d2 < `0` || d2 > `9` {
+		return -1
+	}
+	// status-code is exactly 3 digits, then SP (or the line's CR when an
+	// upstream omits the empty reason-phrase).
+	if buf.len > 12 && buf[12] != ` ` && buf[12] != `\r` {
 		return -1
 	}
 	return int(d0 - `0`) * 100 + int(d1 - `0`) * 10 + int(d2 - `0`)
@@ -259,34 +277,39 @@ pub fn frame_response(buf []u8) int {
 	return int(total)
 }
 
-// value_has_chunked reports whether the Transfer-Encoding value buf[v..end)
-// says (or ends in) 'chunked' — ASCII case-insensitive substring scan. A bare
-// CR makes the value invalid (RFC 9112 §2.2), so the scan stops there.
+// value_has_chunked reports whether the final transfer coding of the
+// Transfer-Encoding value buf[v..end) (the trimmed view) is `chunked` (ASCII
+// case-insensitive): the value is `chunked` or ends in `, chunked` (OWS
+// allowed around the comma). A response whose final coding is not chunked is
+// delimited by connection close (RFC 9112 §6.3), so `chunked, gzip` or
+// `xchunked` must not be framed as chunk frames. A bare CR anywhere in the
+// value makes it invalid (RFC 9112 §2.2).
 @[direct_array_access]
 fn value_has_chunked(buf []u8, v int, end int) bool {
 	needle := 'chunked'
-	mut i := v
-	for i + needle.len <= end {
+	if end - v < needle.len {
+		return false
+	}
+	for i in v .. end {
 		if buf[i] == `\r` {
 			return false
 		}
-		mut ok := true
-		for j in 0 .. needle.len {
-			mut c := buf[i + j]
-			if c >= `A` && c <= `Z` {
-				c += 32
-			}
-			if c != needle[j] {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			return true
-		}
-		i++
 	}
-	return false
+	s := end - needle.len
+	for j in 0 .. needle.len {
+		mut c := buf[s + j]
+		if c >= `A` && c <= `Z` {
+			c += 32
+		}
+		if c != needle[j] {
+			return false
+		}
+	}
+	mut k := s
+	for k > v && (buf[k - 1] == ` ` || buf[k - 1] == `\t`) {
+		k--
+	}
+	return k == v || buf[k - 1] == `,`
 }
 
 @[inline]
@@ -582,20 +605,15 @@ pub fn header_value(buf []u8, name string) (int, int) {
 
 // header_value_from is header_value with the head walk already paid — every
 // path that has `hl` in hand goes through here so the head is scanned once.
+// `hl` comes from head_len, which only returns a length when every line of the
+// head ends in CRLF, so each value ends at its own line's CR and never runs
+// into the next field line (#186).
 @[direct_array_access]
 fn header_value_from(buf []u8, hl int, name string) (int, int) {
 	mut pos := lf_idx(buf, 0) + 1 // past the status line
 	for pos > 0 && pos < hl - 2 {
 		lf := lf_idx(buf, pos)
-		// Lines split on LF, minus the CR of the CRLF when present. On a head
-		// frame_response accepted it always is (a bare LF is err_malformed);
-		// on bytes that never went through it, a value still ends at its own
-		// LF and never runs into the next field line (#186).
-		end := if buf[lf - 1] == `\r` { lf - 1 } else { lf }
-		if end == pos {
-			break // a blank line ends the head
-		}
-		s, l := field_value(buf, pos, end, name)
+		s, l := field_value(buf, pos, lf - 1, name)
 		if s >= 0 {
 			return s, l
 		}
@@ -612,7 +630,10 @@ fn header_value_from(buf []u8, hl int, name string) (int, int) {
 pub fn append_body(mut out []u8, buf []u8, total int) bool {
 	// One head walk serves the bounds AND the framing question.
 	hl := head_len(buf)
-	if hl < 0 || total <= hl {
+	if hl < 0 {
+		return false // not a framed response
+	}
+	if total <= hl {
 		return true // no body
 	}
 	start := hl
@@ -640,8 +661,9 @@ pub fn append_body(mut out []u8, buf []u8, total int) bool {
 			}
 			j++
 		}
-		if j == pos {
-			return false // no chunk-size
+		if j == pos || j >= total
+			|| (buf[j] != `\r` && buf[j] != `;` && buf[j] != ` ` && buf[j] != `\t`) {
+			return false // no chunk-size, or junk after it
 		}
 		for j < total && buf[j] != `\r` {
 			j++
