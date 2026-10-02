@@ -239,7 +239,7 @@ jobs:
         run: |
           v -cc gcc -no-parallel -d vanilla_tls test tests/tls_static_test.v
       # -gc none frees nothing, so a per-request allocation on either path
-      # shows as RSS growth (the leak case only measures in this build).
+      # shows as heap growth (the leak case only measures in this build).
       - name: TLS static files e2e under -gc none
         shell: bash
         env:

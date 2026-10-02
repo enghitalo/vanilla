@@ -40,13 +40,21 @@ import vtest
 
 #include <netinet/tcp.h>
 #include <signal.h>
+#include <malloc.h>
 
 struct C.linger {
 	l_onoff  int
 	l_linger int
 }
 
+// glibc's malloc statistics: only the fields ts_heap_bytes reads.
+struct C.mallinfo2 {
+	uordblks usize // bytes in chunks in use, over every arena
+	hblkhd   usize // bytes in chunks mmapped on their own
+}
+
 fn C.signal(sig int, handler voidptr) voidptr
+fn C.mallinfo2() C.mallinfo2
 
 // static_assets serves bodies of at least one TLS record (16 KiB) with
 // sendfile(2) where it can: the size HttpArena configures.
@@ -74,12 +82,17 @@ const ts_ulp_req = 'GET /ulp HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 const ts_ulp_head = 'HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: keep-alive\r\n\r\n'.bytes()
 const ts_bad_request = 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 // Requests in the leak case, after a warm-up that takes every buffer to its
-// high-water mark. The bound catches a leak of about 100 bytes per request (a
-// 47 KiB copy would be about 235 MB); the measured growth is 0 under -gc none
-// and at most 24 KiB under -race.
+// high-water mark. It measures heap bytes (ts_heap_bytes), not RSS: where
+// transparent huge pages are "always" (GitHub's ubuntu-24.04 runners), RSS
+// rises in 2 MiB steps with no allocation at all (khugepaged collapsing a
+// range, or a huge page faulted in). Measured as RSS, this case failed there
+// with 541 to 552 pages, one huge page plus a few dozen, reported as about
+// 450 B/request. The heap growth is 0 on both paths; one allocation per
+// request would add at least a 32-byte chunk each, 160 KB, well above the
+// bound.
 const ts_leak_requests = 5000
 const ts_leak_warmup = 200
-const ts_leak_max_growth = i64(512 * 1024)
+const ts_leak_max_growth = i64(64 * 1024)
 // Hang backstop for the openssl client only (see the header).
 const ts_backstop = time.Duration(5 * time.second)
 // Every exchange below completes in milliseconds on loopback (the slow
@@ -540,18 +553,13 @@ fn ts_slow_reader(c &openssl.SSLConn) {
 	C.setsockopt(c.handle, C.SOL_SOCKET, C.SO_RCVBUF, &v, sizeof(v))
 }
 
-// ts_rss is this process's resident set size in bytes (VmRSS), or -1.
-fn ts_rss() i64 {
-	status := os.read_file('/proc/self/status') or { return -1 }
-	for line in status.split_into_lines() {
-		if line.starts_with('VmRSS:') {
-			f := line.fields()
-			if f.len >= 2 {
-				return f[1].i64() * 1024 // kB
-			}
-		}
-	}
-	return -1
+// ts_heap_bytes is how many bytes malloc has handed out and not had back, over
+// every thread's arena. Under -gc none every V allocation is a malloc that is
+// never freed. It counts bytes, not pages, so memory that was not allocated
+// (a huge page, an arena trimmed and touched again) does not move it.
+fn ts_heap_bytes() i64 {
+	mi := C.mallinfo2()
+	return i64(mi.uordblks) + i64(mi.hblkhd)
 }
 
 // ts_drain sends `count` requests one after another, alternating between the
@@ -984,13 +992,15 @@ fn check_mixed_routes(ktls bool) ! {
 }
 
 // No allocation per request on either path: under -gc none (nothing is ever
-// freed) the process's RSS grows less than ts_leak_max_growth over
-// ts_leak_requests requests for a 47 KiB body, alternating the in-memory and
-// the disk-backed mount. The client reads into one buffer, so the growth is
-// the server's.
+// freed) the heap grows less than ts_leak_max_growth over ts_leak_requests
+// requests for a 47 KiB body, alternating the in-memory and the disk-backed
+// mount. The client reads into one buffer, so the growth is the server's.
 fn check_no_leak(ktls bool) ! {
 	$if gcboehm ? {
-		return // a collector hides a per-request allocation from RSS
+		return // a collector frees a per-request allocation
+	}
+	$if race ? {
+		return // ThreadSanitizer's allocator replaces malloc, and mallinfo2 does not see it
 	}
 	mut fx := ts_fixture('leak', false)!
 	defer {
@@ -1012,12 +1022,11 @@ fn check_no_leak(ktls bool) ! {
 	lens := [want0.len, ts_expect(fx, reqs[1])!.len]
 	mut buf := []u8{len: 64 * 1024}
 	warm := ts_drain(mut c, reqs, lens, ts_leak_warmup, mut buf)
-	rss0 := ts_rss()
+	heap0 := ts_heap_bytes()
 	done := ts_drain(mut c, reqs, lens, ts_leak_requests, mut buf)
-	rss1 := ts_rss()
+	growth := ts_heap_bytes() - heap0
 	assert warm == ts_leak_warmup && done == ts_leak_requests, 'ktls=${ktls}: ${warm}/${ts_leak_warmup} warm-up and ${done}/${ts_leak_requests} measured answers arrived whole'
-	growth := rss1 - rss0
-	assert rss0 > 0 && growth < ts_leak_max_growth, 'ktls=${ktls}: RSS grew ${growth} bytes over ${ts_leak_requests} requests (${growth / ts_leak_requests} B/request)'
+	assert heap0 > 0 && growth < ts_leak_max_growth, 'ktls=${ktls}: the heap grew ${growth} bytes over ${ts_leak_requests} requests (${growth / ts_leak_requests} B/request)'
 	assert ts_same(ts_exchange(mut c, reqs[0], want0.len), want0), 'ktls=${ktls}: still byte-exact after the run'
 	handed_ok, handed_why := ts_handoffs_ok(fx, ktls)
 	assert handed_ok, handed_why
