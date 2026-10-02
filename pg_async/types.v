@@ -1,6 +1,7 @@
 module pg_async
 
 import encoding.binary
+import math
 import time
 
 // Binary (network byte order) decoders for PostgreSQL result columns.
@@ -27,6 +28,8 @@ pub const oid_int4 = u32(23)
 pub const oid_text = u32(25)
 pub const oid_float4 = u32(700)
 pub const oid_float8 = u32(701)
+pub const oid_name = u32(19)
+pub const oid_bpchar = u32(1042)
 pub const oid_varchar = u32(1043)
 pub const oid_date = u32(1082)
 pub const oid_timestamp = u32(1114)
@@ -71,6 +74,7 @@ const err_numeric_range = error('pg: numeric: out of i64 range at this scale')
 const err_array_malformed = error('pg: array: malformed value')
 const err_array_dims = error('pg: array: only one-dimensional arrays are supported')
 const err_array_null = error('pg: array: NULL element (read it with Row.array_iter)')
+const err_array_elem_type = error('pg: array: element type does not match the accessor')
 
 @[inline]
 pub fn decode_int2(b []u8) !i16 {
@@ -109,8 +113,7 @@ pub fn decode_float4(b []u8) !f32 {
 	if b.len != 4 {
 		return err_float4_width
 	}
-	bits := binary.big_endian_u32(b)
-	return unsafe { *(&f32(&bits)) }
+	return math.f32_from_bits(binary.big_endian_u32(b))
 }
 
 @[inline]
@@ -118,8 +121,7 @@ pub fn decode_float8(b []u8) !f64 {
 	if b.len != 8 {
 		return err_float8_width
 	}
-	bits := binary.big_endian_u64(b)
-	return unsafe { *(&f64(&bits)) }
+	return math.f64_from_bits(binary.big_endian_u64(b))
 }
 
 // decode_text returns the bytes as-is (PG text / varchar / numeric-as-text, and

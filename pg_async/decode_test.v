@@ -305,6 +305,38 @@ fn test_an_array_with_a_null_needs_array_iter() {
 	assert decode_int4(second.bytes)! == 1
 }
 
+fn test_array_helpers_append_all_or_nothing_and_check_the_element_type() {
+	r := row_with([
+		?[]u8(hex('00000001 00000001 00000017 00000003 00000001 00000004 00000001 ffffffff 00000004 00000003'))
+		?[]u8(hex('00000001 00000000 000002bc 00000002 00000001 00000004 3fc00000 00000004 40200000'))
+		?[]u8(hex(text_array_ab)),
+	])
+	// int4[] {1, NULL, 3}: an error, and the buffer keeps only what it had.
+	mut ints := [i32(42)]
+	if _ := r.int4_array_into(0, mut ints) {
+		assert false, 'int4[] with a NULL' + ': must be rejected'
+	}
+	assert ints == [i32(42)], 'nothing is appended on an error'
+	// float4[] {1.5, 2.5}: 4-byte elements, but not int4 (nor text).
+	if _ := r.int4_array_into(1, mut ints) {
+		assert false, 'float4[] as int4[]' + ': must be rejected'
+	}
+	assert ints.len == 1
+	mut texts := [][]u8{}
+	if _ := r.text_array_into(1, mut texts) {
+		assert false, 'float4[] as text[]' + ': must be rejected'
+	}
+	assert texts.len == 0
+	// text[] {a, b}: views into the row, not copies.
+	r.text_array_into(2, mut texts)!
+	assert texts.len == 2 && texts[0].bytestr() == 'a' && texts[1].bytestr() == 'b'
+	lo := usize(r.payload.data)
+	hi := lo + usize(r.payload.len)
+	for t in texts {
+		assert usize(t.data) >= lo && usize(t.data) < hi, 'a view into the row'
+	}
+}
+
 // row_description builds a RowDescription payload for (name, type OID) pairs.
 fn row_description(fields []string, oids []u32) []u8 {
 	mut p := []u8{}
@@ -418,7 +450,11 @@ fn test_decoding_allocates_nothing() {
 	}
 	short := []u8{len: 3}
 	null_row := row_with([?[]u8(none)])
+	arr_row := row_with([?[]u8(hex(int4_array_79)), ?[]u8(hex(text_array_ab))])
+	seeds := decode_seeds()
 	mut out := []u8{cap: 256}
+	mut ints := []i32{cap: 16}
+	mut texts := [][]u8{cap: 16}
 	mut sink := i64(0)
 	before := gc_heap_usage().bytes_since_gc
 	for _ in 0 .. 20_000 {
@@ -443,10 +479,47 @@ fn test_decoding_allocates_nothing() {
 		sink += bad[0]
 		sink += i64(null_row.int4(0) or { -1 })
 		sink += decode_numeric_i64_scaled(num, 0) or { -1 }
+		ints.clear()
+		arr_row.int4_array_into(0, mut ints) or { panic(err) }
+		texts.clear()
+		arr_row.text_array_into(1, mut texts) or { panic(err) }
+		sink += ints[1] + texts.len
+		// A caller-side walk, appending with push_many (BEST_PRACTICES §5).
+		mut walk := arr_row.array_iter(1) or { panic(err) }
+		for {
+			v := walk.next() or { break }
+			unsafe { out.push_many(v.bytes.data, v.bytes.len) }
+		}
+	}
+	// And every decoder and accessor, over one encoding of each input.
+	for seed in seeds {
+		sink += decode_everything(seed, mut out, mut ints, mut texts)
 	}
 	after := gc_heap_usage().bytes_since_gc
 	assert sink != 0
 	assert after == before, '${after - before} bytes allocated'
+}
+
+// int4[] {7, 9} and text[] {a, b}, as PostgreSQL sends them.
+const int4_array_79 = '00000001 00000000 00000017 00000002 00000001 00000004 00000007 00000004 00000009'
+
+const text_array_ab = '00000001 00000000 00000019 00000002 00000001 00000001 61 00000001 62'
+
+// decode_seeds is one valid encoding of everything the decoders read: the
+// mutation test's starting points, and the allocation test's inputs.
+fn decode_seeds() [][]u8 {
+	return [
+		hex('c7e5b8ff8279457ca557cba06320423b'),
+		hex('0002ffcca45c5431'),
+		hex('0000262a'),
+		hex('0003 0001 4000 0004 04d2 162e 2328'),
+		hex('0002 fffe 0000 0006 0004 0bb8'),
+		hex(text_array_ab),
+		hex('00000001 00000001 00000017 00000003 00000001 00000004 00000001 ffffffff 00000004 00000003'),
+		row_description(['id', 'name'], [oid_int4, oid_text]),
+		data_row([?[]u8(hex('00000001')), none, ?[]u8(hex('0003 0001 4000 0004 04d2 162e 2328'))]),
+		data_row([?[]u8(hex(int4_array_79)), ?[]u8(hex(text_array_ab))]),
+	]
 }
 
 // decode_everything runs every decoder, RowDescription reader and Row
@@ -517,17 +590,7 @@ fn decode_everything(b []u8, mut out []u8, mut ints []i32, mut texts [][]u8) i64
 // length, so under AddressSanitizer a read past the end aborts the test
 // (pg_async.yml: "The decoders under AddressSanitizer").
 fn test_mutated_values_are_rejected_or_decoded_in_bounds() {
-	seeds := [
-		hex('c7e5b8ff8279457ca557cba06320423b'),
-		hex('0002ffcca45c5431'),
-		hex('0000262a'),
-		hex('0003 0001 4000 0004 04d2 162e 2328'),
-		hex('0002 fffe 0000 0006 0004 0bb8'),
-		hex('00000001 00000000 00000019 00000002 00000001 00000001 61 00000001 62'),
-		hex('00000001 00000001 00000017 00000003 00000001 00000004 00000001 ffffffff 00000004 00000003'),
-		row_description(['id', 'name'], [oid_int4, oid_text]),
-		data_row([?[]u8(hex('00000001')), none, ?[]u8(hex('0003 0001 4000 0004 04d2 162e 2328'))]),
-	]
+	seeds := decode_seeds()
 	mut x := u64(0x9e37_79b9_7f4a_7c15) // xorshift64: the same cases every run
 	mut out := []u8{cap: 256}
 	mut ints := []i32{cap: 16}

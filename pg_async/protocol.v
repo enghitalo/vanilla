@@ -334,29 +334,54 @@ pub fn (r Row) array_iter(i int) !ArrayIter {
 }
 
 // int4_array_into appends an int4[] column's elements to `out`. A NULL
-// element is an error (walk such arrays with array_iter).
+// element, or another element type, is an error, and then nothing is appended
+// (walk such arrays with array_iter).
+@[direct_array_access]
 pub fn (r Row) int4_array_into(i int, mut out []i32) ! {
-	mut it := r.array_iter(i)!
-	for {
-		v := it.next() or { break }
-		if v.is_null {
-			return err_array_null
+	arr := r.array_iter(i)!
+	if arr.elem_oid != oid_int4 {
+		return err_array_elem_type
+	}
+	// A walk over the checked elements, not arr.next(): appending what a `mut`
+	// iterator yields makes V move the iterator to the heap on every call.
+	start := out.len
+	mut pos := arr.pos
+	for _ in 0 .. arr.left {
+		n := int(i32(binary.big_endian_u32_at(arr.buf, pos)))
+		pos += 4
+		if n != 4 {
+			out.trim(start)
+			return if n < 0 { err_array_null } else { err_int4_width }
 		}
-		out << decode_int4(v.bytes)!
+		out << i32(binary.big_endian_u32_at(arr.buf, pos))
+		pos += 4
 	}
 }
 
-// text_array_into appends a text[] column's elements to `out`, as views that
-// borrow the receive buffer. A NULL element is an error (walk such arrays with
-// array_iter).
+// text_array_into appends a text[] (or varchar[], bpchar[], name[]) column's
+// elements to `out`, as views that borrow the receive buffer. A NULL element,
+// or another element type, is an error, and then nothing is appended (walk
+// such arrays with array_iter).
+@[direct_array_access]
 pub fn (r Row) text_array_into(i int, mut out [][]u8) ! {
-	mut it := r.array_iter(i)!
-	for {
-		v := it.next() or { break }
-		if v.is_null {
+	arr := r.array_iter(i)!
+	if arr.elem_oid != oid_text && arr.elem_oid != oid_varchar && arr.elem_oid != oid_bpchar
+		&& arr.elem_oid != oid_name {
+		return err_array_elem_type
+	}
+	start := out.len
+	mut pos := arr.pos
+	for _ in 0 .. arr.left {
+		n := int(i32(binary.big_endian_u32_at(arr.buf, pos)))
+		pos += 4
+		if n < 0 {
+			out.trim(start)
 			return err_array_null
 		}
-		out << v.bytes
+		view := unsafe { (&u8(arr.buf.data) + pos).vbytes(n) }
+		// push_many, not `out << view`: appending an array element clones it.
+		unsafe { out.push_many(&view, 1) }
+		pos += n
 	}
 }
 
@@ -392,23 +417,19 @@ pub fn (c Columns) len() int {
 // statement that returns no rows, e.g. an INSERT without RETURNING).
 @[direct_array_access]
 pub fn (res &Result) columns() !Columns {
-	// A plain scan, not a FrameIter: a `mut` iterator whose bytes the result
-	// borrows is moved to the heap by V's escape analysis, one allocation per
-	// call.
+	// next_message_at, not a FrameIter: a `mut` iterator whose bytes the
+	// result borrows is moved to the heap by V's escape analysis, one
+	// allocation per call.
 	mut pos := 0
-	for res.frames.len - pos >= 5 {
-		total := 1 + int(binary.big_endian_u32_at(res.frames, pos + 1))
-		if total < 5 || total > res.frames.len - pos {
-			break
+	for {
+		hdr := next_message_at(res.frames, pos) or { break }
+		if hdr.typ == bt_row_description {
+			return columns_from(unsafe { (&u8(res.frames.data) + pos + 5).vbytes(hdr.total - 5) })
 		}
-		typ := res.frames[pos]
-		if typ == bt_row_description {
-			return columns_from(unsafe { (&u8(res.frames.data) + pos + 5).vbytes(total - 5) })
-		}
-		if typ == bt_data_row {
+		if hdr.typ == bt_data_row {
 			break // RowDescription precedes the rows
 		}
-		pos += total
+		pos += hdr.total
 	}
 	return Columns{}
 }
@@ -471,14 +492,13 @@ pub fn (c Columns) name(i int) ![]u8 {
 		return err_columns_range
 	}
 	start := c.field_start(i)
-	mut end := start
-	for c.payload[end] != 0 {
-		end++
-	}
-	return unsafe { (&u8(c.payload.data) + start).vbytes(end - start) }
+	// field_end is past the name's NUL and the 18 bytes after it.
+	return unsafe { (&u8(c.payload.data) + start).vbytes(field_end(c.payload, start) - 19 - start) }
 }
 
-// type_oid returns column i's type OID (oid_int4, oid_uuid, ...).
+// type_oid returns column i's type OID (oid_int4, oid_uuid, ...). It walks
+// the fields before column i: checking a few columns once per result is cheap,
+// checking all of them costs O(n²) field steps.
 @[direct_array_access]
 pub fn (c Columns) type_oid(i int) !u32 {
 	if i < 0 || i >= c.n {
