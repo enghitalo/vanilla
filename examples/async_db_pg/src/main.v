@@ -68,6 +68,15 @@ fn build_pool() voidptr {
 	})
 }
 
+// start_maintenance runs the pool's maintenance timer on this worker: a
+// connection the server closes while idle (restart, idle timeout, a managed
+// database's connection lifetime) is found within ~1 s and re-dialed before a
+// request meets it, instead of failing the next query on it.
+fn start_maintenance(worker_state voidptr, mut event_loop core.EventLoop) {
+	mut st := unsafe { &DbState(worker_state) }
+	st.pool.start_maintenance(mut event_loop) or { eprintln('async_db_pg: ${err}') }
+}
+
 fn targets_db(req []u8) bool {
 	return req.bytestr().contains(' /db') // crude routing — fine for a demo
 }
@@ -228,9 +237,10 @@ fn hex_digit(n u8) u8 {
 
 fn main() {
 	mut s := server.new_server(server.ServerConfig{
-		port:       8099
-		handler:    handler
-		make_state: build_pool
+		port:            8099
+		handler:         handler
+		make_state:      build_pool
+		on_worker_start: start_maintenance
 	})!
 	println('async_db_pg listening on http://localhost:8099/ (GET /db, GET /health)')
 	s.run()
