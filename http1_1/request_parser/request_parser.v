@@ -526,7 +526,8 @@ pub fn frame_request_length_lim_idx(buf []u8, max_header int, max_body int) int 
 	// scans here measurably regressed the hot path — keep it to a single walk
 	// with a cheap per-line reject.)
 	mut content_length := -1
-	mut chunked := false
+	mut chunked := false // chunked is the FINAL coding of the Transfer-Encoding list
+	mut te_seen := false // any Transfer-Encoding line, whatever its codings
 	for {
 		// Cap the head size so a hostile peer can't grow it without bound.
 		if max_header > 0 && pos > max_header {
@@ -548,7 +549,15 @@ pub fn frame_request_length_lim_idx(buf []u8, max_header int, max_body int) int 
 				// of letting the chunked framer run: with a non-chunked body it would
 				// return -1 (incomplete) forever and stall the connection until the
 				// read timeout, never surfacing the 400 (issue #104).
-				if chunked && content_length >= 0 {
+				//
+				// Any Transfer-Encoding decides the framing, not only chunked
+				// (issue #184): with Content-Length it is the same ambiguity; when
+				// chunked is not the final coding the length cannot be determined,
+				// so the server MUST answer 400 and close (§6.3); and an HTTP/1.0
+				// message carrying it MUST be treated as faulty framing (§6.1).
+				// Framing `Transfer-Encoding: gzip` as bodyless parsed its body as
+				// the next request. Cold: te_seen is false on the hot path.
+				if te_seen && (!chunked || content_length >= 0 || request_line_is_http10(buf, rl)) {
 					return frame_err_malformed
 				}
 				if chunked {
@@ -579,18 +588,94 @@ pub fn frame_request_length_lim_idx(buf []u8, max_header int, max_body int) int 
 
 		// Cheap checks: both reject at byte 0 for the vast majority of headers.
 		if v := line_header_value(buf, line_start, line_len, 'Content-Length') {
-			content_length = parse_content_length(buf, v) or { return frame_err_malformed }
+			if v.len < 0 {
+				return frame_err_malformed // whitespace before the colon
+			}
+			n := parse_content_length(buf, v) or { return frame_err_malformed }
+			// Repeated Content-Length lines with differing values are invalid
+			// framing: 400 + close (RFC 9112 §6.3). An identical repeat MAY be
+			// accepted (RFC 9110 §8.6). Either way the length framed is the
+			// FIRST one, the one content_length() reads (issue #184).
+			if content_length >= 0 && n != content_length {
+				return frame_err_malformed
+			}
+			content_length = n
 			// Reject an over-large body from the declared length, BEFORE buffering it.
 			if max_body > 0 && content_length > max_body {
 				return frame_err_body
 			}
 		} else if v := line_header_value(buf, line_start, line_len, 'Transfer-Encoding') {
-			if ci_contains(buf, v, 'chunked') {
-				chunked = true
+			if v.len < 0 {
+				return frame_err_malformed // whitespace before the colon
 			}
+			te_seen = true
+			r := te_fold(buf, v, chunked)
+			if r < 0 {
+				return frame_err_malformed
+			}
+			chunked = r == 1
 		}
 	}
 	return -1
+}
+
+// te_fold folds one Transfer-Encoding field value into the framer's running
+// coding list (repeated field lines form ONE comma-separated list, RFC 9110
+// §5.3). It returns 1 when chunked is now the final coding, 0 when it is not,
+// and -1 when a coding follows chunked: chunked not final, or applied twice,
+// which RFC 9112 §6.1 forbids (§6.3: 400 + close). Codings are whole tokens,
+// compared case-insensitively with the OWS around commas and empty list
+// elements skipped. Never a substring test: `xchunked` is not chunked. A line
+// that names no coding at all is -1 too: hops disagree on whether an empty
+// Transfer-Encoding cancels the framing. Cold: runs only on such a line, and
+// noinline keeps the list walk out of the framer's per-line loop (inlined, it
+// measurably slowed the Content-Length path).
+@[direct_array_access; noinline]
+fn te_fold(buf []u8, v Slice, chunked bool) int {
+	// The value nearly every chunked request carries: one compare, no list walk.
+	if !chunked && v.len == 7 && ascii_ci_eq(&buf[v.start], c'chunked', 7) {
+		return 1
+	}
+	mut last_chunked := chunked
+	mut codings := 0
+	end := v.start + v.len
+	mut i := v.start
+	for i < end {
+		c := buf[i]
+		if c == `,` || c == empty_space || c == u8(9) {
+			i++
+			continue
+		}
+		start := i
+		for i < end && buf[i] != `,` {
+			i++
+		}
+		// Trim trailing OWS; buf[start] is neither OWS nor ',', so this stops there.
+		mut stop := i
+		for buf[stop - 1] == empty_space || buf[stop - 1] == u8(9) {
+			stop--
+		}
+		if last_chunked {
+			return -1
+		}
+		last_chunked = stop - start == 7 && ascii_ci_eq(&buf[start], c'chunked', 7)
+		codings++
+	}
+	if codings == 0 {
+		return -1
+	}
+	return if last_chunked { 1 } else { 0 }
+}
+
+// request_line_is_http10 reports whether the request line whose LF is at `rl`
+// ends in ` HTTP/1.0` (the version is case-sensitive, RFC 9112 §2.3). Cold:
+// the framer asks only once it has seen a Transfer-Encoding line. The minor
+// digit goes first, so an HTTP/1.1 chunked request pays one byte compare.
+@[direct_array_access; noinline]
+fn request_line_is_http10(buf []u8, rl int) bool {
+	end := if rl > 0 && buf[rl - 1] == cr_char { rl - 1 } else { rl }
+	return end >= 9 && buf[end - 1] == `0` && buf[end - 9] == empty_space
+		&& unsafe { C.memcmp(&buf[end - 8], c'HTTP/1.0', 8) } == 0
 }
 
 // frame_expected_total returns the full HTTP/1.1 message length (headers + body)
@@ -725,7 +810,9 @@ pub fn head_expects_100_continue(buf []u8, head_len int) bool {
 
 // content_length returns the request's Content-Length header value, or -1 if it
 // is absent or unparseable. Lets a handler answer by declared length even when
-// the engine drained (never buffered) the body.
+// the engine drained (never buffered) the body. It reads the FIRST field line;
+// the framer refuses differing repeats (400), so on a request the server framed
+// this is the length the body was framed by.
 pub fn (req HttpRequest) content_length() int {
 	s := req.get_header_value_slice('Content-Length') or { return -1 }
 	return parse_content_length(req.buffer, s) or { -1 }
@@ -734,12 +821,27 @@ pub fn (req HttpRequest) content_length() int {
 // line_header_value returns the value Slice if a header line (line_len bytes
 // before CRLF, starting at line_start) has the case-insensitive name `name`
 // immediately followed by ':'. Used by the single-pass framer.
+// A Slice with len -1 means `name` is followed by SP/HTAB: malformed, and
+// refused by every consumer (parse_content_length errors, te_fold finds no
+// coding, ci_contains no match).
 @[direct_array_access; inline]
 fn line_header_value(buf []u8, line_start int, line_len int, name string) ?Slice {
 	if name.len + 1 > line_len {
 		return none
 	}
-	if !ascii_ci_eq(&buf[line_start], name.str, name.len) || buf[line_start + name.len] != colon_u8 {
+	if !ascii_ci_eq(&buf[line_start], name.str, name.len) {
+		return none
+	}
+	if buf[line_start + name.len] != colon_u8 {
+		// `Content-Length : 5` / `Transfer-Encoding\t: chunked`: RFC 9112 §5.1
+		// says a server MUST reject whitespace before the colon with 400, since
+		// one hop reads the field and another ignores it. Treating the line as
+		// absent framed the body as the next request (issue #184), so report it
+		// (len -1) for the framer to refuse. Only reached once the name matched.
+		after := buf[line_start + name.len]
+		if after == empty_space || after == u8(9) {
+			return Slice{line_start, -1}
+		}
 		return none
 	}
 	line_end := line_start + line_len
@@ -762,8 +864,8 @@ fn line_header_value(buf []u8, line_start int, line_len int, name string) ?Slice
 const max_declared = 1 << 30
 
 fn parse_content_length(buf []u8, s Slice) !int {
-	if s.len == 0 {
-		return error('empty Content-Length')
+	if s.len <= 0 {
+		return error('empty Content-Length') // or a malformed line: line_header_value
 	}
 	// Accumulate in i64 so the arithmetic can't wrap a 32-bit int; reject over the
 	// cap. A 32-bit accumulator let a Content-Length of 2147483648 wrap to < 0, so

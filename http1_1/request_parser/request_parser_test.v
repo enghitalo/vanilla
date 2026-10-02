@@ -407,6 +407,122 @@ fn test_frame_cl_te_conflict_rejected() {
 	}
 }
 
+// issue #184: framings that hops can resolve differently must be REJECTED by
+// the framer (400 + close), never resolved on its own: a non-chunked or
+// obfuscated Transfer-Encoding framed as bodyless served the body as a second
+// request; differing Content-Lengths framed by the last value while
+// content_length() read the first; whitespace before the colon hid the field.
+const ambiguous_heads = [
+	// Transfer-Encoding whose final coding is not chunked (RFC 9112 §6.3).
+	'POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n',
+	'POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: identity\r\n\r\n',
+	'POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: nonsense\r\n\r\n',
+	'POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding:\r\n\r\n',
+	'POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, gzip\r\n\r\n',
+	'POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: xchunked\r\n\r\n',
+	'POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunkedx\r\n\r\n',
+	'POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked;x=1\r\n\r\n',
+	'POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n\r\n',
+	// A Transfer-Encoding line naming no coding: does it cancel the chunked?
+	'POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: \r\n\r\n',
+	'POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: ,\r\n\r\n',
+	// chunked applied twice (RFC 9112 §6.1), in one line or across two.
+	'POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, chunked\r\n\r\n',
+	'POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n',
+	// Any Transfer-Encoding with Content-Length, not only chunked (§6.1, §6.3).
+	'POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\nContent-Length: 5\r\n\r\n',
+	'POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nTransfer-Encoding: gzip, chunked\r\n\r\n',
+	// Transfer-Encoding on HTTP/1.0 is faulty framing (RFC 9112 §6.1).
+	'POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n',
+	'POST / HTTP/1.0\r\nHost: a\r\nTransfer-Encoding: gzip, chunked\r\n\r\n',
+	// Whitespace between the field-name and the colon (RFC 9112 §5.1).
+	'POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding : chunked\r\n\r\n',
+	'POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding\t: chunked\r\n\r\n',
+	'POST / HTTP/1.1\r\nHost: a\r\nContent-Length : 5\r\n\r\n',
+	'POST / HTTP/1.1\r\nHost: a\r\ncontent-length\t: 5\r\n\r\n',
+	'POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length : 5\r\n\r\n',
+	// Repeated Content-Length with differing values, in either order (§6.3).
+	'POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\nContent-Length: 5\r\n\r\n',
+	'POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 0\r\n\r\n',
+	'POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\ncontent-length: 6\r\n\r\n',
+]
+
+fn test_frame_ambiguous_framing_rejected() {
+	for head in ambiguous_heads {
+		// The head alone is enough: the verdict must not wait for body bytes
+		// (waiting would stall the connection, the #104 failure mode).
+		req := head.bytes()
+		if got := frame_request_length(req) {
+			assert false, 'must be rejected, framed to ${got}: ${head}'
+		} else {
+			assert err.code() == 400, 'must map to 400, got ${err.code()}: ${head}'
+		}
+		assert frame_request_length_lim_idx(req, 0, 0) == -400, head
+		// A body (or a pipelined request after it) changes nothing.
+		with_body := (head + '5\r\nhello\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: a\r\n\r\n').bytes()
+		assert frame_request_length_lim_idx(with_body, 0, 0) == -400, head
+		// No split point may ever frame the message as complete.
+		for split in 1 .. with_body.len {
+			r := frame_request_length_lim_idx(with_body[..split], 0, 0)
+			assert r == -1 || r == -400, 'prefix ${split} framed to ${r}: ${head}'
+		}
+	}
+}
+
+// The token-list reading must not reject what RFC 9112 accepts: chunked as the
+// final coding, matched case-insensitively, with OWS around commas, empty list
+// elements, and the codings spread over several field lines.
+fn test_frame_transfer_encoding_list_accepted() {
+	body := '5\r\nhello\r\n0\r\n\r\n'
+	for te in [
+		'Transfer-Encoding: chunked\r\n',
+		'Transfer-Encoding: Chunked\r\n',
+		'transfer-encoding: CHUNKED\r\n',
+		'Transfer-Encoding: chunked \r\n',
+		'Transfer-Encoding: gzip, chunked\r\n',
+		'Transfer-Encoding: gzip,chunked\r\n',
+		'Transfer-Encoding:  gzip \t,\t chunked\r\n',
+		'Transfer-Encoding: , gzip,, chunked,\r\n',
+		'Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n',
+	] {
+		req := ('POST / HTTP/1.1\r\nHost: a\r\n' + te + '\r\n' + body).bytes()
+		assert frame_request_length(req)! == req.len, te
+		assert frame_request_length(req[..req.len - 1])! == -1, te
+	}
+	// The version gate reads the request line's version, not its target.
+	req := ('POST /HTTP/1.0 HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n' + body).bytes()
+	assert frame_request_length(req)! == req.len
+}
+
+// An identical repeated Content-Length MAY be accepted (RFC 9110 §8.6): it
+// frames by that one value, and content_length() reports the same value.
+fn test_frame_identical_content_length_repeat_accepted() {
+	for head in [
+		'POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n',
+		'POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\ncontent-length: 005\r\n\r\n',
+	] {
+		req := (head + 'hello').bytes()
+		assert frame_request_length(req)! == req.len, head
+		assert frame_request_length(req[..req.len - 1])! == -1, head
+		decoded := decode_http_request(req)!
+		assert decoded.content_length() == 5, head
+		assert decoded.body.len == 5, head
+	}
+}
+
+// Whitespace before the colon is rejected only on the framing fields, where it
+// changes the message boundary; on any other field it is left to the
+// app-level validator (examples/conformance), so the per-line cost stays nil.
+fn test_frame_ws_before_colon_scope() {
+	host := 'GET / HTTP/1.1\r\nHost : a\r\n\r\n'.bytes()
+	assert frame_request_length(host)! == host.len
+	// A longer field-name that starts with a framing name is a different field.
+	other := 'GET / HTTP/1.1\r\nHost: a\r\nContent-Length-X : 5\r\nTransfer-Encodings: gzip\r\n\r\n'.bytes()
+	assert frame_request_length(other)! == other.len
+	// The sizing hint must not read a length out of the malformed line either.
+	assert frame_expected_total('POST / HTTP/1.1\r\nContent-Length : 5\r\n\r\nhello'.bytes()) == -1
+}
+
 // issue #109: chunk-data MUST be followed by CRLF (RFC 9112 §7.1). A body where
 // the data runs straight into the next token (no terminator) must be rejected
 // 400, not framed to a bogus length that desyncs the connection.
