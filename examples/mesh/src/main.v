@@ -6,8 +6,8 @@
 //
 //   transport.dial_unix (pooled per worker via make_state — a dial costs
 //   ~4× a request, so dial-per-request would dominate) → client.write_get
-//   into a reused scratch → send → event_loop.watch_fd(.readable) +
-//   .suspend → recv → client.frame_response → answer from the continuation.
+//   into a reused scratch → send → event_loop.watch_fd_persistent(.readable)
+//   + .suspend → recv → client.frame_response → answer from the continuation.
 //
 // UDS is the mesh transport on purpose: 2.3–2.7× the throughput of TCP
 // loopback at ~half the CPU per request (issue #122 client study).
@@ -164,7 +164,11 @@ fn edge_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut
 		off += n
 	}
 	st.conns[ci].busy = true
-	event_loop.watch_fd(fd, .readable, on_backend_reply, unsafe { nil })
+	// A pooled fd parks with watch_fd_persistent: if the client disconnects
+	// mid-call, a plain watch_fd would close the pooled connection and drop
+	// the continuation, leaving the slot busy forever (503 once all leak).
+	// This way on_backend_reply still runs on the reply and frees the slot.
+	event_loop.watch_fd_persistent(fd, .readable, on_backend_reply, unsafe { nil })
 	return .suspend
 }
 
@@ -192,7 +196,7 @@ fn on_backend_reply(mut out []u8, ready_fd int, ready_fd_error bool, watch_paylo
 	unsafe { st.conns[ci].resp_buf.push_many(&chunk[0], n) }
 	total := client.frame_response(st.conns[ci].resp_buf)
 	if total == client.incomplete {
-		event_loop.watch_fd(ready_fd, .readable, on_backend_reply, unsafe { nil })
+		event_loop.watch_fd_persistent(ready_fd, .readable, on_backend_reply, unsafe { nil })
 		return .suspend
 	}
 	if total < 0 {
