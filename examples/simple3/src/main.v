@@ -71,7 +71,7 @@ fn main() {
 	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		handler:         fn [app] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
-			return app.handle_request(req_buffer, mut out, -1, unsafe { nil }, mut event_loop)
+			return app.handle_request(req_buffer, mut out, client_fd, worker_state, mut event_loop)
 		}
 		io_multiplexing: unsafe { server.IOBackend(0) }
 	})!
