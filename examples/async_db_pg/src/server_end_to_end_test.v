@@ -45,7 +45,7 @@ const fake = &FakePg{}
 fn test_parked_client_disconnects_do_not_leak_pool_slots() {
 	$if linux {
 		mut f := unsafe { fake }
-		lfd := socket.create_server_socket(0)
+		lfd := socket.create_server_socket(0) or { panic(err) }
 		socket.set_blocking(lfd, true)
 		port := socket.local_port(lfd)
 		spawn fake_pg_accept(lfd)
