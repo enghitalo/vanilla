@@ -33,7 +33,9 @@ pub fn handle_list_products(product_uc application.ProductUseCase) []u8 {
 
 // Login handler
 pub fn handle_login(auth_uc application.AuthUseCase, username string, password string) []u8 {
-	user := auth_uc.login(username, password) or { return http_not_found }
+	// Wrong password and unknown user get the same 401: the response must not
+	// tell which usernames exist.
+	user := auth_uc.login(username, password) or { return http_unauthorized }
 
 	body := json.encode(user)
 	return build_basic_response(200, body.bytes(), 'application/json'.bytes())
