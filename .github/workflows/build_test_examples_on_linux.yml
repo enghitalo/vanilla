@@ -24,6 +24,7 @@ jobs:
           - examples/chunked_streaming/src
           - examples/compression/src
           - examples/conformance/src
+          - examples/cors/src
           - examples/database/src
           - examples/etag/src
           - examples/graceful_shutdown/src
@@ -33,6 +34,7 @@ jobs:
           - examples/json_api/src
           - examples/mesh/src
           - examples/per_server_workers/src
+          - examples/rate_limit/src
           - examples/request_limits/src
           - examples/simple/src
           - examples/simple2/src
