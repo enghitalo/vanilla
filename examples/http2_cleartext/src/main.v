@@ -384,9 +384,10 @@ fn bridge_wake(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload vo
 		reactor:   unsafe { voidptr(&capture) }
 		register:  capture_register
 	}
-	// Through a local: V 0.5.2 f5b31b5 miscompiles a call made straight on
-	// the fn-typed field of a struct reached through a pointer (the C names a
-	// function that does not exist: `fn_ptrint__i32__app_cont`).
+	// Through a local: V3 from vlang/v#28655 until vlang/v#29219 typed a local
+	// named like a C function (`wait`, after `C.wait`) as that function, so
+	// `wait.app_cont(...)` called a nonexistent `fn_ptrint__i32__app_cont`
+	// (vlang/v#29154). Kept for V built in that window; it costs nothing.
 	app_cont := wait.app_cont
 	step := app_cont(mut wait.h1_res, ready_fd, ready_fd_error, wait.app_udata, worker_state, mut
 		probe_loop)
