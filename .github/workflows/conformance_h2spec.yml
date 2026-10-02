@@ -57,7 +57,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y liburing-dev linux-libc-dev
+          sudo apt-get install -y linux-libc-dev
       # -cc gcc -no-parallel: same V-toolchain flake avoidance as the other
       # workflows (tcc/stdatomic fallback race + vlang/v#27749 parallel-codegen
       # link race).
