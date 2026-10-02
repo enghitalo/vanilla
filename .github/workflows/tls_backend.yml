@@ -92,7 +92,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y liburing-dev linux-libc-dev clang
+          sudo apt-get install -y linux-libc-dev clang
 
       # Mbed TLS 4, installed where tls/tls_mbedtls_d_vanilla_tls.c.v looks
       # (-I/usr/local/include -L/usr/local/lib -lmbedtls -lmbedx509
@@ -145,8 +145,7 @@ jobs:
           grep -E '^#define MBEDTLS_THREADING_' /usr/local/include/psa/crypto_config.h || echo '(none)'
 
       # `-cc gcc -no-parallel`: the same V-toolchain flake avoidance as every
-      # other lane (tcc<->gcc fallback race on liburing's <stdatomic.h>, and the
-      # vlang/v#27749 parallel-codegen link race).
+      # other lane (the vlang/v#27749 parallel-codegen link race).
       #
       # No extra link flags: this lane builds exactly what a user's
       # `v -d vanilla_tls` build does. Ubuntu's gcc links with --as-needed by
