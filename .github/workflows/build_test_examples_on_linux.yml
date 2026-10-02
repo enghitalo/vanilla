@@ -53,18 +53,19 @@ jobs:
           # Just the build deps. The previous `apt upgrade -y linux-generic` pulled a
           # full kernel package set (linux-image/headers/firmware) on every run — slow
           # and flaky (dpkg "cannot perform the following tasks"), and pointless for
-          # building examples: liburing-dev is userspace and linux-libc-dev already
-          # ships the io_uring headers, neither needs a running-kernel upgrade.
+          # building examples: no example needs a running-kernel upgrade. No
+          # liburing-dev either: io_uring is opt-in (-d vanilla_io_uring, #189),
+          # so these default builds must not need it (repo-tests builds the flag).
           sudo apt-get update
           # libbrotli1 ships the enc/dec runtime .so.1 that compress.brotli
           # dlopens, so the compression example tests the `br` path for real
           # (without it they skip gracefully).
-          sudo apt-get install -y libsqlite3-dev liburing-dev linux-libc-dev libbrotli1
+          sudo apt-get install -y libsqlite3-dev linux-libc-dev libbrotli1
       # `-cc gcc -no-parallel` makes these debug example builds deterministic.
       # Two independent V-toolchain flakes bite otherwise, both only in the
       # default (non -prod) build — real deployments ship -prod, which is
       # unaffected (verified 0 failures in 20 -prod builds):
-      #   1) Every vanilla server program compiles the Linux io_uring backend,
+      #   1) A `-d vanilla_io_uring` build compiles the Linux io_uring backend,
       #      which pulls in <liburing.h> -> barrier.h -> <stdatomic.h>. V's
       #      bundled tcc cannot parse that stdatomic.h, and its automatic
       #      tcc->gcc fallback is a race (reproduced ~1 in 4 of the SAME source
@@ -114,6 +115,22 @@ jobs:
           VANILLA_NO_IOURING: '1'
         run: |
           v -cc gcc -no-parallel test tests/
+      # io_uring is opt-in at build time (#189): the default builds above never
+      # compile it, so build it here. Same tests with the backend built in (its
+      # e2e cases still self-skip on the hosted runner via VANILLA_NO_IOURING;
+      # server/ adds the multishot-gate unit test and the per-worker listener
+      # checks), plus the io_uring example.
+      - name: Run server/ and tests/ with -d vanilla_io_uring
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+        run: |
+          v -cc gcc -no-parallel -d vanilla_io_uring test server/ tests/
+      - name: Build examples/io_uring_demo with -d vanilla_io_uring
+        shell: bash
+        run: |
+          v -cc gcc -no-parallel -d vanilla_io_uring -o /tmp/io_uring_demo examples/io_uring_demo/src
+          ldd /tmp/io_uring_demo | grep liburing
       # The http2 module's unit tests (HPACK against the RFC 7541 Appendix C
       # vectors, frame codec, ServerConn state machine) — pure-bytes tests
       # with no sockets, so they run here rather than in an example lane.

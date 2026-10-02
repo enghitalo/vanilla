@@ -11,12 +11,24 @@ fn handle_request(req_buffer []u8, mut out []u8, client_fd int, worker_state voi
 	return .done
 }
 
+// The io_uring backend is opt-in at build time (needs liburing):
+//   v -prod -d vanilla_io_uring run examples/io_uring_demo/src
+// Without the flag, and on macOS/Windows, the demo runs on the platform's
+// default backend (epoll / kqueue / iocp).
+fn backend() server.IOBackend {
+	$if linux && vanilla_io_uring ? {
+		return .io_uring
+	} $else {
+		return unsafe { server.IOBackend(0) }
+	}
+}
+
 fn main() {
 	// println('Starting server with ${io_multiplexing} io_multiplexing...')
 
 	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
-		io_multiplexing: unsafe { server.IOBackend(0) }
+		io_multiplexing: backend()
 		handler:         handle_request
 	})!
 

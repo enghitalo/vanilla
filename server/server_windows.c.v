@@ -813,8 +813,5 @@ pub fn (mut srv Server) run() {
 	run_selected_backend(srv, mut srv.threads)
 }
 
-// iou_backend_available: io_uring is Linux-only, so it is never available here.
-// See the Linux definition (server_io_uring_linux.c.v) for the real probe.
-pub fn iou_backend_available() bool {
-	return false
-}
+// iou_backend_available (always false here) lives in
+// server_io_uring_notd_vanilla_io_uring.c.v, compiled on every OS.

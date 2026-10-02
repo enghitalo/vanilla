@@ -204,6 +204,14 @@ pub fn new_server(config ServerConfig) !Server {
 	if config.handler == unsafe { nil } {
 		return error('provide a handler')
 	}
+	// io_uring is opt-in at build time (#189): without `-d vanilla_io_uring` it
+	// is not compiled in (server_io_uring_notd_vanilla_io_uring.c.v). Rejected
+	// before any listener is opened, so a caller can fall back to .epoll.
+	$if linux && !vanilla_io_uring ? {
+		if config.io_multiplexing == .io_uring {
+			return error('the io_uring backend requires building with `-d vanilla_io_uring` (and liburing installed)')
+		}
+	}
 	// on_worker_start arms clientless background watches on the epoll worker's
 	// reactor; the TLS worker has none, so it is epoll + plaintext only for now.
 	if config.on_worker_start != unsafe { nil } {

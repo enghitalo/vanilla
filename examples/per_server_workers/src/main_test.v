@@ -53,9 +53,9 @@ fn test_workers_zero_falls_back_to_default() {
 }
 
 // io_uring is shared-nothing: workers:N creates N SO_REUSEPORT listeners (one per
-// worker) in addition to sizing the thread array.
+// worker) in addition to sizing the thread array. Needs `-d vanilla_io_uring`.
 fn test_workers_io_uring_one_listener_per_worker() {
-	$if linux {
+	$if linux && vanilla_io_uring ? {
 		mut s := server.new_server(server.ServerConfig{
 			port:            18184
 			io_multiplexing: .io_uring

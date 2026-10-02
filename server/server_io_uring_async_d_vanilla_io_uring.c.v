@@ -1,7 +1,9 @@
 module server
 
 // Request drain + watch/park/resume runtime for the io_uring worker (issue
-// #83) — the io_uring twin of backend_epoll/async_linux.c.v. Each ring worker
+// #83) — the io_uring twin of backend_epoll/async_linux.c.v. Compiled only with
+// `-d vanilla_io_uring`, like server_io_uring_d_vanilla_io_uring.c.v (#189).
+// Each ring worker
 // owns an IouEnv (watch registry + handler + per-worker state) and routes
 // client reads through iou_drain_requests and watched-fd readiness through
 // handle_io_uring_poll.

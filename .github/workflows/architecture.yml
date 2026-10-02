@@ -31,11 +31,13 @@ jobs:
         shell: bash
         run: |
           rm -rf -v ./vlang || true
+      # No liburing-dev on purpose: io_uring is opt-in (`-d vanilla_io_uring`,
+      # #189), so a default build must compile without the liburing headers.
       - name: Install dependencies
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y liburing-dev linux-libc-dev
+          sudo apt-get install -y linux-libc-dev
       - name: Install checkout as ~/.vmodules/vanilla
         shell: bash
         run: |
@@ -76,3 +78,20 @@ jobs:
           EOF
           v -cc gcc -no-parallel -o consumer main.v
           ./consumer
+      # #189: a default (epoll) build must neither include liburing at build
+      # time nor link liburing.so.2, or the binary won't start on an image
+      # without it (distroless, -slim, Lambda). Only -d vanilla_io_uring may.
+      - name: Default build does not depend on liburing
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP/consumer"
+          ldd ./consumer
+          if ldd ./consumer | grep liburing; then
+            echo "::error::default build links liburing (io_uring must be opt-in: -d vanilla_io_uring)"
+            exit 1
+          fi
+          v -o consumer.c main.v
+          if grep -qF '<liburing.h>' consumer.c; then
+            echo "::error::default build includes liburing.h (io_uring must be opt-in: -d vanilla_io_uring)"
+            exit 1
+          fi

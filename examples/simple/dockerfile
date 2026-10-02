@@ -14,8 +14,8 @@ RUN git clone --depth 1 https://github.com/vlang/v /opt/vlang && make
 
 RUN ln -s /opt/vlang/v /usr/bin/v
 
-RUN apt -y update && apt -y install liburing-dev linux-libc-dev
-
+# No liburing-dev: the default (epoll) build doesn't use it. Only a
+# `-d vanilla_io_uring` build needs liburing-dev here and liburing2 below.
 RUN v install https://github.com/enghitalo/vanilla
 
 WORKDIR /app
@@ -31,9 +31,9 @@ WORKDIR /app
 # Copy the built binary
 COPY --from=build /app/server /app/server
 
-# Install runtime dependencies including liburing
+# Runtime dependencies: curl for the healthcheck. The binary needs only libc.
 RUN apt -y update && \
-    apt -y install curl liburing2 && \
+    apt -y install curl && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 

@@ -26,7 +26,7 @@ fn test_port_zero_resolves_to_real_port() ! {
 }
 
 fn test_port_zero_io_uring_listeners_share_one_port() ! {
-	$if linux {
+	$if linux && vanilla_io_uring ? {
 		mut srv := new_server(ServerConfig{
 			port:            0
 			io_multiplexing: .io_uring

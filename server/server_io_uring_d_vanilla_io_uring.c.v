@@ -1,5 +1,12 @@
 module server
 
+// The io_uring backend (Linux). Compiled ONLY with `-d vanilla_io_uring`
+// (issue #189): this file and server_io_uring_async_d_vanilla_io_uring.c.v
+// are the only importers of the io_uring module, and imports cannot be
+// conditional in V, so the flag-suffix split is what keeps liburing (headers at
+// build time, liburing.so.2 at run time) out of every other build. Without the
+// flag, server_io_uring_notd_vanilla_io_uring.c.v stands in and new_server
+// rejects `.io_uring` — the same mechanism as the run_poll_*_vanilla_poll pair.
 import io_uring
 import http1_1.response
 import http1_1.request_parser
@@ -26,11 +33,12 @@ fn C.sched_setaffinity(pid int, cpusetsize usize, mask voidptr) int
 
 // iou_backend_available reports whether the io_uring backend can actually run in
 // THIS process (kernel supports io_uring_setup AND it is not blocked by a
-// sandbox). Platform-dispatched: this Linux definition probes for real; the
-// darwin/windows facades return false. Exposed so callers — tests especially —
-// can skip the io_uring backend instead of aborting where it is unavailable
-// (e.g. GitHub's hosted runners deny io_uring_setup under their seccomp policy,
-// which is why CI cannot run the io_uring end-to-end tests).
+// sandbox). This `-d vanilla_io_uring` definition probes for real; the notd
+// stub (any build without the flag, on every OS) returns false. Exposed so
+// callers — tests especially — can skip the io_uring backend instead of
+// aborting where it is unavailable (e.g. GitHub's hosted runners deny
+// io_uring_setup under their seccomp policy, which is why CI cannot run the
+// io_uring end-to-end tests).
 pub fn iou_backend_available() bool {
 	// VANILLA_NO_IOURING is the operator/CI kill-switch. A probe cannot be
 	// atomic with server startup: on a host that caps io_uring (memcg/memlock —

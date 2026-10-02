@@ -16,7 +16,8 @@ fn test_iou_release_supports_multishot() {
 	$if !linux {
 		return
 	}
-	$if linux {
+	// The gate lives in the io_uring backend, compiled only with the flag.
+	$if linux && vanilla_io_uring ? {
 		// >= 5.19 → supported
 		assert iou_release_supports_multishot('5.19.0-generic')
 		assert iou_release_supports_multishot('6.8.0-41-generic')

@@ -7,15 +7,16 @@
 
 module io_uring
 
+// liburing itself (`#include <liburing.h>` + `#flag -luring`) is pulled in by
+// liburing_d_vanilla_io_uring.c.v, i.e. only with `-d vanilla_io_uring`
+// (#189); without the flag liburing_notd_vanilla_io_uring.c.v rejects the import.
 import core
 
-#include <liburing.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <fcntl.h>
 #include <unistd.h>
-#flag -luring
 
 // ==================== C Function Declarations ====================
 

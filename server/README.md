@@ -24,7 +24,7 @@ per-request allocation.
 | Platform | Backend | Accept model | Notes |
 |---|---|---|---|
 | Linux | `.epoll` *(default)* | one central acceptor → round-robins fds to per-worker epolls | `.suspend` watches, `make_state`, `on_worker_start`, TLS |
-| Linux | `.io_uring` | per-worker `SO_REUSEPORT` listener + multishot accept (kernel 5.19+) | `.suspend` watches (oneshot `IORING_OP_POLL_ADD`), `make_state` |
+| Linux | `.io_uring` *(`-d vanilla_io_uring`, needs liburing)* | per-worker `SO_REUSEPORT` listener + multishot accept (kernel 5.19+) | `.suspend` watches (oneshot `IORING_OP_POLL_ADD`), `make_state` |
 | macOS | kqueue | per-worker | `.suspend` watches, `make_state` |
 | Windows | IOCP | one central acceptor → round-robins fds to per-worker IOCP ports | `.done`/`.close` only (`.suspend` closes), `make_state`, limits + timeouts |
 | any POSIX | `.poll` *(`-d vanilla_poll`)* | every worker polls the ONE shared listener (no SO_REUSEPORT assumed) | the QNX/VxWorks portability floor (`backend_poll/`): same request semantics, O(nfds), `.done`/`.close` only, never a default |
@@ -69,7 +69,7 @@ fn handle(request []u8, mut response []u8, client_fd int, worker_state voidptr, 
 fn main() {
 	mut srv := server.new_server(server.ServerConfig{
 		port:            8080
-		io_multiplexing: .epoll // or .io_uring on Linux
+		io_multiplexing: .epoll // or .io_uring on Linux, built with -d vanilla_io_uring
 		handler:         handle
 	})!
 	srv.run() // blocks
@@ -171,7 +171,10 @@ shared by the whole process:
 - `backend_epoll/` — epoll worker (`worker_linux.c.v`), connection state + buffer
   pool (`conn_state_linux.c.v`), request serving + watch reactor
   (`async_linux.c.v`), TLS (`tls_conn_linux.c.v`).
-- `server_io_uring_linux.c.v` + `../io_uring/` — the io_uring backend.
+- `server_io_uring_d_vanilla_io_uring.c.v` (+ `_async_`) + `../io_uring/` — the
+  io_uring backend, compiled only with `-d vanilla_io_uring`; otherwise
+  `server_io_uring_notd_vanilla_io_uring.c.v` stands in and liburing is not a
+  dependency.
 - `../http1_1/request_parser/` — request framing (`frame_request_length_lim`/`_idx`
   with the non-marking `buf_view` window; chunked via `frame_chunked_total`).
 - `../kqueue/`, `../iocp/` — macOS / Windows backend syscall wrappers.
@@ -181,6 +184,6 @@ shared by the whole process:
 Worker count = `VANILLA_WORKERS` env → `runtime.nr_cpus()` (set `VANILLA_WORKERS`
 inside a cpuset/CPU-capped container). The hot path is allocation-free (pooled
 per-connection buffers, zero-copy `buf_view` request windows, one batched send per
-readiness event). epoll ships `-prod -gc none`; io_uring ships `-prod` (default
-GC). See [../docs/V_PERF_TOOLBOX.md](../docs/V_PERF_TOOLBOX.md) and
+readiness event). epoll ships `-prod -gc none`; io_uring ships
+`-prod -d vanilla_io_uring` (default GC). See [../docs/V_PERF_TOOLBOX.md](../docs/V_PERF_TOOLBOX.md) and
 [../docs/BEST_PRACTICES.md](../docs/BEST_PRACTICES.md).

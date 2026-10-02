@@ -5,7 +5,10 @@ import server.backend_epoll
 // Backend selection
 pub enum IOBackend {
 	epoll    = 0 // Linux only
-	io_uring = 1 // Linux only
+	// Linux only, and opt-in at build time: `-d vanilla_io_uring` (needs
+	// liburing). Without the flag new_server rejects it, and the binary does
+	// not link liburing.
+	io_uring = 1
 	// The pure-POSIX poll(2) portability floor (QNX/VxWorks tier). Compiled
 	// on Linux ONLY under `-d vanilla_poll` (new_server rejects it otherwise)
 	// so CI can exercise the RTOS reactor at zero cost to normal builds.

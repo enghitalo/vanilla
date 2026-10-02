@@ -6,14 +6,17 @@
 // particular the bug where the ring was set up on the main thread but driven
 // on a worker thread, which made every io_uring_submit_and_wait fail.
 //
-// io_uring is Linux-only AND requires the io_uring_setup syscall to be
-// permitted by the sandbox. GitHub's hosted runners deny it under seccomp, so
+// io_uring is Linux-only, opt-in at build time (run these with
+// `v -d vanilla_io_uring test tests/`; without the flag they skip), AND
+// requires the io_uring_setup syscall to be permitted by the sandbox.
+// GitHub's hosted runners deny it under seccomp, so
 // both tests SELF-SKIP via server.iou_backend_available() instead of
 // aborting. The backend runs one live ring per process: drive() fully stops
 // each server (shutdown drain included) before returning, so the sequential
 // tests in this binary never overlap rings. The pure multishot-accept
 // kernel-gate test (release-string parsing, no sockets) stays in
 // server/io_uring_backend_test.v — it needs module-internal access.
+import os
 import server
 import core
 import vtest
@@ -110,5 +113,27 @@ fn test_io_uring_pipelined() ! {
 			assert f.bytestr().starts_with('HTTP/1.1 200')
 		}
 		assert out.inflight_after == 0
+	}
+}
+
+// io_uring is opt-in at build time (#189). Without `-d vanilla_io_uring`,
+// `.io_uring` must come back from new_server as an error naming the flag: no
+// exit(), and no listener left open (the check runs before any socket is
+// created), so the caller can fall back to .epoll on the same port.
+fn test_io_uring_requires_build_flag() {
+	$if linux && !vanilla_io_uring ? {
+		assert !server.iou_backend_available()
+		fds_before := os.ls('/proc/self/fd') or { panic(err) }
+		server.new_server(server.ServerConfig{
+			port:            0
+			io_multiplexing: .io_uring
+			handler:         iou_handler
+		}) or {
+			assert err.msg().contains('-d vanilla_io_uring'), err.msg()
+			fds_after := os.ls('/proc/self/fd') or { panic(err) }
+			assert fds_after.len == fds_before.len, 'a rejected .io_uring config must not leave a listener open'
+			return
+		}
+		assert false, 'new_server(.io_uring) must fail without -d vanilla_io_uring'
 	}
 }

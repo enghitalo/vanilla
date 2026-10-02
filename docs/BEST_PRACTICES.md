@@ -230,7 +230,7 @@ valuable for latency/headroom — **not** raw req/s. Correct, cheap, paid once p
 The build mode differs by backend: **epoll ships `-prod -gc none`** — no garbage
 collector, **nothing is ever freed**, so a per-request allocation is not "GC
 pressure" but a permanent **leak** that grows RSS linearly with traffic; the hot
-path must be *literally allocation-free*. **io_uring ships `-prod`** with the
+path must be *literally allocation-free*. **io_uring ships `-prod -d vanilla_io_uring`** with the
 default Boehm GC (per-request allocs are reclaimed). On the pinned V master the
 GC's allocation lock is gone (thread-local alloc), so default-GC allocation scales
 across cores — the alloc-free patterns below still matter (they cut GC

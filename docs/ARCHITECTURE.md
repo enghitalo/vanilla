@@ -14,7 +14,7 @@ import and says nothing). Protocols are **siblings** over one engine:
 | `core/` | protocol-neutral contract: `Handler`, `Step`, `Counter`, `Limits`, hand-off slots. `Handler` is bytes-in/bytes-out — nothing HTTP about it. |
 | `socket/` | listen side: TCP listeners, Windows sockets; UDS listeners and `peer_cred` (kernel-verified pid/uid/gid, §6); fd passing lands here (§7). |
 | `tls/` | mbedTLS split (`-d vanilla_tls` / stub) — server today, client transports later. |
-| `epoll/` `io_uring/` `kqueue/` `iocp/` | thin per-mechanism syscall wrappers, one dir-module each (`poll/` joins them as the portability floor). |
+| `epoll/` `io_uring/` `kqueue/` `iocp/` | thin per-mechanism syscall wrappers, one dir-module each (`poll/` joins them as the portability floor). `io_uring/` is the liburing binding: opt-in via `-d vanilla_io_uring`, like `tls/` and `poll/`. |
 | `server/` | **the engine** (was `http_server`) — one engine, N protocols via conn modes: the takeover seam (issue #136) lets a handler hand a connection to a `core.ConnHandler` (`core.queue_takeover`, epoll-first), so upgrades change the framing authority without changing buffers or backpressure. OS facades (`server_linux.c.v`, …) select an `IOBackend`; `server/backend_*` are the reactors. |
 | `http1_1/` | HTTP/1.1 codecs: `request_parser/`, `response/`; `client/` is the client codec (request serializer + response parser). |
 | `http2/` | frame/hpack/types grow in place: stream mux, flow control, settings. |

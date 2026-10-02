@@ -15,7 +15,7 @@ A minimalist, high-performance HTTP server written in [V](https://vlang.io).
 - **ETag Friendly**: Conditional GETs with `ETag` and `If-None-Match` headers.
 - **Database Friendly**: Example with PostgreSQL connection pool.
 - **Graceful Shutdown**: Drain in-flight requests on `SIGTERM`/`SIGINT` via `srv.shutdown(grace_ms)`.
-- **Multiple Backends**: epoll, io_uring (Linux), kqueue (macOS), IOCP (Windows).
+- **Multiple Backends**: epoll, io_uring (Linux, opt-in: `-d vanilla_io_uring`), kqueue (macOS), IOCP (Windows).
 - **Local IPC**: listen on a unix domain socket (`ServerConfig.unix_socket_path`) instead of TCP — ≈3× lower RTT than TCP loopback, filesystem permissions as access control, kernel-verified peer identity (`socket.peer_cred`: pid/uid/gid via `SO_PEERCRED`/`getpeereid`); dial other local services with `transport.dial_unix`/`dial_tcp`.
 - **One Handler Contract**: a single `handler` signature covers every use case, with every input as an explicit, self-describing parameter — append the response and return `.done`, suspend/resume on any fd (DB sockets, timers, upstream proxies) with `event_loop.watch_fd(...)` + `.suspend`, and reach lock-free per-worker state (e.g. a per-thread DB connection — no shared pool, no mutex) via the `worker_state` parameter.
 - **Compliant with HTTP standards**: Follows [RFC 9112](https://datatracker.ietf.org/doc/rfc9112/) and the [IANA Field Name Registry](https://www.iana.org/assignments/http-fields/http-fields.xhtml). A dedicated [`examples/conformance/`](examples/conformance/) handler is probed in CI by [h1spec](https://github.com/dropseed/h1spec) and [Http11Probe](https://github.com/MDA2AV/Http11Probe) — see [Conformance Testing](#conformance-testing).
@@ -231,7 +231,7 @@ fn main() {
 | `examples/async_sse/` | SSE via async handler (suspend/resume on fd) |
 | `examples/async_db_pg/` | PostgreSQL queries via async handler |
 | `examples/async_timer/` | Async per-request timer |
-| `examples/io_uring_demo/` | io_uring backend demonstration (Linux) |
+| `examples/io_uring_demo/` | io_uring backend demonstration (Linux, build with `-d vanilla_io_uring`) |
 
 ---
 
@@ -380,6 +380,23 @@ v -prod crun examples/simple
 
 ```bash
 v install https://github.com/enghitalo/vanilla
+```
+
+### Optional build flags
+
+A default build needs only the C library: no extra headers to build, no extra
+shared library to ship. Each optional backend is a compile-time flag that brings
+its own dependency. Without the flag the backend is not compiled in, and using
+it returns an error that names the flag.
+
+| Flag | Enables | Needs |
+|---|---|---|
+| `-d vanilla_io_uring` | the io_uring backend (`io_multiplexing: .io_uring`, Linux) | liburing (`liburing-dev` to build, `liburing.so.2` at run time) |
+| `-d vanilla_tls` | HTTPS (`tls_config`) | Mbed TLS 4 |
+| `-d vanilla_poll` | the poll(2) portability backend (`.poll`) | — |
+
+```bash
+v -prod -d vanilla_io_uring -o server .
 ```
 
 ---
