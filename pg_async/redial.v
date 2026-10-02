@@ -16,8 +16,9 @@ import time
 //   .connecting  the socket takes the StartupMessage once connected     → .starting
 //   .starting    take what arrived, answer the SCRAM exchange           → .ready
 //
-// so the worker never waits on the network; name resolution and the SCRAM key
-// derivation (PBKDF2) do run inline, once per attempt. A failed attempt
+// so the worker never waits on the network; name resolution does run inline,
+// once per attempt. The SCRAM key derivation (PBKDF2) does not: the pool's
+// ScramCache already holds it, unless the server changed the salt. A failed attempt
 // (refused, closed, authentication error, or redial_timeout) closes its socket
 // and is retried after redial_backoff, starting at the next resolved address
 // (addr_cursor), so a dead one is not retried first forever. The first attempt starts on the first
@@ -116,6 +117,7 @@ fn (mut c PgConn) redial_step(cfg ConnConfig) !bool {
 			return error('pg: re-dial: short StartupMessage write')
 		}
 		c.scram = ScramClient.new(cfg.user, cfg.password)!
+		c.scram.cache = c.scram_cache // the pool's PBKDF2 result: no derivation per re-dial
 		c.state = .starting
 	}
 	for {
