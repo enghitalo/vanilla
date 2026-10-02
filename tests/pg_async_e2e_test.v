@@ -7,6 +7,11 @@
 // (reactor queue[k] <-> conn.inflight[k], pg_async/PIPELINING_DESIGN.md) — and
 // a failing query must fail only its own request. Skipped without python3
 // (unless VANILLA_REQUIRE_FAKE_PG is set); runs under -race in pg_async.yml.
+//
+// Built with -d vanilla_tls it runs again over TLS (vanilla#196): verify_full
+// against a test CA, a 20000-row result spanning many TLS records, and a TLS
+// 1.3 NewSessionTicket in front of every reply — under edge-triggered epoll a
+// read that stopped at a ticket would strand the reply behind it and hang.
 import os
 import strconv
 import server
@@ -31,12 +36,19 @@ mut:
 }
 
 fn pg_e2e_state() voidptr {
+	ca := os.getenv('PG_E2E_CA') // set by the TLS test
 	cfg := pg_async.ConnConfig{
-		host:     '127.0.0.1'
-		port:     os.getenv('PG_E2E_FAKE_PORT').int()
-		user:     'vanilla'
-		password: 'secret'
-		database: 'vanilla'
+		host:          if ca != '' { 'localhost' } else { '127.0.0.1' }
+		port:          os.getenv('PG_E2E_FAKE_PORT').int()
+		user:          'vanilla'
+		password:      'secret'
+		database:      'vanilla'
+		ssl_mode:      if ca != '' {
+			pg_async.SslMode.verify_full
+		} else {
+			pg_async.SslMode.disable
+		}
+		ssl_root_cert: ca
 	}
 	pool := pg_async.new_pool(cfg, 2) or { panic('pool bring-up failed: ${err}') }
 	return voidptr(&PgE2eState{
@@ -46,8 +58,9 @@ fn pg_e2e_state() voidptr {
 }
 
 // GET /q/<n> runs `select $1::int4` with n and answers n; GET /err runs a
-// failing query and answers 500. The handler pattern of a real app: views and
-// appends, no allocation per request.
+// failing query and answers 500; GET /big runs a 20000-row query and answers
+// the row count once every row checked out. The handler pattern of a real app:
+// views and appends, no allocation per request.
 fn pg_e2e_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut st := unsafe { &PgE2eState(worker_state) }
 	idx := st.pool.acquire_pipelined() or {
@@ -60,8 +73,11 @@ fn pg_e2e_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, m
 	for end < req.len && req[end] != ` ` {
 		end++
 	}
+	big := req.len > 8 && req[5] == `b`
 	ok := if req.len > 8 && req[5] == `e` {
 		conn.async_submit('select 1/0', []?[]u8{})
+	} else if big {
+		conn.async_submit('select g from generate_series(1, 20000) g', []?[]u8{})
 	} else {
 		st.params[0] = ?[]u8(unsafe { (&req[7]).vbytes(end - 7) })
 		conn.async_submit(r'select $1::int4', st.params)
@@ -73,13 +89,17 @@ fn pg_e2e_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, m
 	// The query is queued: park for its outcome whatever the flush did (a
 	// failed flush breaks the connection and async_on_readable reports it).
 	conn.async_flush() or {}
-	event_loop.watch_fd_persistent(st.pool.fd(idx), .readable, pg_e2e_ready, voidptr(usize(idx)))
+	payload := u64(idx) | if big { big_flag } else { u64(0) }
+	event_loop.watch_fd_persistent(st.pool.fd(idx), .readable, pg_e2e_ready, voidptr(payload))
 	return .suspend
 }
 
+// big_flag in the watch payload marks a /big request.
+const big_flag = u64(1) << 32
+
 fn pg_e2e_ready(mut out []u8, ready_fd int, _ bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut st := unsafe { &PgE2eState(worker_state) }
-	mut conn := st.pool.conn(int(usize(watch_payload)))
+	mut conn := st.pool.conn(int(u64(watch_payload) & 0xffff_ffff))
 	if conn.async_wants_write() {
 		conn.async_flush() or {}
 	}
@@ -97,9 +117,20 @@ fn pg_e2e_ready(mut out []u8, ready_fd int, _ bool, watch_payload voidptr, worke
 		out << resp_500
 		return .done
 	}
+	mut value := row.int4(0) or { -1 }
+	if u64(watch_payload) & big_flag != 0 {
+		// The row count, when every row is 1, 2, 3, ... in order.
+		mut rows := 1
+		for value == rows {
+			r := it.next() or { break }
+			rows++
+			value = r.int4(0) or { -1 }
+		}
+		value = if value == rows && rows == 20000 { rows } else { -1 }
+	}
 	mut body := [24]u8{}
 	mut body_view := unsafe { (&body[0]).vbytes(body.len) }
-	n := strconv.write_dec(row.int4(0) or { -1 }, mut body_view)
+	n := strconv.write_dec(value, mut body_view)
 	mut len := [4]u8{}
 	mut len_view := unsafe { (&len[0]).vbytes(len.len) }
 	ln := strconv.write_dec(n, mut len_view)
@@ -124,11 +155,48 @@ fn test_pg_async_pipelined_queries_answer_their_own_requests() ! {
 		fake.stop()
 	}
 	os.setenv('PG_E2E_FAKE_PORT', fake.port.str(), true)
-	// 24 connections x 6 pipelined requests, every 7th one failing: far more
-	// requests than the 4 pooled connections, so queries from different
-	// clients interleave on each connection's pipeline. Accept spreads the 24
-	// round-robin, 12 per worker: within a worker's 2 x max_inflight (16)
-	// pipeline slots, so nothing is shed (503) and every answer is exact.
+	drive_pipelined(false)!
+	assert fake.stat('authenticated') == 4
+}
+
+// The same over TLS (verify_full): every reply comes behind a TLS 1.3
+// NewSessionTicket, and some are 20000 rows (~300 KB, dozens of TLS records).
+fn test_pg_async_pipelined_queries_over_tls() ! {
+	$if !vanilla_tls ? {
+		return
+	}
+	if !testkit.fake_pg_available() || !testkit.test_certs_available() {
+		eprintln('skipping: python3 or openssl not found')
+		return
+	}
+	certs := testkit.test_certs()!
+	defer {
+		os.rmdir_all(certs) or {}
+	}
+	mut fake := testkit.start_fake_pg(['--ssl', 'tls', '--require-ssl', '--cert',
+		os.join_path(certs, 'server.crt'), '--key', os.join_path(certs, 'server.key'),
+		'--tickets-per-query', '1'])!
+	defer {
+		fake.stop()
+	}
+	os.setenv('PG_E2E_FAKE_PORT', fake.port.str(), true)
+	os.setenv('PG_E2E_CA', os.join_path(certs, 'ca.crt'), true)
+	defer {
+		os.unsetenv('PG_E2E_CA')
+	}
+	drive_pipelined(true)!
+	assert fake.stat('tls_handshakes') == 4
+	assert fake.stat('authenticated') == 4
+	assert fake.stat('tickets') == fake.stat('queries')
+}
+
+// drive_pipelined: 24 connections x 6 pipelined requests, every 7th one
+// failing (and, with `big`, every 11th one a 20000-row result): far more
+// requests than the 4 pooled connections, so queries from different clients
+// interleave on each connection's pipeline. Accept spreads the 24
+// round-robin, 12 per worker: within a worker's 2 x max_inflight (16)
+// pipeline slots, so nothing is shed (503) and every answer is exact.
+fn drive_pipelined(big bool) ! {
 	mut scripts := []vtest.Script{}
 	for c in 0 .. 24 {
 		mut send := []u8{}
@@ -136,6 +204,8 @@ fn test_pg_async_pipelined_queries_answer_their_own_requests() ! {
 			id := c * 6 + k
 			if id % 7 == 3 {
 				send << 'GET /err HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+			} else if big && id % 11 == 5 {
+				send << 'GET /big HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 			} else {
 				send << q(id)
 			}
@@ -162,11 +232,13 @@ fn test_pg_async_pipelined_queries_answer_their_own_requests() ! {
 			got := f.bytestr()
 			if id % 7 == 3 {
 				assert got.starts_with('HTTP/1.1 500'), 'request ${id}: ${got}'
+			} else if big && id % 11 == 5 {
+				assert got.starts_with('HTTP/1.1 200'), 'request ${id}: ${got}'
+				assert got.all_after('\r\n\r\n') == '20000', 'request ${id} got ${got.all_after('\r\n\r\n')}'
 			} else {
 				assert got.starts_with('HTTP/1.1 200'), 'request ${id}: ${got}'
 				assert got.all_after('\r\n\r\n') == id.str(), 'request ${id} got ${got.all_after('\r\n\r\n')}'
 			}
 		}
 	}
-	assert fake.stat('authenticated') == 4
 }

@@ -18,11 +18,14 @@ fn types_cfg() ?ConnConfig {
 	}
 	port_env := os.getenv('PGPORT')
 	return ConnConfig{
-		host:     host
-		port:     if port_env != '' { port_env.int() } else { 5432 }
-		user:     os.getenv('PGUSER')
-		password: os.getenv('PGPASSWORD')
-		database: os.getenv('PGDATABASE')
+		host:          host
+		port:          if port_env != '' { port_env.int() } else { 5432 }
+		user:          os.getenv('PGUSER')
+		password:      os.getenv('PGPASSWORD')
+		database:      os.getenv('PGDATABASE')
+		// PGSSLMODE=verify-full + PGSSLROOTCERT: the TLS lane of pg_async.yml
+		ssl_mode:      SslMode.from_string(os.getenv('PGSSLMODE').replace('-', '_')) or { SslMode.disable }
+		ssl_root_cert: os.getenv('PGSSLROOTCERT')
 	}
 }
 

@@ -21,7 +21,9 @@
 #            written to $PG_DIR/certs), and every TCP pg_hba line hostssl —
 #            user `bench` authenticates with scram-sha-256, user `pw_user`
 #            with `password` (cleartext, over TLS only). Plaintext TCP is
-#            rejected.
+#            rejected. The exports then add PGSSLMODE=verify-full and
+#            PGSSLROOTCERT (the test CA), which pg_async's live tests and
+#            bench/pg_async/e2e_server read (build with -d vanilla_tls).
 #   PG_CPUS  taskset CPU list for the server and its backends (benchmarks)
 #
 # The cluster: user bench / password benchpw, database bench, scram-sha-256,
@@ -114,6 +116,7 @@ start() {
 	SQL
 	echo "export PGHOST=127.0.0.1 PGPORT=$port PGUSER=bench PGPASSWORD=benchpw PGDATABASE=bench"
 	if [ "${PG_TLS:-0}" = 1 ]; then
+		echo "export PGSSLMODE=verify-full PGSSLROOTCERT=$dir/certs/ca.crt"
 		echo "export PG_TEST_CA=$dir/certs/ca.crt PG_TEST_CERTS=$dir/certs"
 	fi
 	echo "# throwaway PostgreSQL ($("$PG_BIN/postgres" --version)) up in $dir" >&2

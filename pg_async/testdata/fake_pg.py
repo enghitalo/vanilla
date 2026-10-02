@@ -28,9 +28,22 @@ needs happen deterministically:
       are never answered (the connection stays open)
   --auth scram|trust                (default scram; password --password)
 
+TLS, per run (--ssl; certificates from gen_test_ca.sh via --cert/--key):
+  --ssl off                         answer SSLRequest with 'N' (the default)
+  --ssl tls                         answer 'S', then a TLS 1.3 handshake; the
+      session is the connection from then on
+  --ssl garbage                     answer 'S' followed by plaintext in the
+      same segment: bytes no TLS session protects (CVE-2021-23222)
+  --require-ssl                     refuse a StartupMessage that did not come
+      over TLS, with FATAL 28000 (a hostssl-only pg_hba.conf)
+  --tickets-per-query N             over TLS, send N TLS 1.3 NewSessionTicket
+      messages right before every query's reply (OpenSSL's
+      SSL_new_session_ticket, through ctypes: the ssl module has no call for it)
+
 --stats-file PATH keeps `key=value` counters (accepted, authenticated, queries,
-server_closes, ssl_requests, cancel_requests) up to date, so a test can assert
-on what the server saw. Every connection is logged to stderr.
+server_closes, ssl_requests, tls_handshakes, tickets, cancel_requests) up to
+date, so a test can assert on what the server saw. Every connection is logged
+to stderr.
 
 usage: fake_pg.py --port-file PATH [options]
 """
@@ -42,6 +55,7 @@ import hmac
 import os
 import re
 import socket
+import ssl
 import struct
 import sys
 import threading
@@ -61,6 +75,7 @@ SALT = b'vanilla-fake-pg-salt'
 ITERATIONS = 4096
 
 ARGS = None
+TLS_CTX = None
 STATS = {}
 STATS_LOCK = threading.Lock()
 
@@ -181,16 +196,29 @@ def scram_auth(conn):
 
 
 def startup(conn, cid):
-    """Reads the startup packet (answering an SSLRequest with 'N' first) and
-    authenticates. Returns the startup parameters, or None for a request that
-    ends the connection (CancelRequest)."""
+    """Reads the startup packet, answering an SSLRequest first (--ssl), and
+    authenticates. Returns (connection, startup parameters): the connection is
+    the TLS session once one was accepted. The parameters are None for a
+    request that ends the connection (CancelRequest)."""
     while True:
         ln = struct.unpack('!I', recv_exact(conn, 4))[0]
         body = recv_exact(conn, ln - 4)
         code = struct.unpack('!I', body[:4])[0]
         if code == SSL_REQUEST:
             bump('ssl_requests')
-            conn.sendall(b'N')
+            if ARGS.ssl == 'off' or isinstance(conn, ssl.SSLSocket):
+                conn.sendall(b'N')
+                continue
+            if ARGS.ssl == 'garbage':
+                conn.sendall(b'S' + b'Z\x00\x00\x00\x05I injected before the TLS handshake')
+                log(cid, "answered 'S' + plaintext")
+                while conn.recv(4096):
+                    pass
+                raise EOFError
+            conn.sendall(b'S')
+            conn = TLS_CTX.wrap_socket(conn, server_side=True)
+            bump('tls_handshakes')
+            log(cid, f'TLS: {conn.version()} {conn.cipher()[0]}')
             continue
         if code == GSSENC_REQUEST:
             conn.sendall(b'N')
@@ -198,7 +226,7 @@ def startup(conn, cid):
         if code == CANCEL_REQUEST:
             bump('cancel_requests')
             log(cid, 'CancelRequest')
-            return None
+            return conn, None
         if code != PROTOCOL_3_0:
             raise EOFError
         params = {}
@@ -208,6 +236,11 @@ def startup(conn, cid):
             v, pos = cstr(body, pos)
             params[k.decode()] = v.decode()
         break
+    if ARGS.require_ssl and not isinstance(conn, ssl.SSLSocket):
+        conn.sendall(error_response('FATAL', '28000', 'no pg_hba.conf entry for host "127.0.0.1", user "' +
+                                    params.get('user', '') + '", no encryption'))
+        log(cid, 'refused a plaintext StartupMessage (--require-ssl)')
+        raise EOFError
     if ARGS.auth == 'scram':
         scram_auth(conn)
     conn.sendall(msg(b'R', struct.pack('!I', 0)))
@@ -221,7 +254,28 @@ def startup(conn, cid):
     bump('authenticated')
     log(cid, f'authenticated ({ARGS.auth}) user={params.get("user", "")}')
     conn.sendall(status + msg(b'Z', b'I'))
-    return params
+    return conn, params
+
+
+def new_session_tickets(conn, n):
+    """Makes OpenSSL send n NewSessionTicket messages ahead of the next write
+    on a TLS 1.3 server connection. The ssl module has no call for it, so this
+    reaches SSL_new_session_ticket through ctypes: libssl is resolved through
+    the _ssl extension that links it, and the SSL* is the field after the
+    PyObject header and the socket weakref in CPython's PySSLSocket. The
+    pointer is checked (a TLS 1.3 server) before it is used."""
+    import ctypes
+    lib = ctypes.CDLL(ssl._ssl.__file__)
+    for name in ('SSL_version', 'SSL_is_server', 'SSL_new_session_ticket'):
+        getattr(lib, name).argtypes = [ctypes.c_void_p]
+    off = object.__basicsize__ + ctypes.sizeof(ctypes.c_void_p)
+    ptr = ctypes.c_void_p.from_address(id(conn._sslobj) + off).value
+    if not ptr or lib.SSL_version(ptr) != 0x0304 or lib.SSL_is_server(ptr) != 1:
+        raise RuntimeError('fake_pg: cannot reach the SSL* of this connection')
+    for _ in range(n):
+        if lib.SSL_new_session_ticket(ptr) != 1:
+            raise RuntimeError('fake_pg: SSL_new_session_ticket failed')
+    bump('tickets', n)
 
 
 # ── queries ─────────────────────────────────────────────────────────────────
@@ -346,6 +400,8 @@ def serve(conn, cid):
                     break
             stmts = []
             reply += msg(b'Z', tx)
+            if ARGS.tickets_per_query and isinstance(conn, ssl.SSLSocket):
+                new_session_tickets(conn, ARGS.tickets_per_query)
             if ARGS.close != 'none' and queries >= ARGS.close_after:
                 close_after_reply(conn, cid, reply)
                 return
@@ -373,10 +429,12 @@ def close_after_reply(conn, cid, reply):
 
 def handle(conn, cid):
     try:
-        if startup(conn, cid) is not None:
+        conn, params = startup(conn, cid)
+        if params is not None:
             serve(conn, cid)
-    except (EOFError, OSError, ValueError, IndexError, struct.error):
-        pass
+    except (EOFError, OSError, ValueError, IndexError, struct.error) as e:
+        if isinstance(e, ssl.SSLError):
+            log(cid, f'TLS: {e}')
     finally:
         try:
             conn.close()
@@ -395,7 +453,18 @@ def main():
     ap.add_argument('--close-after', type=int, default=1)
     ap.add_argument('--hang-after', type=int, default=0)
     ap.add_argument('--lifetime', type=float, default=300.0, help='exit after this many seconds')
+    ap.add_argument('--ssl', choices=('off', 'tls', 'garbage'), default='off')
+    ap.add_argument('--require-ssl', action='store_true')
+    ap.add_argument('--cert', default='', help='server certificate (PEM), for --ssl tls')
+    ap.add_argument('--key', default='', help='its private key (PEM)')
+    ap.add_argument('--tickets-per-query', type=int, default=0)
     ARGS = ap.parse_args()
+    if ARGS.ssl == 'tls':
+        global TLS_CTX
+        TLS_CTX = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        TLS_CTX.minimum_version = ssl.TLSVersion.TLSv1_3
+        TLS_CTX.load_cert_chain(ARGS.cert, ARGS.key)
+        TLS_CTX.num_tickets = 0  # what PostgreSQL does; --tickets-per-query sends them on demand
 
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

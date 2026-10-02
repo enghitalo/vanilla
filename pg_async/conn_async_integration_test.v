@@ -19,11 +19,14 @@ fn test_async_query_pump_against_live_pg() {
 	}
 	port_env := os.getenv('PGPORT')
 	cfg := ConnConfig{
-		host:     host
-		port:     if port_env != '' { port_env.int() } else { 5432 }
-		user:     os.getenv('PGUSER')
-		password: os.getenv('PGPASSWORD')
-		database: os.getenv('PGDATABASE')
+		host:          host
+		port:          if port_env != '' { port_env.int() } else { 5432 }
+		user:          os.getenv('PGUSER')
+		password:      os.getenv('PGPASSWORD')
+		database:      os.getenv('PGDATABASE')
+		// PGSSLMODE=verify-full + PGSSLROOTCERT: the TLS lane of pg_async.yml
+		ssl_mode:      SslMode.from_string(os.getenv('PGSSLMODE').replace('-', '_')) or { SslMode.disable }
+		ssl_root_cert: os.getenv('PGSSLROOTCERT')
 	}
 	mut c := PgConn.connect(cfg)!
 	defer {
@@ -84,11 +87,14 @@ fn test_async_pipeline_against_live_pg() {
 	}
 	port_env := os.getenv('PGPORT')
 	cfg := ConnConfig{
-		host:     host
-		port:     if port_env != '' { port_env.int() } else { 5432 }
-		user:     os.getenv('PGUSER')
-		password: os.getenv('PGPASSWORD')
-		database: os.getenv('PGDATABASE')
+		host:          host
+		port:          if port_env != '' { port_env.int() } else { 5432 }
+		user:          os.getenv('PGUSER')
+		password:      os.getenv('PGPASSWORD')
+		database:      os.getenv('PGDATABASE')
+		// PGSSLMODE=verify-full + PGSSLROOTCERT: the TLS lane of pg_async.yml
+		ssl_mode:      SslMode.from_string(os.getenv('PGSSLMODE').replace('-', '_')) or { SslMode.disable }
+		ssl_root_cert: os.getenv('PGSSLROOTCERT')
 	}
 	mut c := PgConn.connect(cfg)!
 	defer {
@@ -198,11 +204,14 @@ fn test_pool_recovers_from_pg_terminate_backend() {
 	}
 	port_env := os.getenv('PGPORT')
 	cfg := ConnConfig{
-		host:     host
-		port:     if port_env != '' { port_env.int() } else { 5432 }
-		user:     os.getenv('PGUSER')
-		password: os.getenv('PGPASSWORD')
-		database: os.getenv('PGDATABASE')
+		host:          host
+		port:          if port_env != '' { port_env.int() } else { 5432 }
+		user:          os.getenv('PGUSER')
+		password:      os.getenv('PGPASSWORD')
+		database:      os.getenv('PGDATABASE')
+		// PGSSLMODE=verify-full + PGSSLROOTCERT: the TLS lane of pg_async.yml
+		ssl_mode:      SslMode.from_string(os.getenv('PGSSLMODE').replace('-', '_')) or { SslMode.disable }
+		ssl_root_cert: os.getenv('PGSSLROOTCERT')
 	}
 	mut pool := PgPool.connect(cfg, 2)!
 	defer {
