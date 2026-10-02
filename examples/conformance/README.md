@@ -34,12 +34,14 @@ checks in [`src/validate.v`](src/validate.v):
 
 Malformed requests reach the handler already framed by
 `frame_request_length_lim`, which rejects the grossest framing errors (missing
-CRLF, over-limit head → 431, over-limit body → 413, bad chunk-size, non-digit
+CRLF, over-limit head → 431, over-limit body → 413, bad chunk-size line or
+chunk extension, malformed or over-limit trailer section → 400 / 431, non-digit
 `Content-Length`, and ambiguous framing → 400: differing repeated
 `Content-Length`, a `Transfer-Encoding` whose final coding is not `chunked`,
 `Transfer-Encoding` on HTTP/1.0, whitespace before the colon of either field —
 [#184](https://github.com/enghitalo/vanilla/issues/184)) *before* the handler
-runs. The handler covers everything that needs the parsed header view.
+runs. A valid trailer section is framed and its fields discarded (RFC 9112
+§7.1.2). The handler covers everything that needs the parsed header view.
 
 ## Run it
 

@@ -583,11 +583,11 @@ pub fn frame_request_length_lim_idx(buf []u8, max_header int, max_body int) int 
 				if chunked {
 					// Cold path: the chunked framer still returns a Result; map it
 					// to a sentinel (the one boxing here is off the GET hot path).
-					return frame_chunked_total(buf, body_start, max_body) or {
-						if err.code() == 413 {
-							frame_err_body
-						} else {
-							frame_err_malformed
+					return frame_chunked_total(buf, body_start, max_header, max_body) or {
+						match err.code() {
+							413 { frame_err_body }
+							431 { frame_err_header }
+							else { frame_err_malformed }
 						}
 					}
 				}
@@ -934,31 +934,204 @@ fn ci_contains(buf []u8, val Slice, needle string) bool {
 	return false
 }
 
-fn hex_digit(c u8) !int {
+// hex_digit returns the value of hex digit c, or -1 when c is not one. A plain
+// int, not !int: the chunk-size loop ends on the first non-digit, and an
+// error() there would box a MessageError on every chunk line.
+@[inline]
+fn hex_digit(c u8) int {
 	return match c {
 		`0`...`9` { int(c - `0`) }
 		`a`...`f` { int(c - `a` + 10) }
 		`A`...`F` { int(c - `A` + 10) }
-		else { error('not a hex digit') }
+		else { -1 }
 	}
 }
 
-// frame_chunked_total walks chunk-size lines from body_start and returns the
-// total message length once the terminating zero-length chunk + CRLF is present,
-// -1 if more bytes are needed, or an error on malformed chunk framing.
+// tchar bitmaps (RFC 9110 §5.6.2: DIGIT, ALPHA and !#$%&'*+-.^_`|~) for bytes
+// 0-63 and 64-127: a shift and a mask per byte instead of a 20-arm compare.
+const chunk_tchar_lo = u64(0x03ff6cfa00000000)
+const chunk_tchar_hi = u64(0x57ffffffc7fffffe)
+
+// chunk_tchar reports whether c is a tchar (a token byte).
+@[inline]
+fn chunk_tchar(c u8) bool {
+	if c < 64 {
+		return (chunk_tchar_lo >> c) & 1 != 0
+	}
+	return c < 128 && (chunk_tchar_hi >> (c - 64)) & 1 != 0
+}
+
+// chunk_skip_bws skips BWS (SP / HTAB) in buf[i..end] and returns the next index.
+@[direct_array_access; inline]
+fn chunk_skip_bws(buf []u8, i int, end int) int {
+	mut k := i
+	for k < end && (buf[k] == empty_space || buf[k] == htab_char) {
+		k++
+	}
+	return k
+}
+
+// chunk_ext_ok reports whether buf[start..end] (from just after the chunk-size
+// up to the line's CR) is a well-formed chunk-ext (RFC 9112 §7.1.1):
+//
+//   chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )
+//   chunk-ext-name = token, chunk-ext-val = token / quoted-string
+//
+// Extension semantics are ignored, but the syntax is checked: "skip to the end
+// of the line" is where hops disagree about the line end (a bare CR or LF, junk
+// after the size), the desync class #109 fixed for the chunk-data CRLF (#185).
 @[direct_array_access]
-fn frame_chunked_total(buf []u8, body_start int, max_body int) !int {
+fn chunk_ext_ok(buf []u8, start int, end int) bool {
+	mut i := start
+	for i < end {
+		i = chunk_skip_bws(buf, i, end)
+		if i >= end || buf[i] != `;` {
+			return false
+		}
+		i = chunk_skip_bws(buf, i + 1, end)
+		name := i
+		for i < end && chunk_tchar(buf[i]) {
+			i++
+		}
+		if i == name {
+			return false // `;` with no extension name
+		}
+		eq := chunk_skip_bws(buf, i, end)
+		if eq >= end || buf[eq] != `=` {
+			continue // no value; any BWS left must lead to the next `;`
+		}
+		i = chunk_skip_bws(buf, eq + 1, end)
+		if i < end && buf[i] == `"` {
+			// quoted-string: qdtext / quoted-pair, neither of which admits a
+			// control byte other than HTAB.
+			i++
+			for {
+				if i >= end {
+					return false // unterminated quoted-string
+				}
+				mut c := buf[i]
+				if c == `"` {
+					i++
+					break
+				}
+				if c == 0x5c { // backslash: quoted-pair
+					i++
+					if i >= end {
+						return false
+					}
+					c = buf[i]
+				}
+				if (c < 0x20 && c != htab_char) || c == 0x7f {
+					return false
+				}
+				i++
+			}
+		} else {
+			val := i
+			for i < end && chunk_tchar(buf[i]) {
+				i++
+			}
+			if i == val {
+				return false // `=` with no value
+			}
+		}
+	}
+	return true
+}
+
+// trailer_line_ok reports whether buf[start..end] (a trailer line without its
+// CRLF) is a field-line (RFC 9112 §5): a token field-name, `:`, then a value
+// with no control byte but HTAB. Trailer fields are discarded, but the framer
+// reads past them, so it only frames past a line every strict hop also reads
+// as a field: never a bare CR (RFC 9112 §2.2), obs-fold or a request line.
+@[direct_array_access]
+fn trailer_line_ok(buf []u8, start int, end int) bool {
+	mut i := start
+	for i < end && chunk_tchar(buf[i]) {
+		i++
+	}
+	if i == start || i >= end || buf[i] != colon_u8 {
+		return false
+	}
+	i++
+	for i < end {
+		c := buf[i]
+		if (c < 0x20 && c != htab_char) || c == 0x7f {
+			return false
+		}
+		i++
+	}
+	return true
+}
+
+// frame_trailer_section frames the trailer section after the last chunk, from
+// `start` (RFC 9112 §7.1.2): `*( field-line CRLF ) CRLF`. Trailer fields are
+// not exposed to handlers (a recipient MAY discard them), but their bytes are
+// part of the message, so the framer reads past them (§7.1.3). It returns the
+// offset just past the closing empty line, -1 until that line has arrived, or
+// an error: 400 for a malformed line, 431 once the section outgrows max_header
+// (the bound the header section has). The old framer wanted the closing CRLF
+// right after the last chunk and returned -1 forever on a trailer (#185).
+@[direct_array_access]
+fn frame_trailer_section(buf []u8, start int, max_header int) !int {
+	mut pos := start
+	for {
+		if max_header > 0 && pos - start > max_header {
+			return error_with_code('trailer section too large', 431)
+		}
+		if pos >= buf.len {
+			return -1
+		}
+		// The empty line ends the body: checked in place, so the common case (no
+		// trailer at all) costs two byte compares, not a memchr.
+		if buf[pos] == cr_char {
+			if pos + 1 >= buf.len {
+				return -1
+			}
+			if buf[pos + 1] == lf_char {
+				return pos + 2
+			}
+		}
+		line_lf := find_byte_idx(&buf[pos], buf.len - pos, lf_char)
+		if line_lf < 0 {
+			// Unterminated line: every byte buffered past `start` is trailer.
+			if max_header > 0 && buf.len - start > max_header {
+				return error_with_code('trailer section too large', 431)
+			}
+			return -1
+		}
+		line_end := pos + line_lf - 1 // index of the CR before the LF
+		if line_lf == 0 || buf[line_end] != cr_char {
+			return error_with_code('trailer line not terminated by CRLF', 400)
+		}
+		if !trailer_line_ok(buf, pos, line_end) {
+			return error_with_code('malformed trailer field', 400)
+		}
+		pos = line_end + 2
+	}
+	return -1
+}
+
+// frame_chunked_total frames a chunked body from body_start (RFC 9112 §7.1):
+//
+//   chunked-body = *chunk last-chunk trailer-section CRLF
+//   chunk        = chunk-size [ chunk-ext ] CRLF chunk-data CRLF
+//   last-chunk   = 1*("0") [ chunk-ext ] CRLF
+//
+// It returns the total message length once the empty line closing the trailer
+// section is buffered, -1 if more bytes are needed, or an error whose code is
+// the status to send: 400 malformed, 413 body over max_body, 431 trailer
+// section over max_header. Every line must end in CRLF: a bare LF, or a bare
+// CR anywhere in a chunk-size or trailer line, is a 400, never a line end.
+@[direct_array_access]
+fn frame_chunked_total(buf []u8, body_start int, max_header int, max_body int) !int {
 	// Bound the buffered chunked payload (the total length isn't known up front).
 	if max_body > 0 && buf.len - body_start > max_body {
 		return error_with_code('body exceeds ${max_body} bytes', 413)
 	}
 	mut pos := body_start
 	for {
-		if pos >= buf.len {
-			return -1
-		}
-		line_lf := find_byte(&buf[pos], buf.len - pos, lf_char) or { return -1 }
-		size_end := pos + line_lf // index of LF
+		// chunk-size = 1*HEXDIG.
 		// Accumulate the chunk-size in i64 so the arithmetic itself can never wrap a
 		// 32-bit int, then reject anything over max_declared. A 32-bit accumulator
 		// let 0x80000000 wrap NEGATIVE (crlf_at went out of bounds → segfault under
@@ -967,30 +1140,55 @@ fn frame_chunked_total(buf []u8, body_start int, max_body int) !int {
 		// after each digit catches both before size is ever used as an index.
 		mut size64 := i64(0)
 		mut j := pos
-		for j < size_end && buf[j] != cr_char {
-			c := buf[j]
-			if c == `;` {
-				break // chunk extensions: ignore the rest of the size line
+		for j < buf.len {
+			d := hex_digit(buf[j])
+			if d < 0 {
+				break
 			}
-			d := hex_digit(c) or { return error_with_code('invalid chunk size', 400) }
 			size64 = size64 * 16 + d
 			if size64 > max_declared {
 				return error_with_code('chunk size exceeds ${max_declared} bytes', 400)
 			}
 			j++
 		}
-		size := int(size64)
-		data_start := size_end + 1
-		if size == 0 {
-			// Terminating chunk; require the closing CRLF (trailers not modeled).
-			if data_start + 1 >= buf.len {
+		if j >= buf.len {
+			return -1 // the size line has not fully arrived
+		}
+		// At least one digit: an empty or extension-only (`;ext`) size line is
+		// not a last chunk (#185).
+		if j == pos {
+			return error_with_code('invalid chunk size', 400)
+		}
+		// The size line ends in CRLF, right after the digits or after a
+		// well-formed chunk-ext. A bare LF, a bare CR or junk is never a line end
+		// (`5\n`, `5\rZZ\n`, `5;a\rb\r\n`) (#185). Only an extension needs the
+		// memchr for its LF; a plain size line is checked in place.
+		mut line_end := j // index of the line's CR
+		if buf[j] != cr_char {
+			if buf[j] != `;` && buf[j] != empty_space && buf[j] != htab_char {
+				return error_with_code('invalid chunk size', 400)
+			}
+			line_lf := find_byte_idx(&buf[j], buf.len - j, lf_char)
+			if line_lf < 0 {
 				return -1
 			}
-			if buf[data_start] == cr_char && buf[data_start + 1] == lf_char {
-				return data_start + 2
+			line_end = j + line_lf - 1
+			if buf[line_end] != cr_char || !chunk_ext_ok(buf, j, line_end) {
+				return error_with_code('invalid chunk-size line', 400)
 			}
+		}
+		if line_end + 1 >= buf.len {
 			return -1
 		}
+		if buf[line_end + 1] != lf_char {
+			return error_with_code('chunk-size line not terminated by CRLF', 400)
+		}
+		data_start := line_end + 2
+		if size64 == 0 {
+			// last-chunk: frame past the trailer section to the closing CRLF.
+			return frame_trailer_section(buf, data_start, max_header)
+		}
+		size := int(size64)
 		// chunk-data is followed by a REQUIRED CRLF (RFC 9112 §7.1). Verify those
 		// two bytes really are CR LF instead of assuming them — a body like
 		// `5\r\nhello0\r\n\r\n` (data runs straight into the next chunk-size, no
