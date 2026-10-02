@@ -298,6 +298,11 @@ their request.
   benchmark (see the wiki's *Gotchas* page). Genuine `400` (bad body) / `404`
   (missing row) stay as they are.
 - Keep the pool sized to the worker/thread model.
+- Expect pooled connections to die (restart, failover, `pg_terminate_backend`,
+  idle or lifetime caps): the pool skips a broken connection and re-dials it
+  without blocking, so `release` it on every path, error or not. Decide retries
+  on the typed error — `err is pg_async.PgError && err.sqlstate == '40001'` —
+  and on `conn.is_broken()` for a lost connection, never on the message text.
 
 **Don't**
 
