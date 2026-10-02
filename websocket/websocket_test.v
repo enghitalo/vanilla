@@ -4,6 +4,8 @@ module websocket
 // examples) plus the malformed-input matrix frame_head must reject. Pure
 // codec tests — the connection-level behaviour (upgrade, echo, close) is
 // end-to-end tested in examples/websocket_echo.
+import crypto.sha1
+import encoding.base64
 
 fn test_accept_key_rfc_vector() {
 	// RFC 6455 §1.3: the sample nonce and its expected accept value.
@@ -12,6 +14,21 @@ fn test_accept_key_rfc_vector() {
 	out << 'Sec-WebSocket-Accept: '.bytes()
 	append_accept_key(mut out, 'dGhlIHNhbXBsZSBub25jZQ==')
 	assert out.bytestr() == 'Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo='
+}
+
+fn test_accept_key_matches_crypto_sha1() {
+	// The in-module Sha1 against vlib's, for every key length from 0 to 200:
+	// key + GUID then crosses each padding edge (55/56/63/64 bytes mod 64) and
+	// spans one to five blocks.
+	for n in 0 .. 201 {
+		mut key := []u8{len: n}
+		for i in 0 .. n {
+			key[i] = u8(`A` + (i * 7 + n) % 58)
+		}
+		k := key.bytestr()
+		want := base64.encode(sha1.sum((k + ws_guid).bytes()))
+		assert accept_key(k) == want, 'key length ${n}'
+	}
 }
 
 fn test_masked_hello_rfc_vector() {
