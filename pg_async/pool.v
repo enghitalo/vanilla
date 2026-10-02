@@ -81,9 +81,15 @@ pub fn (p &PgPool) idx_of_fd(fd int) ?int {
 // none if every connection is busy or broken (the caller sheds load — e.g. 503
 // — or queues). An idle broken slot it passes gets its re-dial advanced one
 // non-blocking step, and is taken the moment it is ready again.
+//
+// A connection that still carries pipelined queries (acquire_pipelined) is
+// not idle for acquire(), even though nobody holds it exclusively: the
+// borrower's release() would find those queries in flight and retire the
+// connection, failing the requests they belong to.
 pub fn (mut p PgPool) acquire() ?int {
 	for i in 0 .. p.conns.len {
-		if p.idle[i] && (p.conns[i].state == .ready || p.conns[i].redial(p.cfg)) {
+		if p.idle[i] && p.conns[i].inflight.len == 0
+			&& (p.conns[i].state == .ready || p.conns[i].redial(p.cfg)) {
 			p.idle[i] = false
 			return i
 		}
@@ -116,6 +122,11 @@ pub fn (mut p PgPool) release(idx int) {
 // connections per worker, N in-flight queries each lifts the per-worker DB
 // concurrency ceiling to conns×N without needing a large pool.
 //
+// A connection held exclusively by acquire() is never shared: its borrower may
+// hold it across several queries (BEGIN … COMMIT over park/resume, with no
+// query in flight in between), and a pipelined query would land inside that
+// transaction.
+//
 // Broken connections are skipped, and re-dialed once their in-flight count is
 // back to 0 — which relies on the FIFO contract every pipelined caller already
 // keeps: a request that submitted a query parks on the connection and consumes
@@ -124,6 +135,9 @@ pub fn (mut p PgPool) acquire_pipelined() ?int {
 	mut best := -1
 	mut best_depth := max_inflight
 	for i in 0 .. p.conns.len {
+		if !p.idle[i] {
+			continue // held by acquire(): its borrower may be mid-transaction
+		}
 		if p.conns[i].state != .ready && !p.conns[i].redial(p.cfg) {
 			continue
 		}
