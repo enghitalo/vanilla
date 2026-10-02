@@ -48,3 +48,7 @@ perf.data
 perf.data.old
 callgrind.out.*
 massif.out.*
+
+# Python bytecode (pg_async/testdata/fake_pg.py, bench/pg_async/*.py)
+__pycache__/
+*.pyc

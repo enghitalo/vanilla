@@ -101,8 +101,15 @@ a handful of pipelined conns saturate the link — so the per-worker 2-conn pool
 fixable by pipelining, not by more connections.
 
 ## Local validation harness
-A wrk lua script mirroring HttpArena's async-db/crud mixes lets us pipeline-test
-pg_async locally against a seeded PG (solves "can't pipeline-test locally").
+`bench/pg_async/` pipeline-tests pg_async locally against a seeded PG
+(`pg_async/testdata/throwaway_pg.sh`): `e2e.sh` (req/s, latency, server CPU per
+request for the `acquire()` and `acquire_pipelined()` shapes), `leak.sh` (RSS
+slope per request under `-gc none` vs Boehm, fd counts, for steady, error-heavy,
+disconnect and churn loads), `callgrind.sh` (allocations per request) and
+`codec_bench.v` (the driver's CPU per query, no server). Deterministic failure
+paths run in CI against `pg_async/testdata/fake_pg.py`, a scriptable fake
+server; `tests/pg_async_e2e_test.v` checks the FIFO alignment end to end
+through the epoll reactor.
 
 ## Parser-correctness regression to bank
 header+body-arrive-in-ONE-recv + chunked-terminator-read-on-a-SECOND-recv can cause

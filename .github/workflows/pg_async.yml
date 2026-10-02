@@ -1,0 +1,358 @@
+name: pg_async (PostgreSQL client)
+
+# The native PostgreSQL client (pg_async/) in CI. Three lanes:
+#
+#   fake  — PostgreSQL-free and deterministic: the unit tests, the tests
+#           against pg_async/testdata/fake_pg.py (a scriptable fake server:
+#           python3, stdlib only; real SCRAM-SHA-256), and the e2e suite that
+#           parks pg_async queries on vanilla's epoll reactor
+#           (tests/pg_async_e2e_test.v). Everything that starts a server runs
+#           again under -race (ThreadSanitizer). The benchmark programs are
+#           built, so they cannot rot.
+#   live  — the same tests against real PostgreSQL 16 and 18 (scram-sha-256
+#           service containers; the live tests run when PGHOST is set), plus
+#           the end-to-end benchmark server answering real queries.
+#   tls   — a TLS-only PostgreSQL (hostssl lines for scram-sha-256 and for
+#           `password`, plaintext rejected; certificates from a test CA
+#           generated at run time by pg_async/testdata/gen_test_ca.sh) and the
+#           `-d vanilla_tls` build of pg_async, on both Mbed TLS legs of
+#           tls_backend.yml (same pinned tag, same cache).
+#
+# Benchmarks and the leak harness (bench/pg_async/) are LOCAL tools: a shared
+# runner is too noisy to compare loads (bench/load.sh). The codec micro-bench
+# is A/B'd on main by bench.yml (bench/ci_bench.sh).
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'pg_async/**'
+      - 'bench/pg_async/**'
+      - 'bench/ci_bench.sh'
+      - 'tests/pg_async_e2e_test.v'
+      # What the e2e suite and the bench server build on.
+      - 'core/**'
+      - 'server/**'
+      - 'epoll/**'
+      - 'io_uring/**'
+      - 'poll/**'
+      - 'http1_1/**'
+      - 'socket/**'
+      - 'transport/**'
+      - 'tls/**'
+      - 'testkit/**'
+      - 'vtest/**'
+      - '.github/workflows/pg_async.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'pg_async/**'
+      - 'bench/pg_async/**'
+      - 'bench/ci_bench.sh'
+      - 'tests/pg_async_e2e_test.v'
+      # What the e2e suite and the bench server build on.
+      - 'core/**'
+      - 'server/**'
+      - 'epoll/**'
+      - 'io_uring/**'
+      - 'poll/**'
+      - 'http1_1/**'
+      - 'socket/**'
+      - 'transport/**'
+      - 'tls/**'
+      - 'testkit/**'
+      - 'vtest/**'
+      - '.github/workflows/pg_async.yml'
+
+env:
+  # Bump together with tls_backend.yml: the cache key below is shared with it.
+  MBEDTLS_TAG: v4.2.0
+  # A missing python3 must fail the fake-server tests here, not skip them.
+  VANILLA_REQUIRE_FAKE_PG: '1'
+  # The repo's kill-switch for hosted runners whose per-worker io_uring ring
+  # init fails after a passing probe (see poll_backend.yml); the suites here
+  # run on epoll.
+  VANILLA_NO_IOURING: '1'
+
+jobs:
+  fake:
+    runs-on: ubuntu-latest
+    name: unit + fake PostgreSQL (+ -race)
+    # vtest has no client-side timeouts: a liveness bug hangs, this bounds it.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up V
+        uses: vlang/setup-v@v1.7
+      - name: Remove Vlang folder to avoid conflicts
+        shell: bash
+        run: |
+          rm -rf -v ./vlang || true
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev linux-libc-dev clang python3
+      # `-cc gcc -no-parallel`: the toolchain-flake avoidance every lane uses
+      # (see build_test_examples_on_linux.yml). No PGHOST: the live tests skip.
+      - name: pg_async/ (unit + fake server)
+        shell: bash
+        run: |
+          v -cc gcc -no-parallel test pg_async/
+      - name: pg_async parked on the epoll reactor (e2e)
+        shell: bash
+        run: |
+          v -cc gcc -no-parallel test tests/pg_async_e2e_test.v
+      - name: Build the benchmarks
+        shell: bash
+        run: |
+          v -prod -gc none -d pg_async_bench -o /tmp/pg_codec bench/pg_async/codec_bench.v
+          BENCH_ITERS=8000 /tmp/pg_codec
+          v -prod -gc none -o /tmp/pg_e2e_server bench/pg_async/e2e_server
+      # See race_detector.yml for these two steps.
+      - name: Make ASLR compatible with ThreadSanitizer
+        shell: bash
+        run: |
+          sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Pick the ThreadSanitizer compiler
+        shell: bash
+        run: |
+          printf 'int main(void) { return 0; }\n' > /tmp/tsan_probe.c
+          if clang -fsanitize=thread /tmp/tsan_probe.c -o /tmp/tsan_probe && /tmp/tsan_probe; then
+            echo 'RACE_CC=clang' >> "$GITHUB_ENV"
+          else
+            echo 'RACE_CC=gcc' >> "$GITHUB_ENV"
+          fi
+      - name: Under -race
+        shell: bash
+        env:
+          VRACE: 'halt_on_error=0'
+        run: |
+          v -race -cc "$RACE_CC" -no-parallel test tests/pg_async_e2e_test.v
+          v -race -cc "$RACE_CC" -no-parallel test pg_async/
+
+  live:
+    runs-on: ubuntu-latest
+    name: live PostgreSQL ${{ matrix.pg }} (scram-sha-256)
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [ '16', '18' ]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          POSTGRES_USER: bench
+          POSTGRES_PASSWORD: benchpw
+          POSTGRES_DB: bench
+          POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+          POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U bench -d bench"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: '5432'
+      PGUSER: bench
+      PGPASSWORD: benchpw
+      PGDATABASE: bench
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up V
+        uses: vlang/setup-v@v1.7
+      - name: Remove Vlang folder to avoid conflicts
+        shell: bash
+        run: |
+          rm -rf -v ./vlang || true
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev linux-libc-dev clang python3
+      - name: Seed the database
+        shell: bash
+        run: |
+          docker exec -e PGPASSWORD=benchpw ${{ job.services.postgres.id }} \
+            psql -U bench -d bench -v ON_ERROR_STOP=1 -c "
+              create table pg_async_demo (id int4 primary key, name text);
+              insert into pg_async_demo values (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+              select version();"
+      - name: pg_async/ (unit + fake server + live)
+        shell: bash
+        run: |
+          v -cc gcc -no-parallel test pg_async/
+      - name: End-to-end benchmark server against PostgreSQL ${{ matrix.pg }}
+        shell: bash
+        run: |
+          v -prod -gc none -o /tmp/pg_e2e_server bench/pg_async/e2e_server
+          VANILLA_WORKERS=2 PG_POOL_SIZE=2 BENCH_PORT=8099 /tmp/pg_e2e_server &
+          srv=$!
+          for _ in $(seq 1 100); do curl -sf http://127.0.0.1:8099/health >/dev/null && break; sleep 0.1; done
+          want='[{"id":1,"name":"alpha"},{"id":2,"name":"beta"},{"id":3,"name":"gamma"}]'
+          for path in /db /dbp /dbslow; do
+            got=$(curl -sf "http://127.0.0.1:8099$path")
+            [ "$got" = "$want" ] || { echo "$path answered: $got"; exit 1; }
+          done
+          [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8099/dberr)" = 500 ]
+          kill "$srv"
+      - name: Make ASLR compatible with ThreadSanitizer
+        shell: bash
+        run: |
+          sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Pick the ThreadSanitizer compiler
+        shell: bash
+        run: |
+          printf 'int main(void) { return 0; }\n' > /tmp/tsan_probe.c
+          if clang -fsanitize=thread /tmp/tsan_probe.c -o /tmp/tsan_probe && /tmp/tsan_probe; then
+            echo 'RACE_CC=clang' >> "$GITHUB_ENV"
+          else
+            echo 'RACE_CC=gcc' >> "$GITHUB_ENV"
+          fi
+      - name: pg_async/ under -race
+        shell: bash
+        env:
+          VRACE: 'halt_on_error=0'
+        run: |
+          v -race -cc "$RACE_CC" -no-parallel test pg_async/
+
+  tls:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        threading: [ 'off', 'on' ]
+    name: TLS-only PostgreSQL, -d vanilla_tls (Mbed TLS threading ${{ matrix.threading }})
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up V
+        uses: vlang/setup-v@v1.7
+      - name: Remove Vlang folder to avoid conflicts
+        shell: bash
+        run: |
+          rm -rf -v ./vlang || true
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liburing-dev linux-libc-dev clang python3 postgresql-client
+      # Mbed TLS 4, exactly as tls_backend.yml builds it: same tag, same legs,
+      # same cache key (so a build cached by either workflow serves both).
+      - name: Cache Mbed TLS ${{ env.MBEDTLS_TAG }} (threading ${{ matrix.threading }})
+        id: mbedtls-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/mbedtls-stage
+          key: mbedtls-${{ env.MBEDTLS_TAG }}-shared${{ matrix.threading == 'on' && '-threading' || '' }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Build Mbed TLS ${{ env.MBEDTLS_TAG }} from source (threading ${{ matrix.threading }})
+        if: steps.mbedtls-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          sudo apt-get install -y python3-jinja2 python3-jsonschema
+          git clone --depth 1 --recursive -b "$MBEDTLS_TAG" \
+            https://github.com/Mbed-TLS/mbedtls /tmp/mbedtls
+          if [ "${{ matrix.threading }}" = on ]; then
+            (cd /tmp/mbedtls && python3 scripts/config.py set MBEDTLS_THREADING_C \
+              && python3 scripts/config.py set MBEDTLS_THREADING_PTHREAD)
+            test "$(grep -cE '^#define MBEDTLS_THREADING_(C|PTHREAD)( |$)' \
+              /tmp/mbedtls/tf-psa-crypto/include/psa/crypto_config.h)" = 2
+          fi
+          cmake -S /tmp/mbedtls -B /tmp/mbedtls/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_TESTING=OFF -DENABLE_PROGRAMS=OFF \
+            -DUSE_SHARED_MBEDTLS_LIBRARY=ON -DUSE_STATIC_MBEDTLS_LIBRARY=OFF \
+            -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_INSTALL_LIBDIR=lib
+          cmake --build /tmp/mbedtls/build -j"$(nproc)"
+          DESTDIR="$HOME/mbedtls-stage" cmake --install /tmp/mbedtls/build
+      - name: Install Mbed TLS into /usr/local
+        shell: bash
+        run: |
+          sudo cp -a "$HOME/mbedtls-stage/usr/local/." /usr/local/
+          sudo ldconfig
+          grep -m1 'define MBEDTLS_VERSION_STRING ' /usr/local/include/mbedtls/build_info.h
+      # A TLS-only PostgreSQL. docker run rather than a service container: the
+      # certificates are generated by this job, after services start. The key
+      # must belong to the server's user (PostgreSQL refuses it otherwise), so
+      # the files are copied in and chowned before the stock entrypoint runs.
+      - name: Start a TLS-only PostgreSQL 16 (test CA)
+        shell: bash
+        run: |
+          pg_async/testdata/gen_test_ca.sh "$RUNNER_TEMP/pg-certs"
+          cat > "$RUNNER_TEMP/pg-certs/pg_hba.conf" <<'HBA'
+          local     all  all               trust
+          hostssl   all  pw_user  all      password
+          hostssl   all  all      all      scram-sha-256
+          hostnossl all  all      all      reject
+          HBA
+          docker run -d --name pg-tls -p 55433:5432 \
+            -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=benchpw -e POSTGRES_DB=bench \
+            -v "$RUNNER_TEMP/pg-certs:/certs-src:ro" \
+            --entrypoint bash postgres:16 -c '
+              mkdir -p /certs &&
+              cp /certs-src/server.crt /certs-src/server.key /certs-src/pg_hba.conf /certs/ &&
+              chown -R postgres /certs && chmod 600 /certs/server.key &&
+              exec docker-entrypoint.sh postgres -c ssl=on \
+                -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key \
+                -c hba_file=/certs/pg_hba.conf'
+          # Ready over TCP: docker-entrypoint.sh first runs a temporary server
+          # for initdb with listen_addresses='' (Unix socket only), and a probe
+          # on the socket could catch that one, before the database exists.
+          for _ in $(seq 1 60); do
+            docker exec pg-tls pg_isready -h 127.0.0.1 -U bench -d bench >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec pg-tls pg_isready -h 127.0.0.1 -U bench -d bench || { docker logs pg-tls; exit 1; }
+          docker exec pg-tls psql -U bench -d bench -v ON_ERROR_STOP=1 -c "
+            create table pg_async_demo (id int4 primary key, name text);
+            insert into pg_async_demo values (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+            create role pw_user login password 'pwpass';
+            grant select on pg_async_demo to pw_user;"
+          echo "PG_TEST_CA=$RUNNER_TEMP/pg-certs/ca.crt" >> "$GITHUB_ENV"
+          echo "PG_TEST_CERTS=$RUNNER_TEMP/pg-certs" >> "$GITHUB_ENV"
+      # The instance itself, checked with libpq: verify-full succeeds for both
+      # auth methods, a hostname outside the certificate fails, plaintext is
+      # rejected.
+      - name: Check the TLS-only instance with psql
+        shell: bash
+        run: |
+          base="host=localhost port=55433 dbname=bench sslrootcert=$PG_TEST_CA"
+          PGPASSWORD=benchpw psql "$base user=bench sslmode=verify-full" -Atc \
+            "select ssl, version from pg_stat_ssl where pid = pg_backend_pid()"
+          PGPASSWORD=pwpass psql "$base user=pw_user sslmode=verify-full" -Atc 'select count(*) from pg_async_demo'
+          # The negative checks must fail for the reason they test, not just
+          # fail (an unreachable address or a bad password would also do).
+          if err=$(PGPASSWORD=benchpw psql "host=127.0.0.2 port=55433 dbname=bench user=bench sslmode=verify-full sslrootcert=$PG_TEST_CA" -c 'select 1' 2>&1); then
+            echo 'verify-full accepted a host outside the certificate'; exit 1
+          fi
+          grep -q 'does not match host name' <<<"$err" || { echo "unexpected failure: $err"; exit 1; }
+          if err=$(PGPASSWORD=benchpw psql "$base user=bench sslmode=disable" -c 'select 1' 2>&1); then
+            echo 'the TLS-only instance accepted plaintext'; exit 1
+          fi
+          grep -q 'no encryption' <<<"$err" || { echo "unexpected failure: $err"; exit 1; }
+      - name: pg_async/ and the e2e suite, built with -d vanilla_tls
+        shell: bash
+        run: |
+          v -cc gcc -no-parallel -d vanilla_tls test pg_async/
+          v -cc gcc -no-parallel -d vanilla_tls test tests/pg_async_e2e_test.v
+      - name: Make ASLR compatible with ThreadSanitizer
+        shell: bash
+        run: |
+          sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Pick the ThreadSanitizer compiler
+        shell: bash
+        run: |
+          printf 'int main(void) { return 0; }\n' > /tmp/tsan_probe.c
+          if clang -fsanitize=thread /tmp/tsan_probe.c -o /tmp/tsan_probe && /tmp/tsan_probe; then
+            echo 'RACE_CC=clang' >> "$GITHUB_ENV"
+          else
+            echo 'RACE_CC=gcc' >> "$GITHUB_ENV"
+          fi
+      - name: The e2e suite under -race, -d vanilla_tls
+        shell: bash
+        env:
+          VRACE: 'halt_on_error=0'
+        run: |
+          v -race -cc "$RACE_CC" -no-parallel -d vanilla_tls test tests/pg_async_e2e_test.v

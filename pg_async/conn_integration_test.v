@@ -6,13 +6,18 @@ module pg_async
 import os
 
 // Live-Postgres integration tests. Skipped unless PGHOST is set, so CI without a
-// database stays green. Run against a local container, e.g.:
+// database stays green (pg_async.yml runs them against PostgreSQL 16 and 18).
+// Run against a local container, e.g.:
 //
 //   docker run -d --name pgtest -p 55432:5432 \
 //     -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=benchpw -e POSTGRES_DB=bench \
 //     -e POSTGRES_HOST_AUTH_METHOD=scram-sha-256 postgres:18.3-alpine
 //   PGHOST=127.0.0.1 PGPORT=55432 PGUSER=bench PGPASSWORD=benchpw PGDATABASE=bench \
 //     v test pg_async/
+//
+// or, without Docker, a throwaway cluster from the local server binaries:
+//
+//   eval "$(pg_async/testdata/throwaway_pg.sh start)" && v test pg_async/
 
 fn pg_test_cfg() ?ConnConfig {
 	host := os.getenv('PGHOST')

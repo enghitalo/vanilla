@@ -117,7 +117,15 @@ samples=$(mktemp)
 for i in $(seq 1 "$RUNS"); do
 	t0=$(now)
 	"${PIN[@]}" "$@" >/dev/null 2>&1
+	rc=$?
 	t1=$(now)
+	if [ "$rc" -ne 0 ]; then
+		# A run that crashed or bailed out is not a timing: a panic in the first
+		# millisecond would otherwise be the fastest "run".
+		echo "ERROR: run $i exited with status $rc — no summary" >&2
+		rm -f "$samples"
+		exit 1
+	fi
 	awk -v a="$t0" -v b="$t1" 'BEGIN{ printf "%.6f\n", b-a }' >> "$samples"
 	printf '  run %2d: %s\n' "$i" "$(tail -1 "$samples")"
 done
