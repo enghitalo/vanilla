@@ -18,6 +18,7 @@ mut:
 	conns []PgConn
 	idle  []bool     // idle[i] ⇒ conns[i] is free to take a query
 	cfg   ConnConfig // to re-dial a lost connection
+	scram &ScramCache = unsafe { nil } // PBKDF2 result shared by every connection and re-dial
 }
 
 // PgPool.connect brings up `size` connections (size >= 1) and returns a ready
@@ -27,8 +28,9 @@ pub fn PgPool.connect(cfg ConnConfig, size int) !PgPool {
 		return error('pg pool: size must be >= 1')
 	}
 	mut conns := []PgConn{cap: size}
+	scram := &ScramCache{}
 	for i in 0 .. size {
-		mut c := PgConn.connect(cfg) or {
+		mut c := PgConn.connect_cached(cfg, scram) or {
 			close_all(mut conns)
 			return error('pg pool: connection ${i} failed: ${err}')
 		}
@@ -43,6 +45,7 @@ pub fn PgPool.connect(cfg ConnConfig, size int) !PgPool {
 		conns: conns
 		idle:  []bool{len: size, init: true}
 		cfg:   cfg
+		scram: scram
 	}
 }
 

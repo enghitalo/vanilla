@@ -253,6 +253,10 @@ mut:
 	// attempt moves it on, so a dead address (an IPv6 one on an IPv4-only path,
 	// a failed-over primary) is not retried first forever.
 	addr_cursor int
+	// scram_cache is the pool's PBKDF2 cache (ScramCache), shared by its
+	// connections so a bring-up derives once and a re-dial not at all; nil
+	// for a standalone connection.
+	scram_cache &ScramCache = unsafe { nil }
 }
 
 struct Msg {
@@ -263,10 +267,17 @@ struct Msg {
 // PgConn.connect opens a TCP connection and runs the startup + SCRAM-SHA-256
 // handshake, returning once the server reports ReadyForQuery.
 pub fn PgConn.connect(cfg ConnConfig) !PgConn {
+	return PgConn.connect_cached(cfg, unsafe { nil })
+}
+
+// connect_cached is connect with the SCRAM key derivation taken from (and
+// stored in) `cache` when it is set: the pool's bring-up path.
+fn PgConn.connect_cached(cfg ConnConfig, cache &ScramCache) !PgConn {
 	fd := dial(&cfg, false, 0)!
 	mut c := PgConn{
-		fd:       fd
-		recv_buf: []u8{cap: 16 * 1024}
+		fd:          fd
+		recv_buf:    []u8{cap: 16 * 1024}
+		scram_cache: cache
 	}
 	c.handshake(cfg) or {
 		C.close(fd)
@@ -357,6 +368,7 @@ fn (mut c PgConn) handshake(cfg ConnConfig) ! {
 	c.send(startup)!
 
 	mut scram := ScramClient.new(cfg.user, cfg.password)!
+	scram.cache = c.scram_cache
 	for {
 		msg := c.read_msg()!
 		if c.on_startup_msg(msg.typ, msg.payload, mut scram)! {

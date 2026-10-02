@@ -28,6 +28,66 @@ mut:
 	client_first_bare string
 	server_signature  []u8 // computed in handle_server_first, checked in handle_server_final
 	done              bool
+	// cache, when set, supplies the PBKDF2 result for a (salt, iterations) it
+	// already derived (ScramCache); nil derives every time.
+	cache &ScramCache = unsafe { nil }
+}
+
+// ScramCache keeps the PBKDF2 result for one (salt, iteration count). A role's
+// SCRAM verifier on the server does not change between connections, so a pool
+// derives Hi(password, salt, i) (4096 iterations of HMAC-SHA-256 by default,
+// ~10 ms of CPU and several MB of allocations with V's crypto.pbkdf2) once,
+// and every other connection and every re-dial reuses it: a reconnect then
+// costs the worker no key derivation and, under -gc none, leaks nothing for
+// it. A new salt or count (the role's password was changed) derives again.
+// It holds password-equivalent material, like the ConnConfig it comes from:
+// per pool (one worker thread, no lock), never logged.
+@[heap]
+pub struct ScramCache {
+mut:
+	salt       []u8
+	iterations int
+	client_key []u8
+	server_key []u8
+	derived    int // PBKDF2 runs so far (tests check the reuse)
+}
+
+// keys returns ClientKey and ServerKey for (password, salt, iterations),
+// deriving them only when the cache holds another salt or count.
+fn (mut cache ScramCache) keys(password string, salt []u8, iterations int) !([]u8, []u8) {
+	if cache.client_key.len == 0 || cache.iterations != iterations || cache.salt != salt {
+		client_key, server_key := derive_keys(password, salt, iterations)!
+		cache.client_key = client_key
+		cache.server_key = server_key
+		cache.salt = salt.clone()
+		cache.iterations = iterations
+		cache.derived++
+	}
+	return cache.client_key, cache.server_key
+}
+
+// derive_keys computes ClientKey := HMAC(SaltedPassword, "Client Key") and
+// ServerKey := HMAC(SaltedPassword, "Server Key"), where SaltedPassword :=
+// Hi(password, salt, i) = PBKDF2-HMAC-SHA256 (32 bytes).
+fn derive_keys(password string, salt []u8, iterations int) !([]u8, []u8) {
+	mut pw := password.bytes()
+	mut salted_password := pbkdf2.key(pw, salt, iterations, sha256.size, sha256.new()) or {
+		wipe(mut pw)
+		return err
+	}
+	client_key := hmac.new(salted_password, 'Client Key'.bytes(), sha256.sum, sha256.block_size)
+	server_key := hmac.new(salted_password, 'Server Key'.bytes(), sha256.sum, sha256.block_size)
+	// Password-equivalent temporaries: don't leave them in freed memory.
+	wipe(mut pw)
+	wipe(mut salted_password)
+	return client_key, server_key
+}
+
+// wipe zeroes a buffer that held secret material.
+fn wipe(mut b []u8) {
+	if b.len > 0 {
+		unsafe { vmemset(b.data, 0, b.len) }
+	}
 }
 
 // ScramClient.new builds a client with a fresh random nonce (base64 of 18
@@ -87,11 +147,15 @@ pub fn (mut c ScramClient) handle_server_first(server_first []u8) ![]u8 {
 		return error('scram: malformed server-first message')
 	}
 
-	// SaltedPassword := Hi(password, salt, i) = PBKDF2-HMAC-SHA256, 32 bytes.
+	// ClientKey and ServerKey from SaltedPassword := Hi(password, salt, i):
+	// from the pool's cache when it already derived this (salt, i).
 	salt := base64.decode(salt_b64)
-	salted_password := pbkdf2.key(c.password.bytes(), salt, iter, sha256.size, sha256.new())!
-	// ClientKey := HMAC(SaltedPassword, "Client Key"); StoredKey := H(ClientKey).
-	client_key := hmac.new(salted_password, 'Client Key'.bytes(), sha256.sum, sha256.block_size)
+	client_key, server_key := if c.cache != unsafe { nil } {
+		c.cache.keys(c.password, salt, iter)!
+	} else {
+		derive_keys(c.password, salt, iter)!
+	}
+	// StoredKey := H(ClientKey).
 	stored_key := sha256.sum(client_key)
 
 	// client-final-message-without-proof, then the full AuthMessage.
@@ -107,7 +171,6 @@ pub fn (mut c ScramClient) handle_server_first(server_first []u8) ![]u8 {
 	}
 
 	// ServerSignature := HMAC(ServerKey, AuthMessage), verified in the final step.
-	server_key := hmac.new(salted_password, 'Server Key'.bytes(), sha256.sum, sha256.block_size)
 	c.server_signature = hmac.new(server_key, auth_message.bytes(), sha256.sum, sha256.block_size)
 
 	return '${client_final_bare},p=${base64.encode(client_proof)}'.bytes()
