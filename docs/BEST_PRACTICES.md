@@ -288,6 +288,22 @@ and once every slot has leaked the worker sheds every query with 503
 `watch_fd` for per-request fds (a timerfd, a pipe), which must be closed with
 their request.
 
+Pooled connections also die under you: a restart, a failover, an idle timeout, a
+managed database's connection lifetime. `pg_async` breaks such a connection,
+never hands it out again, and re-dials it off the request path. Run
+`pool.start_maintenance(mut event_loop)` from `on_worker_start` (Linux epoll;
+elsewhere call `pool.maintain()` periodically). The handler's part
+(`examples/async_db_pg`):
+
+- Park every query `submit` accepted, even when `async_flush` failed: its
+  continuation's `async_on_readable` is what reports the outcome.
+- In the continuation, when `ready_fd_error` is set and the reply is still
+  incomplete, call `conn.mark_broken()` and poll once more. That ends the query
+  (kind `unknown`). Never re-arm a dead fd.
+- Map the error honestly: `err is pg_async.PgError && err.kind == .server` (the
+  statement failed) → 500; anything else (connection lost, outcome unknown) →
+  503.
+
 **Do**
 
 - Use the **pool**, not a connection per request; build params/queries into

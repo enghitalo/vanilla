@@ -93,6 +93,25 @@ pub fn dial_tcp(ipv4 string, port int) !int {
 	return fd
 }
 
+fn C.transport_dial_addr(addr voidptr, len u32) int
+fn C.transport_connect_error(fd int) int
+
+// dial_addr starts a NON-BLOCKING connect to an already-resolved address: a
+// sockaddr of any family (one getaddrinfo result, IPv4 or IPv6) and its
+// length. It returns the fd at once, close-on-exec, or -errno when the socket
+// or the connect failed outright. Allocation-free, for callers that retry in a
+// loop (a pool re-dialing). The connect is usually still in flight: wait until
+// the fd is writable, then read its outcome with connect_error.
+pub fn dial_addr(addr voidptr, addrlen u32) int {
+	return C.transport_dial_addr(addr, addrlen)
+}
+
+// connect_error is the outcome of a non-blocking connect once its fd is
+// writable: 0 when it connected, else the errno (SO_ERROR).
+pub fn connect_error(fd int) int {
+	return C.transport_connect_error(fd)
+}
+
 // dial_unix connects NON-BLOCKING to an AF_UNIX stream listener. Unlike TCP
 // (where a SYN queues), a UDS connect on a FULL listen backlog fails
 // immediately with EAGAIN (issue #122 §8) — surfaced as its own message so

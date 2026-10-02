@@ -13,7 +13,9 @@ module main
 //   GET /health  no database
 //
 // /db, /dbp and /dbslow render pg_async_demo (3 rows, seeded by
-// pg_async/testdata/throwaway_pg.sh) as JSON. Configuration: the PG* env vars,
+// pg_async/testdata/throwaway_pg.sh) as JSON. A failed statement answers 500,
+// a lost connection or a full pool 503; each worker's maintenance timer
+// re-dials connections the server closed. Configuration: the PG* env vars,
 // PG_POOL_SIZE (connections per worker, default 4), BENCH_PORT (default 8099),
 // VANILLA_WORKERS. Driven by bench/pg_async/e2e.sh and leak.sh.
 import os
@@ -117,26 +119,26 @@ fn park_query(mut st DbState, query string, exclusive bool, mut out []u8, mut ev
 		return .done
 	}
 	mut conn := st.pool.conn(idx)
-	if !conn.async_submit(query, []?[]u8{}) {
+	queued := conn.submit(query, []?[]u8{}) or { false } // broken: nothing was sent
+	if !queued {
 		if exclusive {
 			st.pool.release(idx)
 		}
 		out << resp_503
 		return .done
 	}
-	conn.async_flush() or {
-		if exclusive {
-			st.pool.release(idx)
-		}
-		out << resp_500
-		return .done
-	}
-	// A partial flush finishes in on_db_ready (async_wants_write): the query
-	// is already in the connection's in-flight FIFO, so the request must park
-	// for its reply either way.
+	// The query is in the connection's in-flight FIFO: park for its outcome
+	// even if this flush fails (on_db_ready then gets the error) — every
+	// submitted query needs its parked request.
+	conn.async_flush() or {}
 	payload := u64(idx) | if exclusive { exclusive_flag } else { u64(0) }
-	event_loop.watch_fd_persistent(st.pool.fd(idx), .readable, on_db_ready, voidptr(payload))
+	event_loop.watch_fd_persistent(st.pool.fd(idx), interest(conn), on_db_ready, voidptr(payload))
 	return .suspend
+}
+
+// interest: writability while request bytes are still unsent, else the reply.
+fn interest(conn &pg_async.PgConn) core.WatchInterest {
+	return if conn.async_wants_write() { .writable } else { .readable }
 }
 
 fn on_db_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
@@ -148,22 +150,15 @@ fn on_db_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload vo
 	if conn.async_wants_write() {
 		conn.async_flush() or {}
 	}
-	poll := conn.async_on_readable() or {
-		if exclusive {
-			st.pool.release(idx)
-		}
-		out << resp_500
-		return .done
+	mut poll := conn.async_on_readable() or { return db_failed(mut st, idx, exclusive, err, mut out) }
+	if !poll.ready && ready_fd_error {
+		// A dead socket with the reply incomplete: give up on the connection,
+		// which ends this query (unknown) — never re-arm a dead fd.
+		conn.mark_broken()
+		poll = conn.async_on_readable() or { return db_failed(mut st, idx, exclusive, err, mut out) }
 	}
 	if !poll.ready {
-		if ready_fd_error {
-			if exclusive {
-				st.pool.release(idx)
-			}
-			out << resp_500
-			return .done
-		}
-		event_loop.watch_fd_persistent(ready_fd, .readable, on_db_ready, watch_payload)
+		event_loop.watch_fd_persistent(ready_fd, interest(conn), on_db_ready, watch_payload)
 		return .suspend
 	}
 	unsafe {
@@ -192,6 +187,20 @@ fn on_db_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload vo
 	wi(mut out, st.body.len)
 	wb(mut out, resp_json_sep)
 	wb(mut out, st.body)
+	return .done
+}
+
+// db_failed answers a query that ended in an error: 500 when the server
+// failed the statement, 503 when the connection was lost (outcome unknown).
+fn db_failed(mut st DbState, idx int, exclusive bool, err IError, mut out []u8) core.Step {
+	if exclusive {
+		st.pool.release(idx)
+	}
+	if err is pg_async.PgError && err.kind == .server {
+		out << resp_500
+	} else {
+		out << resp_503
+	}
 	return .done
 }
 
@@ -234,11 +243,18 @@ fn hex_digit(n u8) u8 {
 	return if n < 10 { `0` + n } else { `a` + (n - 10) }
 }
 
+// start_maintenance re-dials this worker's broken connections from a timer.
+fn start_maintenance(worker_state voidptr, mut event_loop core.EventLoop) {
+	mut st := unsafe { &DbState(worker_state) }
+	st.pool.start_maintenance(mut event_loop) or { eprintln('pg_async bench: ${err}') }
+}
+
 fn main() {
 	mut s := server.new_server(server.ServerConfig{
-		port:       env_or('BENCH_PORT', '8099').int()
-		handler:    handler
-		make_state: build_state
+		port:            env_or('BENCH_PORT', '8099').int()
+		handler:         handler
+		make_state:      build_state
+		on_worker_start: start_maintenance
 	})!
 	s.run()
 }

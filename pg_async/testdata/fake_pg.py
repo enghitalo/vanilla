@@ -26,11 +26,17 @@ needs happen deterministically:
       FATAL 57P01 (administrator command) 50 ms later, then close
   --hang-after K                    the K-th and later queries of a connection
       are never answered (the connection stays open)
+  --desync-after K                  the K-th query is answered with bytes that
+      cannot be a reply (a message length of 2)
+  --mute                            accept, read, never answer: not even the
+      authentication request
   --auth scram|trust                (default scram; password --password)
 
 --stats-file PATH keeps `key=value` counters (accepted, authenticated, queries,
 server_closes, ssl_requests, cancel_requests) up to date, so a test can assert
-on what the server saw. Every connection is logged to stderr.
+on what the server saw. Every connection is logged to stderr, or to
+--log-file. The server exits when its parent process does (a test that
+panicked) or after --lifetime seconds.
 
 usage: fake_pg.py --port-file PATH [options]
 """
@@ -65,8 +71,11 @@ STATS = {}
 STATS_LOCK = threading.Lock()
 
 
+LOG = sys.stderr
+
+
 def log(cid, text):
-    print(f'fake-pg conn {cid}: {text}', file=sys.stderr, flush=True)
+    print(f'{time.monotonic():.3f} fake-pg conn {cid}: {text}', file=LOG, flush=True)
 
 
 def bump(key, n=1):
@@ -326,6 +335,11 @@ def serve(conn, cid):
                 log(cid, f'query {queries}: hanging (never answered)')
                 stmts = []
                 continue
+            if ARGS.desync_after and queries == ARGS.desync_after:
+                log(cid, f'query {queries}: answered with garbage')
+                conn.sendall(b'1' + struct.pack('!I', 2) + b'\x00\x00\x00\x00')
+                stmts = []
+                continue
             reply = b''
             for stmt_sql, params in stmts:
                 reply += msg(b'1') + msg(b'2')
@@ -367,6 +381,10 @@ def close_after_reply(conn, cid, reply):
 
 def handle(conn, cid):
     try:
+        if ARGS.mute:
+            while conn.recv(4096):
+                pass
+            return
         if startup(conn, cid) is not None:
             serve(conn, cid)
     except (EOFError, OSError, ValueError, IndexError, struct.error):
@@ -379,7 +397,7 @@ def handle(conn, cid):
 
 
 def main():
-    global ARGS
+    global ARGS, LOG
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--port-file', required=True, help='written with the listening port once ready')
     ap.add_argument('--stats-file', default='')
@@ -388,8 +406,14 @@ def main():
     ap.add_argument('--close', choices=('none', 'delayed', 'immediate', 'fatal'), default='none')
     ap.add_argument('--close-after', type=int, default=1)
     ap.add_argument('--hang-after', type=int, default=0)
+    ap.add_argument('--desync-after', type=int, default=0)
+    ap.add_argument('--mute', action='store_true')
     ap.add_argument('--lifetime', type=float, default=300.0, help='exit after this many seconds')
+    ap.add_argument('--log-file', default='')
     ARGS = ap.parse_args()
+    if ARGS.log_file:
+        LOG = open(ARGS.log_file, 'a')
+    parent = os.getppid()
 
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -403,7 +427,7 @@ def main():
     os.replace(tmp, ARGS.port_file)  # atomic: the reader never sees a partial port
     deadline = time.time() + ARGS.lifetime
     cid = 0
-    while time.time() < deadline:
+    while time.time() < deadline and os.getppid() == parent:
         try:
             conn, _ = srv.accept()
         except socket.timeout:

@@ -58,11 +58,63 @@ pub fn (mut c ScramClient) client_first() []u8 {
 	return '${gs2_header}${c.client_first_bare}'.bytes()
 }
 
+// ScramCache keeps the PBKDF2 result for one (salt, iteration count): a role's
+// SCRAM verifier on the server does not change between connections, so a
+// pool computes Hi(password, salt, i) — 4096 iterations of HMAC-SHA-256, ~14
+// ms of CPU here, most of a connect's cost — once, and every other connection
+// and every re-dial reuses it. It holds password-equivalent material, like the
+// pool's ConnConfig: per pool, never logged.
+struct ScramCache {
+mut:
+	salt       []u8
+	iterations int
+	client_key []u8
+	server_key []u8
+	computed   int // PBKDF2 runs (tests check the reuse)
+}
+
+// keys returns ClientKey and ServerKey for (password, salt, iterations),
+// computing them only when the cache holds another salt or count.
+fn (mut cache ScramCache) keys(password string, salt []u8, iterations int) !([]u8, []u8) {
+	if cache.client_key.len == 0 || cache.iterations != iterations || cache.salt != salt {
+		// SaltedPassword := Hi(password, salt, i) = PBKDF2-HMAC-SHA256, 32 bytes.
+		mut pw := password.bytes()
+		mut salted_password := pbkdf2.key(pw, salt, iterations, sha256.size, sha256.new()) or {
+			wipe(mut pw)
+			return err
+		}
+		cache.client_key = hmac.new(salted_password, 'Client Key'.bytes(), sha256.sum, sha256.block_size)
+		cache.server_key = hmac.new(salted_password, 'Server Key'.bytes(), sha256.sum, sha256.block_size)
+		cache.salt = salt.clone()
+		cache.iterations = iterations
+		cache.computed++
+		// Password-equivalent temporaries: don't leave them in freed memory.
+		wipe(mut pw)
+		wipe(mut salted_password)
+	}
+	return cache.client_key, cache.server_key
+}
+
+// wipe zeroes a buffer that held secret material.
+fn wipe(mut b []u8) {
+	if b.len > 0 {
+		unsafe { vmemset(b.data, 0, b.len) }
+	}
+}
+
 // handle_server_first parses the server-first message (r= combined nonce, s=
 // base64 salt, i= iteration count), runs the SCRAM computation, stashes the
 // expected ServerSignature for the final step, and returns the client-final
 // message carrying the ClientProof.
 pub fn (mut c ScramClient) handle_server_first(server_first []u8) ![]u8 {
+	mut cache := ScramCache{}
+	return c.reply_to_server_first(server_first, c.password, mut cache)
+}
+
+// reply_to_server_first is handle_server_first with the password passed in
+// (the dialer keeps it in the pool's config, never on a connection) and the
+// PBKDF2 result taken from `cache` when it matches.
+fn (mut c ScramClient) reply_to_server_first(server_first []u8, password string, mut cache ScramCache) ![]u8 {
 	sf := server_first.bytestr()
 	mut combined_nonce := ''
 	mut salt_b64 := ''
@@ -87,11 +139,10 @@ pub fn (mut c ScramClient) handle_server_first(server_first []u8) ![]u8 {
 		return error('scram: malformed server-first message')
 	}
 
-	// SaltedPassword := Hi(password, salt, i) = PBKDF2-HMAC-SHA256, 32 bytes.
 	salt := base64.decode(salt_b64)
-	salted_password := pbkdf2.key(c.password.bytes(), salt, iter, sha256.size, sha256.new())!
-	// ClientKey := HMAC(SaltedPassword, "Client Key"); StoredKey := H(ClientKey).
-	client_key := hmac.new(salted_password, 'Client Key'.bytes(), sha256.sum, sha256.block_size)
+	// ClientKey := HMAC(SaltedPassword, "Client Key"); ServerKey likewise.
+	client_key, server_key := cache.keys(password, salt, iter)!
+	// StoredKey := H(ClientKey).
 	stored_key := sha256.sum(client_key)
 
 	// client-final-message-without-proof, then the full AuthMessage.
@@ -107,7 +158,6 @@ pub fn (mut c ScramClient) handle_server_first(server_first []u8) ![]u8 {
 	}
 
 	// ServerSignature := HMAC(ServerKey, AuthMessage), verified in the final step.
-	server_key := hmac.new(salted_password, 'Server Key'.bytes(), sha256.sum, sha256.block_size)
 	c.server_signature = hmac.new(server_key, auth_message.bytes(), sha256.sum, sha256.block_size)
 
 	return '${client_final_bare},p=${base64.encode(client_proof)}'.bytes()

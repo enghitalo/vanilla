@@ -45,9 +45,13 @@ pub fn start_fake_pg(args []string) !FakePg {
 	port_file := os.join_path(dir, 'port')
 	stats := os.join_path(dir, 'stats')
 	mut p := os.new_process(python)
-	mut all := [fake_pg_script, '--port-file', port_file, '--stats-file', stats]
+	mut all := [fake_pg_script, '--port-file', port_file, '--stats-file', stats, '--log-file',
+		os.join_path(dir, 'log')]
 	all << args
 	p.set_args(all)
+	// Its own stdio, not the test's: a test runner reads the test's output to
+	// EOF, which a fake still holding it would postpone until the fake exits.
+	p.set_redirect_stdio()
 	p.run()
 	// The script writes the port file atomically once it listens.
 	for _ in 0 .. 1000 {
@@ -83,6 +87,11 @@ pub fn (mut f FakePg) stop() {
 		f.proc = unsafe { nil }
 	}
 	os.rmdir_all(f.dir) or {}
+}
+
+// log returns what the fake server logged (one line per connection event).
+pub fn (f &FakePg) log() string {
+	return os.read_file(os.join_path(f.dir, 'log')) or { '' }
 }
 
 // stat returns one of the fake server's counters (accepted, authenticated,

@@ -35,9 +35,12 @@ const fake_reply = build_fake_reply()
 // (atomics only).
 struct FakePg {
 mut:
-	hold i64 // 1: a query's reply waits until this is cleared
-	held i64 // queries received while hold was set
-	eofs i64 // pooled connections the server side closed
+	hold     i64 // 1: a query's reply waits until this is cleared
+	held     i64 // queries received while hold was set
+	eofs     i64 // pooled connections the server side closed
+	kill     i64 // 1: the next reply is sent, then that connection is closed (and this cleared)
+	killed   i64 // connections closed that way
+	startups i64 // connections that completed the startup
 }
 
 const fake = &FakePg{}
@@ -169,6 +172,7 @@ fn fake_pg_conn(fd int) {
 	mut ready := []u8{}
 	pg_msg(mut ready, `R`, [u8(0), 0, 0, 0]) // AuthenticationOk
 	pg_msg(mut ready, `Z`, [u8(`I`)])
+	stdatomic.add_i64(&f.startups, 1)
 	send_all(fd, ready)
 	for {
 		head := read_exact(fd, 5) or {
@@ -195,6 +199,13 @@ fn fake_pg_conn(fd int) {
 					}
 				}
 				send_all(fd, fake_reply)
+				if stdatomic.load_i64(&f.kill) == 1 {
+					// The server side ends this connection right after the
+					// reply: a restart / pg_terminate_backend, as the pool sees it.
+					stdatomic.store_i64(&f.kill, 0)
+					stdatomic.add_i64(&f.killed, 1)
+					return
+				}
 			}
 			else {} // Parse / Bind / Describe / Execute
 		}
@@ -266,4 +277,67 @@ fn send_all(fd int, b []u8) {
 fn peer_closed(fd int) bool {
 	mut b := u8(0)
 	return C.recv(fd, &b, 1, C.MSG_PEEK | C.MSG_DONTWAIT) == 0
+}
+
+// A connection the server closes (vanilla#191) is never handed out again: the
+// query it carried got its reply, the next requests use the other connections,
+// and the maintenance timer (on_worker_start) re-dials it — so no /db fails.
+fn test_connections_the_server_closes_are_redialed() {
+	$if linux {
+		mut f := unsafe { fake }
+		stdatomic.store_i64(&f.hold, 0)
+		lfd := socket.create_server_socket(0)
+		socket.set_blocking(lfd, true)
+		port := socket.local_port(lfd)
+		spawn fake_pg_accept(lfd)
+		os.setenv('PGHOST', '127.0.0.1', true)
+		os.setenv('PGPORT', port.str(), true)
+		os.setenv('PGUSER', 'vanilla', true)
+		os.setenv('PGPASSWORD', '', true)
+		os.setenv('PGDATABASE', 'vanilla', true)
+		base := stdatomic.load_i64(&f.startups)
+		mut h := vtest.start(server.ServerConfig{
+			handler:         handler
+			make_state:      build_pool
+			on_worker_start: start_maintenance
+			workers:         1
+		}) or {
+			assert false, err.msg()
+			return
+		}
+		defer {
+			h.stop()
+		}
+		// The worker brings its pool up in make_state, which may still be
+		// running when the server starts accepting.
+		startups0 := base + pool_size
+		assert settle(fn [startups0] () bool {
+			g := unsafe { fake }
+			return stdatomic.load_i64(&g.startups) >= startups0
+		})
+		for i in 0 .. 3 * pool_size {
+			stdatomic.store_i64(&f.kill, 1) // this reply is its connection's last
+			// The first answer, not a retry: no request is ever given the dead
+			// connection, so none is shed or fails.
+			o := h.fire([
+				vtest.Script{
+					rounds: [vtest.Round{
+						send: db_req
+						want: 1
+					}]
+				},
+			]) or {
+				assert false, err.msg()
+				return
+			}
+			got := if o.conns[0].frames.len > 0 { o.conns[0].frames[0] } else { o.conns[0].raw }
+			assert got == want_resp, 'request ${i}: ${got.bytestr()}'
+			// The closed connection is re-dialed before the next request.
+			assert settle(fn [startups0, i] () bool {
+				g := unsafe { fake }
+				return stdatomic.load_i64(&g.startups) >= startups0 + i + 1
+			}), 'not re-dialed after request ${i}'
+		}
+		assert stdatomic.load_i64(&f.killed) >= 3 * pool_size
+	}
 }

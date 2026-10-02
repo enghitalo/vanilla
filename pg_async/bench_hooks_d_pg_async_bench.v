@@ -9,10 +9,10 @@ module pg_async
 // bench_conn_on_fd wraps an already-connected socket as a ready connection
 // (the state PgConn.connect leaves behind after its handshake).
 pub fn bench_conn_on_fd(fd int) PgConn {
-	return PgConn{
-		fd:       fd
-		recv_buf: []u8{cap: 16 * 1024}
-	}
+	mut c := new_conn()
+	c.fd = fd
+	c.broken = false
+	return c
 }
 
 // bench_discard_inflight forgets the in-flight queries and the unsent request

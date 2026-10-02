@@ -122,6 +122,10 @@ mut:
 	// watch table must not be touched (a dedup/append there would either revive
 	// the tombstone or duplicate it).
 	rearming_dead bool
+	// The reused `response` of a tombstone's continuation, whose output is
+	// discarded (epoll's Reactor.scratch: a fresh array per tombstone grew per
+	// disconnect).
+	scratch []u8
 }
 
 struct PendingIouPoll {
@@ -640,13 +644,15 @@ fn drain_pipelined_iou(mut env IouEnv, ext_fd int, ready_err bool, limits Limits
 		// Never dereference conn state for a dead slot — identity is the captured fd.
 		if slot.dead || unsafe { conn == nil } || unsafe { conn.owner == nil }
 			|| conn.fd != slot.client_fd {
-			mut scratch := []u8{}
+			unsafe {
+				env.scratch.len = 0
+			}
 			mut dead_loop := iou_event_loop(mut env, slot.client_fd)
 			// rearming_dead: a re-arm from this tombstone's continuation must ONLY
 			// re-queue the oneshot poll — the queue slot stays as-is and the watch
 			// table is untouched (see iou_register_watch).
 			env.rearming_dead = true
-			dead_step := slot.cont(mut scratch, ext_fd, ready_err, slot.udata, env.state, mut
+			dead_step := slot.cont(mut env.scratch, ext_fd, ready_err, slot.udata, env.state, mut
 				dead_loop)
 			env.rearming_dead = false
 			if dead_step == .suspend {

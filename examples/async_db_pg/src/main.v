@@ -11,6 +11,11 @@ import pg_async
 // GET /db request acquires a connection, issues a query, parks on the PG socket
 // with event_loop.watch_fd_persistent, and the continuation renders the rows
 // once they arrive — all on the worker's single epoll loop, never blocking it.
+// on_worker_start runs the pool's maintenance timer, which re-dials a
+// connection the server closed (a restart, a failover, pg_terminate_backend)
+// off the request path. Answers are honest: 500 when the server failed the
+// query, 503 when the database could not answer (pool exhausted, connection
+// lost) — a retry may succeed.
 // This is the template the HttpArena framework's async-db/fortunes endpoints
 // follow.
 //
@@ -68,6 +73,12 @@ fn build_pool() voidptr {
 	})
 }
 
+// start_maintenance re-dials this worker's broken connections from a timer.
+fn start_maintenance(worker_state voidptr, mut event_loop core.EventLoop) {
+	mut st := unsafe { &DbState(worker_state) }
+	st.pool.start_maintenance(mut event_loop) or { eprintln('async_db_pg: ${err}') }
+}
+
 fn targets_db(req []u8) bool {
 	return req.bytestr().contains(' /db') // crude routing — fine for a demo
 }
@@ -81,59 +92,58 @@ fn handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut even
 	}
 	mut st := unsafe { &DbState(worker_state) }
 	idx := st.pool.acquire() or {
-		out << resp_503
+		out << resp_503 // every connection busy (or being re-dialed): shed
 		return .done
 	}
 	mut conn := st.pool.conn(idx)
-	if !conn.async_submit(r'select id, name from pg_async_demo order by id', []?[]u8{}) {
-		// Connection saturated (pipeline full) — shed.
+	queued := conn.submit(r'select id, name from pg_async_demo order by id', []?[]u8{}) or {
+		false // the connection broke since it was handed out: nothing was sent
+	}
+	if !queued {
 		st.pool.release(idx)
 		out << resp_503
 		return .done
 	}
-	flushed := conn.async_flush() or {
-		st.pool.release(idx)
-		out << resp_500
-		return .done
-	}
-	if !flushed {
-		// Tiny queries flush in one write; a partial send is a v1 edge we don't handle.
-		st.pool.release(idx)
-		out << resp_500
-		return .done
-	}
-	// The pool owns this socket and reuses it, so park with watch_fd_persistent,
-	// never watch_fd. If the client disconnects mid-query, a plain watch_fd would
-	// close the pooled socket and drop the continuation: release() would never
-	// run, and after pool_size such disconnects every /db on this worker gets 503.
-	// The persistent watch keeps the socket open and still runs on_db_ready when
-	// the reply arrives (its response is discarded), which drains the reply and
-	// releases the slot. The slot index rides in watch_payload.
-	event_loop.watch_fd_persistent(st.pool.fd(idx), .readable, on_db_ready, voidptr(usize(idx)))
+	// The query is in flight: park for its outcome even if this flush fails —
+	// the continuation then receives the error. The pool owns this socket and
+	// reuses it, so park with watch_fd_persistent, never watch_fd. If the client
+	// disconnects mid-query, a plain watch_fd would close the pooled socket and
+	// drop the continuation: release() would never run, and after pool_size such
+	// disconnects every /db on this worker gets 503. The persistent watch keeps
+	// the socket open and still runs on_db_ready when the reply arrives (its
+	// response is discarded), which drains the reply and releases the slot. The
+	// slot index rides in watch_payload.
+	conn.async_flush() or {}
+	event_loop.watch_fd_persistent(st.pool.fd(idx), interest(conn), on_db_ready, voidptr(usize(idx)))
 	return .suspend
 }
 
-// on_db_ready runs when the watched PG socket is readable: it pumps the result
+// interest is what the parked request waits for: writability while request
+// bytes are still unsent (a full socket buffer), else the reply.
+fn interest(conn &pg_async.PgConn) core.WatchInterest {
+	return if conn.async_wants_write() { .writable } else { .readable }
+}
+
+// on_db_ready runs when the watched PG socket is ready: it pumps the result
 // and, once complete, renders the rows as JSON and releases the connection.
 // Every path that does not re-arm releases the slot.
 fn on_db_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut st := unsafe { &DbState(worker_state) }
 	idx := int(usize(watch_payload))
 	mut conn := st.pool.conn(idx)
-	poll := conn.async_on_readable() or {
-		st.pool.release(idx)
-		out << resp_500
-		return .done
+	if conn.async_wants_write() {
+		conn.async_flush() or {}
+	}
+	mut poll := conn.async_on_readable() or { return db_failed(mut st, idx, err, mut out) }
+	if !poll.ready && ready_fd_error {
+		// Error/hangup with the reply still incomplete: the socket is dead.
+		// Re-arming a dead level-triggered fd would busy-spin the worker; give
+		// up on the connection instead, which ends this query (unknown).
+		conn.mark_broken()
+		poll = conn.async_on_readable() or { return db_failed(mut st, idx, err, mut out) }
 	}
 	if !poll.ready {
-		if ready_fd_error {
-			// Error/hangup with the reply still incomplete: the socket is dead.
-			// Re-arming a dead level-triggered fd would busy-spin the worker.
-			st.pool.release(idx)
-			out << resp_500
-			return .done
-		}
-		event_loop.watch_fd_persistent(ready_fd, .readable, on_db_ready, watch_payload) // more bytes to come
+		event_loop.watch_fd_persistent(ready_fd, interest(conn), on_db_ready, watch_payload) // more bytes to come
 		return .suspend
 	}
 	unsafe {
@@ -160,6 +170,19 @@ fn on_db_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload vo
 	wi(mut out, st.body.len)
 	wb(mut out, resp_json_sep)
 	wb(mut out, st.body)
+	return .done
+}
+
+// db_failed answers a query that ended in an error and releases its slot: 500
+// when the server failed the statement, 503 when the connection was lost (the
+// outcome is unknown; a read like this one is safe to retry).
+fn db_failed(mut st DbState, idx int, err IError, mut out []u8) core.Step {
+	st.pool.release(idx)
+	if err is pg_async.PgError && err.kind == .server {
+		out << resp_500
+	} else {
+		out << resp_503
+	}
 	return .done
 }
 
@@ -228,9 +251,10 @@ fn hex_digit(n u8) u8 {
 
 fn main() {
 	mut s := server.new_server(server.ServerConfig{
-		port:       8099
-		handler:    handler
-		make_state: build_pool
+		port:            8099
+		handler:         handler
+		make_state:      build_pool
+		on_worker_start: start_maintenance
 	})!
 	println('async_db_pg listening on http://localhost:8099/ (GET /db, GET /health)')
 	s.run()

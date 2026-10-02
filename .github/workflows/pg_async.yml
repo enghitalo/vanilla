@@ -113,6 +113,7 @@ jobs:
           VRACE: 'halt_on_error=0'
         run: |
           v -race -cc "$RACE_CC" -no-parallel test tests/pg_async_e2e_test.v
+          v -race -cc "$RACE_CC" -no-parallel test examples/async_db_pg/src
           v -race -cc "$RACE_CC" -no-parallel test pg_async/
 
   live:

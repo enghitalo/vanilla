@@ -88,12 +88,79 @@ connection desyncs or corrupts:
    stream resyncs at the next ReadyForQuery so pipelined siblings still complete.
 5. **Prepared-statement cache** (SQL→stmt name, evict on ParseComplete failure) —
    async-db/fortunes use one fixed SQL, so this drops the per-request Parse.
-6. **Round-robin a SMALL pool** where each conn multiplexes; evict+reopen broken.
+6. **Round-robin a SMALL pool** where each conn multiplexes; evict+reopen broken
+   (see *Connection health* below).
 
 These are also the read-bound case for the whole approach: the win is mostly CPU
 reduction (fewer syscalls/parses per query), and because Postgres replies in order
 a handful of pipelined conns saturate the link — so the per-worker 2-conn pool is
 fixable by pipelining, not by more connections.
+
+## Connection health (#191)
+A pooled connection dies under the app: a restart or failover, an
+administrator's `pg_terminate_backend`, `idle_session_timeout`, a managed
+database's maximum connection lifetime, a reset, a vanished peer. The rules:
+
+1. **One outcome per submitted query, in submission order.** Each
+   `async_on_readable` call that completes returns ONE query's outcome:
+   - its `Result` once its ReadyForQuery arrived;
+   - a `PgError` of kind `server` (the statement failed; the connection is
+     fine);
+   - a `PgError` of kind `unknown` (the connection broke before that query's
+     ReadyForQuery: it may or may not have run, so never retry a
+     non-idempotent statement on it automatically).
+
+   **Success requires ReadyForQuery.** A complete reply followed by the server
+   closing the socket (in the same read, even) is still a success: what was
+   received is framed before the close is acted on.
+2. **Park every submitted query**, even when its flush failed. The
+   continuation's `async_on_readable` call delivers the outcome, and keeps the
+   reactor's queue aligned with the in-flight FIFO (`queue[k] ↔ inflight[k]`).
+   The one way to abandon a query is `release()` on a slot held with
+   `acquire()` without parking for it: the connection is then retired (broken,
+   its queries dropped, re-dialed), so no later borrower receives the
+   abandoned reply. A broken connection never answers not-ready: a caller
+   whose query is gone gets an error, rather than re-arming a watch on a dead
+   socket.
+3. **A broken connection is never handed out.** It breaks on EOF, a recv/send
+   error, a FATAL/PANIC (its SQLSTATE, e.g. 57P01, becomes the in-flight queries'
+   error), bytes that cannot be a reply (desync), or `mark_broken()` (the app
+   saw `ready_fd_error` with the reply incomplete). `submit` then refuses with
+   kind `broken` (nothing sent: safe to retry elsewhere). `acquire` (round-robin)
+   and `acquire_pipelined` skip it, and `acquire_pipelined` never shares a
+   connection held by `acquire()`.
+4. **The fd is closed only once its queue drained.** `maintain()` closes and
+   re-dials a broken slot only when nothing is in flight on it and no
+   `acquire()` holds it, so no parked request or watch still refers to the fd
+   number (vanilla#100's fd-reuse hazard).
+5. **Re-dial never blocks the worker.** Connecting is a non-blocking state
+   machine (`dial.v`: connect → StartupMessage → SCRAM → ReadyForQuery), stepped
+   by `maintain()` from the pool's maintenance timer (`start_maintenance`: a
+   clientless timerfd watch, every ~2 ms while a dial is in flight). The
+   connection that breaks pulls the timer in (one `timerfd_settime` per break,
+   never per query).
+   - Failed attempts back off exponentially with equal jitter, using a per-pool
+     xorshift (no shared `rand`), and fail over to the next resolved address.
+   - A hostname whose every address failed is re-resolved on a helper thread
+     (`getaddrinfo` blocks).
+   - PBKDF2 (~14 ms of CPU per SCRAM login) runs once per pool: `ScramCache`.
+6. **Idle connections are probed** about once a second (one
+   `recv(MSG_PEEK | MSG_DONTWAIT)`), so a session the server ended while idle is
+   re-dialed before a request meets it. Between probes, the first query on such
+   a connection fails once (kind `unknown`).
+7. **Dial hardening.** The dialer:
+   - tries every `getaddrinfo` result (IPv4 or IPv6, `transport.dial_addr`),
+     each with its own `connect_timeout_ms`, and bounds the handshake too;
+   - sets `TCP_NODELAY`, `SO_KEEPALIVE` (30 s idle / 10 s / 3 probes) and
+     `TCP_USER_TIMEOUT` (30 s), so a peer that vanished without a RST is
+     detected within about a minute, not after ~15 minutes of retransmissions.
+8. **Errors cost nothing.** Each connection owns two `PgError` records (the
+   failed statement's, and the broken connection's), reused for every error. An
+   error path allocates nothing; a record's strings are valid until the next
+   call on that connection.
+
+The HTTP layer answers honestly: 500 for kind `server`, 503 for a lost
+connection or an exhausted pool (`examples/async_db_pg`, `tests/pg_async_e2e_test.v`).
 
 ## Local validation harness
 `bench/pg_async/` pipeline-tests pg_async locally against a seeded PG

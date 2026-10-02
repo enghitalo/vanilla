@@ -108,6 +108,13 @@ mut:
 	// events for its number that the batch already collected. nil for a bare
 	// Reactor (unit tests).
 	st &PlainState = unsafe { nil }
+	// The `response` handed to a continuation that has no client to answer —
+	// a clientless background watch, or a tombstone draining a disconnected
+	// client's reply — whose output is discarded. Reused (len reset, never
+	// freed) rather than a fresh array per call: a tombstone's continuation
+	// renders its whole response before the runtime drops it, and a fresh
+	// array grew per disconnect, a leak under -gc none.
+	scratch []u8
 }
 
 // close_watch_fd DELs and closes a request-owned watch fd, stamping its
@@ -1092,7 +1099,9 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 	// conn and skewing active_conns). The fd OBJECT is the app's: it created it and
 	// closes it — except on a clean .done/.close, where the runtime owns teardown.
 	if parked_client < 0 {
-		mut scratch := []u8{}
+		unsafe {
+			reactor.scratch.len = 0
+		}
 		mut bg_loop := core.EventLoop{
 			client_fd: -1
 			loop_fd:   epoll_fd
@@ -1106,7 +1115,7 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 		// body itself. The plain worker never narrows the gate otherwise, so it
 		// reopens right after the call.
 		core.set_queue_file_allowed(false)
-		step := cont(mut scratch, ext_fd, ready_err, entry_udata, state, mut bg_loop)
+		step := cont(mut reactor.scratch, ext_fd, ready_err, entry_udata, state, mut bg_loop)
 		core.set_queue_file_allowed(true)
 		// A clientless watch has no connection to take over — drain the
 		// thread-local slot so a misbehaving continuation can't leak one.
@@ -1266,7 +1275,9 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 		// it. Never re-look-up st.conns for a dead slot — the fd may have been reused.
 		if slot.dead || client_fd < 0 || client_fd >= st.conns.len
 			|| unsafe { st.conns[client_fd] == nil } {
-			mut scratch := []u8{}
+			unsafe {
+				reactor.scratch.len = 0
+			}
 			mut dead_loop := core.EventLoop{
 				client_fd: client_fd
 				loop_fd:   epoll_fd
@@ -1281,7 +1292,8 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 			reactor.rearming_dead = true
 			// No file from a continuation (on_watch_ready).
 			core.set_queue_file_allowed(false)
-			dead_step := slot.cont(mut scratch, ext_fd, ready_err, slot.udata, state, mut dead_loop)
+			dead_step := slot.cont(mut reactor.scratch, ext_fd, ready_err, slot.udata, state, mut
+				dead_loop)
 			core.set_queue_file_allowed(true)
 			reactor.rearming_dead = false
 			// A dead client cannot be taken over — drain the thread-local slot.
