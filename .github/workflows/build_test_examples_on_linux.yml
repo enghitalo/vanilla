@@ -55,23 +55,23 @@ jobs:
           # Just the build deps. The previous `apt upgrade -y linux-generic` pulled a
           # full kernel package set (linux-image/headers/firmware) on every run — slow
           # and flaky (dpkg "cannot perform the following tasks"), and pointless for
-          # building examples: liburing-dev is userspace and linux-libc-dev already
-          # ships the io_uring headers, neither needs a running-kernel upgrade.
+          # building examples: linux-libc-dev is userspace and needs no
+          # running-kernel upgrade. (No liburing: the io_uring module drives the
+          # ring through the raw syscalls, #189.)
           sudo apt-get update
           # libbrotli1 ships the enc/dec runtime .so.1 that compress.brotli
           # dlopens, so the compression example tests the `br` path for real
           # (without it they skip gracefully).
-          sudo apt-get install -y libsqlite3-dev liburing-dev linux-libc-dev libbrotli1
+          sudo apt-get install -y libsqlite3-dev linux-libc-dev libbrotli1
       # `-cc gcc -no-parallel` makes these debug example builds deterministic.
       # Two independent V-toolchain flakes bite otherwise, both only in the
       # default (non -prod) build — real deployments ship -prod, which is
       # unaffected (verified 0 failures in 20 -prod builds):
-      #   1) Every vanilla server program compiles the Linux io_uring backend,
-      #      which pulls in <liburing.h> -> barrier.h -> <stdatomic.h>. V's
-      #      bundled tcc cannot parse that stdatomic.h, and its automatic
-      #      tcc->gcc fallback is a race (reproduced ~1 in 4 of the SAME source
-      #      flaking). Pinning gcc removes tcc entirely (and the wasted
-      #      tcc-then-retry double compile).
+      #   1) Until #189 every vanilla server program pulled in <liburing.h> ->
+      #      barrier.h -> <stdatomic.h>, which V's bundled tcc could not parse,
+      #      and its automatic tcc->gcc fallback is a race (reproduced ~1 in 4 of
+      #      the SAME source flaking). liburing is gone; gcc stays pinned so these
+      #      builds keep using the compiler they are validated with.
       #   2) V's PARALLEL debug codegen non-deterministically emits one array
       #      `.free()` unmangled (`array_free` instead of `builtin__array_free`,
       #      an undefined-reference link error — surfaces in backend_epoll's
@@ -109,7 +109,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y liburing-dev linux-libc-dev
+          sudo apt-get install -y linux-libc-dev
       - name: Run tests/
         shell: bash
         env:
