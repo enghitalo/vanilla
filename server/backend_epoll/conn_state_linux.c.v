@@ -187,6 +187,11 @@ mut:
 	// The worker's watch reactor, so close_conn can tear a parked connection's
 	// watch down on every close path (see close_conn).
 	reactor &Reactor = unsafe { nil }
+	// This worker's in-flight counter (one of Server.inflight), set by
+	// process_events_plain before it serves anything. A connection parked on
+	// a watch holds one count until it resumes or closes (park_conn), so
+	// Server.shutdown() waits for parked requests, not only running ones.
+	inflight &core.Counter = unsafe { nil }
 	// close_seq counts this worker's closes (mark_stale: connections and the
 	// watch fds it tears down); closed_at[fd] is its value at fd's last close
 	// (grown on demand), and batch_seq its value when the current batch of
@@ -431,6 +436,33 @@ fn state_create(mut st PlainState, fd int) &ConnState {
 		st.conns[fd] = cs
 	}
 	return st.conns[fd]
+}
+
+// park_conn parks cs on the watched ext_fd (awaiting_fd), and unpark_conn
+// takes it off. They are the only writers of awaiting_fd (close_conn
+// unparks too), so this worker's
+// in-flight counter holds exactly one count per parked connection: from
+// the park until its continuation resumes it, or until it closes (client
+// gone, error, timeout). Server.shutdown() then drains parked requests
+// too. A continuation that re-parks the connection (a multi-step chain) is
+// unparked and parked again inside on_watch_ready, whose own count covers
+// the gap. One uncontended atomic per park and per resume (the counter is
+// this worker's, on its own cache line); a request that never parks pays
+// nothing.
+@[inline]
+fn park_conn(mut st PlainState, mut cs ConnState, ext_fd int) {
+	if cs.awaiting_fd < 0 {
+		stdatomic.add_i64(&st.inflight.n, 1)
+	}
+	cs.awaiting_fd = ext_fd
+}
+
+@[inline]
+fn unpark_conn(mut st PlainState, mut cs ConnState) {
+	if cs.awaiting_fd >= 0 {
+		cs.awaiting_fd = -1
+		stdatomic.add_i64(&st.inflight.n, -1)
+	}
 }
 
 // park_write arms the write deadline (once) and subscribes the fd to EPOLLOUT so
@@ -756,6 +788,7 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			} else if cs.awaiting_fd >= 0 {
 				detach_rejected_watch(mut st.reactor, epoll_fd, cs.awaiting_fd, fd)
 			}
+			unpark_conn(mut st, mut cs) // releases a parked request's in-flight count
 			if cs.read_deadline != 0 {
 				st.parked--
 			}
@@ -785,7 +818,7 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			cs.file_remaining = 0
 			cs.body_drain = 0
 			cs.drain_off = 0
-			cs.awaiting_fd = -1
+			// awaiting_fd is already -1 (unpark_conn above)
 			cs.close_after_flush = false
 			cs.sent_100 = false
 			cs.takeover = unsafe { nil }

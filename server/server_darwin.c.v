@@ -49,7 +49,7 @@ fn handle_accept_loop(socket_fd int, main_kq int, worker_kqs []int) {
 	}
 }
 
-pub fn run_kqueue_backend(socket_fd int, handler core.Handler, make_state fn () voidptr, after_server_start core.AfterStartFn, port int, limits Limits, mut threads []thread) {
+pub fn run_kqueue_backend(socket_fd int, handler core.Handler, make_state fn () voidptr, after_server_start core.AfterStartFn, port int, limits Limits, inflight []&core.Counter, mut threads []thread) {
 	main_kq := kqueue.create_kqueue_fd()
 	if main_kq < 0 {
 		return
@@ -78,7 +78,7 @@ pub fn run_kqueue_backend(socket_fd int, handler core.Handler, make_state fn () 
 		// One worker loop for every handler: it owns a watch registry and resumes
 		// parked requests when a watched fd fires (see async_darwin.c.v); a handler
 		// that never suspends just appends and returns .done.
-		threads[i] = spawn process_kqueue_worker(kq, handler, make_state, limits)
+		threads[i] = spawn process_kqueue_worker(kq, handler, make_state, limits, inflight[i])
 	}
 
 	println('listening on http://localhost:${port}/ (kqueue)')
@@ -97,7 +97,7 @@ fn run_selected_backend(srv Server, mut threads []thread) {
 	match srv.io_multiplexing {
 		.kqueue {
 			run_kqueue_backend(srv.socket_fd, srv.handler, srv.make_state, srv.after_server_start,
-				srv.port, srv.limits, mut threads)
+				srv.port, srv.limits, srv.inflight, mut threads)
 		}
 	}
 }

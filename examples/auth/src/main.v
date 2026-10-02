@@ -51,13 +51,31 @@ import http1_1.request_parser
 import http1_1.response
 import crypto.argon2
 import crypto.hmac
+import crypto.rand
 import crypto.sha256
 import encoding.base64
+import os
 import strconv
 import strings
 import time
 
-const jwt_secret = 'change-me-in-production'.bytes()
+// ---- JWT signing key ---------------------------------------------------------
+// The HMAC key comes from the environment, never from source: a key in a repo
+// is a key anyone can mint tokens with. main() refuses to start without
+// JWT_SECRET (>= 32 bytes), e.g. `JWT_SECRET=$(openssl rand -base64 32)`.
+const jwt_secret_min_len = 32
+const jwt_secret = load_jwt_secret()
+
+// load_jwt_secret reads JWT_SECRET once at init. Unset or too short, it falls
+// back to a random per-process key, so a token is never signed with a known
+// value even where main()'s check is skipped (the tests call handle() directly).
+fn load_jwt_secret() []u8 {
+	s := os.getenv('JWT_SECRET')
+	if s.len >= jwt_secret_min_len {
+		return s.bytes()
+	}
+	return rand.bytes(jwt_secret_min_len) or { panic(err) }
+}
 
 // ---- password hashing (argon2id, RFC 9106) ---------------------------------
 // The demo user's PHC hash is computed ONCE at init (~200 ms at the RFC
@@ -333,6 +351,13 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, m
 }
 
 fn main() {
+	// A per-process random key would make every token die with the process and
+	// differ between replicas: require the real one instead of starting with it.
+	if os.getenv('JWT_SECRET').len < jwt_secret_min_len {
+		eprintln('JWT_SECRET must be set to at least ${jwt_secret_min_len} random bytes, e.g.')
+		eprintln('  JWT_SECRET=$(openssl rand -base64 32) v run examples/auth/src')
+		exit(1)
+	}
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
 	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {

@@ -187,6 +187,7 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 	core.enable_takeover()
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut st := new_plain_state()
+	st.inflight = counter // parked requests count toward the shutdown drain (park_conn)
 	st.reactor = unsafe { &reactor }
 	reactor.st = unsafe { &st }
 	// Arm clientless background watches (timerfd refresh, signalfd, ...) on THIS

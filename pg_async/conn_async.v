@@ -48,8 +48,18 @@ mut:
 	frames        []u8
 	error         string
 	sqlstate      string
+	severity      string
 	rows_affected u64
 	frame_slot    int
+}
+
+// pg_error is the query's ErrorResponse as a typed error (call when error != '').
+fn (q &PendingQuery) pg_error() PgError {
+	return PgError{
+		severity: q.severity
+		sqlstate: q.sqlstate
+		message:  q.error
+	}
 }
 
 // set_nonblocking flips the connection socket to non-blocking. Call once, after
@@ -76,10 +86,10 @@ pub fn (c &PgConn) inflight_count() int {
 }
 
 // can_submit reports whether the connection can accept another pipelined query
-// (pipeline depth below max_inflight). The caller sheds when this is false on
-// every pooled connection.
+// (live, and pipeline depth below max_inflight). The caller sheds when this is
+// false on every pooled connection.
 pub fn (c &PgConn) can_submit() bool {
-	return c.inflight.len < max_inflight
+	return c.state == .ready && c.inflight.len < max_inflight
 }
 
 // async_submit serializes one extended-protocol query (binary results) and
@@ -87,10 +97,10 @@ pub fn (c &PgConn) can_submit() bool {
 // FIFO. Up to max_inflight queries may be pipelined back-to-back; each carries
 // its own Sync so Postgres replies in submit order. Returns false (and submits
 // nothing) when the connection is saturated — the ring is full or the send
-// buffer cannot fit the frame — so the caller must shed. Pair with async_flush
-// (on writable) and async_on_readable (on readable).
+// buffer cannot fit the frame — or broken (is_broken), so the caller must shed.
+// Pair with async_flush (on writable) and async_on_readable (on readable).
 pub fn (mut c PgConn) async_submit(query_text string, params []?[]u8) bool {
-	if c.inflight.len >= max_inflight {
+	if c.state != .ready || c.inflight.len >= max_inflight {
 		return false
 	}
 	// Serialize into the per-connection reusable scratch, then copy it into the fixed
@@ -180,8 +190,12 @@ pub fn (c &PgConn) async_wants_write() bool {
 
 // async_flush sends as much of the pending request as the socket will take.
 // Returns true once the whole request is sent; false on EAGAIN (leave writable
-// interest armed and call again when writable).
+// interest armed and call again when writable). A send failure breaks the
+// connection (is_broken): the queries in flight then fail on async_on_readable.
 pub fn (mut c PgConn) async_flush() !bool {
+	if c.state != .ready {
+		return c.loss_error()
+	}
 	for c.send_off < c.send_len {
 		n := C.send(c.fd, unsafe { &u8(c.send_buf.data) + c.send_off },
 			usize(c.send_len - c.send_off), C.MSG_NOSIGNAL)
@@ -192,7 +206,8 @@ pub fn (mut c PgConn) async_flush() !bool {
 		if n < 0 && (C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK) {
 			return false
 		}
-		return error('pg: async send failed (errno ${C.errno})')
+		c.lose('async send failed (errno ${C.errno})')
+		return error('pg: ${c.loss}')
 	}
 	// Fully drained — reset so the next append starts at the front of the buffer.
 	c.send_off = 0
@@ -224,7 +239,17 @@ const not_ready = QueryPoll{}
 // returns the next finished query in FIFO order, then a not-ready poll once the
 // new front needs more bytes (stay parked). A server ErrorResponse fails only
 // its own query (surfaced after that query's ReadyForQuery, keeping the stream
-// in sync); pipelined siblings still complete on subsequent calls.
+// in sync) as a PgError carrying its SQLSTATE; pipelined siblings still
+// complete on subsequent calls.
+//
+// Connection loss (EOF, a socket error, a FATAL/PANIC ErrorResponse) breaks the
+// connection (is_broken) but never discards what was already received: every
+// reply buffered before the loss is still delivered in order — a result that
+// arrived together with the server's FIN is a success. Only then does each
+// remaining query fail, one per call: with the FATAL's PgError (e.g. 57P01,
+// terminating connection due to administrator command) when the server sent
+// one, else 'pg: connection closed by server'. A broken connection never
+// reports not-ready, so a caller never re-arms a watch on a dead socket.
 pub fn (mut c PgConn) async_on_readable() !QueryPoll {
 	// Everything received so far has been framed → reset the cursor to the front so
 	// recv_buf doesn't ratchet upward (the common between-edges state).
@@ -237,7 +262,9 @@ pub fn (mut c PgConn) async_on_readable() !QueryPoll {
 	// Drain the socket to EAGAIN, recv-ing STRAIGHT into recv_buf's spare tail — no
 	// per-iteration 16 KiB scratch alloc + copy. recv_buf is persistent + reused; only
 	// when the tail is full do we compact the framed prefix, then grow by doubling.
-	for {
+	// Only while the connection is live: after a loss nothing more can arrive, but
+	// what already did is still framed below.
+	for c.state == .ready {
 		if c.recv_buf.len == c.recv_buf.cap {
 			if c.recv_pos > 0 {
 				rem := c.recv_buf.len - c.recv_pos
@@ -273,12 +300,16 @@ pub fn (mut c PgConn) async_on_readable() !QueryPoll {
 			continue
 		}
 		if n == 0 {
-			return error('pg: connection closed by server')
+			// EOF. Not an early return: the bytes that came with the FIN (a whole
+			// result, or the FATAL that explains the close) are framed first.
+			c.lose('connection closed by server')
+			break
 		}
 		if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
 			break
 		}
-		return error('pg: async recv failed (errno ${C.errno})')
+		c.lose('async recv failed (errno ${C.errno})')
+		break
 	}
 	for c.inflight.len > 0 {
 		hdr := next_message_at(c.recv_buf, c.recv_pos) or { break }
@@ -292,6 +323,14 @@ pub fn (mut c PgConn) async_on_readable() !QueryPoll {
 				info := parse_error_response(payload)
 				c.inflight[0].error = info.message.bytestr()
 				c.inflight[0].sqlstate = info.code.bytestr()
+				c.inflight[0].severity = info.severity.bytestr()
+				if ends_session(info.severity) {
+					// FATAL/PANIC: the server ends the session, no ReadyForQuery
+					// follows. The front query fails with it below; the queries
+					// behind it fail with it too (loss_error).
+					c.fatal = c.inflight[0].pg_error()
+					c.lose('connection closed by server')
+				}
 			}
 			else {}
 		}
@@ -300,19 +339,9 @@ pub fn (mut c PgConn) async_on_readable() !QueryPoll {
 		is_ready := typ == bt_ready_for_query
 		c.recv_pos += hdr.total
 		if is_ready {
-			// Pop the completed front query. Its frames buffer is now owned
-			// solely by `done`, so it is handed off without cloning.
-			done := c.inflight[0]
-			c.inflight.delete(0)
-			// Return the (possibly grown) accumulator to its pool slot so any growth
-			// is kept and the slot is reused next ring cycle — no per-query alloc. The
-			// Result borrows the same backing; it is consumed by the resume callback
-			// before the slot can be reused (a full ring cycle away).
-			if done.frame_slot >= 0 && done.frame_slot < c.frame_pool.len {
-				c.frame_pool[done.frame_slot] = done.frames
-			}
+			done := c.pop_front()
 			if done.error != '' {
-				return error('pg: query failed: ${done.error} (SQLSTATE ${done.sqlstate})')
+				return done.pg_error()
 			}
 			return QueryPoll{
 				ready:  true
@@ -323,5 +352,33 @@ pub fn (mut c PgConn) async_on_readable() !QueryPoll {
 			}
 		}
 	}
+	if c.state != .ready {
+		// Lost, and the front query's reply is not (all) here: it cannot
+		// complete. Fail it with its own ErrorResponse when one arrived (the
+		// FATAL), else with why the connection was lost.
+		if c.inflight.len > 0 {
+			done := c.pop_front()
+			if done.error != '' {
+				return done.pg_error()
+			}
+		}
+		return c.loss_error()
+	}
 	return not_ready // front query needs more bytes (or none in flight) — see `not_ready`
+}
+
+// pop_front removes the front in-flight query, returning its (possibly grown)
+// accumulator to its pool slot so the growth is kept and the slot is reused
+// next ring cycle — no per-query alloc. Its frames buffer is then owned solely
+// by the returned query and handed off without cloning: a Result borrows the
+// same backing and is consumed by the resume callback before the slot can be
+// reused (a full ring cycle away).
+@[inline]
+fn (mut c PgConn) pop_front() PendingQuery {
+	done := c.inflight[0]
+	c.inflight.delete(0)
+	if done.frame_slot >= 0 && done.frame_slot < c.frame_pool.len {
+		c.frame_pool[done.frame_slot] = done.frames
+	}
+	return done
 }
