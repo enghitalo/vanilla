@@ -198,6 +198,8 @@ pub:
 }
 
 // new_server validates `config` and opens the listeners; `run` starts serving.
+// A listener it cannot open (port in use, not permitted, out of fds) is
+// returned as an error whose code is the errno (WSAGetLastError() on Windows).
 //
 // On POSIX, if SIGPIPE still has its default action, new_server sets it to
 // ignored, process-wide, as nginx does. sendfile(2) has no MSG_NOSIGNAL, so a
@@ -233,31 +235,6 @@ pub fn new_server(config ServerConfig) !Server {
 		}
 		if config.tls_config != unsafe { nil } {
 			return error('TLS over a unix socket is not supported')
-		}
-	}
-
-	mut socket_fd := 0
-	$if !windows {
-		if config.unix_socket_path != '' {
-			socket_fd = socket.create_unix_server_socket(config.unix_socket_path)!
-		} else {
-			socket_fd = socket.create_server_socket(config.port)
-		}
-	} $else {
-		socket_fd = socket.create_server_socket(config.port)
-	}
-
-	// port: 0 = ephemeral. The kernel picked a free port at bind time; read it back
-	// ONCE so (a) the io_uring per-worker listeners below bind the SAME port and
-	// actually join the SO_REUSEPORT group (each create_server_socket(0) would pick
-	// a DIFFERENT port), and (b) Server.port tells every consumer — tests dialing
-	// back, co-hosted servers, the startup banners — the real port. A UDS
-	// listener has no port; the address is unix_socket_path.
-	mut port := config.port
-	if port == 0 && config.unix_socket_path == '' {
-		port = socket.local_port(socket_fd)
-		if port <= 0 {
-			return error('could not resolve ephemeral port for listener fd ${socket_fd}')
 		}
 	}
 
@@ -299,6 +276,37 @@ pub fn new_server(config ServerConfig) !Server {
 	// from threads.len, so two co-hosted servers can split the cores independently.
 	n_workers := if config.workers > 0 { config.workers } else { max_thread_pool_size }
 
+	// The listeners are opened only now, once the config is valid, so a rejected
+	// config leaves nothing bound. A listener failure (EADDRINUSE, EACCES,
+	// EMFILE…) is returned to the caller after closing every listener already
+	// opened: a leaked SO_REUSEPORT listener would take a share of the port's
+	// connections and never accept them.
+	mut socket_fd := 0
+	$if !windows {
+		if config.unix_socket_path != '' {
+			socket_fd = socket.create_unix_server_socket(config.unix_socket_path)!
+		} else {
+			socket_fd = socket.create_server_socket(config.port)!
+		}
+	} $else {
+		socket_fd = socket.create_server_socket(config.port)!
+	}
+
+	// port: 0 = ephemeral. The kernel picked a free port at bind time; read it back
+	// ONCE so (a) the io_uring per-worker listeners below bind the SAME port and
+	// actually join the SO_REUSEPORT group (each create_server_socket(0) would pick
+	// a DIFFERENT port), and (b) Server.port tells every consumer — tests dialing
+	// back, co-hosted servers, the startup banners — the real port. A UDS
+	// listener has no port; the address is unix_socket_path.
+	mut port := config.port
+	if port == 0 && config.unix_socket_path == '' {
+		port = socket.local_port(socket_fd)
+		if port <= 0 {
+			socket.close_socket(socket_fd)
+			return error('could not resolve ephemeral port for listener fd ${socket_fd}')
+		}
+	}
+
 	// Listeners the server will accept on. The first is always socket_fd. The
 	// io_uring backend is shared-nothing with one SO_REUSEPORT listener PER worker,
 	// so create the rest up front (worker 0 reuses socket_fd): then shutdown() can
@@ -311,7 +319,13 @@ pub fn new_server(config ServerConfig) !Server {
 	$if linux {
 		if io_multiplexing == .io_uring && config.unix_socket_path == '' {
 			for _ in 1 .. n_workers {
-				listener_fds << socket.create_server_socket(port)
+				fd := socket.create_server_socket(port) or {
+					for l in listener_fds {
+						socket.close_socket(l)
+					}
+					return err
+				}
+				listener_fds << fd
 			}
 		}
 	}
