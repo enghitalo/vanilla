@@ -18,11 +18,16 @@ fn live_cfg() ?pg_async.ConnConfig {
 	}
 	port_env := os.getenv('PGPORT')
 	return pg_async.ConnConfig{
-		host:     host
-		port:     if port_env != '' { port_env.int() } else { 5432 }
-		user:     os.getenv('PGUSER')
-		password: os.getenv('PGPASSWORD')
-		database: os.getenv('PGDATABASE')
+		host:          host
+		port:          if port_env != '' { port_env.int() } else { 5432 }
+		user:          os.getenv('PGUSER')
+		password:      os.getenv('PGPASSWORD')
+		database:      os.getenv('PGDATABASE')
+		// PGSSLMODE=verify-full + PGSSLROOTCERT: the TLS lane of pg_async.yml
+		ssl_mode:      pg_async.SslMode.from_string(os.getenv('PGSSLMODE').replace('-', '_')) or {
+			pg_async.SslMode.disable
+		}
+		ssl_root_cert: os.getenv('PGSSLROOTCERT')
 	}
 }
 

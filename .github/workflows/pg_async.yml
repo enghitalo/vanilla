@@ -33,6 +33,7 @@ on:
       - 'bench/pg_async/**'
       - 'bench/ci_bench.sh'
       - 'tests/pg_async_e2e_test.v'
+      - 'tests/pg_async_maintenance_test.v'
       # What the e2e suite and the bench server build on.
       - 'core/**'
       - 'server/**'
@@ -53,6 +54,7 @@ on:
       - 'bench/pg_async/**'
       - 'bench/ci_bench.sh'
       - 'tests/pg_async_e2e_test.v'
+      - 'tests/pg_async_maintenance_test.v'
       # What the e2e suite and the bench server build on.
       - 'core/**'
       - 'server/**'
@@ -200,6 +202,7 @@ jobs:
         shell: bash
         run: |
           v -cc gcc -no-parallel test pg_async/
+          v -cc gcc -no-parallel test tests/pg_async_maintenance_test.v
       - name: End-to-end benchmark server against PostgreSQL ${{ matrix.pg }}
         shell: bash
         run: |
@@ -368,6 +371,7 @@ jobs:
           export PGSSLROOTCERT="$PG_TEST_CA"
           v -cc gcc -no-parallel -d vanilla_tls test pg_async/
           v -cc gcc -no-parallel -d vanilla_tls test tests/pg_async_e2e_test.v
+          v -cc gcc -no-parallel -d vanilla_tls test tests/pg_async_maintenance_test.v
       # -gc none frees nothing: 4000 queries over TLS must leave the heap
       # where the warm-up left it (test_tls_queries_do_not_grow_the_heap, in
       # heap bytes), so pg_async allocates nothing per query over TLS and
