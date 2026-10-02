@@ -130,6 +130,19 @@ jobs:
         run: |
           v -race -cc "$RACE_CC" -no-parallel test tests/pg_async_e2e_test.v
           v -race -cc "$RACE_CC" -no-parallel test pg_async/
+      # The decoders index the server's bytes without bounds checks
+      # (@[direct_array_access]). decode_test.v feeds them mutated values in
+      # buffers of exactly their length, so a read past a value's end aborts.
+      # AddressSanitizer needs the ASLR setting above too; -gc none keeps every
+      # allocation a plain malloc it can see.
+      - name: The decoders under AddressSanitizer
+        shell: bash
+        env:
+          ASAN_OPTIONS: 'detect_leaks=0:abort_on_error=1'
+          UBSAN_OPTIONS: 'halt_on_error=1:print_stacktrace=1'
+        run: |
+          v -cc gcc -gc none -no-parallel -cflags -fsanitize=address,undefined \
+            -ldflags -fsanitize=address,undefined test pg_async/decode_test.v
 
   live:
     runs-on: ubuntu-latest

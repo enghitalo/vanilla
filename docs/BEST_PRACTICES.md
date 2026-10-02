@@ -292,6 +292,19 @@ their request.
 
 - Use the **pool**, not a connection per request; build params/queries into
   reused per-worker buffers (the DB path is allocation-free under `-gc none`).
+- Read results with the typed `Row` accessors (`int4`, `text`, `uuid_into`,
+  `time`, `numeric_i64_scaled`, `array_iter`, …): they decode the binary
+  values in place and allocate nothing, errors included, and the `_into`
+  variants append into a buffer you reuse. When you walk an `array_iter`
+  yourself, append each element with `push_many`: `out << v.bytes` inside that
+  loop makes V move the iterator to the heap, an allocation per call. The
+  bytes the accessors return borrow the connection's buffer: copy what must
+  outlive the continuation. A typed accessor rejects SQL NULL; read a nullable
+  column with `row.col(i)` and test `is_null`. To address columns by name,
+  resolve each index once per result (`cols := res.columns()!`, then
+  `cols.index('name')`), not once per row. The accessors check a value's
+  width, not its column's type: when the query doesn't fix the types, compare
+  `cols.type_oid(i)` with `oid_*` once per result.
 - Under saturation, **shed with the honest status**: `503 Service Unavailable`
   when the pool is momentarily full, not `400`/`404`. A backpressure shed is not
   a client error — misreporting it as `4xx` showed up as spurious failures in the

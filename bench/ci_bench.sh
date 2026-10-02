@@ -49,6 +49,7 @@ BENCHES=(
 	"pg_async_submit|bench/pg_async/codec_bench.v|-d pg_async_bench|submit|800000"
 	"pg_async_frame|bench/pg_async/codec_bench.v|-d pg_async_bench|frame|400000"
 	"pg_async_rows|bench/pg_async/codec_bench.v|-d pg_async_bench|rows|3000000"
+	"pg_async_types|bench/pg_async/codec_bench.v|-d pg_async_bench|types|10000000"
 )
 # Standardize the loop count for the A/B: the benches read BENCH_ITERS. 2M keeps
 # even the cheapest bench (request_parser, ~0.3s) comfortably above the runner's
@@ -148,11 +149,9 @@ for entry in "${BENCHES[@]}"; do
 		emit "| \`$name\` | $base_cell | — | — | ❌ $why (HEAD) |"
 		continue
 	elif [ -z "$base_min" ]; then
-		if [ -z "$base_bin" ]; then
-			emit "| \`$name\` | — | $(printf '%.3f' "$head_min")s | — | 🆕 new bench |"
-		else
-			emit "| \`$name\` | — | $(printf '%.3f' "$head_min")s | — | ❌ run failed (baseline) |"
-		fi
+		# Absent at the baseline, or present but unable to run this entry's
+		# args (a phase added since): new either way.
+		emit "| \`$name\` | — | $(printf '%.3f' "$head_min")s | — | 🆕 new bench |"
 		continue
 	fi
 
