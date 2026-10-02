@@ -245,16 +245,18 @@ pub fn shutdown_socket(fd int) {
 	close_socket(fd)
 }
 
-pub fn create_server_socket(port int) int {
+// create_server_socket opens a non-blocking TCP listener on 0.0.0.0:`port`.
+// A failed step (socket, setsockopt, bind, listen: EADDRINUSE, EACCES,
+// EMFILE…) closes the fd and returns an error carrying errno as its code, so
+// new_server hands it to the caller instead of ending the process.
+pub fn create_server_socket(port int) !int {
 	// Unix body in `$else` — see connect_to_server for why.
 	$if windows {
 		return create_server_socket_on_windows(port)
 	} $else {
 		server_fd := C.socket(C.AF_INET, C.SOCK_STREAM, 0)
 		if server_fd < 0 {
-			eprintln(@LOCATION)
-			C.perror(c'Socket creation failed')
-			exit(1)
+			return listen_error(-1, 'socket', port)
 		}
 
 		set_blocking(server_fd, false)
@@ -265,19 +267,13 @@ pub fn create_server_socket(port int) int {
 			// On Linux/other Unix, use SO_REUSEPORT for socket sharding/load balancing
 			// SO_REUSEPORT allows multiple workers to bind() and accept() independently
 			if C.setsockopt(server_fd, C.SOL_SOCKET, C.SO_REUSEPORT, &opt, sizeof(opt)) < 0 {
-				eprintln(@LOCATION)
-				C.perror(c'setsockopt SO_REUSEPORT failed')
-				close_socket(server_fd)
-				exit(1)
+				return listen_error(server_fd, 'setsockopt SO_REUSEPORT', port)
 			}
 
 			eprintln('[socket] SO_REUSEPORT enabled for load balancing')
 		} $else {
 			if C.setsockopt(server_fd, C.SOL_SOCKET, C.SO_REUSEADDR, &opt, sizeof(opt)) < 0 {
-				eprintln(@LOCATION)
-				C.perror(c'setsockopt SO_REUSEADDR failed')
-				close_socket(server_fd)
-				exit(1)
+				return listen_error(server_fd, 'setsockopt SO_REUSEADDR', port)
 			}
 		}
 
@@ -291,19 +287,25 @@ pub fn create_server_socket(port int) int {
 
 		// Cast to voidptr to fix the type mismatch
 		if C.bind(server_fd, voidptr(&server_addr), sizeof(server_addr)) < 0 {
-			eprintln(@LOCATION)
-			C.perror(c'Bind failed')
-			close_socket(server_fd)
-			exit(1)
+			return listen_error(server_fd, 'bind', port)
 		}
 
 		if C.listen(server_fd, listen_backlog) < 0 {
-			eprintln(@LOCATION)
-			C.perror(c'Listen failed')
-			close_socket(server_fd)
-			exit(1)
+			return listen_error(server_fd, 'listen', port)
 		}
 
 		return server_fd
 	}
+}
+
+// listen_error closes `fd` (if open) and returns the failed `step` as an
+// error: errno's text in the message, errno itself as the code. errno is read
+// first, before close() can overwrite it.
+fn listen_error(fd int, step string, port int) IError {
+	code := C.errno
+	if fd >= 0 {
+		close_socket(fd)
+	}
+	return error_with_code('${step} 0.0.0.0:${port}: ${unsafe { cstring_to_vstring(C.strerror(code)) }}',
+		code)
 }

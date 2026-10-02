@@ -51,9 +51,8 @@ pub fn unlink_socket_path(path string) {
 // create_unix_server_socket binds and listens on an AF_UNIX stream socket at
 // `path`, non-blocking, and returns the listener fd. A stale socket file at
 // the path is unlinked first (standard for UDS servers: the file outlives the
-// process). Unlike create_server_socket (TCP, exits on failure at startup),
-// path problems are user config errors — surface them as `!` so new_server
-// can report them.
+// process). Like create_server_socket (TCP), failures surface as `!` so
+// new_server can report them.
 pub fn create_unix_server_socket(path string) !int {
 	mut addr := C.sockaddr_un{}
 	fill_sockaddr_un(path, mut addr)!
