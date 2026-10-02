@@ -10,17 +10,20 @@ module main
 //
 //   v -prod -gc none -d pg_async_bench -o /tmp/pgcodec bench/pg_async/codec_bench.v
 //   bench/measure.sh /tmp/pgcodec submit   # async_submit: 8 pipelined queries
-//   bench/measure.sh /tmp/pgcodec frame    # submit + async_on_readable framing
+//   bench/measure.sh /tmp/pgcodec frame    # submit + the replies' socketpair
+//                                          # write + recv + framing
 //   bench/measure.sh /tmp/pgcodec rows     # Result.rows() + every accessor
 //   bench/measure.sh /tmp/pgcodec decode   # the decoders alone
 //   bench/measure.sh /tmp/pgcodec types    # uuid, timestamp, date, numeric, float4,
 //                                          # array and RowDescription lookups
 //
-// Framing alone is `frame` minus `submit` per query. BENCH_ITERS overrides the
-// work per phase, in that phase's unit: queries (submit, frame; rounded to
-// whole rounds of 8), rows (rows) or decoder calls (decode, types). The default (no
-// argument) is `all`: every phase once, each timed (what bench/ci_bench.sh
-// A/Bs). Under -gc none a phase that allocated per query would show in the
+// `frame` minus `submit` per query is the framing plus this harness writing
+// the canned replies into the socketpair (a real server's kernel does that
+// part). BENCH_ITERS overrides the work per phase, in that phase's unit:
+// queries (submit, frame; rounded to whole rounds of 8), rows (rows) or decoder
+// calls (decode, types). The default (no argument) is `all`: every phase once,
+// each timed. bench/ci_bench.sh A/Bs submit, frame, rows and types, one phase
+// per run. Under -gc none a phase that allocated per query would show in the
 // RSS printed at the end.
 import benchmark
 import os

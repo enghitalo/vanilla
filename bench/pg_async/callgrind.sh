@@ -32,6 +32,12 @@ POOL="${POOL:-2}"
 PORT="${BENCH_PORT:-8099}"
 shapes=("$@")
 [ ${#shapes[@]} -gt 0 ] || shapes=(dbp db errors disconnects)
+for shape in "${shapes[@]}"; do
+	case "$shape" in
+		dbp | db | errors | disconnects) ;;
+		*) echo "unknown shape '$shape' (dbp db errors disconnects)" >&2; exit 2 ;;
+	esac
+done
 
 for tool in wrk v valgrind callgrind_control python3; do
 	command -v "$tool" >/dev/null || { echo "ERROR: $tool not installed" >&2; exit 2; }
@@ -48,7 +54,8 @@ cleanup() {
 trap cleanup EXIT
 
 if [ -z "${PGHOST:-}" ]; then
-	eval "$(pg_async/testdata/throwaway_pg.sh start)" || exit 2
+	pg_env=$(pg_async/testdata/throwaway_pg.sh start) || exit 2
+	eval "$pg_env"
 	pg_started=1
 fi
 

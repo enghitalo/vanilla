@@ -47,6 +47,12 @@ LOAD_CPUS="${LOAD_CPUS:-$((WORKERS % ncpu))}"
 PG_CPUS="${PG_CPUS:-$((ncpu - 1))}"
 shapes=("$@")
 [ ${#shapes[@]} -gt 0 ] || shapes=(steady exclusive errors disconnects churn)
+for shape in "${shapes[@]}"; do
+	case "$shape" in
+		steady | exclusive | errors | disconnects | churn) ;;
+		*) echo "unknown shape '$shape' (steady exclusive errors disconnects churn)" >&2; exit 2 ;;
+	esac
+done
 
 for tool in wrk v python3 psql; do
 	command -v "$tool" >/dev/null || { echo "ERROR: $tool not installed" >&2; exit 2; }
@@ -65,7 +71,8 @@ cleanup() {
 trap cleanup EXIT
 
 if [ -z "${PGHOST:-}" ]; then
-	eval "$(PG_CPUS=$PG_CPUS pg_async/testdata/throwaway_pg.sh start)" || exit 2
+	pg_env=$(PG_CPUS=$PG_CPUS pg_async/testdata/throwaway_pg.sh start) || exit 2
+	eval "$pg_env"
 	pg_started=1
 fi
 
@@ -161,6 +168,8 @@ for shape in "${shapes[@]}"; do
 		load "$shape" "$WARMUP" >/dev/null
 		rss0=$(rss_kib "$srv_pid")
 		fd0=$(fd_count "$srv_pid")
+		# Count the window's kills only: what the warm-up's cost is in rss0.
+		[ "$shape" = churn ] && : >"$work/killed"
 		: >"$work/rss.csv"
 		(
 			t=0
@@ -182,7 +191,14 @@ for shape in "${shapes[@]}"; do
 		fd1=$(fd_count "$srv_pid")
 		kill "$sampler" 2>/dev/null
 		wait "$sampler" 2>/dev/null
-		after=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/dbp")
+		# Recovered? The last kill may have landed just before the load
+		# stopped, so give the pool up to 5 s to answer 200 again.
+		after=000
+		for _ in $(seq 1 50); do
+			after=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/dbp")
+			[ "$after" = 200 ] && break
+			sleep 0.1
+		done
 		failed=$(awk '/Non-2xx or 3xx responses:/ {print $NF}' "$work/wrk.out" 2>/dev/null)
 		[ "$shape" = disconnects ] && failed=
 		stop_server

@@ -26,7 +26,8 @@ const resp_200_sep = '\r\n\r\n'.bytes()
 
 struct PgE2eState {
 mut:
-	pool &pg_async.PgPool
+	pool   &pg_async.PgPool
+	params []?[]u8 // one reused slot: no parameter array per request
 }
 
 fn pg_e2e_state() voidptr {
@@ -39,7 +40,8 @@ fn pg_e2e_state() voidptr {
 	}
 	pool := pg_async.new_pool(cfg, 2) or { panic('pool bring-up failed: ${err}') }
 	return voidptr(&PgE2eState{
-		pool: pool
+		pool:   pool
+		params: []?[]u8{len: 1}
 	})
 }
 
@@ -61,21 +63,21 @@ fn pg_e2e_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, m
 	ok := if req.len > 8 && req[5] == `e` {
 		conn.async_submit('select 1/0', []?[]u8{})
 	} else {
-		conn.async_submit(r'select $1::int4', [?[]u8(unsafe { (&req[7]).vbytes(end - 7) })])
+		st.params[0] = ?[]u8(unsafe { (&req[7]).vbytes(end - 7) })
+		conn.async_submit(r'select $1::int4', st.params)
 	}
 	if !ok {
 		out << resp_503
 		return .done
 	}
-	conn.async_flush() or {
-		out << resp_500
-		return .done
-	}
+	// The query is queued: park for its outcome whatever the flush did (a
+	// failed flush breaks the connection and async_on_readable reports it).
+	conn.async_flush() or {}
 	event_loop.watch_fd_persistent(st.pool.fd(idx), .readable, pg_e2e_ready, voidptr(usize(idx)))
 	return .suspend
 }
 
-fn pg_e2e_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+fn pg_e2e_ready(mut out []u8, ready_fd int, _ bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut st := unsafe { &PgE2eState(worker_state) }
 	mut conn := st.pool.conn(int(usize(watch_payload)))
 	if conn.async_wants_write() {
@@ -86,10 +88,7 @@ fn pg_e2e_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload v
 		return .done
 	}
 	if !poll.ready {
-		if ready_fd_error {
-			out << resp_500
-			return .done
-		}
+		// Even on ready_fd_error: a broken connection never reports not-ready.
 		event_loop.watch_fd_persistent(ready_fd, .readable, pg_e2e_ready, watch_payload)
 		return .suspend
 	}

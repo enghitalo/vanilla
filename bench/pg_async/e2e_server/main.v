@@ -124,22 +124,19 @@ fn park_query(mut st DbState, query string, exclusive bool, mut out []u8, mut ev
 		out << resp_503
 		return .done
 	}
-	conn.async_flush() or {
-		if exclusive {
-			st.pool.release(idx)
-		}
-		out << resp_500
-		return .done
-	}
-	// A partial flush finishes in on_db_ready (async_wants_write): the query
-	// is already in the connection's in-flight FIFO, so the request must park
-	// for its reply either way.
+	// From here on the query is in the connection's in-flight FIFO: the
+	// request parks for its outcome whatever the flush did. A partial flush
+	// finishes in on_db_ready (async_wants_write); a failed one breaks the
+	// connection, and async_on_readable then reports the error. Answering
+	// without parking would leave the entry unconsumed, and the slot would
+	// never be re-dialed (pool.v's FIFO contract).
+	conn.async_flush() or {}
 	payload := u64(idx) | if exclusive { exclusive_flag } else { u64(0) }
 	event_loop.watch_fd_persistent(st.pool.fd(idx), .readable, on_db_ready, voidptr(payload))
 	return .suspend
 }
 
-fn on_db_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+fn on_db_ready(mut out []u8, ready_fd int, _ bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut st := unsafe { &DbState(worker_state) }
 	payload := u64(watch_payload)
 	idx := int(payload & 0xffff_ffff)
@@ -156,13 +153,10 @@ fn on_db_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload vo
 		return .done
 	}
 	if !poll.ready {
-		if ready_fd_error {
-			if exclusive {
-				st.pool.release(idx)
-			}
-			out << resp_500
-			return .done
-		}
+		// Not complete yet: keep waiting, even on ready_fd_error. A socket
+		// error breaks the connection inside async_on_readable, and a broken
+		// connection never reports not-ready, so this cannot spin on a dead
+		// fd; answering here instead would abandon the query in the FIFO.
 		event_loop.watch_fd_persistent(ready_fd, .readable, on_db_ready, watch_payload)
 		return .suspend
 	}
