@@ -1,6 +1,7 @@
 module pg_async
 
 import encoding.binary
+import time
 
 // PostgreSQL frontend/backend wire protocol v3 — framing, message builders, and
 // result iteration. Pure and I/O-free: builders append bytes to a caller-owned
@@ -141,7 +142,7 @@ pub fn (mut it FrameIter) next() ?Frame {
 	}
 	frame := Frame{
 		typ:     it.buf[it.pos]
-		payload: it.buf[it.pos + 5..it.pos + total]
+		payload: unsafe { (&u8(it.buf.data) + it.pos + 5).vbytes(total - 5) }
 	}
 	it.pos += total
 	return frame
@@ -184,7 +185,8 @@ pub fn (mut it RowIter) next() ?Row {
 
 // Row is one DataRow payload. Columns are read by index; the payload is walked
 // each access (columns are few, so O(n) is fine at handler scale). All values
-// are binary (Bind requests result-format-code 1 for every column).
+// are binary (Bind requests result-format-code 1 for every column). To read a
+// column by name, look its index up once per result (Result.columns()).
 pub struct Row {
 pub:
 	payload []u8
@@ -198,20 +200,26 @@ pub:
 	bytes   []u8
 }
 
+const err_row_short = error('pg: datarow: short payload')
+const err_row_range = error('pg: datarow: column index out of range')
+const err_row_truncated = error('pg: datarow: truncated value')
+const err_row_null = error('pg: unexpected NULL (read a nullable column with Row.col)')
+
 // col returns column i: error on malformed/out-of-range, is_null set for SQL
 // NULL, else the borrowed column bytes.
+@[direct_array_access]
 pub fn (r Row) col(i int) !DataValue {
 	if r.payload.len < 2 {
-		return error('datarow: short payload')
+		return err_row_short
 	}
 	ncols := int(i16(binary.big_endian_u16_at(r.payload, 0)))
 	if i < 0 || i >= ncols {
-		return error('datarow: col ${i} out of range (${ncols} cols)')
+		return err_row_range
 	}
 	mut pos := 2
 	for idx in 0 .. ncols {
 		if pos + 4 > r.payload.len {
-			return error('datarow: truncated length')
+			return err_row_truncated
 		}
 		// read the 4-byte length at offset WITHOUT slicing the payload — the slice
 		// (array descriptor alloc) per length-read dominated the row-decode CPU
@@ -226,23 +234,23 @@ pub fn (r Row) col(i int) !DataValue {
 			}
 			continue
 		}
-		if pos + clen > r.payload.len {
-			return error('datarow: truncated value')
+		if clen > r.payload.len - pos {
+			return err_row_truncated
 		}
 		if idx == i {
 			return DataValue{
-				bytes: r.payload[pos..pos + clen]
+				bytes: unsafe { (&u8(r.payload.data) + pos).vbytes(clen) }
 			}
 		}
 		pos += clen
 	}
-	return error('datarow: col not found')
+	return err_row_range
 }
 
 fn (r Row) require(i int) ![]u8 {
 	dv := r.col(i)!
 	if dv.is_null {
-		return error('unexpected NULL at col ${i}')
+		return err_row_null
 	}
 	return dv.bytes
 }
@@ -263,12 +271,240 @@ pub fn (r Row) boolean(i int) !bool {
 	return decode_bool(r.require(i)!)
 }
 
+pub fn (r Row) float4(i int) !f32 {
+	return decode_float4(r.require(i)!)
+}
+
 pub fn (r Row) float8(i int) !f64 {
 	return decode_float8(r.require(i)!)
 }
 
 pub fn (r Row) text(i int) ![]u8 {
 	return decode_text(r.require(i)!)
+}
+
+// uuid returns a uuid column's 16 bytes.
+pub fn (r Row) uuid(i int) ![16]u8 {
+	return decode_uuid(r.require(i)!)
+}
+
+// uuid_into appends a uuid column's canonical text (36 characters) to `out`.
+pub fn (r Row) uuid_into(i int, mut out []u8) ! {
+	uuid_into(r.require(i)!, mut out)!
+}
+
+// timestamp_us returns a timestamp / timestamptz column as microseconds since
+// 2000-01-01 (or timestamp_infinity / timestamp_neg_infinity).
+pub fn (r Row) timestamp_us(i int) !i64 {
+	return decode_timestamp_us(r.require(i)!)
+}
+
+// time returns a timestamp / timestamptz column as a time.Time (UTC); ±infinity
+// is an error (read timestamp_us).
+pub fn (r Row) time(i int) !time.Time {
+	return timestamp_time(decode_timestamp_us(r.require(i)!)!)
+}
+
+// date_days returns a date column as days since 2000-01-01 (or date_infinity /
+// date_neg_infinity).
+pub fn (r Row) date_days(i int) !i32 {
+	return decode_date_days(r.require(i)!)
+}
+
+// date returns a date column as a time.Time at midnight UTC; ±infinity is an
+// error (read date_days).
+pub fn (r Row) date(i int) !time.Time {
+	return date_time(decode_date_days(r.require(i)!)!)
+}
+
+// numeric_text_into appends a numeric column's exact decimal text to `out`.
+pub fn (r Row) numeric_text_into(i int, mut out []u8) ! {
+	numeric_text_into(r.require(i)!, mut out)!
+}
+
+// numeric_i64_scaled returns a numeric column as a count of 10^-scale units
+// (decode_numeric_i64_scaled): exact, or an error.
+pub fn (r Row) numeric_i64_scaled(i int, scale int) !i64 {
+	return decode_numeric_i64_scaled(r.require(i)!, scale)
+}
+
+// array_iter returns an iterator over a one-dimensional array column.
+pub fn (r Row) array_iter(i int) !ArrayIter {
+	return decode_array(r.require(i)!)
+}
+
+// int4_array_into appends an int4[] column's elements to `out`. A NULL
+// element is an error (walk such arrays with array_iter).
+pub fn (r Row) int4_array_into(i int, mut out []i32) ! {
+	mut it := r.array_iter(i)!
+	for {
+		v := it.next() or { break }
+		if v.is_null {
+			return err_array_null
+		}
+		out << decode_int4(v.bytes)!
+	}
+}
+
+// text_array_into appends a text[] column's elements to `out`, as views that
+// borrow the receive buffer. A NULL element is an error (walk such arrays with
+// array_iter).
+pub fn (r Row) text_array_into(i int, mut out [][]u8) ! {
+	mut it := r.array_iter(i)!
+	for {
+		v := it.next() or { break }
+		if v.is_null {
+			return err_array_null
+		}
+		out << v.bytes
+	}
+}
+
+// col_by_name returns the column named `name`, per the result's
+// RowDescription. It searches the names on every call: in a loop over rows,
+// look the index up once with Columns.index.
+pub fn (r Row) col_by_name(cols Columns, name string) !DataValue {
+	i := cols.index(name) or { return err_columns_no_such }
+	return r.col(i)
+}
+
+// ── RowDescription ──────────────────────────────────────────────────────────
+
+const err_columns_malformed = error('pg: rowdescription: malformed message')
+const err_columns_range = error('pg: rowdescription: column index out of range')
+const err_columns_no_such = error('pg: rowdescription: no column by that name')
+
+// Columns is a result's RowDescription: each column's name and type OID, read
+// from the borrowed message on demand. Nothing is parsed unless asked, so
+// index-based row access never pays for it.
+pub struct Columns {
+mut:
+	n       int
+	payload []u8
+}
+
+// len is the number of columns.
+pub fn (c Columns) len() int {
+	return c.n
+}
+
+// columns returns the result's RowDescription (an empty Columns for a
+// statement that returns no rows, e.g. an INSERT without RETURNING).
+@[direct_array_access]
+pub fn (res &Result) columns() !Columns {
+	// A plain scan, not a FrameIter: a `mut` iterator whose bytes the result
+	// borrows is moved to the heap by V's escape analysis, one allocation per
+	// call.
+	mut pos := 0
+	for res.frames.len - pos >= 5 {
+		total := 1 + int(binary.big_endian_u32_at(res.frames, pos + 1))
+		if total < 5 || total > res.frames.len - pos {
+			break
+		}
+		typ := res.frames[pos]
+		if typ == bt_row_description {
+			return columns_from(unsafe { (&u8(res.frames.data) + pos + 5).vbytes(total - 5) })
+		}
+		if typ == bt_data_row {
+			break // RowDescription precedes the rows
+		}
+		pos += total
+	}
+	return Columns{}
+}
+
+// columns_from checks a RowDescription payload: every field complete.
+@[direct_array_access]
+fn columns_from(payload []u8) !Columns {
+	if payload.len < 2 {
+		return err_columns_malformed
+	}
+	n := int(i16(binary.big_endian_u16_at(payload, 0)))
+	if n < 0 {
+		return err_columns_malformed
+	}
+	mut pos := 2
+	for _ in 0 .. n {
+		pos = field_end(payload, pos)
+		if pos < 0 {
+			return err_columns_malformed
+		}
+	}
+	if pos != payload.len {
+		return err_columns_malformed
+	}
+	return Columns{
+		n:       n
+		payload: payload
+	}
+}
+
+// field_end is where the field at pos ends: its NUL-terminated name, then 18
+// bytes (table OID, column number, type OID, type size, modifier, format);
+// -1 when it does not fit.
+@[direct_array_access]
+fn field_end(p []u8, pos int) int {
+	mut i := pos
+	for i < p.len && p[i] != 0 {
+		i++
+	}
+	if i >= p.len || p.len - (i + 1) < 18 {
+		return -1
+	}
+	return i + 1 + 18
+}
+
+// field_start is the offset of field i (columns_from checked them all).
+@[direct_array_access]
+fn (c Columns) field_start(i int) int {
+	mut pos := 2
+	for _ in 0 .. i {
+		pos = field_end(c.payload, pos)
+	}
+	return pos
+}
+
+// name returns column i's name, as a view of the message.
+@[direct_array_access]
+pub fn (c Columns) name(i int) ![]u8 {
+	if i < 0 || i >= c.n {
+		return err_columns_range
+	}
+	start := c.field_start(i)
+	mut end := start
+	for c.payload[end] != 0 {
+		end++
+	}
+	return unsafe { (&u8(c.payload.data) + start).vbytes(end - start) }
+}
+
+// type_oid returns column i's type OID (oid_int4, oid_uuid, ...).
+@[direct_array_access]
+pub fn (c Columns) type_oid(i int) !u32 {
+	if i < 0 || i >= c.n {
+		return err_columns_range
+	}
+	end := field_end(c.payload, c.field_start(i))
+	// The type OID sits 12 bytes before the field's end: 4 (type OID) + 2
+	// (type size) + 4 (modifier) + 2 (format).
+	return binary.big_endian_u32_at(c.payload, end - 12)
+}
+
+// index returns the index of the first column named `name`, or none. It
+// compares bytes in place: no allocation.
+@[direct_array_access]
+pub fn (c Columns) index(name string) ?int {
+	mut pos := 2
+	for i in 0 .. c.n {
+		end := field_end(c.payload, pos)
+		name_len := end - 19 - pos
+		if name_len == name.len
+			&& unsafe { vmemcmp(&u8(c.payload.data) + pos, name.str, name.len) } == 0 {
+			return i
+		}
+		pos = end
+	}
+	return none
 }
 
 // ── backend message details ─────────────────────────────────────────────────

@@ -13,10 +13,12 @@ module main
 //   bench/measure.sh /tmp/pgcodec frame    # submit + async_on_readable framing
 //   bench/measure.sh /tmp/pgcodec rows     # Result.rows() + every accessor
 //   bench/measure.sh /tmp/pgcodec decode   # the decoders alone
+//   bench/measure.sh /tmp/pgcodec types    # uuid, timestamp, date, numeric, float4,
+//                                          # array and RowDescription lookups
 //
 // Framing alone is `frame` minus `submit` per query. BENCH_ITERS overrides the
 // work per phase, in that phase's unit: queries (submit, frame; rounded to
-// whole rounds of 8), rows (rows) or decoder calls (decode). The default (no
+// whole rounds of 8), rows (rows) or decoder calls (decode, types). The default (no
 // argument) is `all`: every phase once, each timed (what bench/ci_bench.sh
 // A/Bs). Under -gc none a phase that allocated per query would show in the
 // RSS printed at the end.
@@ -37,8 +39,8 @@ const query = 'select id, name, category, price, quantity, active, tags, rating_
 
 fn main() {
 	phase := if os.args.len > 1 { os.args[1] } else { 'all' }
-	if phase !in ['submit', 'frame', 'rows', 'decode', 'all'] {
-		eprintln('usage: codec_bench [submit|frame|rows|decode|all]')
+	if phase !in ['submit', 'frame', 'rows', 'decode', 'types', 'all'] {
+		eprintln('usage: codec_bench [submit|frame|rows|decode|types|all]')
 		exit(2)
 	}
 	reply := canned_reply()
@@ -63,6 +65,11 @@ fn main() {
 		calls := iters(50_000_000)
 		acc += bench_decode(calls / 7)
 		b.measure('decode: ${calls} decoder calls')
+	}
+	if phase in ['types', 'all'] {
+		calls := iters(10_000_000)
+		acc += bench_types(reply, calls / 10)
+		b.measure('types:  ${calls} decoder / lookup calls')
 	}
 	println('acc=${acc} (ignore; keeps the optimizer honest)')
 	println('VmRSS: ${vm_rss_kib()} KiB')
@@ -178,6 +185,47 @@ fn bench_decode(n int) u64 {
 	}
 	return acc
 }
+
+// bench_types: the decoders #198 added, over pre-split column bytes, and the
+// RowDescription lookups (Result.columns, Columns.index). Text forms go into a
+// reused buffer, as a handler would render them.
+fn bench_types(reply []u8, n int) u64 {
+	uuid := [u8(0xc7), 0xe5, 0xb8, 0xff, 0x82, 0x79, 0x45, 0x7c, 0xa5, 0x57, 0xcb, 0xa0, 0x63,
+		0x20, 0x42, 0x3b]
+	ts := [u8(0x00), 0x02, 0xff, 0xcc, 0xa4, 0x5c, 0x54, 0x31]
+	date := [u8(0x00), 0x00, 0x26, 0x2a]
+	num := [u8(0x00), 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x7b, 0x11, 0x94]
+	f4 := [u8(0x40), 0x20, 0x00, 0x00]
+	arr := [u8(0), 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 25, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 1, `a`, 0,
+		0, 0, 1, `b`]
+	res := pg_async.Result{
+		frames: reply
+	}
+	mut out := []u8{cap: 64}
+	mut acc := u64(0)
+	for _ in 0 .. n {
+		unsafe {
+			out.len = 0
+		}
+		pg_async.uuid_into(uuid, mut out) or {}
+		us := pg_async.decode_timestamp_us(ts) or { 0 }
+		acc += u64((pg_async.timestamp_time(us) or { pg_async_zero_time }).second)
+		acc += u64(pg_async.decode_date_days(date) or { 0 })
+		pg_async.numeric_text_into(num, mut out) or {}
+		acc += u64(pg_async.decode_numeric_i64_scaled(num, 2) or { 0 })
+		acc += u64(pg_async.decode_float4(f4) or { 0 } > 2.0)
+		mut it := pg_async.decode_array(arr) or { continue }
+		for {
+			v := it.next() or { break }
+			acc += u64(v.bytes.len)
+		}
+		cols := res.columns() or { continue }
+		acc += u64(cols.index('rating_count') or { 0 }) + u64(out.len)
+	}
+	return acc
+}
+
+const pg_async_zero_time = pg_async.timestamp_time(0) or { panic(err) }
 
 // canned_reply is one query's complete reply as async_on_readable frames it:
 // ParseComplete, BindComplete, RowDescription (9 columns), rows_per_query
