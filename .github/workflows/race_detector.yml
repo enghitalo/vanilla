@@ -102,6 +102,10 @@ jobs:
         shell: bash
         run: |
           v -race -cc "$RACE_CC" -no-parallel -run-only 'test_epoll_*' test tests/backend_behaviors_test.v
+      - name: shutdown_drain_test.v (epoll: shutdown() drains running and parked requests)
+        shell: bash
+        run: |
+          v -race -cc "$RACE_CC" -no-parallel -run-only 'test_epoll_*' test tests/shutdown_drain_test.v
       - name: uds_test.v (epoll) and vtest smoke
         shell: bash
         run: |
