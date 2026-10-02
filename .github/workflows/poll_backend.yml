@@ -50,7 +50,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y liburing-dev linux-libc-dev
+          sudo apt-get install -y linux-libc-dev
       # The whole behaviour suite (pipelining, split framing, max_connections,
       # read timeout, connection reaping, large-body drain, half-close,
       # 100-continue, graceful shutdown) runs against .poll via the $if vanilla_poll ? test fns, with
