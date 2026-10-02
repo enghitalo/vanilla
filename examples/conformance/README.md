@@ -61,29 +61,26 @@ Both run in CI on every push/PR — see
 and
 [`.github/workflows/conformance_http11probe.yml`](../../.github/workflows/conformance_http11probe.yml).
 
-## Known limitations (tracked as core-vanilla issues)
+## Former limitations, now fixed in the core
 
 A handler can only decide a request the framer has already accepted as a complete
-message, so some conformance gaps live in the core framer
-(`http1_1.request_parser`, which every backend uses), not in this example. The
-ones still open are tracked as issues:
+message, so these conformance gaps lived in the core framer
+(`http1_1.request_parser`, which every backend uses), not in this example. All of
+them are fixed:
 
 - **Ambiguous framing resolved instead of rejected**
-  ([#184](https://github.com/enghitalo/vanilla/issues/184)): with duplicate
-  `Content-Length` the framer uses the last value while `content_length()`
-  returns the first, and a non-`chunked` or obfuscated `Transfer-Encoding` is
-  framed as bodyless or as chunked.
+  ([#184](https://github.com/enghitalo/vanilla/issues/184)): differing repeated
+  `Content-Length`, a `Transfer-Encoding` whose final coding is not `chunked`,
+  `Transfer-Encoding` on HTTP/1.0 and whitespace before the colon of either field
+  now get `400` and a close.
 - **Chunked framer**
-  ([#185](https://github.com/enghitalo/vanilla/issues/185)): a chunked body with
-  a trailer section is never framed, and the chunk-size line is parsed leniently
-  (empty or extension-only size, bare LF, junk after CR).
+  ([#185](https://github.com/enghitalo/vanilla/issues/185)): a trailer section is
+  framed (its fields discarded), and a malformed chunk-size line (empty or
+  extension-only size, bare LF, junk after CR) gets `400`.
 - **Field-value whitespace**
-  ([#186](https://github.com/enghitalo/vanilla/issues/186)): trailing OWS and a
-  leading HTAB stay in field values (so `Content-Length: 5 ` gets `400`), and a
-  value can run past a bare LF into the next field line.
-
-These gaps used to be listed here and are now **fixed** in the core:
-
+  ([#186](https://github.com/enghitalo/vanilla/issues/186)): OWS around a field
+  value is excluded (`Content-Length: 5 ` is valid), a value ends at its own
+  line, and a bare LF gets `400`.
 - **`Content-Length` + `Transfer-Encoding` together**
   ([#104](https://github.com/enghitalo/vanilla/issues/104)): the framer rejects
   the message as soon as the header section ends, instead of waiting for more
