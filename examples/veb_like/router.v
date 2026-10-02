@@ -21,7 +21,7 @@ const empty_params = map[string]Slice{}
 // WITHOUT the `?query`, so query strings never break matching.
 //
 // Cold path (no handler matched): a malformed request yields 400 (never panics —
-// a panic would take down the worker thread); a known path under a different
+// a panic would end the whole server process); a known path under a different
 // method yields 405 + Allow; anything else yields 404.
 fn router(req_buffer []u8, _ int, app App) ![]u8 {
 	req := request_parser.decode_http_request(req_buffer) or { return bad_request_response }

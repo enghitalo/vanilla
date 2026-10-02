@@ -83,9 +83,15 @@ pub mut:
 // the hot path (measured: no throughput change). Idle keep-alive connections
 // hold no in-flight work, so they're simply dropped on exit.
 //
-// Call it from a signal handler, then `exit(0)`. It is safe to call from another
-// thread while `run()` is blocked: stopping the listeners halts new accepts;
-// existing workers finish their current request.
+// Do NOT call it (or `exit`) inside a signal handler: the handler runs in
+// async-signal context, on whichever thread the kernel interrupts, and neither
+// call is async-signal-safe (a worker interrupted there would also spin here,
+// unable to finish its own request). Let the handler only write(2) a byte to a
+// pipe, and call shutdown from an ordinary thread blocked on that pipe, then
+// `exit(0)` — see "Graceful Shutdown" in the README and
+// examples/graceful_shutdown. It is safe to call from another thread while
+// `run()` is blocked: stopping the listeners halts new accepts; existing
+// workers finish their current request.
 pub fn (s Server) shutdown(grace_ms int) {
 	// Tell the io_uring accept handlers to stop re-arming BEFORE the listeners are
 	// shut, so the resulting accept-error completion already observes the flag.

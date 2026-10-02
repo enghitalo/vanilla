@@ -1,7 +1,7 @@
 ### Run the SSE server
 
 ```sh
-v -prod run examples/sse
+v -prod run examples/sse/src
 ```
 
 ### Serve the front-end

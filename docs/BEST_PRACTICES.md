@@ -380,6 +380,11 @@ vanilla targets [RFC 9112](https://datatracker.ietf.org/doc/rfc9112/) and the
   for JSON, escape for HTML).
 - Don't leak internal errors to clients — log detail server-side, return a
   generic message.
+- Never `panic` on request input; answer a `4xx`/`5xx` instead. A V `panic`
+  exits the whole process (all workers, every open connection), not just the
+  worker that hit it, and vanilla installs no recovery around handler calls.
+  Run the server under a supervisor that restarts it (systemd `Restart=always`,
+  a container restart policy).
 
 ---
 
@@ -400,7 +405,10 @@ Handlers are pure, so you can feed them raw requests directly via
     | nc localhost 3000
   ```
 
-See [examples/TESTING.md](../examples/TESTING.md) for the full guide.
+See the README's [End-to-End Testing](../README.md#end-to-end-testing) section
+for both layers (in-process and over a real socket), and
+[VTEST.md](VTEST.md) for the `vtest` scripted client that drives a running
+server.
 
 ---
 
