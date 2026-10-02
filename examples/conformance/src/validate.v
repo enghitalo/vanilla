@@ -16,9 +16,11 @@ enum Verdict {
 // per-check comments for the spec reference.
 //
 // Layering: the framer (frame_request_length_lim) has already rejected the
-// grossest framing errors (missing CRLF, over-limit head/body, bad chunk-size,
-// invalid Content-Length digits) before the handler ever runs — those arrive as
-// a 400 from the backend, never reaching here. This function covers the checks
+// grossest framing errors (missing CRLF, over-limit head/body, bad chunk-size
+// line or chunk extension, malformed trailer line, invalid Content-Length
+// digits) before the handler ever runs — those arrive as a 400 from the
+// backend, never reaching here. A chunked body's trailer section is framed and
+// left in req.body (trailer fields are discarded). This function covers the checks
 // that require the parsed header view: version gate, Host rules, CL/TE conflict,
 // field-name/value syntax, obsolete folding, and unknown transfer-codings.
 fn classify(req request_parser.HttpRequest) Verdict {
