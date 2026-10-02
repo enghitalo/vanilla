@@ -190,7 +190,7 @@ fn maybe_pin_worker(cpu int) {
 // op in flight at a time (recv → send → recv …), so its buffers are never
 // touched by two operations concurrently.
 
-fn handle_io_uring_accept(worker &io_uring.Worker, cqe &C.io_uring_cqe, limits Limits, active_conns &core.Counter) {
+fn handle_io_uring_accept(worker &io_uring.Worker, cqe &io_uring.Cqe, limits Limits, active_conns &core.Counter) {
 	res := cqe.res
 	if res >= 0 {
 		fd := res
@@ -239,10 +239,10 @@ fn handle_io_uring_accept(worker &io_uring.Worker, cqe &C.io_uring_cqe, limits L
 	}
 }
 
-fn handle_io_uring_read(worker &io_uring.Worker, cqe &C.io_uring_cqe, mut env IouEnv, limits Limits, active_conns &core.Counter) {
+fn handle_io_uring_read(worker &io_uring.Worker, cqe &io_uring.Cqe, mut env IouEnv, limits Limits, active_conns &core.Counter) {
 	track := limits.max_connections > 0
 	res := cqe.res
-	c_ptr := io_uring.decode_connection_ptr(C.io_uring_cqe_get_data64(cqe))
+	c_ptr := io_uring.decode_connection_ptr(cqe.user_data)
 	if unsafe { c_ptr == nil } {
 		return
 	}
@@ -391,10 +391,10 @@ fn buf_view(buf []u8, start int, length int) []u8 {
 	return v
 }
 
-fn handle_io_uring_write(worker &io_uring.Worker, cqe &C.io_uring_cqe, mut env IouEnv, limits Limits, active_conns &core.Counter) {
+fn handle_io_uring_write(worker &io_uring.Worker, cqe &io_uring.Cqe, mut env IouEnv, limits Limits, active_conns &core.Counter) {
 	track := limits.max_connections > 0
 	res := cqe.res
-	c_ptr := io_uring.decode_connection_ptr(C.io_uring_cqe_get_data64(cqe))
+	c_ptr := io_uring.decode_connection_ptr(cqe.user_data)
 	if unsafe { c_ptr == nil } {
 		return
 	}
@@ -476,8 +476,8 @@ fn handle_io_uring_write(worker &io_uring.Worker, cqe &C.io_uring_cqe, mut env I
 	}
 }
 
-fn dispatch_io_uring_cqe(worker &io_uring.Worker, cqe &C.io_uring_cqe, mut env IouEnv, limits Limits, active_conns &core.Counter) {
-	op := io_uring.decode_op_type(C.io_uring_cqe_get_data64(cqe))
+fn dispatch_io_uring_cqe(worker &io_uring.Worker, cqe &io_uring.Cqe, mut env IouEnv, limits Limits, active_conns &core.Counter) {
+	op := io_uring.decode_op_type(cqe.user_data)
 	match op {
 		io_uring.op_accept {
 			handle_io_uring_accept(worker, cqe, limits, active_conns)
@@ -567,7 +567,7 @@ fn io_uring_worker_main(listener int, cpu_id int, handler core.Handler, make_sta
 	// startup — one uname() call, off the hot path.
 	worker.use_multishot = iou_multishot_accept_supported()
 	// Skip the per-enter fget/fput on the ring fd.
-	C.io_uring_register_ring_fd(&worker.ring)
+	io_uring.register_ring_fd(&worker.ring)
 
 	// Per-worker state (issue #93): build THIS worker's thread-local state once
 	// (e.g. its own DB pool / reused render scratch); every handler call on this
@@ -610,14 +610,14 @@ fn io_uring_worker_loop(worker &io_uring.Worker, mut env IouEnv, limits Limits, 
 	sweep_ms := limits.sweep_interval_ms()
 	sweep_on := sweep_ms > 0
 	sweep_ns := u64(sweep_ms) * 1_000_000
-	mut ts := C.__kernel_timespec{
+	mut ts := io_uring.KernelTimespec{
 		tv_sec:  0
 		tv_nsec: i64(sweep_ns)
 	}
 	mut next_sweep := u64(0)
 	mut wait_ns := sweep_ns // time left until the next due scan
 
-	mut cqes := unsafe { [io_uring.drain_batch]&C.io_uring_cqe{} }
+	mut cqes := unsafe { [io_uring.drain_batch]&io_uring.Cqe{} }
 	for {
 		// ONE syscall per loop iteration: flush every SQE queued during the last
 		// drain and block until at least one completion is ready (or, when a
@@ -626,11 +626,10 @@ fn io_uring_worker_loop(worker &io_uring.Worker, mut env IouEnv, limits Limits, 
 		// live.
 		mut ret := 0
 		if sweep_on && worker.free_top < worker.conns.len {
-			mut first := &C.io_uring_cqe(unsafe { nil })
 			ts.tv_nsec = i64(wait_ns)
-			ret = C.io_uring_submit_and_wait_timeout(&worker.ring, &first, 1, &ts, unsafe { nil })
+			ret = io_uring.submit_and_wait_timeout(&worker.ring, 1, &ts)
 		} else {
-			ret = C.io_uring_submit_and_wait(&worker.ring, 1)
+			ret = io_uring.submit_and_wait(&worker.ring, 1)
 		}
 		if ret < 0 {
 			if ret == -C.EINTR || ret == -C.ETIME {
@@ -644,21 +643,21 @@ fn io_uring_worker_loop(worker &io_uring.Worker, mut env IouEnv, limits Limits, 
 		// Batch-drain the CQ: copy out ready CQEs, dispatch (which only queues
 		// new SQEs), then acknowledge the whole batch with one cq_advance.
 		for {
-			n := C.io_uring_peek_batch_cqe(&worker.ring, &cqes[0], u32(io_uring.drain_batch))
+			n := io_uring.peek_batch_cqe(&worker.ring, &cqes[0], u32(io_uring.drain_batch))
 			if n == 0 {
 				break
 			}
 			for i in 0 .. int(n) {
 				dispatch_io_uring_cqe(worker, cqes[i], mut env, limits, active_conns)
 			}
-			C.io_uring_cq_advance(&worker.ring, n)
+			io_uring.cq_advance(&worker.ring, n)
 			if int(n) < io_uring.drain_batch {
 				break
 			}
 			// A full batch may mean more are ready: flush the SQEs queued so far
 			// to free SQ slots before draining the rest (keeps the SQ from ever
 			// overflowing, regardless of how many completions piled up).
-			C.io_uring_submit(&worker.ring)
+			io_uring.submit(&worker.ring)
 		}
 		// Re-queue watch polls that hit a momentarily-full SQ during the drain —
 		// the submit at the top of the next iteration flushes them. A park is
@@ -685,28 +684,21 @@ fn io_uring_worker_loop(worker &io_uring.Worker, mut env IouEnv, limits Limits, 
 // RLIMIT_MEMLOCK still gets a working ring. SQPOLL is intentionally never used.
 // Returns the negotiated SQ entry count; errors only if every entry/flag
 // combination fails.
-fn iou_init_ring(ring &C.io_uring) !u32 {
+fn iou_init_ring(ring &io_uring.Ring) !u32 {
 	entry_candidates := [u32(io_uring.default_ring_entries), u32(8192), u32(4096), u32(2048),
 		u32(1024), u32(512), u32(256)]
 	for entries in entry_candidates {
-		mut p := C.io_uring_params{}
-		p.flags = io_uring.setup_single_issuer | io_uring.setup_defer_taskrun
-		if C.io_uring_queue_init_params(entries, ring, &p) == 0 {
+		if io_uring.queue_init(entries, ring, io_uring.setup_single_issuer | io_uring.setup_defer_taskrun) == 0 {
 			return entries
 		}
-
-		p = C.io_uring_params{}
-		p.flags = io_uring.setup_single_issuer | io_uring.setup_coop_taskrun
-		if C.io_uring_queue_init_params(entries, ring, &p) == 0 {
+		if io_uring.queue_init(entries, ring, io_uring.setup_single_issuer | io_uring.setup_coop_taskrun) == 0 {
 			return entries
 		}
-
-		p = C.io_uring_params{}
-		if C.io_uring_queue_init_params(entries, ring, &p) == 0 {
+		if io_uring.queue_init(entries, ring, 0) == 0 {
 			return entries
 		}
 	}
-	return error('io_uring_queue_init_params failed for all ring entry/flag combinations')
+	return error('io_uring_setup failed for all ring entry/flag combinations')
 }
 
 // iou_multishot_accept_supported reports whether the running kernel supports

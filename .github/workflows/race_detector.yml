@@ -74,7 +74,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y liburing-dev linux-libc-dev clang
+          sudo apt-get install -y linux-libc-dev clang
       # TSan maps its shadow memory at fixed ranges, which the runner kernel's
       # 32-bit mmap randomization can collide with ("ThreadSanitizer:
       # unexpected memory mapping"). 28 bits is the long-standing default.

@@ -592,8 +592,8 @@ fn iou_finish_resume(mut env IouEnv, mut conn io_uring.Connection, limits Limits
 // POLL_ADD the CQE res carries the returned event mask (or a negative errno);
 // POLLERR/POLLHUP (or an errno) surface as the portable Worker.ready_err.
 @[direct_array_access; manualfree]
-fn handle_io_uring_poll(cqe &C.io_uring_cqe, mut env IouEnv, limits Limits, active_conns &core.Counter) {
-	ext_fd := io_uring.decode_ext_fd(C.io_uring_cqe_get_data64(cqe))
+fn handle_io_uring_poll(cqe &io_uring.Cqe, mut env IouEnv, limits Limits, active_conns &core.Counter) {
+	ext_fd := io_uring.decode_ext_fd(cqe.user_data)
 	if ext_fd < 0 || ext_fd >= env.watches.len || !env.watches[ext_fd].active {
 		return
 	}
