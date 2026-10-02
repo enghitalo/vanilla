@@ -480,6 +480,124 @@ fn test_frame_chunked_missing_terminator() {
 	assert frame_request_length(ok)! == ok.len
 }
 
+// issue #185: the chunked framer and the trailer section / strict size lines.
+const chunked_head = 'POST /x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n'
+
+// frame_chunked_code frames chunked_head + body and returns the result, or the
+// negated error code (-400 / -413 / -431) when the framer rejects it.
+fn frame_chunked_code(body string, max_header int, max_body int) int {
+	return frame_request_length_lim((chunked_head + body).bytes(), max_header, max_body) or {
+		-err.code()
+	}
+}
+
+// A trailer section (RFC 9112 §7.1.2) is framed past, to its closing CRLF. The
+// framer used to want that CRLF right after the last chunk, so a trailer field
+// left the request "incomplete" forever (a hang with default Limits, a 408
+// with a read timeout).
+fn test_frame_chunked_trailer() {
+	one := (chunked_head + '5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n').bytes()
+	assert frame_request_length(one)! == one.len
+	several := (chunked_head + '5\r\nhello\r\n0\r\nX-Checksum: abc\r\nX-Sig:\t"a, b" \r\n' +
+		'Expires: Wed, 21 Oct 2015 07:28:00 GMT\r\nX-Empty:\r\n\r\n').bytes()
+	assert frame_request_length(several)! == several.len
+	// A trailer field the server must not act on is still just framed past.
+	cl := (chunked_head + '5\r\nhello\r\n0\r\nContent-Length: 50\r\n\r\n').bytes()
+	assert frame_request_length(cl)! == cl.len
+	// The last chunk may carry an extension and leading zeros.
+	ext := (chunked_head + '5\r\nhello\r\n000;x=1\r\nX-A: b\r\n\r\n').bytes()
+	assert frame_request_length(ext)! == ext.len
+	// Pipelined: only the first message, trailer included, is framed.
+	next := 'GET /b HTTP/1.1\r\nHost: x\r\n\r\n'
+	two := (one.bytestr() + next).bytes()
+	assert frame_request_length(two)! == one.len
+}
+
+// The trailer section is bounded by max_header (431), like the header section,
+// whether its oversized line is complete or still unterminated.
+fn test_frame_chunked_trailer_limit() {
+	big := '5\r\nhello\r\n0\r\nX-Pad: ' + 'a'.repeat(200) + '\r\n\r\n'
+	assert frame_chunked_code(big, 128, 0) == -431
+	unterminated := '5\r\nhello\r\n0\r\nX-Pad: ' + 'a'.repeat(200)
+	assert frame_chunked_code(unterminated, 128, 0) == -431
+	many := '5\r\nhello\r\n0\r\n' + 'X-A: b\r\n'.repeat(40) + '\r\n'
+	assert frame_chunked_code(many, 128, 0) == -431
+	// Under the limit it frames; 0 = unlimited.
+	assert frame_chunked_code(big, 1024, 0) == chunked_head.len + big.len
+	assert frame_chunked_code(big, 0, 0) == chunked_head.len + big.len
+	// max_body still bounds the whole chunked body, trailer included (413).
+	assert frame_chunked_code(big, 0, 64) == -413
+	// The no-Result twin carries the same sentinel.
+	t := frame_request_length_lim_idx((chunked_head + big).bytes(), 128, 0)
+	assert t < -1 && -t == 431
+}
+
+// chunk-size = 1*HEXDIG [ chunk-ext ] CRLF (RFC 9112 §7.1). Each of these was
+// framed before #185 (the first two as the LAST chunk); each is now a 400.
+fn test_frame_chunked_strict_size_line() {
+	bad := [
+		'\r\n\r\n', // empty chunk-size
+		';ext\r\n\r\n', // extension, no size
+		';ext\r\nhello\r\n0\r\n\r\n',
+		'5\nhello\r\n0\r\n\r\n', // bare LF ends the size line
+		'5\rZZ\nhello\r\n0\r\n\r\n', // junk between CR and LF
+		'5\rZZ\r\nhello\r\n0\r\n\r\n', // bare CR, then junk
+		'5;a\rb\r\nhello\r\n0\r\n\r\n', // bare CR inside an extension
+		'5;a\nhello\r\n0\r\n\r\n', // bare LF after an extension
+		'5\r\nhello\r\n0\n\r\n', // bare LF ends the last-chunk line
+		' 5\r\nhello\r\n0\r\n\r\n', // leading SP
+		'5 \r\nhello\r\n0\r\n\r\n', // trailing SP (BWS only precedes `;`)
+		'+5\r\nhello\r\n0\r\n\r\n',
+		'0x5\r\nhello\r\n0\r\n\r\n',
+		'5;\r\nhello\r\n0\r\n\r\n', // `;` with no name
+		'5;bad[=x\r\nhello\r\n0\r\n\r\n', // non-token name
+		'5;\x00ext\r\nhello\r\n0\r\n\r\n', // NUL in an extension
+		'5;a=\r\nhello\r\n0\r\n\r\n', // `=` with no value
+		'5;a="x\r\nhello\r\n0\r\n\r\n', // unterminated quoted-string
+		'5;a="x\x01"\r\nhello\r\n0\r\n\r\n', // control byte in a quoted-string
+		'5;a \r\nhello\r\n0\r\n\r\n', // trailing BWS after a name
+		'5;a=b c\r\nhello\r\n0\r\n\r\n', // two tokens, no `;`
+	]
+	for b in bad {
+		assert frame_chunked_code(b, 0, 0) == -400, 'must be 400: ${b.bytes()}'
+	}
+}
+
+// Trailer lines follow the same rules: CRLF line ends, field-line syntax.
+fn test_frame_chunked_malformed_trailer() {
+	bad := [
+		'5\r\nhello\r\n0\r\n\n', // bare LF closes the trailer section
+		'5\r\nhello\r\n0\r\nX-A: b\n\r\n', // bare LF ends a trailer line
+		'5\r\nhello\r\n0\r\nX-A: b\rc\r\n\r\n', // bare CR in a value
+		'5\r\nhello\r\n0\r\nX-A: b\r\r\nGET /s HTTP/1.1\r\nHost: x\r\n\r\n',
+		'5\r\nhello\r\n0\r\nX-A: b\r\n c\r\n\r\n', // obs-fold
+		'5\r\nhello\r\n0\r\nGET /s HTTP/1.1\r\n\r\n', // not a field-line
+		'5\r\nhello\r\n0\r\n: b\r\n\r\n', // empty field-name
+		'5\r\nhello\r\n0\r\nX-A : b\r\n\r\n', // SP before the colon
+		'5\r\nhello\r\n0\r\nX-A: b\x00\r\n\r\n', // NUL in a value
+	]
+	for b in bad {
+		assert frame_chunked_code(b, 0, 0) == -400, 'must be 400: ${b.bytes()}'
+	}
+}
+
+// What stays accepted: extensions (RFC 9112 §7.1.1, incl. BWS and a quoted
+// value), upper- and lower-case hex, leading zeros.
+fn test_frame_chunked_allowed_shapes() {
+	good := [
+		'5;name=value\r\nhello\r\n0\r\n\r\n',
+		'5;a;b=c;d="q"\r\nhello\r\n0\r\n\r\n',
+		'5 ; a = "x \\" y\t" ;b\r\nhello\r\n0\r\n\r\n',
+		'A\r\n0123456789\r\n0\r\n\r\n',
+		'a\r\n0123456789\r\n0\r\n\r\n',
+		'0005\r\nhello\r\n0;last\r\n\r\n',
+		'0\r\n\r\n',
+	]
+	for g in good {
+		assert frame_chunked_code(g, 0, 0) == chunked_head.len + g.len, 'must frame: ${g}'
+	}
+}
+
 // Overflow hardening (found by adversarial review of the #109 change). V's `int`
 // is 32-bit signed; a chunk-size or Content-Length that overflows it must be
 // rejected 400, never wrapped: a wrap-to-negative chunk size made crlf_at go
@@ -603,6 +721,9 @@ fn test_frame_split_fuzz() {
 		'GET / HTTP/1.1\r\nHost: x\r\n\r\n',
 		'POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\nhello world',
 		'POST /c HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n0\r\n\r\n',
+		// #185: extensions, a quoted value and a trailer section — no prefix may
+		// be a 400 or framed early.
+		'POST /t HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n4;a="b;c"\r\nWiki\r\n0;z\r\nX-Checksum: abc\r\nX-B: c\r\n\r\n',
 	]
 	for r in requests {
 		full := r.bytes()

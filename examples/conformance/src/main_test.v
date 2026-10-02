@@ -98,6 +98,12 @@ fn test_valid_chunked_accepted() {
 	assert status_of('POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n') == 200
 }
 
+fn test_valid_chunked_with_trailer_accepted() {
+	// A trailer section (RFC 9112 §7.1.2) is framed by the core (#185) and sits in
+	// the body, after the last chunk: it is not a header field to validate here.
+	assert status_of('POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n') == 200
+}
+
 fn test_chunked_http10_rejected() {
 	// Transfer-Encoding is HTTP/1.1+; a 1.0 request carrying it is 400 (RFC 9112 §6.1).
 	assert status_of('POST / HTTP/1.0\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n') == 400

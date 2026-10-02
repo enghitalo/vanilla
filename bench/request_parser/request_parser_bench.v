@@ -20,6 +20,16 @@ const raw_request = ('GET /users/42/posts?id=123&format=json&page=2 HTTP/1.1\r\n
 	'Host: example.com\r\n' + 'User-Agent: wrk/4.1\r\n' + 'Accept: application/json\r\n' +
 	'Accept-Encoding: gzip, deflate\r\n' + 'Connection: keep-alive\r\n' + '\r\n').bytes()
 
+// A chunked upload: three chunks (one with an extension) and the last chunk,
+// without and with a trailer section.
+const chunked_request = ('POST /upload HTTP/1.1\r\n' + 'Host: example.com\r\n' +
+	'Transfer-Encoding: chunked\r\n' + '\r\n' + '4\r\nWiki\r\n' + '5;ext=1\r\npedia\r\n' +
+	'E\r\n in\r\n\r\nchunks.\r\n' + '0\r\n\r\n').bytes()
+const chunked_trailer_request = ('POST /upload HTTP/1.1\r\n' + 'Host: example.com\r\n' +
+	'Transfer-Encoding: chunked\r\n' + '\r\n' + '4\r\nWiki\r\n' + '5;ext=1\r\npedia\r\n' +
+	'E\r\n in\r\n\r\nchunks.\r\n' + '0\r\n' + 'X-Checksum: sha256=abc\r\n' + 'X-Sig: 1\r\n' +
+	'\r\n').bytes()
+
 fn main() {
 	// Loop count: BENCH_ITERS env if set (CI uses a smaller value for speed),
 	// else 5M for stable local numbers. See bench/ci_bench.sh.
@@ -33,6 +43,17 @@ fn main() {
 	println('Accept-Encoding = "${enc.to_string(req0.buffer)}"')
 	fmt := req0.get_query_slice('format'.bytes()) or { panic('query lookup failed') }
 	println('?format         = "${fmt.to_string(req0.buffer)}"')
+	chunked_total := request_parser.frame_request_length(chunked_request) or { panic(err) }
+	if chunked_total != chunked_request.len {
+		panic('chunked framing: ${chunked_total} != ${chunked_request.len}')
+	}
+	trailer_total := request_parser.frame_request_length(chunked_trailer_request) or {
+		panic(err)
+	}
+	if trailer_total != chunked_trailer_request.len {
+		panic('chunked + trailer framing: ${trailer_total} != ${chunked_trailer_request.len}')
+	}
+	println('chunked framed  = ${chunked_total} bytes (+ trailer: ${trailer_total})')
 	println('iterations      = ${iterations}\n')
 
 	mut acc := 0 // accumulator prevents dead-code elimination
@@ -68,6 +89,19 @@ fn main() {
 		acc += request_parser.frame_request_length(raw_request) or { -1 }
 	}
 	b.measure('frame_request_length')
+
+	// 5) Chunked framing — the frame_chunked_total walk (size lines, extensions,
+	// data CRLFs, last chunk).
+	for _ in 0 .. iterations {
+		acc += request_parser.frame_request_length(chunked_request) or { -1 }
+	}
+	b.measure('frame_request_length (chunked)')
+
+	// 6) The same body plus a trailer section (two trailer fields).
+	for _ in 0 .. iterations {
+		acc += request_parser.frame_request_length(chunked_trailer_request) or { -1 }
+	}
+	b.measure('frame_request_length (chunked + trailer)')
 
 	println('\nchecksum=${acc} (ignore; keeps the optimizer honest)')
 }

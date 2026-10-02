@@ -56,6 +56,29 @@ fn test_decode_chunked_malformed_errors() {
 	}
 }
 
+fn test_trailer_section_is_skipped() ! {
+	// RFC 9112 §7.1.2: trailer fields after the last chunk are discarded, but
+	// next_pos must land past the empty line that closes the section (#185).
+	enc := '5\r\nhello\r\n0\r\nX-Checksum: abc\r\nX-B: c\r\n\r\n'.bytes()
+	assert decode_all(enc)!.bytestr() == 'hello'
+	_, l1, p1 := next_chunk(enc, 0, enc.len)!
+	assert l1 == 5
+	_, l2, p2 := next_chunk(enc, p1, enc.len)!
+	assert l2 == 0
+	assert p2 == enc.len
+	// Bare LF in a trailer line, or a truncated section, must error.
+	if _ := decode_all('5\r\nhello\r\n0\r\nX-A: b\n\r\n'.bytes()) {
+		assert false, 'bare-LF trailer line must error'
+	}
+	if _ := decode_all('5\r\nhello\r\n0\r\nX-A: b\r\n'.bytes()) {
+		assert false, 'trailer section without its empty line must error'
+	}
+	// Bare LF after a chunk extension.
+	if _ := decode_all('5;a\nhello\r\n0\r\n\r\n'.bytes()) {
+		assert false, 'bare LF in a chunk-size line must error'
+	}
+}
+
 fn test_next_chunk_yields_views() ! {
 	enc := '5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n'.bytes()
 	d1, l1, p1 := next_chunk(enc, 0, enc.len)!
@@ -94,6 +117,16 @@ fn test_chunked_request_is_echoed() ! {
 	assert out.contains('Transfer-Encoding: chunked')
 	body := out.all_after('\r\n\r\n').bytes()
 	assert decode_all(body)!.bytestr() == 'hello world'
+}
+
+fn test_chunked_request_with_trailer_is_echoed() ! {
+	// The core frames a trailer section (#185), so the handler must walk past it.
+	req := 'POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n' +
+		'5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n'
+	out := serve(req)
+	assert out.starts_with('HTTP/1.1 200 OK')
+	body := out.all_after('\r\n\r\n').bytes()
+	assert decode_all(body)!.bytestr() == 'hello'
 }
 
 fn test_smuggling_guard_via_validate_http1() {
