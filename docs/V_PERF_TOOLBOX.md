@@ -144,26 +144,13 @@ recipes are reproducible.)
 *which function allocates and how many times per request*. The recipe that makes
 it usable:
 
-- **Build with `-cc gcc`, not the default tcc** — callgrind can't resolve V app
-  symbols from tcc's debug info (everything shows as a hex address); gcc emits
-  DWARF, so `pg_async__*` (and the unprefixed `main` module functions) are named.
-- **Line numbers are C lines, in a file V deletes.** Despite `v help build-c`,
-  `-g` emits no `#line`
-  ([vlang/v#29152](https://github.com/vlang/v/issues/29152)): the DWARF names
-  `src.c` in a `.<bin>.v3cc.*` build dir that V removes after linking, so
-  callgrind, helgrind, gdb and addr2line print `src.c:N` with nothing to open.
-  Keep the C with a `-cc` wrapper (in gdb,
-  `set substitute-path <DW_AT_comp_dir> /tmp/keptc`):
-
-  ```sh
-  mkdir -p /tmp/keptc && cat > /tmp/keepcc <<'EOF'
-  #!/bin/sh
-  for a; do case "$a" in *.c) cp "$a" /tmp/keptc/ ;; esac; done
-  exec gcc "$@"
-  EOF
-  chmod +x /tmp/keepcc
-  v -g -gc none -cc /tmp/keepcc .
-  ```
+- **Build with `-cc gcc`, not the default tcc** — callgrind names a tcc build's
+  functions but gives them no file:line (`???`); gcc emits DWARF, so
+  `pg_async__*` (and the unprefixed `main` module functions) come with lines.
+- **`-g` lines are `.v` lines** on V ≥ 56509a4
+  ([vlang/v#29220](https://github.com/vlang/v/pull/29220)); older V3 builds
+  print `src.c:N` from a deleted file — keep the C with a `-cc` wrapper
+  ([#168](https://github.com/enghitalo/vanilla/pull/168)).
 - **`--instr-atstart=no`, then `callgrind_control -i on` *after* a hard warmup** —
   so pool bring-up + SCRAM + buffers reaching high-water run uninstrumented and
   only steady-state per-request work is counted.
