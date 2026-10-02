@@ -76,7 +76,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y liburing-dev linux-libc-dev
+          sudo apt-get install -y linux-libc-dev
 
       # --- Hard gate: deterministic handler-level conformance assertions --------
       # `-cc gcc -no-parallel`: the default build hits two V-toolchain flakes —
@@ -85,8 +85,8 @@ jobs:
       #     unmangled (`array_free` vs `builtin__array_free`) → intermittent
       #     `undefined reference` at link. It is a codegen bug, so it is NOT
       #     C-compiler-dependent; only -no-parallel eliminates it.
-      #   * -cc gcc avoids the separate tcc<->gcc fallback race on liburing's
-      #     <stdatomic.h> (which every server build pulls in).
+      #   * -cc gcc: every lane builds with gcc (it also avoided a tcc<->gcc
+      #     fallback race on liburing's <stdatomic.h> until #189 dropped liburing).
       # Matches the example matrix workflows. -prod is not immune to #27749, so
       # keep -no-parallel here even though these are debug builds.
       - name: Build examples/conformance

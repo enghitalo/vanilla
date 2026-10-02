@@ -382,6 +382,14 @@ v -prod crun examples/simple
 v install https://github.com/enghitalo/vanilla
 ```
 
+### System libraries
+
+None on Linux: the io_uring backend drives the kernel ring through the raw
+`io_uring_setup` / `io_uring_enter` / `io_uring_register` syscalls, not
+liburing, so neither building nor running a vanilla binary needs liburing
+(`ldd` lists only libc and libm). Minimal images (`-slim`, distroless) work
+as they are.
+
 ---
 
 ## Benchmarking

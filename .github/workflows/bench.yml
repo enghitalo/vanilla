@@ -78,7 +78,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsqlite3-dev liburing-dev linux-libc-dev
+          sudo apt-get install -y libsqlite3-dev linux-libc-dev
       - name: Same-runner A/B benchmark
         id: bench
         shell: bash
