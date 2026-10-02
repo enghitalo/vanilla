@@ -6,7 +6,8 @@ each allocator entry point by its immediate caller, and divides by the number
 of requests the instrumented window served (docs/V_PERF_TOOLBOX.md,
 "Profiling allocations"). Under -gc none every allocation is plain libc, so
 the libc total is the number that must read 0 in steady state; the V-level
-table names the code that asked for it.
+table names the code that asked for it. The instructions per request come
+from the dump's total (the instrumented window only).
 
 usage: callgrind_allocs.py <callgrind.out> <requests>
 """
@@ -44,9 +45,13 @@ def main():
     calls = defaultdict(int)  # (caller, callee) -> calls
     cur = None
     callee = None
+    instructions = 0
     with open(path, errors='replace') as f:
         for line in f:
             line = line.rstrip('\n')
+            if line.startswith('summary:') or line.startswith('totals:'):
+                instructions = int(line.split()[1])
+                continue
             m = NAMED.match(line)
             if m:
                 kind, ident, name = m.groups()
@@ -73,6 +78,7 @@ def main():
     libc_total = sum(n for (caller, c), n in calls.items() if c in LIBC and caller not in LIBC)
     per = requests if requests > 0 else 1
     print(f'requests in the instrumented window: {requests}')
+    print(f'instructions: {instructions}  =  {instructions / per:.0f} per request')
     print(f'libc allocation calls: {libc_total}  =  {libc_total / per:.4f} per request')
     if libc_total == 0:
         return

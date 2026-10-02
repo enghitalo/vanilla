@@ -1,5 +1,6 @@
 /*
- * vanilla_tls — thin C adapter over Mbed TLS 4 (TLS 1.3).
+ * vanilla_tls — thin C adapter over Mbed TLS 4 (TLS 1.3): the HTTPS server,
+ * and pg_async's TLS client (vtls_client_setup).
  * Cert generation ported from concept-examples/TLS/server.c.
  */
 #ifndef _GNU_SOURCE
@@ -15,6 +16,7 @@
 #include <mbedtls/pem.h>
 #include <mbedtls/oid.h>
 #include <mbedtls/asn1.h>
+#include <mbedtls/error.h> /* mbedtls_strerror: the client's error messages */
 #include <psa/crypto.h>
 #include <psa/crypto_values.h>
 #include <stddef.h> /* offsetof */
@@ -68,6 +70,10 @@ struct vtls_ctx {
     // vtls_set_ktls_rx_no_pad: set before the server starts, copied into each
     // session by vtls_session_new (plain int: no thread writes it concurrently).
     int ktls_rx_no_pad;
+    // A client config (vtls_client_setup): the trusted CAs and how the
+    // server's certificate is checked (VTLS_VERIFY_*).
+    mbedtls_x509_crt cachain;
+    int verify;
 };
 
 // kTLS key capture: the TLS 1.3 application traffic secrets, filled by
@@ -100,6 +106,9 @@ typedef struct {
     int closed;      // a recv saw EOF (1) or failed (2): reported once the read-ahead is empty
     int defer_send;  // vtls_write is encrypting under the crypto lock: hold the send
     int deferred;    // ...and a record is encrypted and waiting to be sent
+    int bio_want;    // the receive callback answered WANT_READ in this Mbed TLS call
+    int peer_closed; // the peer ended the session: EOF or close_notify (vtls_peer_closed)
+    int last_err;    // the Mbed TLS error that failed the handshake (vtls_handshake_error)
     size_t ra_off, ra_len; // unread ciphertext is ra[ra_off..ra_len]
     unsigned char ra[VTLS_READAHEAD];
 } vtls_session;
@@ -186,6 +195,7 @@ vtls_ctx *vtls_ctx_new(void) {
     if (!c) return NULL;
     mbedtls_ssl_config_init(&c->conf);
     mbedtls_x509_crt_init(&c->srvcert);
+    mbedtls_x509_crt_init(&c->cachain);
     mbedtls_pk_init(&c->pkey);
     return c;
 }
@@ -194,6 +204,7 @@ void vtls_ctx_free(vtls_ctx *c) {
     if (!c) return;
     VTLS_LOCK();
     mbedtls_x509_crt_free(&c->srvcert);
+    mbedtls_x509_crt_free(&c->cachain);
     if (c->key_id != 0) psa_destroy_key(c->key_id);
     mbedtls_pk_free(&c->pkey);
     mbedtls_ssl_config_free(&c->conf);
@@ -440,6 +451,7 @@ static int vtls_recv(vtls_session *s, unsigned char *dst, size_t want) {
     if (r < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             s->readable = 0;
+            s->bio_want = 1;
             return MBEDTLS_ERR_SSL_WANT_READ;
         }
         s->closed = 2;
@@ -466,7 +478,10 @@ static int vtls_bio_recv(void *ctx, unsigned char *buf, size_t len) {
     vtls_session *s = (vtls_session *)((char *)ctx - offsetof(vtls_session, net));
     if (s->ra_off >= s->ra_len) {
         if (s->closed) return s->closed == 1 ? 0 : MBEDTLS_ERR_NET_RECV_FAILED;
-        if (!s->readable) return MBEDTLS_ERR_SSL_WANT_READ;
+        if (!s->readable) {
+            s->bio_want = 1;
+            return MBEDTLS_ERR_SSL_WANT_READ;
+        }
         // Exact reads during the handshake; a large ask (a big record's body)
         // goes straight into mbedTLS's buffer.
         if (!s->readahead || len >= VTLS_READAHEAD) return vtls_recv(s, buf, len);
@@ -534,9 +549,10 @@ void vtls_session_free(void *sess) {
     vtls_session *s = (vtls_session *)sess;
     // On a kTLS socket the kernel owns record framing; a userspace close_notify via
     // mbedtls would write a spurious, wrongly-framed record. Skip it (a missing
-    // close_notify is tolerated by peers). For the plain userspace path, send it.
+    // close_notify is tolerated by peers). For the plain userspace path, send it,
+    // unless the session was detached from its socket (vtls_session_reset(-1)).
     VTLS_LOCK();
-    if (!s->ktls) mbedtls_ssl_close_notify(&s->ssl);
+    if (!s->ktls && s->net.fd >= 0) mbedtls_ssl_close_notify(&s->ssl);
     mbedtls_ssl_free(&s->ssl);
     VTLS_UNLOCK();
     free(s);
@@ -554,43 +570,81 @@ static int map_ret(int ret) {
     return VTLS_ERROR;
 }
 
+// Mbed TLS also answers WANT_READ when the socket was never asked: right after
+// reading a TLS 1.3 NewSessionTicket's header (it parks the message and wants
+// to be called again to process it) and after skipping a warning alert. The
+// records behind it may already be in the read-ahead or the socket, and under
+// EPOLLET no new edge would come for them, so such a WANT_READ is called
+// again, not reported: only the receive callback's WANT_READ (bio_want) means
+// drained. A NewSessionTicket (MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET, a
+// client only) is read past too: tickets are never used to resume. The bound
+// only guards against a library loop that would make no progress.
+#define VTLS_RETRIES 64
+
+static int vtls_retry(vtls_session *s, int ret) {
+    return ret == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET
+           || (ret == MBEDTLS_ERR_SSL_WANT_READ && !s->bio_want);
+}
+
 int vtls_handshake(void *sess) {
-    VTLS_LOCK();
-    int ret = mbedtls_ssl_handshake(&((vtls_session *)sess)->ssl);
-    VTLS_UNLOCK();
-    return (ret == 0) ? VTLS_OK : map_ret(ret);
+    vtls_session *s = (vtls_session *)sess;
+    int ret, n = 0;
+    do {
+        s->bio_want = 0;
+        VTLS_LOCK();
+        ret = mbedtls_ssl_handshake(&s->ssl);
+        VTLS_UNLOCK();
+    } while (vtls_retry(s, ret) && ++n < VTLS_RETRIES);
+    if (ret == 0) return VTLS_OK;
+    int r = map_ret(ret);
+    if (r == VTLS_ERROR) s->last_err = ret;
+    return r;
 }
 
 void vtls_mark_readable(void *sess) { ((vtls_session *)sess)->readable = 1; }
 
 int vtls_read(void *sess, unsigned char *buf, size_t len) {
     vtls_session *s = (vtls_session *)sess;
-    if (s->ra_off >= s->ra_len && !s->closed && mbedtls_ssl_get_bytes_avail(&s->ssl) == 0
-        && !mbedtls_ssl_check_pending(&s->ssl)) {
-        // Nothing decrypted is waiting and no record is being processed:
-        // mbedTLS needs input. Drained (the last recv came back short), it
-        // could only answer WANT_READ (a partial record needs more), so answer
-        // it here without entering the library — every burst ends so. Else
-        // fetch the input before taking the crypto lock, not under it.
-        if (!s->readable) return VTLS_WANT;
-        if (s->readahead && ra_fill(s) == MBEDTLS_ERR_SSL_WANT_READ) return VTLS_WANT;
-        // Bytes, EOF or an error: mbedTLS takes it from the read-ahead state.
-    }
-    VTLS_LOCK();
-    int ret = mbedtls_ssl_read(&s->ssl, buf, len);
-    VTLS_UNLOCK();
+    int ret, n = 0;
+    do {
+        if (s->ra_off >= s->ra_len && !s->closed && mbedtls_ssl_get_bytes_avail(&s->ssl) == 0
+            && !mbedtls_ssl_check_pending(&s->ssl)) {
+            // Nothing decrypted is waiting and no record is being processed:
+            // mbedTLS needs input. Drained (the last recv came back short), it
+            // could only answer WANT_READ (a partial record needs more), so answer
+            // it here without entering the library — every burst ends so. Else
+            // fetch the input before taking the crypto lock, not under it.
+            if (!s->readable) return VTLS_WANT;
+            if (s->readahead && ra_fill(s) == MBEDTLS_ERR_SSL_WANT_READ) return VTLS_WANT;
+            // Bytes, EOF or an error: mbedTLS takes it from the read-ahead state.
+        }
+        s->bio_want = 0;
+        VTLS_LOCK();
+        ret = mbedtls_ssl_read(&s->ssl, buf, len);
+        VTLS_UNLOCK();
+    } while (vtls_retry(s, ret) && ++n < VTLS_RETRIES);
     if (ret > 0) return ret;
-    if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return VTLS_ERROR; // closed
+    if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) { // closed
+        s->peer_closed = 1;
+        return VTLS_ERROR;
+    }
     return map_ret(ret); // VTLS_WANT (-2) or VTLS_ERROR (-1)
 }
 
+int vtls_peer_closed(void *sess) { return ((vtls_session *)sess)->peer_closed; }
+
 int vtls_write(void *sess, const unsigned char *buf, size_t len) {
     vtls_session *s = (vtls_session *)sess;
-    VTLS_LOCK();
-    s->defer_send = VTLS_SERIALIZED; // encrypt under the lock, send after it
-    int ret = mbedtls_ssl_write(&s->ssl, buf, len);
-    s->defer_send = 0;
-    VTLS_UNLOCK();
+    int ret;
+    do {
+        // A client's write first finishes a NewSessionTicket a read left
+        // parked (see vtls_retry); write on past it.
+        VTLS_LOCK();
+        s->defer_send = VTLS_SERIALIZED; // encrypt under the lock, send after it
+        ret = mbedtls_ssl_write(&s->ssl, buf, len);
+        s->defer_send = 0;
+        VTLS_UNLOCK();
+    } while (ret == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET);
     if (s->deferred) {
         // The record is encrypted and pending in mbedTLS (it saw WANT_WRITE).
         // Called again with the same arguments, as its API requires, it only
@@ -604,13 +658,141 @@ int vtls_write(void *sess, const unsigned char *buf, size_t len) {
         //     setting; never called here), else sizing the record calls
         //     mbedtls_ssl_get_record_expansion...
         //   - ...which reads PSA's key store only for a CBC suite: the
-        //     version is pinned to TLS 1.3 (setup), whose suites are all AEAD.
+        //     version is pinned to TLS 1.3 (setup, and client_setup), whose
+        //     suites are all AEAD.
         // Change any of these and this call needs the lock too.
         s->deferred = 0;
         ret = mbedtls_ssl_write(&s->ssl, buf, len);
     }
     if (ret >= 0) return ret;
     return map_ret(ret);
+}
+
+// ---- client (pg_async) ------------------------------------------------------
+
+// verify_chain_only is VTLS_VERIFY_CA's certificate callback. The session still
+// names the host, for SNI, so Mbed TLS checks the name as well: drop that one
+// finding on the server's own certificate, keep every chain error.
+static int verify_chain_only(void *p, mbedtls_x509_crt *crt, int depth, uint32_t *flags) {
+    (void)p;
+    (void)crt;
+    if (depth == 0) *flags &= ~(uint32_t)MBEDTLS_X509_BADCERT_CN_MISMATCH;
+    return 0;
+}
+
+static int client_setup(vtls_ctx *c, const char *ca_file, int verify) {
+    int ret = mbedtls_ssl_config_defaults(&c->conf, MBEDTLS_SSL_IS_CLIENT,
+                                          MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
+    if (ret != 0) return ret;
+    // TLS 1.3 only, as on the server: vtls_write's unlocked flush relies on it
+    // (see there). No suite list: the server picks among Mbed TLS's defaults.
+    mbedtls_ssl_conf_min_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_3);
+    mbedtls_ssl_conf_max_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_3);
+    c->verify = verify;
+    if (verify == VTLS_VERIFY_NONE) {
+        mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_NONE);
+        return 0;
+    }
+    // A positive count is certificates that did not parse (a system bundle may
+    // hold a few Mbed TLS cannot read); the rest are trusted. None at all is
+    // an error, not an empty trust store.
+    ret = mbedtls_x509_crt_parse_file(&c->cachain, ca_file);
+    if (ret < 0) return ret;
+    if (c->cachain.version == 0) return MBEDTLS_ERR_X509_CERT_UNKNOWN_FORMAT;
+    mbedtls_ssl_conf_ca_chain(&c->conf, &c->cachain, NULL);
+    mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+    if (verify == VTLS_VERIFY_CA) mbedtls_ssl_conf_verify(&c->conf, verify_chain_only, NULL);
+    return 0;
+}
+
+int vtls_client_setup(vtls_ctx *c, const char *ca_file, int verify) {
+    VTLS_LOCK(); // parsing the CAs runs PSA (key import)
+    int ret = client_setup(c, ca_file, verify);
+    VTLS_UNLOCK();
+    return ret;
+}
+
+// client_rearm puts a client session's own state back to "new, on fd". The
+// client reads ahead from the first byte: there is no kTLS handoff to keep
+// the handshake's reads exact for.
+static void client_rearm(vtls_session *s, int fd) {
+    s->net.fd = fd;
+    s->readable = 1;
+    s->readahead = 1;
+    s->closed = 0;
+    s->peer_closed = 0;
+    s->last_err = 0;
+    s->defer_send = 0;
+    s->deferred = 0;
+    s->ra_off = 0;
+    s->ra_len = 0;
+}
+
+void *vtls_client_session_new(vtls_ctx *c, int fd, const char *host) {
+    vtls_session *s = (vtls_session *)calloc(1, sizeof(vtls_session));
+    if (!s) return NULL;
+    unsigned char ip[16];
+    int is_ip = inet_pton(AF_INET, host, ip) == 1 || inet_pton(AF_INET6, host, ip) == 1;
+    mbedtls_ssl_init(&s->ssl);
+    VTLS_LOCK();
+    int ret = mbedtls_ssl_setup(&s->ssl, &c->conf);
+    // The host is the SNI and, under VERIFY_FULL, the name to check. An IP
+    // address is no SNI (RFC 6066), so it is set only when it must be checked;
+    // NULL still counts as "set" for Mbed TLS's verify-without-a-name guard.
+    if (ret == 0) ret = mbedtls_ssl_set_hostname(&s->ssl, (is_ip && c->verify != VTLS_VERIFY_FULL) ? NULL : host);
+    if (ret != 0) mbedtls_ssl_free(&s->ssl);
+    VTLS_UNLOCK();
+    if (ret != 0) {
+        free(s);
+        return NULL;
+    }
+    client_rearm(s, fd);
+    mbedtls_ssl_set_bio(&s->ssl, &s->net, vtls_bio_send, vtls_bio_recv, NULL);
+    return s;
+}
+
+int vtls_session_reset(void *sess, int fd) {
+    vtls_session *s = (vtls_session *)sess;
+    VTLS_LOCK(); // drops the old session's keys from PSA's store
+    int ret = mbedtls_ssl_session_reset(&s->ssl); // keeps the host name and the bio
+    VTLS_UNLOCK();
+    client_rearm(s, fd);
+    return ret;
+}
+
+void vtls_handshake_error(void *sess, char *buf, size_t len) {
+    vtls_session *s = (vtls_session *)sess;
+    if (len == 0) return;
+    buf[0] = '\0';
+    if (s->last_err == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
+        uint32_t flags = mbedtls_ssl_get_verify_result(&s->ssl);
+        if (flags != 0 && flags != (uint32_t)-1) {
+            const char *what = (flags & MBEDTLS_X509_BADCERT_NOT_TRUSTED)
+                ? "the server certificate is not trusted (it does not chain to a trusted root certificate)"
+                : (flags & MBEDTLS_X509_BADCERT_CN_MISMATCH)
+                ? "the server certificate does not match the host name"
+                : "the server certificate failed verification";
+            // Then Mbed TLS's findings, one per line: joined on one.
+            char info[512];
+            int n = mbedtls_x509_crt_verify_info(info, sizeof(info), "", flags);
+            for (int i = 0; i < n; i++) {
+                if (info[i] == '\n') info[i] = (i + 1 < n) ? ';' : '\0';
+            }
+            snprintf(buf, len, "%s: %s", what, n > 0 ? info : "");
+            return;
+        }
+    }
+    if (s->closed == 1 || s->last_err == MBEDTLS_ERR_SSL_CONN_EOF) {
+        snprintf(buf, len, "the server closed the connection during the TLS handshake");
+        return;
+    }
+    vtls_error_string(s->last_err, buf, len);
+}
+
+void vtls_error_string(int err, char *buf, size_t len) {
+    char text[160];
+    mbedtls_strerror(err, text, sizeof(text));
+    snprintf(buf, len, "%s (Mbed TLS -0x%04x)", text, (unsigned)(-err));
 }
 
 // ---- kTLS handoff -----------------------------------------------------------

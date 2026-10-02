@@ -8,6 +8,9 @@ module tls
 // instead, so a plain-HTTP server (and the benchmark entry) builds with no
 // Mbed TLS dependency at all.
 //
+// The server side is the HTTPS worker's; the client side (new_client) is
+// pg_async's TLS to PostgreSQL.
+//
 //   real impl  -> tls_mbedtls_d_vanilla_tls.c.v   (built with `-d vanilla_tls`)
 //   stub       -> tls_stub_notd_vanilla_tls.c.v   (built by default)
 //
@@ -53,7 +56,23 @@ pub:
 	persist_dir string
 }
 
-// Session is a per-connection TLS session bound to an accepted, non-blocking fd.
+// Verify is how a client checks the server's certificate (new_client).
+pub enum Verify {
+	off   // not at all: the connection is encrypted, the server is not authenticated
+	chain // the certificate chains to a trusted CA
+	full  // ...and names the host dialed (a DNS or IP SAN)
+}
+
+// Session is a per-connection TLS session bound to a non-blocking fd: an
+// accepted one (Config.new_session) or a connected one (new_client_session).
+// The zero Session is no session at all (active() is false).
 pub struct Session {
 	sess voidptr
+}
+
+// active reports whether this is a live session rather than the zero Session:
+// the one check pg_async's I/O makes to pick TLS or the plain socket.
+@[inline]
+pub fn (s &Session) active() bool {
+	return s.sess != unsafe { nil }
 }

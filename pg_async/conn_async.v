@@ -184,9 +184,11 @@ fn (mut c PgConn) append_send(frame []u8) bool {
 }
 
 // async_wants_write reports whether request bytes are still pending (so the
-// reactor should keep writable interest armed).
+// reactor should keep writable interest armed) — or, over TLS, a read is
+// blocked until the socket takes a write of Mbed TLS's own. Either way
+// async_flush is what moves it on.
 pub fn (c &PgConn) async_wants_write() bool {
-	return c.send_off < c.send_len
+	return c.send_off < c.send_len || c.tls_read_blocked
 }
 
 // async_flush sends as much of the pending request as the socket will take.
@@ -197,17 +199,28 @@ pub fn (mut c PgConn) async_flush() !bool {
 	if c.state != .ready {
 		return c.loss_error()
 	}
+	if c.tls_read_blocked {
+		// A TLS read waits to send something of Mbed TLS's own: retry that read
+		// first (into recv_buf; async_on_readable frames it). A query record
+		// written now would flush Mbed TLS's pending bytes in its place.
+		c.fill_recv_buf()
+		if c.state != .ready {
+			return c.loss_error()
+		}
+		if c.tls_read_blocked {
+			return false
+		}
+	}
 	for c.send_off < c.send_len {
-		n := C.send(c.fd, unsafe { &u8(c.send_buf.data) + c.send_off },
-			usize(c.send_len - c.send_off), C.MSG_NOSIGNAL)
+		n := c.send_some(unsafe { &u8(c.send_buf.data) + c.send_off }, c.send_len - c.send_off)
 		if n > 0 {
 			c.send_off += n
 			continue
 		}
-		if n < 0 && (C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK) {
+		if n == io_again {
 			return false
 		}
-		c.lose('async send failed (errno ${C.errno})')
+		c.lose(c.io_error('async send'))
 		return error('pg: ${c.loss}')
 	}
 	// Fully drained — reset so the next append starts at the front of the buffer.
@@ -260,58 +273,7 @@ pub fn (mut c PgConn) async_on_readable() !QueryPoll {
 			c.recv_buf.len = 0
 		}
 	}
-	// Drain the socket to EAGAIN, recv-ing STRAIGHT into recv_buf's spare tail — no
-	// per-iteration 16 KiB scratch alloc + copy. recv_buf is persistent + reused; only
-	// when the tail is full do we compact the framed prefix, then grow by doubling.
-	// Only while the connection is live: after a loss nothing more can arrive, but
-	// what already did is still framed below.
-	for c.state == .ready {
-		if c.recv_buf.len == c.recv_buf.cap {
-			if c.recv_pos > 0 {
-				rem := c.recv_buf.len - c.recv_pos
-				if rem > 0 {
-					unsafe {
-						C.memmove(c.recv_buf.data, &u8(c.recv_buf.data) + c.recv_pos, usize(rem))
-					}
-				}
-				unsafe {
-					c.recv_buf.len = rem
-				}
-				c.recv_pos = 0
-			}
-			if c.recv_buf.len == c.recv_buf.cap {
-				// Grow by the current cap (doubling), or a 16 KiB floor when cap is 0
-				// (recv_buf comes back cap-0 after the blocking handshake — grow_cap(0)
-				// would be a no-op, leaving spare=0 and recv reading nothing forever).
-				unsafe {
-					c.recv_buf.grow_cap(if c.recv_buf.cap > 0 {
-						c.recv_buf.cap
-					} else {
-						16 * 1024
-					})
-				}
-			}
-		}
-		spare := c.recv_buf.cap - c.recv_buf.len
-		n := C.recv(c.fd, unsafe { &u8(c.recv_buf.data) + c.recv_buf.len }, usize(spare), 0)
-		if n > 0 {
-			unsafe {
-				c.recv_buf.len += n
-			}
-			continue
-		}
-		if n == 0 {
-			// EOF. Not an early return: the bytes that came with the FIN (a whole
-			// result, or the FATAL that explains the close) are framed first.
-			c.lose('connection closed by server')
-			break
-		}
-		if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
-			break
-		}
-		c.lose('async recv failed (errno ${C.errno})')
-		break
-	}
+	c.fill_recv_buf()
 	for c.inflight.len > 0 {
 		hdr := next_message_at(c.recv_buf, c.recv_pos) or { break }
 		typ := c.recv_buf[c.recv_pos]
@@ -366,6 +328,69 @@ pub fn (mut c PgConn) async_on_readable() !QueryPoll {
 		return c.loss_error()
 	}
 	return not_ready // front query needs more bytes (or none in flight) — see `not_ready`
+}
+
+// fill_recv_buf drains the transport to EAGAIN (over TLS: until the socket is
+// drained AND Mbed TLS holds no more records), recv-ing STRAIGHT into
+// recv_buf's spare tail — no per-iteration 16 KiB scratch alloc + copy.
+// recv_buf is persistent + reused; only when the tail is full do we compact
+// the framed prefix, then grow by doubling. Only while the connection is live:
+// after a loss nothing more can arrive, but what already did is still framed.
+@[inline]
+fn (mut c PgConn) fill_recv_buf() {
+	if c.tls.active() {
+		// Any wake may follow new bytes: the session read on from where it
+		// last found the socket drained.
+		c.tls.mark_readable()
+		c.tls_read_blocked = false
+	}
+	for c.state == .ready {
+		if c.recv_buf.len == c.recv_buf.cap {
+			if c.recv_pos > 0 {
+				rem := c.recv_buf.len - c.recv_pos
+				if rem > 0 {
+					unsafe {
+						C.memmove(c.recv_buf.data, &u8(c.recv_buf.data) + c.recv_pos, usize(rem))
+					}
+				}
+				unsafe {
+					c.recv_buf.len = rem
+				}
+				c.recv_pos = 0
+			}
+			if c.recv_buf.len == c.recv_buf.cap {
+				// Grow by the current cap (doubling), or a 16 KiB floor when cap is 0
+				// (recv_buf comes back cap-0 after the blocking handshake — grow_cap(0)
+				// would be a no-op, leaving spare=0 and recv reading nothing forever).
+				unsafe {
+					c.recv_buf.grow_cap(if c.recv_buf.cap > 0 {
+						c.recv_buf.cap
+					} else {
+						16 * 1024
+					})
+				}
+			}
+		}
+		spare := c.recv_buf.cap - c.recv_buf.len
+		n := c.recv_some(unsafe { &u8(c.recv_buf.data) + c.recv_buf.len }, spare)
+		if n > 0 {
+			unsafe {
+				c.recv_buf.len += n
+			}
+			continue
+		}
+		if n == 0 {
+			// EOF. Not an early return: the bytes that came with the FIN (a whole
+			// result, or the FATAL that explains the close) are framed first.
+			c.lose('connection closed by server')
+			break
+		}
+		if n == io_again {
+			break
+		}
+		c.lose(c.io_error('async recv'))
+		break
+	}
 }
 
 // pop_front removes the front in-flight query, returning its (possibly grown)

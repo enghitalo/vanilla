@@ -79,3 +79,27 @@ pub fn (s &Session) alpn() string {
 }
 
 pub fn (s &Session) free() {}
+
+pub fn (s &Session) peer_closed() bool {
+	return false
+}
+
+pub fn system_ca_file() string {
+	return ''
+}
+
+pub fn new_client(ca_file string, verify Verify) !&Config {
+	return error(not_built)
+}
+
+pub fn (c &Config) new_client_session(fd int, host string) ?Session {
+	return none
+}
+
+pub fn (s &Session) reset(fd int) bool {
+	return false
+}
+
+pub fn (s &Session) handshake_error() string {
+	return not_built
+}

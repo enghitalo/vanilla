@@ -40,6 +40,12 @@ fn C.vtls_ktls_failed(sess voidptr) int
 fn C.vtls_ktls_abort(sess voidptr)
 fn C.vtls_set_ktls(ctx voidptr, enabled int)
 fn C.vtls_set_ktls_rx_no_pad(ctx voidptr, enabled int)
+fn C.vtls_peer_closed(sess voidptr) int
+fn C.vtls_client_setup(ctx voidptr, ca_file &char, verify int) int
+fn C.vtls_client_session_new(ctx voidptr, fd int, host &char) voidptr
+fn C.vtls_session_reset(sess voidptr, fd int) int
+fn C.vtls_handshake_error(sess voidptr, buf &char, len usize)
+fn C.vtls_error_string(err int, buf &char, len usize)
 
 // init performs process-wide crypto init (psa_crypto_init). Call once at startup.
 // parallel_crypto reports whether TLS workers can run their crypto in
@@ -298,4 +304,97 @@ pub fn (s &Session) alpn() string {
 
 pub fn (s &Session) free() {
 	C.vtls_session_free(s.sess)
+}
+
+// peer_closed reports whether the peer ended the TLS session (EOF, or a
+// close_notify alert): read_into's `closed` is then a clean close.
+pub fn (s &Session) peer_closed() bool {
+	return C.vtls_peer_closed(s.sess) == 1
+}
+
+// ---- client ------------------------------------------------------------------
+
+// system_ca_file is the system's bundle of trusted CA certificates (PEM):
+// $SSL_CERT_FILE when set, else the first that exists of the paths Linux
+// distributions, Alpine and the BSDs/macOS use. '' if there is none.
+pub fn system_ca_file() string {
+	from_env := os.getenv('SSL_CERT_FILE')
+	if from_env != '' {
+		return from_env
+	}
+	for path in ['/etc/ssl/certs/ca-certificates.crt', // Debian, Ubuntu, Arch, Gentoo
+	'/etc/pki/tls/certs/ca-bundle.crt', // Fedora, RHEL
+	'/etc/ssl/ca-bundle.pem', // openSUSE
+	'/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem', // CentOS / RHEL 7
+	'/etc/ssl/cert.pem'] { // Alpine, macOS, the BSDs
+		if os.is_file(path) {
+			return path
+		}
+	}
+	return ''
+}
+
+// new_client builds a TLS 1.3 client config that accepts the suites the
+// server offers and checks its certificate per `verify` against the PEM
+// bundle `ca_file` ('' = system_ca_file(); unused with .off). One config
+// serves any number of client sessions; free() it after the last one.
+pub fn new_client(ca_file string, verify Verify) !&Config {
+	initialize()!
+	mut path := ''
+	if verify != .off {
+		path = if ca_file != '' { ca_file } else { system_ca_file() }
+		if path == '' {
+			return error('vtls: no system CA bundle found (set SSL_CERT_FILE or give the root certificates)')
+		}
+		if !os.is_file(path) {
+			return error('vtls: root certificate file ${path} not found')
+		}
+	}
+	ctx := C.vtls_ctx_new()
+	if ctx == unsafe { nil } {
+		return error('vtls: out of memory')
+	}
+	rc := C.vtls_client_setup(ctx, &char(path.str), int(verify))
+	if rc != 0 {
+		C.vtls_ctx_free(ctx)
+		return error('vtls: cannot load the root certificates from ${path}: ${error_text(rc)}')
+	}
+	return &Config{
+		ctx: ctx
+	}
+}
+
+// new_client_session starts a client session on `fd`, a connected
+// NON-BLOCKING socket, to server `host` (SNI, and the name verified under
+// Verify.full). Drive it with handshake() like a server session.
+pub fn (c &Config) new_client_session(fd int, host string) ?Session {
+	s := C.vtls_client_session_new(c.ctx, fd, &char(host.str))
+	if s == unsafe { nil } {
+		return none
+	}
+	return Session{
+		sess: s
+	}
+}
+
+// reset re-arms a client session for a new handshake to the same host on a
+// new socket, keeping its buffers (a reconnect allocates nothing). fd -1
+// detaches it from a socket about to be closed: nothing it does later can
+// reach that fd number once the kernel reuses it.
+pub fn (s &Session) reset(fd int) bool {
+	return C.vtls_session_reset(s.sess, fd) == 0
+}
+
+// handshake_error says why handshake() returned `closed`: the certificate
+// verification that failed, or the TLS error.
+pub fn (s &Session) handshake_error() string {
+	mut buf := [512]u8{}
+	C.vtls_handshake_error(s.sess, &char(&buf[0]), usize(buf.len))
+	return unsafe { cstring_to_vstring(&char(&buf[0])) }
+}
+
+fn error_text(rc int) string {
+	mut buf := [256]u8{}
+	C.vtls_error_string(rc, &char(&buf[0]), usize(buf.len))
+	return unsafe { cstring_to_vstring(&char(&buf[0])) }
 }

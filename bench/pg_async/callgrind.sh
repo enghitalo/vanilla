@@ -18,7 +18,8 @@
 # Shapes: dbp (/dbp, pipelined), db (/db, acquire/release), errors (50%
 # /dberr), disconnects (clients hanging up mid-query on /dbslow).
 # Environment: WARMUP [10] s, WINDOW [10] s, POOL [2]; one worker (valgrind
-# serializes threads anyway).
+# serializes threads anyway); TLS [0] (1: -d vanilla_tls, talking TLS as in
+# e2e.sh). Besides the allocations it prints the instructions per request.
 
 set -uo pipefail
 export LC_ALL=C
@@ -54,13 +55,15 @@ cleanup() {
 trap cleanup EXIT
 
 if [ -z "${PGHOST:-}" ]; then
-	pg_env=$(pg_async/testdata/throwaway_pg.sh start) || exit 2
+	pg_env=$(PG_TLS="${TLS:-0}" pg_async/testdata/throwaway_pg.sh start) || exit 2
 	eval "$pg_env"
 	pg_started=1
 fi
 
-echo "building bench/pg_async/e2e_server (-prod -gc none -cc gcc -g)..."
-v -prod -gc none -cc gcc -g -o "$work/server" bench/pg_async/e2e_server >"$work/build.log" 2>&1 || {
+tlsflag=()
+[ "${TLS:-0}" = 1 ] && tlsflag=(-d vanilla_tls)
+echo "building bench/pg_async/e2e_server (-prod -gc none -cc gcc -g ${tlsflag[*]})..."
+v -prod -gc none -cc gcc -g "${tlsflag[@]}" -o "$work/server" bench/pg_async/e2e_server >"$work/build.log" 2>&1 || {
 	cat "$work/build.log"
 	exit 2
 }

@@ -399,6 +399,7 @@ fn test_tls_pool_redials_a_lost_connection() {
 		pool.release(k)
 		assert f.fake.stat('tls_handshakes') == 2
 		assert f.fake.stat('authenticated') == 2
+		assert pool.scram.derived == 1, "the TLS re-dial must reuse the pool's SCRAM key (ScramCache)"
 		return
 	}
 	assert false, 'the lost TLS connection was not re-dialed'

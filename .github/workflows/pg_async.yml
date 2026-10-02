@@ -12,11 +12,14 @@ name: pg_async (PostgreSQL client)
 #   live  — the same tests against real PostgreSQL 16 and 18 (scram-sha-256
 #           service containers; the live tests run when PGHOST is set), plus
 #           the end-to-end benchmark server answering real queries.
-#   tls   — a TLS-only PostgreSQL (hostssl lines for scram-sha-256 and for
-#           `password`, plaintext rejected; certificates from a test CA
-#           generated at run time by pg_async/testdata/gen_test_ca.sh) and the
-#           `-d vanilla_tls` build of pg_async, on both Mbed TLS legs of
-#           tls_backend.yml (same pinned tag, same cache).
+#   tls   — pg_async's TLS client (`-d vanilla_tls`, vanilla#196) on both Mbed
+#           TLS legs of tls_backend.yml (same pinned tag, same cache): the
+#           fake-server TLS tests, then every live suite with sslmode
+#           verify-full against a TLS-only PostgreSQL (hostssl lines for
+#           scram-sha-256 and for `password`, plaintext rejected; certificates
+#           from a test CA generated at run time by
+#           pg_async/testdata/gen_test_ca.sh), the e2e suite over TLS, the TLS
+#           client under AddressSanitizer, and all of it under -race.
 #
 # Benchmarks and the leak harness (bench/pg_async/) are LOCAL tools: a shared
 # runner is too noisy to compare loads (bench/load.sh). The codec micro-bench
@@ -345,11 +348,34 @@ jobs:
             echo 'the TLS-only instance accepted plaintext'; exit 1
           fi
           grep -q 'no encryption' <<<"$err" || { echo "unexpected failure: $err"; exit 1; }
-      - name: pg_async/ and the e2e suite, built with -d vanilla_tls
+      # pg_async over TLS, sslmode verify-full against the test CA: the
+      # fake-server TLS tests (fake_pg.py's TLS modes: tickets mid-query, 'N',
+      # 'S' + plaintext, a wrong-host certificate...), every live suite (they
+      # read PGSSLMODE / PGSSLROOTCERT) and tls_live_test.v (TLS 1.3 in
+      # pg_stat_ssl, a host outside the certificate, the wrong CA, a result
+      # spanning many records, re-dial over TLS after pg_terminate_backend);
+      # then the e2e suite over TLS on the epoll reactor.
+      - name: pg_async/ and the e2e suite over TLS (verify-full)
         shell: bash
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: '55433'
+          PGUSER: bench
+          PGPASSWORD: benchpw
+          PGDATABASE: bench
+          PGSSLMODE: verify-full
         run: |
+          export PGSSLROOTCERT="$PG_TEST_CA"
           v -cc gcc -no-parallel -d vanilla_tls test pg_async/
           v -cc gcc -no-parallel -d vanilla_tls test tests/pg_async_e2e_test.v
+      # -gc none frees nothing: 4000 queries over TLS must leave the heap
+      # where the warm-up left it (test_tls_queries_do_not_grow_the_heap, in
+      # heap bytes), so pg_async allocates nothing per query over TLS and
+      # every allocation Mbed TLS makes per record is returned.
+      - name: pg_async over TLS under -gc none (heap growth per query)
+        shell: bash
+        run: |
+          v -gc none -cc gcc -no-parallel -d vanilla_tls test pg_async/tls_test.v
       - name: Make ASLR compatible with ThreadSanitizer
         shell: bash
         run: |
@@ -363,9 +389,38 @@ jobs:
           else
             echo 'RACE_CC=gcc' >> "$GITHUB_ENV"
           fi
-      - name: The e2e suite under -race, -d vanilla_tls
+      - name: pg_async/ and the e2e suite under -race, over TLS
         shell: bash
         env:
           VRACE: 'halt_on_error=0'
+          PGHOST: 127.0.0.1
+          PGPORT: '55433'
+          PGUSER: bench
+          PGPASSWORD: benchpw
+          PGDATABASE: bench
+          PGSSLMODE: verify-full
         run: |
+          export PGSSLROOTCERT="$PG_TEST_CA"
           v -race -cc "$RACE_CC" -no-parallel -d vanilla_tls test tests/pg_async_e2e_test.v
+          v -race -cc "$RACE_CC" -no-parallel -d vanilla_tls test pg_async/
+      # The client's C (tls/vanilla_tls.c) under AddressSanitizer + UBSan: the
+      # TLS tests read and write exact-size C buffers, so an access past either
+      # end — Mbed TLS's own memcpy included — aborts. -gc none keeps every V
+      # allocation a plain malloc ASan sees; it needs the ASLR setting above.
+      - name: The TLS client under AddressSanitizer
+        shell: bash
+        env:
+          ASAN_OPTIONS: 'detect_leaks=0:abort_on_error=1'
+          UBSAN_OPTIONS: 'halt_on_error=1:print_stacktrace=1'
+          PGHOST: 127.0.0.1
+          PGPORT: '55433'
+          PGUSER: bench
+          PGPASSWORD: benchpw
+          PGDATABASE: bench
+          PGSSLMODE: verify-full
+        run: |
+          export PGSSLROOTCERT="$PG_TEST_CA"
+          for t in tls/tls_test.v pg_async/tls_test.v pg_async/tls_live_test.v tests/pg_async_e2e_test.v; do
+            v -cc gcc -gc none -no-parallel -d vanilla_tls -cflags -fsanitize=address,undefined \
+              -ldflags -fsanitize=address,undefined test "$t"
+          done

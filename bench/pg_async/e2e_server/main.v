@@ -13,9 +13,10 @@ module main
 //   GET /health  no database
 //
 // /db, /dbp and /dbslow render pg_async_demo (3 rows, seeded by
-// pg_async/testdata/throwaway_pg.sh) as JSON. Configuration: the PG* env vars,
-// PG_POOL_SIZE (connections per worker, default 4), BENCH_PORT (default 8099),
-// VANILLA_WORKERS. Driven by bench/pg_async/e2e.sh and leak.sh.
+// pg_async/testdata/throwaway_pg.sh) as JSON. Configuration: the PG* env vars
+// (PGSSLMODE + PGSSLROOTCERT for TLS, in a -d vanilla_tls build), PG_POOL_SIZE
+// (connections per worker, default 4), BENCH_PORT (default 8099),
+// VANILLA_WORKERS. Driven by bench/pg_async/e2e.sh and leak.sh (TLS=1 for both).
 import os
 import strconv
 import server
@@ -61,11 +62,15 @@ fn env_or(name string, dflt string) string {
 
 fn build_state() voidptr {
 	cfg := pg_async.ConnConfig{
-		host:     env_or('PGHOST', '127.0.0.1')
-		port:     env_or('PGPORT', '5432').int()
-		user:     os.getenv('PGUSER')
-		password: os.getenv('PGPASSWORD')
-		database: os.getenv('PGDATABASE')
+		host:          env_or('PGHOST', '127.0.0.1')
+		port:          env_or('PGPORT', '5432').int()
+		user:          os.getenv('PGUSER')
+		password:      os.getenv('PGPASSWORD')
+		database:      os.getenv('PGDATABASE')
+		ssl_mode:      pg_async.SslMode.from_string(env_or('PGSSLMODE', 'disable').replace('-', '_')) or {
+			panic('pg_async bench: PGSSLMODE must be disable, require, verify-ca or verify-full')
+		}
+		ssl_root_cert: os.getenv('PGSSLROOTCERT')
 	}
 	pool := pg_async.new_pool(cfg, env_or('PG_POOL_SIZE', '4').int()) or {
 		panic('pg_async bench: pool bring-up failed: ${err}')

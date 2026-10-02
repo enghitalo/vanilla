@@ -1,5 +1,7 @@
 module pg_async
 
+import tls
+
 // PgPool is a per-worker pool of PostgreSQL connections. Each worker owns its
 // own pool — no cross-worker sharing, so no locks (the make_state model). The
 // connections are brought up (connect + SCRAM) blocking at init, then flipped to
@@ -19,6 +21,10 @@ mut:
 	idle  []bool     // idle[i] ⇒ conns[i] is free to take a query
 	cfg   ConnConfig // to re-dial a lost connection
 	scram &ScramCache = unsafe { nil } // PBKDF2 result shared by every connection and re-dial
+	// tls_cfg is the client TLS config every connection's session comes from
+	// (ssl_mode != .disable): the trusted CAs are parsed once per pool, not
+	// per connection or per re-dial.
+	tls_cfg &tls.Config = unsafe { nil }
 }
 
 // PgPool.connect brings up `size` connections (size >= 1) and returns a ready
@@ -27,25 +33,44 @@ pub fn PgPool.connect(cfg ConnConfig, size int) !PgPool {
 	if size < 1 {
 		return error('pg pool: size must be >= 1')
 	}
+	mut tls_cfg := &tls.Config(unsafe { nil })
+	if cfg.ssl_mode != .disable {
+		tls_cfg = new_tls_config(&cfg) or { return error('pg pool: ${err}') }
+	}
 	mut conns := []PgConn{cap: size}
 	scram := &ScramCache{}
 	for i in 0 .. size {
-		mut c := PgConn.connect_cached(cfg, scram) or {
+		mut c := PgConn{
+			recv_buf:    []u8{cap: 16 * 1024}
+			scram_cache: scram
+			tls_cfg:     tls_cfg
+		}
+		c.bring_up(&cfg) or {
+			c.teardown()
 			close_all(mut conns)
+			free_tls_config(tls_cfg)
 			return error('pg pool: connection ${i} failed: ${err}')
 		}
 		c.set_nonblocking() or {
 			c.close()
 			close_all(mut conns)
+			free_tls_config(tls_cfg)
 			return error('pg pool: set_nonblocking on connection ${i} failed: ${err}')
 		}
 		conns << c
 	}
 	return PgPool{
-		conns: conns
-		idle:  []bool{len: size, init: true}
-		cfg:   cfg
-		scram: scram
+		conns:   conns
+		idle:    []bool{len: size, init: true}
+		cfg:     cfg
+		scram:   scram
+		tls_cfg: tls_cfg
+	}
+}
+
+fn free_tls_config(c &tls.Config) {
+	if c != unsafe { nil } {
+		c.free()
 	}
 }
 
@@ -171,7 +196,9 @@ pub fn (p &PgPool) fd(idx int) int {
 	return p.conns[idx].fd
 }
 
-// close terminates every connection in the pool.
+// close terminates every connection in the pool, then frees its TLS config.
 pub fn (mut p PgPool) close() {
 	close_all(mut p.conns)
+	free_tls_config(p.tls_cfg)
+	p.tls_cfg = unsafe { nil }
 }
