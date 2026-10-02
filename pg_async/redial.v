@@ -19,7 +19,8 @@ import time
 // so the worker never waits on the network; name resolution and the SCRAM key
 // derivation (PBKDF2) do run inline, once per attempt. A failed attempt
 // (refused, closed, authentication error, or redial_timeout) closes its socket
-// and is retried after redial_backoff. The first attempt starts on the first
+// and is retried after redial_backoff, starting at the next resolved address
+// (addr_cursor), so a dead one is not retried first forever. The first attempt starts on the first
 // acquire after the loss, so with steady traffic a slot is back within a few
 // requests while its siblings keep serving.
 
@@ -79,9 +80,13 @@ fn (mut c PgConn) redial_start(cfg ConnConfig) ! {
 	c.send_len = 0
 	c.fatal = PgError{}
 	c.loss = ''
-	c.fd = dial(cfg.host, cfg.port, true)!
+	c.fd = dial(&cfg, true, c.addr_cursor)!
 	c.state = .connecting
-	c.dial_deadline = time.sys_mono_now() + redial_timeout
+	c.dial_deadline = time.sys_mono_now() + if cfg.connect_timeout_ms > 0 {
+		u64(cfg.connect_timeout_ms) * u64(time.millisecond)
+	} else {
+		redial_timeout
+	}
 }
 
 // redial_step runs whatever part of the bring-up needs no waiting; true once
@@ -154,4 +159,5 @@ fn (mut c PgConn) redial_failed(now u64) {
 	}
 	c.state = .broken
 	c.retry_at = now + redial_backoff
+	c.addr_cursor++
 }

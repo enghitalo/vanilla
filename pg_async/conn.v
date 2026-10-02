@@ -34,46 +34,137 @@ mut:
 	ai_next      voidptr
 }
 
+#include <poll.h>
+#include "@VMODROOT/pg_async/pg_async_shim.h"
+
 fn C.socket(domain int, typ int, protocol int) int
 fn C.connect(sockfd int, addr voidptr, addrlen u32) int
 fn C.close(fd int) int
 fn C.getaddrinfo(node &char, service &char, hints &C.addrinfo, res &&C.addrinfo) int
 fn C.freeaddrinfo(res &C.addrinfo)
+fn C.pg_async_wait(fd int, events int, timeout_ms int) int
+fn C.pg_async_tune(fd int, nodelay int, ka_idle int, ka_intvl int, ka_cnt int, user_timeout_ms int)
+fn C.pg_async_gai_strerror(rc int) &char
+fn C.pg_async_getsockopt_int(fd int, level int, name int) int
 
-// dial resolves host:port (getaddrinfo) and opens a TCP connection. Blocking,
-// unless `nonblocking`: then the socket is O_NONBLOCK before connect(), which
-// may still be in flight on return (EINPROGRESS) — the re-dial path (redial.v)
-// finishes it without waiting on the network.
-fn dial(host string, port int, nonblocking bool) !int {
+// Addr is one resolved address of the server: a sockaddr copied out of
+// getaddrinfo's list, so the list can be freed right away.
+struct Addr {
+mut:
+	family int
+	len    u32
+	data   [128]u8 // sizeof(struct sockaddr_storage)
+}
+
+// resolve returns every address getaddrinfo gives for host:port, in its order
+// (IPv6 and IPv4 alike); dial tries them in turn. Blocking: DNS.
+fn resolve(host string, port int) ![]Addr {
 	mut hints := C.addrinfo{}
 	unsafe { vmemset(&hints, 0, int(sizeof(hints))) }
 	hints.ai_family = C.AF_UNSPEC
 	hints.ai_socktype = C.SOCK_STREAM
 	port_str := port.str()
 	mut res := &C.addrinfo(unsafe { nil })
-	if C.getaddrinfo(&char(host.str), &char(port_str.str), &hints, &res) != 0 {
-		return error('pg: getaddrinfo failed for ${host}:${port}')
+	rc := C.getaddrinfo(&char(host.str), &char(port_str.str), &hints, &res)
+	if rc != 0 {
+		reason := unsafe { cstring_to_vstring(C.pg_async_gai_strerror(rc)) }
+		return error('pg: cannot resolve ${host}:${port}: ${reason}')
 	}
 	defer {
 		C.freeaddrinfo(res)
 	}
-	fd := C.socket(res.ai_family, res.ai_socktype, res.ai_protocol)
-	if fd < 0 {
-		return error('pg: socket() failed')
+	mut out := []Addr{}
+	mut ai := res
+	for ai != unsafe { nil } {
+		if ai.ai_addrlen > 0 && ai.ai_addrlen <= 128 {
+			mut a := Addr{
+				family: ai.ai_family
+				len:    u32(ai.ai_addrlen)
+			}
+			unsafe { vmemcpy(&a.data[0], ai.ai_addr, ai.ai_addrlen) }
+			out << a
+		}
+		ai = unsafe { &C.addrinfo(ai.ai_next) }
 	}
-	if nonblocking {
-		flags := C.fcntl(fd, C.F_GETFL, 0)
-		if flags < 0 || C.fcntl(fd, C.F_SETFL, flags | int(C.O_NONBLOCK)) < 0 {
+	if out.len == 0 {
+		return error('pg: no usable address for ${host}:${port}')
+	}
+	return out
+}
+
+// connect_addr opens a TCP socket to `a`. The connect() is always started
+// non-blocking. With `nonblocking` the socket is returned as is (the connect
+// may still be in flight: the re-dial path, redial.v, finishes it without
+// waiting on the network). Otherwise this waits up to timeout_ms (0 = no
+// bound) for the connect to complete, then returns a blocking socket. On
+// error the socket is closed and the errno is the error code.
+fn connect_addr(a &Addr, nonblocking bool, timeout_ms int) !int {
+	fd := C.socket(a.family, C.SOCK_STREAM, 0)
+	if fd < 0 {
+		return error_with_code('socket() failed', C.errno)
+	}
+	flags := C.fcntl(fd, C.F_GETFL, 0)
+	if flags < 0 || C.fcntl(fd, C.F_SETFL, flags | int(C.O_NONBLOCK)) < 0 {
+		e := C.errno
+		C.close(fd)
+		return error_with_code('fcntl(O_NONBLOCK) failed', e)
+	}
+	if C.connect(fd, voidptr(&a.data[0]), a.len) != 0 {
+		e := C.errno
+		if e != C.EINPROGRESS {
 			C.close(fd)
-			return error('pg: fcntl(O_NONBLOCK) failed')
+			return error_with_code('connect failed (errno ${e})', e)
+		}
+		if !nonblocking {
+			r := C.pg_async_wait(fd, C.POLLOUT, if timeout_ms > 0 { timeout_ms } else { -1 })
+			if r == 0 {
+				C.close(fd)
+				return error_with_code('connect timed out after ${timeout_ms} ms', C.ETIMEDOUT)
+			}
+			so_error := C.pg_async_getsockopt_int(fd, C.SOL_SOCKET, C.SO_ERROR)
+			if r < 0 || so_error != 0 {
+				C.close(fd)
+				code := if so_error > 0 { so_error } else { C.errno }
+				return error_with_code('connect failed (errno ${code})', code)
+			}
 		}
 	}
-	if C.connect(fd, res.ai_addr, u32(res.ai_addrlen)) != 0
-		&& !(nonblocking && C.errno == C.EINPROGRESS) {
+	if !nonblocking && C.fcntl(fd, C.F_SETFL, flags) < 0 {
+		e := C.errno
 		C.close(fd)
-		return error('pg: connect to ${host}:${port} failed')
+		return error_with_code('fcntl(restore blocking) failed', e)
 	}
 	return fd
+}
+
+// dial resolves cfg.host:cfg.port and connects to the first address that
+// accepts, starting at address `start` (mod the count) and trying each in
+// turn. Every socket it returns is tuned (pg_async_tune): TCP_NODELAY, so a
+// small pipelined query is not held back by Nagle waiting on the server's
+// delayed ACK; keepalive and TCP_USER_TIMEOUT, so a peer that vanished
+// without a FIN or RST is noticed. Blocking (each connect bounded by
+// connect_timeout_ms), unless `nonblocking`: then the first address whose
+// connect() starts is returned with the connect possibly still in flight.
+fn dial(cfg &ConnConfig, nonblocking bool, start int) !int {
+	addrs := resolve(cfg.host, cfg.port)!
+	return dial_addrs(addrs, cfg, nonblocking, start)
+}
+
+// dial_addrs is dial over an already resolved address list.
+fn dial_addrs(addrs []Addr, cfg &ConnConfig, nonblocking bool, start int) !int {
+	mut last := ''
+	for i in 0 .. addrs.len {
+		a := &addrs[(start + i) % addrs.len]
+		fd := connect_addr(a, nonblocking, cfg.connect_timeout_ms) or {
+			last = err.msg()
+			continue
+		}
+		C.pg_async_tune(fd, if cfg.tcp_nodelay { 1 } else { 0 }, cfg.tcp_keepalive_idle_s,
+			cfg.tcp_keepalive_interval_s,
+			cfg.tcp_keepalive_count, cfg.tcp_user_timeout_ms)
+		return fd
+	}
+	return error('pg: connect to ${cfg.host}:${cfg.port} failed on all ${addrs.len} address(es): ${last}')
 }
 
 pub struct ConnConfig {
@@ -83,6 +174,28 @@ pub:
 	user     string
 	password string
 	database string
+	// connect_timeout_ms bounds the TCP connect to each resolved address on
+	// the blocking bring-up path, and one whole re-dial attempt (connect +
+	// handshake) on the non-blocking path. 0 = no bound on bring-up.
+	connect_timeout_ms int = 5000
+	// tcp_nodelay disables Nagle on the connection (what libpq does). Without
+	// it a pipelined query written while an earlier one is unacknowledged can
+	// wait for the server's delayed ACK (~40 ms on Linux). The cost is one TCP
+	// segment per query flush instead of coalesced ones: a few µs of server CPU
+	// per request under deep pipelining on loopback.
+	tcp_nodelay bool = true
+	// TCP keepalive: after tcp_keepalive_idle_s seconds without traffic, probe
+	// every tcp_keepalive_interval_s; tcp_keepalive_count unanswered probes
+	// drop the connection, so an idle pooled connection whose server vanished
+	// (no FIN/RST: a host down, a NAT or firewall that forgot it) is found
+	// broken instead of swallowing the next query. idle 0 = keepalive off.
+	tcp_keepalive_idle_s     int = 30
+	tcp_keepalive_interval_s int = 10
+	tcp_keepalive_count      int = 3
+	// tcp_user_timeout_ms (Linux): how long sent data may stay unacknowledged
+	// before the kernel drops the connection. 0 = the OS default (~15 min of
+	// retransmissions).
+	tcp_user_timeout_ms int = 30_000
 }
 
 // LinkState is a connection's health. A live connection is .ready. It turns
@@ -136,6 +249,10 @@ mut:
 	scram         ScramClient
 	retry_at      u64
 	dial_deadline u64
+	// addr_cursor is the resolved address the next re-dial starts at: a failed
+	// attempt moves it on, so a dead address (an IPv6 one on an IPv4-only path,
+	// a failed-over primary) is not retried first forever.
+	addr_cursor int
 }
 
 struct Msg {
@@ -146,7 +263,7 @@ struct Msg {
 // PgConn.connect opens a TCP connection and runs the startup + SCRAM-SHA-256
 // handshake, returning once the server reports ReadyForQuery.
 pub fn PgConn.connect(cfg ConnConfig) !PgConn {
-	fd := dial(cfg.host, cfg.port, false)!
+	fd := dial(&cfg, false, 0)!
 	mut c := PgConn{
 		fd:       fd
 		recv_buf: []u8{cap: 16 * 1024}
