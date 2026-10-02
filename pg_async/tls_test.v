@@ -405,6 +405,42 @@ fn test_tls_pool_redials_a_lost_connection() {
 	assert false, 'the lost TLS connection was not re-dialed'
 }
 
+// Pool maintenance over TLS: a FATAL the server sends while the connection
+// sits idle is an encrypted record, so probe_idle must read it through the
+// session (never raw into recv_buf) to find it, and maintain() then re-dials
+// over TLS with no query and no acquire().
+fn test_tls_maintain_finds_a_fatal_sent_while_idle() {
+	certs := tls_ready() or { return }
+	defer {
+		os.rmdir_all(certs) or {}
+	}
+	mut f := tls_fixture(certs, server_args(certs, 'server', ['--close', 'fatal']))!
+	defer {
+		f.stop()
+	}
+	mut pool := PgPool.connect(f.cfg(.verify_full, 'localhost'), 1)!
+	defer {
+		pool.close()
+	}
+	mut c := pool.conn(0)
+	assert c.async_submit('select 1', []?[]u8{})
+	assert int_of(pump(mut c, 5000)!) == 1
+	time.sleep(200 * time.millisecond) // the FATAL comes 50 ms after the reply
+	pool.conns[0].probe_idle()
+	assert pool.conns[0].state == .broken
+	assert pool.conns[0].fatal.sqlstate == '57P01', 'the FATAL must be decrypted, not lost'
+	sw := time.new_stopwatch()
+	for sw.elapsed().milliseconds() < 5000 && pool.conns[0].state != .ready {
+		time.sleep(i64(pool.maintain()) * time.millisecond)
+	}
+	assert pool.conns[0].state == .ready, 'maintain() did not re-dial over TLS'
+	assert pool.conns[0].tls.active()
+	assert f.fake.stat('tls_handshakes') == 2
+	mut c2 := pool.conn(0)
+	assert c2.async_submit('select 2', []?[]u8{})
+	assert int_of(pump(mut c2, 5000)!) == 2
+}
+
 fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
 
 // A query record the socket cannot take whole stays encrypted inside Mbed

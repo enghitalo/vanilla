@@ -25,6 +25,10 @@ mut:
 	// (ssl_mode != .disable): the trusted CAs are parsed once per pool, not
 	// per connection or per re-dial.
 	tls_cfg &tls.Config = unsafe { nil }
+	// The maintenance timer (start_maintenance), -1 if none; closed tells its
+	// next tick to stop.
+	timer_fd int = -1
+	closed   bool
 }
 
 // PgPool.connect brings up `size` connections (size >= 1) and returns a ready
@@ -198,6 +202,7 @@ pub fn (p &PgPool) fd(idx int) int {
 
 // close terminates every connection in the pool, then frees its TLS config.
 pub fn (mut p PgPool) close() {
+	p.closed = true // a running maintenance timer stops at its next tick
 	close_all(mut p.conns)
 	free_tls_config(p.tls_cfg)
 	p.tls_cfg = unsafe { nil }
