@@ -3,13 +3,18 @@ module main
 // Regressions in the demo's wiring (main.v), on the SQLite adapter behind the
 // connection pool, against a throwaway database file: the pool stays open and
 // gets every connection back, a fresh database gets its `users` table (and a
-// second start keeps it), and a failed login answers 401.
+// second start keeps it), a failed login answers 401, and passwords are stored
+// as argon2id hashes that no response carries (#193).
+// (Each register/login pays one argon2id: a few seconds in a debug build.)
 import application
+import db.sqlite
 import infrastructure.database
 import infrastructure.http
 import os
 import pool
 import time
+
+const plaintext = 'correct horse battery staple'
 
 // Two idle connections, as in main(): the pooled connections share one file
 // while the pool validates idle ones in the background.
@@ -90,12 +95,60 @@ fn test_failed_login_is_401() ! {
 	reg := http.handle_register(user_uc, 'carol', 'carol@example.com', 'password123').bytestr()
 	assert reg.starts_with('HTTP/1.1 201 Created\r\n'), reg
 
-	// Wrong password and unknown user: the same 401, not a 404.
+	// Wrong password and unknown user: the same 401, not a 404 (and the same
+	// argon2id cost, via the dummy hash, for the unknown user).
 	for resp in [
 		http.handle_login(auth_uc, 'carol', 'wrong password'),
 		http.handle_login(auth_uc, 'carol', ''),
 		http.handle_login(auth_uc, 'mallory', 'password123'),
 	] {
 		assert resp.bytestr().starts_with('HTTP/1.1 401 Unauthorized\r\n'), resp.bytestr()
+	}
+}
+
+// Password-handling regression (#193): register, login and list run through
+// the real use cases, auth service, HTTP handlers and SQLite adapter. Asserts
+// that no response carries the password or its hash, and that the database
+// stores an argon2id hash, not the plaintext.
+fn test_password_is_hashed_and_never_serialized() ! {
+	path := temp_db_path('hash')
+	mut dbpool := database.new_sqlite_pool(path, test_pool_cfg)!
+	defer {
+		dbpool.close() or {}
+		os.rm(path) or {}
+	}
+	repo := new_user_repository('sqlite', mut dbpool)!
+	user_uc := application.new_user_usecase(repo)
+	auth_uc := application.new_auth_usecase(http.new_simple_auth_service(repo))
+
+	reg := http.handle_register(user_uc, 'alice', 'alice@example.com', plaintext).bytestr()
+	assert reg.starts_with('HTTP/1.1 201'), reg
+	assert reg.contains('"username":"alice"')
+
+	// Stored: an argon2id PHC string, never the plaintext.
+	conn := dbpool.acquire()!
+	defer {
+		dbpool.release(conn) or {}
+	}
+	db := conn as sqlite.DB
+	rows := db.exec('SELECT password_hash FROM users')!
+	assert rows.len == 1
+	stored := rows[0].vals[0]
+	assert stored != plaintext
+	assert stored.starts_with('$argon2id$')
+
+	login := http.handle_login(auth_uc, 'alice', plaintext).bytestr()
+	assert login.starts_with('HTTP/1.1 200'), login
+	assert login.contains('"username":"alice"')
+
+	list := http.handle_list_users(user_uc).bytestr()
+	assert list.starts_with('HTTP/1.1 200'), list
+	assert list.contains('"username":"alice"')
+
+	// No `password` / `password_hash` key, no plaintext, no hash — anywhere.
+	for resp in [reg, login, list] {
+		assert !resp.contains('password'), resp
+		assert !resp.contains(plaintext), resp
+		assert !resp.contains('argon2'), resp
 	}
 }

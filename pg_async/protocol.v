@@ -330,6 +330,44 @@ pub fn parse_error_response(payload []u8) ErrorInfo {
 	}
 }
 
+// PgError is a server-reported error (an ErrorResponse) as a typed V error, so a
+// caller branches on the SQLSTATE instead of matching the message text:
+//
+//   poll := conn.async_on_readable() or {
+//       if err is pg_async.PgError && err.sqlstate == '40001' {
+//           // serialization failure: retry the whole transaction
+//       }
+//       ...
+//   }
+//
+// msg() is the same text these errors always carried ("pg: query failed:
+// <message> (SQLSTATE <code>)"); code() stays 0 (a SQLSTATE is alphanumeric,
+// e.g. 57P01, so it has no faithful int form). A FATAL or PANIC severity means
+// the server also ended the session: the connection is then broken (see
+// PgConn.is_broken) and its pool re-dials it.
+pub struct PgError {
+	Error
+pub:
+	severity string // non-localized severity: ERROR, FATAL or PANIC
+	sqlstate string // the five-character SQLSTATE, e.g. 23505, 40001, 57P01
+	message  string // the primary human-readable message
+}
+
+pub fn (e PgError) msg() string {
+	return 'pg: query failed: ${e.message} (SQLSTATE ${e.sqlstate})'
+}
+
+// ends_session reports whether an ErrorResponse severity terminates the session
+// (FATAL / PANIC): the server closes the connection right after sending it, so
+// no ReadyForQuery follows.
+fn ends_session(severity []u8) bool {
+	if severity.len != 5 {
+		return false
+	}
+	s := unsafe { tos(severity.data, severity.len) } // a view: compared, never kept
+	return s == 'FATAL' || s == 'PANIC'
+}
+
 // parse_command_complete extracts rows-affected from a CommandComplete tag
 // ("SELECT 5", "INSERT 0 3", "UPDATE 2"): the LAST integer token (0 if none).
 pub fn parse_command_complete(payload []u8) u64 {

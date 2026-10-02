@@ -89,6 +89,11 @@ connection desyncs or corrupts:
 5. **Prepared-statement cache** (SQL→stmt name, evict on ParseComplete failure) —
    async-db/fortunes use one fixed SQL, so this drops the per-request Parse.
 6. **Round-robin a SMALL pool** where each conn multiplexes; evict+reopen broken.
+   (Evict+reopen is in: a conn lost to EOF / a socket error / a FATAL is
+   skipped by `acquire*()` and re-dialed non-blocking once its in-flight
+   queries have drained with their errors — `redial.v`, vanilla#191. That
+   drain is why the FIFO contract also binds a request whose flush failed: it
+   still parks and consumes its error, or its slot never comes back.)
 
 These are also the read-bound case for the whole approach: the win is mostly CPU
 reduction (fewer syscalls/parses per query), and because Postgres replies in order

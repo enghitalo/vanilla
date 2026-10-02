@@ -87,16 +87,14 @@ pub fn connect_to_server_on_windows(port int) !int {
 	return client_fd
 }
 
-pub fn create_server_socket_on_windows(port int) int {
-	init_winsock() or {
-		eprintln('Failed to initialize Winsock: ${err}')
-		exit(1)
-	}
+// create_server_socket_on_windows is create_server_socket's Winsock twin: a
+// failed step closes the socket and returns an error, it never exits.
+pub fn create_server_socket_on_windows(port int) !int {
+	init_winsock()!
 
 	server_fd := C.socket(C.AF_INET, C.SOCK_STREAM, 0)
 	if server_fd < 0 {
-		eprintln(@LOCATION + ' Socket creation failed: ${C.WSAGetLastError()}')
-		exit(1)
+		return wsa_listen_error(-1, 'socket', port)
 	}
 
 	// The listening socket stays BLOCKING on purpose: the IOCP backend accepts
@@ -105,9 +103,7 @@ pub fn create_server_socket_on_windows(port int) int {
 
 	opt := 1
 	if C.setsockopt(server_fd, C.SOL_SOCKET, C.SO_REUSEADDR, &opt, sizeof(opt)) == socket_error {
-		eprintln(@LOCATION + ' setsockopt SO_REUSEADDR failed: ${C.WSAGetLastError()}')
-		close_socket(server_fd)
-		exit(1)
+		return wsa_listen_error(server_fd, 'setsockopt SO_REUSEADDR', port)
 	}
 
 	// Bind to INADDR_ANY (0.0.0.0)
@@ -119,16 +115,23 @@ pub fn create_server_socket_on_windows(port int) int {
 	}
 
 	if C.bind(server_fd, voidptr(&server_addr), sizeof(server_addr)) == socket_error {
-		eprintln(@LOCATION + ' Bind failed: ${C.WSAGetLastError()}')
-		close_socket(server_fd)
-		exit(1)
+		return wsa_listen_error(server_fd, 'bind', port)
 	}
 
 	if C.listen(server_fd, listen_backlog) == socket_error {
-		eprintln(@LOCATION + ' Listen failed: ${C.WSAGetLastError()}')
-		close_socket(server_fd)
-		exit(1)
+		return wsa_listen_error(server_fd, 'listen', port)
 	}
 
 	return server_fd
+}
+
+// wsa_listen_error is listen_error for Winsock, which reports the cause
+// through WSAGetLastError() instead of errno (e.g. 10048 = WSAEADDRINUSE).
+// The code is read first, before closesocket() can overwrite it.
+fn wsa_listen_error(fd int, step string, port int) IError {
+	code := C.WSAGetLastError()
+	if fd >= 0 {
+		close_socket(fd)
+	}
+	return error_with_code('${step} 0.0.0.0:${port}: WSA error ${code}', code)
 }

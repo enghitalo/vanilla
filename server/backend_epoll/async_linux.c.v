@@ -742,7 +742,7 @@ fn drain_takeover(mut reactor Reactor, epoll_fd int, fd int, limits core.Limits,
 					}
 					return false
 				}
-				cs.awaiting_fd = event_loop.last_watched
+				park_conn(mut st, mut cs, event_loop.last_watched)
 				update_read_deadline(limits, mut st, mut cs) // parked ⇒ clears any armed deadline
 				if cs.write_buf.len > cs.write_off {
 					flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs)
@@ -992,7 +992,7 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 					}
 					return false
 				}
-				cs.awaiting_fd = event_loop.last_watched // park; leftover stays buffered for resume
+				park_conn(mut st, mut cs, event_loop.last_watched) // leftover stays buffered for resume
 			}
 			.close {
 				compact_read_buf(mut cs, pos)
@@ -1133,7 +1133,7 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 	if unsafe { cs == nil } {
 		return
 	}
-	cs.awaiting_fd = -1
+	unpark_conn(mut st, mut cs) // this call's own count (above) covers the continuation
 	mut event_loop := core.EventLoop{
 		client_fd: client_fd
 		loop_fd:   epoll_fd
@@ -1239,7 +1239,7 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 					return
 				}
 			}
-			cs.awaiting_fd = event_loop.last_watched // re-armed (multi-step); stay parked
+			park_conn(mut st, mut cs, event_loop.last_watched) // re-armed (multi-step); stay parked
 		}
 		.close {
 			close_conn(epoll_fd, client_fd, active_conns, mut st)
@@ -1295,7 +1295,7 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 			continue
 		}
 		mut cs := st.conns[client_fd]
-		cs.awaiting_fd = -1
+		unpark_conn(mut st, mut cs)
 		mut event_loop := core.EventLoop{
 			client_fd: client_fd
 			loop_fd:   epoll_fd
@@ -1370,7 +1370,7 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 						break
 					}
 				}
-				cs.awaiting_fd = ext_fd
+				park_conn(mut st, mut cs, ext_fd)
 				break
 			}
 			.close {
@@ -1397,7 +1397,7 @@ fn close_client(mut reactor Reactor, epoll_fd int, fd int, active_conns &core.Co
 		mut cs := st.conns[fd]
 		if unsafe { cs != nil } && cs.awaiting_fd >= 0 {
 			ext_fd := cs.awaiting_fd
-			cs.awaiting_fd = -1 // torn down here; close_conn must not detach it again
+			unpark_conn(mut st, mut cs) // torn down here; close_conn must not detach it again
 			if ext_fd == fd {
 				// Parked on its own socket's writability: only the watch goes —
 				// close_conn's release_conn closes the socket, exactly once.

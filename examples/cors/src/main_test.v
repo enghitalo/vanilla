@@ -52,7 +52,25 @@ fn test_simple_request_without_origin() {
 	assert out.contains('200 OK')
 	assert out.contains('{"ok":true}')
 	assert !out.contains('Access-Control-Allow-Origin')
-	assert !out.contains('Vary: Origin')
+}
+
+fn test_every_variant_carries_vary_origin() {
+	// The response depends on Origin, so a shared cache must key on it for
+	// EVERY variant — the plain one included, or a cache can serve the plain
+	// variant to an allowed origin (no Access-Control-Allow-Origin => blocked).
+	for c in [preflight_tail, ok_cors_tail, resp_ok_plain, resp_403] {
+		assert c.bytestr().contains('\r\nVary: Origin\r\n')
+	}
+	for raw in [
+		'OPTIONS /api HTTP/1.1\r\nOrigin: http://localhost:5173\r\n\r\n', // 204 preflight
+		'OPTIONS /api HTTP/1.1\r\nOrigin: https://evil.com\r\n\r\n', // 403 preflight
+		'GET /api HTTP/1.1\r\nOrigin: https://app.example.com\r\n\r\n', // 200 + CORS
+		'GET /api HTTP/1.1\r\nOrigin: https://evil.com\r\n\r\n', // 200 plain
+		'GET /api HTTP/1.1\r\nHost: x\r\n\r\n', // 200 plain, no Origin
+	] {
+		out := serve(raw.bytes()).bytestr()
+		assert out.contains('\r\nVary: Origin\r\n'), out
+	}
 }
 
 fn test_malformed_request_errors() {
