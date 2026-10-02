@@ -64,7 +64,8 @@ cleanup() {
 trap cleanup EXIT
 
 if [ -z "${PGHOST:-}" ]; then
-	eval "$(PG_CPUS=$PG_CPUS pg_async/testdata/throwaway_pg.sh start)" || exit 2
+	pg_env=$(PG_CPUS=$PG_CPUS pg_async/testdata/throwaway_pg.sh start) || exit 2
+	eval "$pg_env"
 	pg_started=1
 fi
 

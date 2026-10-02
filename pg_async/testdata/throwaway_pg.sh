@@ -8,6 +8,10 @@
 #   v test pg_async/                                     # the live tests now run
 #   pg_async/testdata/throwaway_pg.sh stop
 #
+# In a script, capture the exports first: `pg_env=$(... start) || exit` stops
+# on a failed start, while `eval "$(... start)" || exit` cannot (an empty eval
+# succeeds).
+#
 # Environment:
 #   PG_PORT  TCP port on 127.0.0.1 (default 55432)
 #   PG_DIR   cluster directory (default ${TMPDIR:-/tmp}/vanilla-pg-$PG_PORT)

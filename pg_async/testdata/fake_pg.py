@@ -161,6 +161,12 @@ def scram_auth(conn):
     client_final = body.decode()
     without_proof = client_final[:client_final.index(',p=')]
     proof = base64.b64decode(client_final[client_final.index(',p=') + 3:])
+    # What PostgreSQL also rejects: the channel binding must echo the GS2
+    # header ("n,," is c=biws) and the nonce must be the combined one above.
+    attrs = dict(kv.split('=', 1) for kv in without_proof.split(','))
+    if attrs.get('c') != 'biws' or attrs.get('r') != nonce:
+        conn.sendall(error_response('FATAL', '08P01', 'invalid SCRAM response (nonce or channel binding mismatch)'))
+        raise EOFError
     auth_message = f'{client_first_bare},{server_first},{without_proof}'.encode()
     salted = hashlib.pbkdf2_hmac('sha256', ARGS.password.encode(), SALT, ITERATIONS)
     client_key = hmac.new(salted, b'Client Key', hashlib.sha256).digest()

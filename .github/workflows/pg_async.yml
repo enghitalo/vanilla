@@ -27,25 +27,41 @@ on:
     branches: [ main ]
     paths:
       - 'pg_async/**'
-      - 'examples/async_db_pg/**'
       - 'bench/pg_async/**'
-      - 'tls/**'
+      - 'bench/ci_bench.sh'
+      - 'tests/pg_async_e2e_test.v'
+      # What the e2e suite and the bench server build on.
       - 'core/**'
       - 'server/**'
+      - 'epoll/**'
+      - 'io_uring/**'
+      - 'poll/**'
+      - 'http1_1/**'
+      - 'socket/**'
+      - 'transport/**'
+      - 'tls/**'
       - 'testkit/**'
-      - 'tests/pg_async_e2e_test.v'
+      - 'vtest/**'
       - '.github/workflows/pg_async.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'pg_async/**'
-      - 'examples/async_db_pg/**'
       - 'bench/pg_async/**'
-      - 'tls/**'
+      - 'bench/ci_bench.sh'
+      - 'tests/pg_async_e2e_test.v'
+      # What the e2e suite and the bench server build on.
       - 'core/**'
       - 'server/**'
+      - 'epoll/**'
+      - 'io_uring/**'
+      - 'poll/**'
+      - 'http1_1/**'
+      - 'socket/**'
+      - 'transport/**'
+      - 'tls/**'
       - 'testkit/**'
-      - 'tests/pg_async_e2e_test.v'
+      - 'vtest/**'
       - '.github/workflows/pg_async.yml'
 
 env:
@@ -281,10 +297,14 @@ jobs:
               exec docker-entrypoint.sh postgres -c ssl=on \
                 -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key \
                 -c hba_file=/certs/pg_hba.conf'
+          # Ready over TCP: docker-entrypoint.sh first runs a temporary server
+          # for initdb with listen_addresses='' (Unix socket only), and a probe
+          # on the socket could catch that one, before the database exists.
           for _ in $(seq 1 60); do
-            docker exec pg-tls pg_isready -U bench -d bench >/dev/null 2>&1 && break
+            docker exec pg-tls pg_isready -h 127.0.0.1 -U bench -d bench >/dev/null 2>&1 && break
             sleep 1
           done
+          docker exec pg-tls pg_isready -h 127.0.0.1 -U bench -d bench || { docker logs pg-tls; exit 1; }
           docker exec pg-tls psql -U bench -d bench -v ON_ERROR_STOP=1 -c "
             create table pg_async_demo (id int4 primary key, name text);
             insert into pg_async_demo values (1, 'alpha'), (2, 'beta'), (3, 'gamma');
@@ -302,12 +322,16 @@ jobs:
           PGPASSWORD=benchpw psql "$base user=bench sslmode=verify-full" -Atc \
             "select ssl, version from pg_stat_ssl where pid = pg_backend_pid()"
           PGPASSWORD=pwpass psql "$base user=pw_user sslmode=verify-full" -Atc 'select count(*) from pg_async_demo'
-          if PGPASSWORD=benchpw psql "host=127.0.0.2 port=55433 dbname=bench user=bench sslmode=verify-full sslrootcert=$PG_TEST_CA" -c 'select 1' 2>/dev/null; then
+          # The negative checks must fail for the reason they test, not just
+          # fail (an unreachable address or a bad password would also do).
+          if err=$(PGPASSWORD=benchpw psql "host=127.0.0.2 port=55433 dbname=bench user=bench sslmode=verify-full sslrootcert=$PG_TEST_CA" -c 'select 1' 2>&1); then
             echo 'verify-full accepted a host outside the certificate'; exit 1
           fi
-          if PGPASSWORD=benchpw psql "$base user=bench sslmode=disable" -c 'select 1' 2>/dev/null; then
+          grep -q 'does not match host name' <<<"$err" || { echo "unexpected failure: $err"; exit 1; }
+          if err=$(PGPASSWORD=benchpw psql "$base user=bench sslmode=disable" -c 'select 1' 2>&1); then
             echo 'the TLS-only instance accepted plaintext'; exit 1
           fi
+          grep -q 'no encryption' <<<"$err" || { echo "unexpected failure: $err"; exit 1; }
       - name: pg_async/ and the e2e suite, built with -d vanilla_tls
         shell: bash
         run: |

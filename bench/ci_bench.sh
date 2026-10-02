@@ -34,18 +34,21 @@ ISSUE_THRESHOLD="${BENCH_ISSUE_THRESHOLD:-10}" # a regression must clear THIS to
                                              # 5-10%) does not file issues on its own
 export BENCH_RUNS="${BENCH_RUNS:-5}"         # passed through to measure.sh
 
-# Hot-path micro-benches to A/B. name | source [| extra V flags [| run args]] —
-# each built with -prod -gc none (plus its flags) and run with its args. All run
+# Hot-path micro-benches to A/B. name | source [| extra V flags [| run args
+# [| iterations]]] — each built with -prod -gc none (plus its flags) and run with
+# its args; iterations, when given, replace BENCH_ITERS for that entry. All run
 # on every invocation; BENCH_ITERS (below) keeps the full set to a few minutes
-# in CI. The pg_async codec bench runs one phase per entry (see its header).
+# in CI. The pg_async codec bench runs one phase per entry, at its own default
+# work (its BENCH_ITERS counts queries or rows, not loop iterations), from one
+# binary per side (see its header).
 BENCHES=(
 	"request_parser|bench/request_parser/request_parser_bench.v"
 	"middleware|bench/middleware/middleware_bench.v"
 	"etag_hash|bench/etag_hash/etag_hash.v"
 	"static_assets|bench/static_assets_bench/static_assets_bench.v"
-	"pg_async_submit|bench/pg_async/codec_bench.v|-d pg_async_bench|submit"
-	"pg_async_frame|bench/pg_async/codec_bench.v|-d pg_async_bench|frame"
-	"pg_async_rows|bench/pg_async/codec_bench.v|-d pg_async_bench|rows"
+	"pg_async_submit|bench/pg_async/codec_bench.v|-d pg_async_bench|submit|800000"
+	"pg_async_frame|bench/pg_async/codec_bench.v|-d pg_async_bench|frame|400000"
+	"pg_async_rows|bench/pg_async/codec_bench.v|-d pg_async_bench|rows|3000000"
 )
 # Standardize the loop count for the A/B: the benches read BENCH_ITERS. 2M keeps
 # even the cheapest bench (request_parser, ~0.3s) comfortably above the runner's
@@ -75,16 +78,31 @@ v wipe-cache >/dev/null 2>&1 || true
 worktree_ok=1
 git worktree add --detach "$wt" "$BASE_REF" >/dev/null 2>&1 || worktree_ok=0
 
-# build_and_measure <checkout-dir> <bench-relpath> <out-bin> [flags] [args] -> min seconds (or "")
-build_and_measure() {
-	local dir="$1" src="$2" bin="$3" flags="${4:-}" args="${5:-}"
-	# shellcheck disable=SC2086 # flags and args are word lists
-	if ! ( cd "$dir" && v -prod -gc none $flags -o "$bin" "$src" ) >/dev/null 2>&1; then
-		echo ""   # bench absent at this ref, or build failed
-		return
+# build <checkout-dir> <bench-relpath> <flags>: sets BIN to the binary, or to ""
+# when the build fails (the bench is absent at that ref). One build per
+# (checkout, source, flags): entries that only differ in their run args share it.
+# (A function, not $(...): the cache must outlive the call.)
+declare -A built=()
+build() {
+	local key="$1|$2|$3" bin
+	if [ -z "${built[$key]+set}" ]; then
+		bin="$bins/bin_${#built[@]}"
+		# shellcheck disable=SC2086 # flags is a word list
+		if ( cd "$1" && v -prod -gc none $3 -o "$bin" "$2" ) >/dev/null 2>&1; then
+			built[$key]=$bin
+		else
+			built[$key]=
+		fi
 	fi
-	# shellcheck disable=SC2086
-	BENCH_PERF=0 "$MEASURE" "$bin" $args 2>/dev/null | awk '/^min/{print $3; exit}'
+	BIN=${built[$key]}
+}
+
+# measure <binary> <args> <iterations> -> min seconds, or "" when a run fails
+# (measure.sh then prints no summary).
+measure() {
+	# shellcheck disable=SC2086 # args is a word list
+	BENCH_ITERS="${3:-$BENCH_ITERS}" BENCH_PERF=0 "$MEASURE" "$1" $2 2>/dev/null |
+		awk '/^min/{print $3; exit}'
 }
 
 emit() {
@@ -104,7 +122,7 @@ if [ "$worktree_ok" -ne 1 ]; then
 	emit "⚠️ Could not check out baseline \`${BASE_REF}\` (shallow clone? need \`fetch-depth: 2\`). No comparison."
 	exit 0
 fi
-emit "Same-runner A/B on \`${RUNNER_OS:-local}\`, toolchain \`$(v version 2>/dev/null || echo 'V unknown')\`. Hosted runners are noisy — treat **|Δ| < ${THRESHOLD}%** as noise. Each side is the **minimum of ${BENCH_RUNS} runs** of ${BENCH_ITERS} iterations (\`bench/measure.sh\`)."
+emit "Same-runner A/B on \`${RUNNER_OS:-local}\`, toolchain \`$(v version 2>/dev/null || echo 'V unknown')\`. Hosted runners are noisy — treat **|Δ| < ${THRESHOLD}%** as noise. Each side is the **minimum of ${BENCH_RUNS} runs** of ${BENCH_ITERS} iterations (the \`pg_async\` phases: their own default work) (\`bench/measure.sh\`)."
 emit ''
 emit '| bench | baseline | this commit | Δ | |'
 emit '|---|--:|--:|--:|:--|'
@@ -112,18 +130,29 @@ emit '|---|--:|--:|--:|:--|'
 regressions=0         # > THRESHOLD       (flagged in the table)
 issue_regressions=0   # > ISSUE_THRESHOLD (confident enough to open an issue)
 for entry in "${BENCHES[@]}"; do
-	IFS='|' read -r name src flags args <<< "$entry"
-	base_min="$(build_and_measure "$wt"   "$src" "$bins/base_$name" "$flags" "$args")"
-	head_min="$(build_and_measure "$ROOT" "$src" "$bins/head_$name" "$flags" "$args")"
+	IFS='|' read -r name src flags args iters <<< "$entry"
+	build "$wt" "$src" "$flags"
+	base_bin=$BIN
+	build "$ROOT" "$src" "$flags"
+	head_bin=$BIN
+	base_min=
+	head_min=
+	[ -n "$base_bin" ] && base_min="$(measure "$base_bin" "$args" "$iters")"
+	[ -n "$head_bin" ] && head_min="$(measure "$head_bin" "$args" "$iters")"
 
-	if [ -z "$head_min" ] && [ -z "$base_min" ]; then
-		emit "| \`$name\` | — | — | — | ❌ build failed both sides |"
+	if [ -z "$head_min" ]; then
+		why='run failed'
+		[ -z "$head_bin" ] && why='build failed'
+		base_cell='—'
+		[ -n "$base_min" ] && base_cell="$(printf '%.3f' "$base_min")s"
+		emit "| \`$name\` | $base_cell | — | — | ❌ $why (HEAD) |"
 		continue
 	elif [ -z "$base_min" ]; then
-		emit "| \`$name\` | — | $(printf '%.3f' "$head_min")s | — | 🆕 new bench |"
-		continue
-	elif [ -z "$head_min" ]; then
-		emit "| \`$name\` | $(printf '%.3f' "$base_min")s | — | — | ❌ build failed (HEAD) |"
+		if [ -z "$base_bin" ]; then
+			emit "| \`$name\` | — | $(printf '%.3f' "$head_min")s | — | 🆕 new bench |"
+		else
+			emit "| \`$name\` | — | $(printf '%.3f' "$head_min")s | — | ❌ run failed (baseline) |"
+		fi
 		continue
 	fi
 
