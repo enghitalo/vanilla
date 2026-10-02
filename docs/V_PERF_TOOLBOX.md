@@ -173,6 +173,14 @@ each under load for a fixed window sampling `VmRSS`, report bytes/request + the
 trajectory (linear climb = real leak; jump-then-flat = one-time setup). Subtract
 the Boehm floor. A **hard RSS cap** kills a runaway so it's safe unattended.
 
+**In a test, assert on heap bytes, not RSS.** RSS moves in pages, and where
+transparent huge pages are `always` (GitHub's ubuntu-24.04 runners) in 2 MiB steps
+with no allocation at all: khugepaged collapsing a range, or a huge page faulted in.
+glibc's `mallinfo2()` (`uordblks + hblkhd`: bytes in use over every arena) is exact
+under `-gc none`, where every V allocation is a `malloc`; see
+[tests/tls_static_test.v](../tests/tls_static_test.v). Under `-race`
+ThreadSanitizer's allocator replaces malloc, and `mallinfo2` does not see it.
+
 **heaptrack caveat:** it sees `-gc none` allocations, but attributes from process
 start, so one-time bring-up (SCRAM/PBKDF2, lazy init) blurs the per-request
 signal. callgrind with post-warmup instrumentation is the disambiguator.
