@@ -1,21 +1,17 @@
-// sudo apt update && sudo apt upgrade -y linux-generic
-// git clone git@github.com:axboe/liburing.git
-// cd liburing
-// ./configure
-// make
-// sudo make install
-
 module io_uring
 
 import core
+// For C.atomic_load_u32 / C.atomic_store_u32 on the ring indices the kernel
+// shares with us (see peek_batch_cqe, cq_advance, cq_needs_flush).
+import sync.stdatomic as _
 
-#include <liburing.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <fcntl.h>
 #include <unistd.h>
-#flag -luring
+#include <sys/mman.h>
+#include <sys/syscall.h>
 
 // ==================== C Function Declarations ====================
 
@@ -89,6 +85,8 @@ pub const ioring_cqe_f_more = u32(1 << 1)
 pub const setup_coop_taskrun = u32(1 << 8)
 pub const setup_single_issuer = u32(1 << 12)
 pub const setup_defer_taskrun = u32(1 << 13)
+// Tried first by queue_init on every ring (see there).
+const setup_no_sqarray = u32(1 << 16)
 
 // User data bit masks
 const op_type_shift = 48
@@ -120,76 +118,469 @@ pub fn decode_ext_fd(data u64) int {
 	return int(data & ptr_mask)
 }
 
-// ==================== C Bindings ====================
+// ==================== Kernel ring (no liburing) ====================
+//
+// The ring is driven straight through the three io_uring syscalls
+// (io_uring_setup / io_uring_enter / io_uring_register) and the SQ/CQ rings
+// they mmap, so a binary that imports `server` needs neither liburing's headers
+// to build nor liburing.so to start (#189). The structs are the kernel ABI from
+// include/uapi/linux/io_uring.h, declared here rather than taken from
+// <linux/io_uring.h> so the build does not depend on the kernel-header version;
+// io_uring_abi_test.v checks every size, offset and constant against the
+// header. Function names and semantics follow liburing's (2.x), which this
+// replaces, for the subset vanilla uses. SQPOLL is never set, so the kernel
+// touches the SQ only inside io_uring_enter, on the ring's own thread.
 
-// io_uring structures and functions.
-// Deliberately field-less: no member is ever accessed from V (the ring is only
-// passed by pointer to liburing), and V cgen emits designated initializers for
-// every V-declared field on `C.io_uring{}` literals — any field list that does
-// not match the compiling liburing header verbatim is a C error
-// (https://github.com/vlang/v/issues/27793).
-pub struct C.io_uring {}
-
-pub struct C.io_uring_sqe {}
-
-// Relative timeout for io_uring_submit_and_wait_timeout (kernel ABI struct).
-pub struct C.__kernel_timespec {
+// Sqe is struct io_uring_sqe (64 bytes). Each kernel union is flattened to the
+// member vanilla writes; the comment lists the members it overlays. prepare_*
+// assign a whole Sqe literal, so every field not named there is zeroed.
+pub struct Sqe {
 pub mut:
-	tv_sec  i64
-	tv_nsec i64
+	opcode      u8
+	flags       u8
+	ioprio      u16
+	fd          i32
+	off         u64 // off | addr2
+	addr        u64 // addr | splice_off_in
+	len         u32
+	op_flags    u32 // rw_flags | msg_flags | accept_flags | poll32_events | timeout_flags | ...
+	user_data   u64
+	buf_index   u16 // buf_index | buf_group
+	personality u16
+	file_index  u32 // splice_fd_in | file_index | optlen | addr_len
+	addr3       u64
+	pad2        u64
 }
 
-pub struct C.io_uring_cqe {
+// Cqe is struct io_uring_cqe (16 bytes; vanilla never sets CQE32).
+pub struct Cqe {
+pub:
 	user_data u64
 	res       i32
 	flags     u32
 }
 
-// io_uring_params. Field access is by name against the real C struct (this is a
-// `C.` type, so the kernel header in <liburing.h> defines the true layout); we
-// only declare the fields we touch. `features` is filled by the kernel on init.
-pub struct C.io_uring_params {
+// Relative timeout for submit_and_wait_timeout (struct __kernel_timespec).
+pub struct KernelTimespec {
+pub mut:
+	tv_sec  i64
+	tv_nsec i64
+}
+
+// struct io_sqring_offsets / io_cqring_offsets: where each ring field lives in
+// the mmap'd ring, filled by io_uring_setup.
+struct SqringOffsets {
+	head         u32
+	tail         u32
+	ring_mask    u32
+	ring_entries u32
+	flags        u32
+	dropped      u32
+	array        u32
+	resv1        u32
+	user_addr    u64
+}
+
+struct CqringOffsets {
+	head         u32
+	tail         u32
+	ring_mask    u32
+	ring_entries u32
+	overflow     u32
+	cqes         u32
+	flags        u32
+	resv1        u32
+	user_addr    u64
+}
+
+// struct io_uring_params: `flags` goes in, the kernel fills the rest.
+struct Params {
+	sq_entries     u32
+	cq_entries     u32
 	flags          u32
 	sq_thread_cpu  u32
 	sq_thread_idle u32
 	features       u32
+	wq_fd          u32
+	resv           [3]u32
+	sq_off         SqringOffsets
+	cq_off         CqringOffsets
 }
 
-// C function bindings
-fn C.io_uring_queue_init_params(entries u32, ring &C.io_uring, p &C.io_uring_params) int
-fn C.io_uring_queue_exit(ring &C.io_uring)
-fn C.io_uring_get_sqe(ring &C.io_uring) &C.io_uring_sqe
-fn C.io_uring_prep_accept(sqe &C.io_uring_sqe, fd int, addr voidptr, addrlen voidptr, flags int)
-fn C.io_uring_prep_multishot_accept(sqe &C.io_uring_sqe, fd int, addr voidptr, addrlen voidptr, flags int)
-fn C.io_uring_sqe_set_data64(sqe &C.io_uring_sqe, data u64)
-fn C.io_uring_prep_recv(sqe &C.io_uring_sqe, fd int, buf voidptr, nbytes usize, flags int)
-fn C.io_uring_prep_send(sqe &C.io_uring_sqe, fd int, buf voidptr, nbytes usize, flags int)
-fn C.io_uring_prep_poll_add(sqe &C.io_uring_sqe, fd int, poll_mask u32)
-fn C.io_uring_submit(ring &C.io_uring) int
+// struct io_uring_getevents_arg, the IORING_ENTER_EXT_ARG argument.
+struct GeteventsArg {
+	sigmask       u64
+	sigmask_sz    u32
+	min_wait_usec u32
+	ts            u64
+}
 
-// One syscall per loop iteration: flush every SQE queued since the last call
-// AND block until at least wait_nr completions are ready. With DEFER_TASKRUN
-// this is also what runs the deferred task work, so the CQ is populated before
-// we peek it.
-fn C.io_uring_submit_and_wait(ring &C.io_uring, wait_nr u32) int
+// struct io_uring_rsrc_update, the IORING_(UN)REGISTER_RING_FDS argument.
+struct RsrcUpdate {
+mut:
+	offset u32
+	resv   u32
+	data   u64
+}
 
-// Like submit_and_wait, but wakes after `ts` even with no completion (returns
-// -ETIME). Used to drive a periodic connection-timeout sweep without a busy poll.
-fn C.io_uring_submit_and_wait_timeout(ring &C.io_uring, cqe_ptr &&C.io_uring_cqe, wait_nr u32, ts &C.__kernel_timespec, sigmask voidptr) int
-fn C.io_uring_wait_cqe(ring &C.io_uring, cqe_ptr &&C.io_uring_cqe) int
-fn C.io_uring_peek_cqe(ring &C.io_uring, cqe_ptr &&C.io_uring_cqe) int
+// Kernel ABI constants (include/uapi/linux/io_uring.h).
+const ioring_op_poll_add = u8(6)
+const ioring_op_timeout = u8(11)
+const ioring_op_accept = u8(13)
+const ioring_op_send = u8(26)
+const ioring_op_recv = u8(27)
+const ioring_accept_multishot = u16(1 << 0)
+const ioring_off_sq_ring = isize(0)
+const ioring_off_cq_ring = isize(0x8000000)
+const ioring_off_sqes = isize(0x10000000)
+const ioring_feat_single_mmap = u32(1 << 0)
+const ioring_feat_ext_arg = u32(1 << 8)
+const ioring_enter_getevents = u32(1 << 0)
+const ioring_enter_ext_arg = u32(1 << 3)
+const ioring_enter_registered_ring = u32(1 << 4)
+const ioring_register_ring_fds = 20
+const ioring_unregister_ring_fds = 21
+const ioring_sq_cq_overflow = u32(1 << 1)
+const ioring_sq_taskrun = u32(1 << 2)
+// sizeof(sigset_t) as the kernel sees it (_NSIG / 8), as liburing passes it.
+const sigset_size = u32(8)
 
-// Copy up to `count` ready CQE pointers out of the ring in one shot; returns how
-// many were copied. Paired with a single cq_advance(n) — never cqe_seen per CQE.
-fn C.io_uring_peek_batch_cqe(ring &C.io_uring, cqes &&C.io_uring_cqe, count u32) u32
-fn C.io_uring_cqe_seen(ring &C.io_uring, cqe &C.io_uring_cqe)
+// user_data of the IORING_OP_TIMEOUT SQE that submit_and_wait_timeout queues on
+// kernels without IORING_FEAT_EXT_ARG (liburing's LIBURING_UDATA_TIMEOUT). Its op
+// bits decode to no op_* type, so the CQE dispatcher ignores it.
+pub const timeout_user_data = u64(0xFFFF_FFFF_FFFF_FFFF)
 
-// Acknowledge a whole batch of CQEs at once (advance the CQ head by nr).
-fn C.io_uring_cq_advance(ring &C.io_uring, nr u32)
-fn C.io_uring_cqe_get_data64(cqe &C.io_uring_cqe) u64
+// Ring is one io_uring instance: the ring fd plus the SQ/CQ the kernel shares
+// through mmap (liburing's struct io_uring). Only the worker thread that owns
+// it touches it.
+pub struct Ring {
+mut:
+	sq_khead    &u32 = unsafe { nil }
+	sq_ktail    &u32 = unsafe { nil }
+	sq_kflags   &u32 = unsafe { nil }
+	sqes        &Sqe = unsafe { nil }
+	sq_mask     u32
+	sq_entries  u32
+	sqe_head    u32 // [sqe_head, sqe_tail) are filled but not yet published to the kernel
+	sqe_tail    u32
+	cq_khead    &u32 = unsafe { nil }
+	cq_ktail    &u32 = unsafe { nil }
+	cqes        &Cqe = unsafe { nil }
+	cq_mask     u32
+	sq_ring     voidptr
+	sq_ring_sz  usize
+	cq_ring     voidptr // == sq_ring when the kernel maps both rings at once
+	cq_ring_sz  usize
+	features    u32
+	ring_fd     int = -1
+	enter_fd    int = -1 // ring_fd, or its registered index after register_ring_fd
+	enter_flags u32 // IORING_ENTER_REGISTERED_RING once registered
+}
 
-// Register the ring fd so io_uring_enter skips the per-call fget/fput.
-fn C.io_uring_register_ring_fd(ring &C.io_uring) int
+// queue_init sets `ring` up with `entries` SQ slots and the IORING_SETUP_*
+// `flags` (liburing's io_uring_queue_init_params). Like liburing it first asks
+// for IORING_SETUP_NO_SQARRAY (kernel 6.6+: the kernel reads SQEs in ring order,
+// with no index array) and retries without it if the kernel rejects that.
+// Returns 0, or -errno with `ring` untouched.
+pub fn queue_init(entries u32, ring &Ring, flags u32) int {
+	ret := setup_ring(entries, ring, flags | setup_no_sqarray)
+	if ret != -C.EINVAL {
+		return ret
+	}
+	return setup_ring(entries, ring, flags)
+}
+
+fn setup_ring(entries u32, ring &Ring, flags u32) int {
+	p := Params{
+		flags: flags
+	}
+	fd := unsafe { C.syscall(C.SYS_io_uring_setup, entries, &p) }
+	if fd < 0 {
+		return -C.errno
+	}
+	mut sq_ring_sz := usize(p.sq_off.array) + usize(p.sq_entries) * sizeof(u32)
+	mut cq_ring_sz := usize(p.cq_off.cqes) + usize(p.cq_entries) * sizeof(Cqe)
+	single_mmap := p.features & ioring_feat_single_mmap != 0
+	if single_mmap {
+		if cq_ring_sz > sq_ring_sz {
+			sq_ring_sz = cq_ring_sz
+		}
+		cq_ring_sz = sq_ring_sz
+	}
+	sq_ring := map_ring(fd, sq_ring_sz, ioring_off_sq_ring)
+	if sq_ring == unsafe { nil } {
+		err := -C.errno
+		C.close(fd)
+		return err
+	}
+	mut cq_ring := sq_ring
+	if !single_mmap {
+		cq_ring = map_ring(fd, cq_ring_sz, ioring_off_cq_ring)
+		if cq_ring == unsafe { nil } {
+			err := -C.errno
+			unsafe { C.munmap(sq_ring, sq_ring_sz) }
+			C.close(fd)
+			return err
+		}
+	}
+	sqes := map_ring(fd, usize(p.sq_entries) * sizeof(Sqe), ioring_off_sqes)
+	if sqes == unsafe { nil } {
+		err := -C.errno
+		unsafe {
+			if !single_mmap {
+				C.munmap(cq_ring, cq_ring_sz)
+			}
+			C.munmap(sq_ring, sq_ring_sz)
+		}
+		C.close(fd)
+		return err
+	}
+	mut r := unsafe { &Ring(ring) }
+	unsafe {
+		sq := &u8(sq_ring)
+		cq := &u8(cq_ring)
+		r.sq_khead = &u32(sq + p.sq_off.head)
+		r.sq_ktail = &u32(sq + p.sq_off.tail)
+		r.sq_kflags = &u32(sq + p.sq_off.flags)
+		r.sq_mask = *&u32(sq + p.sq_off.ring_mask)
+		r.sq_entries = *&u32(sq + p.sq_off.ring_entries)
+		r.cq_khead = &u32(cq + p.cq_off.head)
+		r.cq_ktail = &u32(cq + p.cq_off.tail)
+		r.cq_mask = *&u32(cq + p.cq_off.ring_mask)
+		r.cqes = &Cqe(cq + p.cq_off.cqes)
+		r.sqes = &Sqe(sqes)
+		if flags & setup_no_sqarray == 0 {
+			// The kernel reads SQ slot i through array[i]: point slot i at SQE i, once.
+			array := &u32(sq + p.sq_off.array)
+			for i in u32(0) .. r.sq_entries {
+				array[i] = i
+			}
+		}
+	}
+	r.sqe_head = 0
+	r.sqe_tail = 0
+	r.sq_ring = sq_ring
+	r.sq_ring_sz = sq_ring_sz
+	r.cq_ring = cq_ring
+	r.cq_ring_sz = cq_ring_sz
+	r.features = p.features
+	r.ring_fd = fd
+	r.enter_fd = fd
+	r.enter_flags = 0
+	return 0
+}
+
+// map_ring maps one region of a new ring; nil on failure, with errno set.
+fn map_ring(fd int, size usize, offset isize) voidptr {
+	ptr := unsafe {
+		C.mmap(nil, size, C.PROT_READ | C.PROT_WRITE, C.MAP_SHARED | C.MAP_POPULATE, fd, offset)
+	}
+	if isize(ptr) == -1 { // MAP_FAILED
+		return unsafe { nil }
+	}
+	return ptr
+}
+
+// queue_exit unmaps and closes a ring set up by queue_init (io_uring_queue_exit).
+pub fn queue_exit(ring &Ring) {
+	mut r := unsafe { &Ring(ring) }
+	if r.ring_fd < 0 {
+		return
+	}
+	if r.enter_flags & ioring_enter_registered_ring != 0 {
+		up := RsrcUpdate{
+			offset: u32(r.enter_fd)
+		}
+		unsafe { C.syscall(C.SYS_io_uring_register, r.ring_fd, ioring_unregister_ring_fds, &up, 1) }
+	}
+	unsafe {
+		C.munmap(r.sqes, usize(r.sq_entries) * sizeof(Sqe))
+		if r.cq_ring != r.sq_ring {
+			C.munmap(r.cq_ring, r.cq_ring_sz)
+		}
+		C.munmap(r.sq_ring, r.sq_ring_sz)
+	}
+	C.close(r.ring_fd)
+	unsafe {
+		*r = Ring{}
+	}
+}
+
+// register_ring_fd registers the ring fd so each io_uring_enter skips the
+// fget/fput on it (io_uring_register_ring_fd, kernel 5.18+). Returns 1 on
+// success, else -errno; the ring keeps working unregistered.
+pub fn register_ring_fd(ring &Ring) int {
+	mut r := unsafe { &Ring(ring) }
+	if r.enter_flags & ioring_enter_registered_ring != 0 {
+		return -C.EEXIST
+	}
+	up := RsrcUpdate{
+		offset: u32(0xFFFF_FFFF) // -1: the kernel picks the slot and writes it back
+		data:   u64(r.ring_fd)
+	}
+	ret := unsafe { C.syscall(C.SYS_io_uring_register, r.ring_fd, ioring_register_ring_fds, &up, 1) }
+	if ret < 0 {
+		return -C.errno
+	}
+	if ret == 1 {
+		r.enter_fd = int(up.offset)
+		r.enter_flags = ioring_enter_registered_ring
+	}
+	return ret
+}
+
+// get_sqe returns the next free SQE, or nil when the SQ is full
+// (io_uring_get_sqe). The caller assigns the whole SQE (prepare_*). The kernel
+// advances the SQ head only inside our own io_uring_enter, so a plain load is
+// enough here.
+@[inline]
+fn get_sqe(ring &Ring) &Sqe {
+	mut r := unsafe { &Ring(ring) }
+	tail := r.sqe_tail
+	if tail - unsafe { *r.sq_khead } >= r.sq_entries {
+		return unsafe { nil }
+	}
+	r.sqe_tail = tail + 1
+	return unsafe { &r.sqes[tail & r.sq_mask] }
+}
+
+// flush_sq publishes the SQEs filled since the last flush and returns how many
+// the kernel has not consumed yet (liburing's __io_uring_flush_sq). The kernel
+// reads the tail only inside io_uring_enter, which orders this plain store.
+@[inline]
+fn flush_sq(mut r Ring) u32 {
+	tail := r.sqe_tail
+	if r.sqe_head != tail {
+		r.sqe_head = tail
+		unsafe {
+			*r.sq_ktail = tail
+		}
+	}
+	return tail - unsafe { *r.sq_khead }
+}
+
+// cq_needs_flush reports whether the kernel holds completions back (a CQ
+// overflow backlog, or task work flagged by COOP_TASKRUN) that only an
+// io_uring_enter(GETEVENTS) posts (liburing's cq_ring_needs_flush).
+@[inline]
+fn cq_needs_flush(r &Ring) bool {
+	return C.atomic_load_u32(r.sq_kflags) & (ioring_sq_cq_overflow | ioring_sq_taskrun) != 0
+}
+
+// enter calls io_uring_enter on the ring, through its registered index once
+// register_ring_fd succeeded. Returns the syscall result, or -errno.
+fn enter(r &Ring, to_submit u32, min_complete u32, flags u32, arg voidptr, argsz usize) int {
+	ret := unsafe {
+		C.syscall(C.SYS_io_uring_enter, r.enter_fd, to_submit, min_complete, flags | r.enter_flags,
+			arg, argsz)
+	}
+	if ret < 0 {
+		return -C.errno
+	}
+	return ret
+}
+
+// submit hands the queued SQEs to the kernel (io_uring_submit). Returns how many
+// were submitted, or -errno; makes no syscall when there is nothing to do.
+pub fn submit(ring &Ring) int {
+	mut r := unsafe { &Ring(ring) }
+	to_submit := flush_sq(mut r)
+	flush_cq := cq_needs_flush(r)
+	if to_submit == 0 && !flush_cq {
+		return 0
+	}
+	return enter(r, to_submit, 0, if flush_cq { ioring_enter_getevents } else { u32(0) },
+		unsafe { nil }, 0)
+}
+
+// submit_and_wait hands the queued SQEs to the kernel and blocks until at least
+// `wait_nr` (>= 1) completions are ready, in one io_uring_enter
+// (io_uring_submit_and_wait). With DEFER_TASKRUN this is also what runs the
+// deferred task work, so the CQ is populated before it is peeked. Returns how
+// many SQEs were submitted, or -errno.
+pub fn submit_and_wait(ring &Ring, wait_nr u32) int {
+	mut r := unsafe { &Ring(ring) }
+	return enter(r, flush_sq(mut r), wait_nr, ioring_enter_getevents, unsafe { nil }, 0)
+}
+
+// submit_and_wait_timeout is submit_and_wait that also returns once `ts` has
+// elapsed with no completion; that is -ETIME when nothing was submitted
+// (io_uring_submit_and_wait_timeout). Kernels before 5.11 lack
+// IORING_FEAT_EXT_ARG: there, as in liburing, the timeout goes in as an
+// IORING_OP_TIMEOUT SQE (user_data timeout_user_data, which the dispatcher
+// ignores), and `ts` must stay valid until its CQE arrives.
+pub fn submit_and_wait_timeout(ring &Ring, wait_nr u32, ts &KernelTimespec) int {
+	mut r := unsafe { &Ring(ring) }
+	if r.features & ioring_feat_ext_arg != 0 {
+		arg := GeteventsArg{
+			sigmask_sz: sigset_size
+			ts:         u64(voidptr(ts))
+		}
+		return enter(r, flush_sq(mut r), wait_nr, ioring_enter_getevents | ioring_enter_ext_arg,
+			&arg, sizeof(GeteventsArg))
+	}
+	mut sqe := get_sqe(r)
+	if sqe == unsafe { nil } {
+		ret := submit(r)
+		if ret < 0 {
+			return ret
+		}
+		sqe = get_sqe(r)
+		if sqe == unsafe { nil } {
+			return -C.EAGAIN
+		}
+	}
+	unsafe {
+		*sqe = Sqe{
+			opcode:    ioring_op_timeout
+			fd:        -1
+			off:       u64(wait_nr)
+			addr:      u64(voidptr(ts))
+			len:       1
+			user_data: timeout_user_data
+		}
+	}
+	return submit_and_wait(r, wait_nr)
+}
+
+// peek_batch_cqe stores pointers to up to `count` ready CQEs in `cqes` and
+// returns how many (io_uring_peek_batch_cqe). It does not consume them: pair it
+// with one cq_advance(n) once the batch is dispatched. When the CQ is empty but
+// the kernel holds completions back (see cq_needs_flush), one
+// io_uring_enter(GETEVENTS) posts them first.
+pub fn peek_batch_cqe(ring &Ring, cqes &&Cqe, count u32) u32 {
+	mut flushed := false
+	for {
+		head := unsafe { *ring.cq_khead }
+		// The kernel publishes CQEs by advancing the tail: load it before reading them.
+		ready := C.atomic_load_u32(ring.cq_ktail) - head
+		if ready > 0 {
+			n := if ready < count { ready } else { count }
+			for i in u32(0) .. n {
+				unsafe {
+					cqes[i] = &ring.cqes[(head + i) & ring.cq_mask]
+				}
+			}
+			return n
+		}
+		if flushed || !cq_needs_flush(ring) {
+			return 0
+		}
+		enter(ring, 0, 0, ioring_enter_getevents, unsafe { nil }, 0)
+		flushed = true
+	}
+	return 0
+}
+
+// cq_advance hands `nr` consumed CQEs back to the kernel (io_uring_cq_advance).
+// The atomic store orders every read of those CQEs before the kernel can reuse
+// their slots.
+@[inline]
+pub fn cq_advance(ring &Ring, nr u32) {
+	if nr > 0 {
+		C.atomic_store_u32(ring.cq_khead, unsafe { *ring.cq_khead } + nr)
+	}
+}
 
 // htonl function converts a u_long from host to TCP/IP network byte order (which is big-endian).
 // htonl() function converts the unsigned long integer hostlong from host byte order to network byte order.
@@ -271,7 +662,7 @@ pub mut:
 
 pub struct Worker {
 pub mut:
-	ring          C.io_uring
+	ring          Ring
 	cpu_id        int
 	tid           C.pthread_t
 	socket_fd     int
@@ -447,18 +838,20 @@ pub fn pool_release_from_ptr(worker &Worker, mut c Connection) {
 
 // Prepare accept operation (multishot when supported)
 // Returns true if SQE was successfully obtained, false otherwise
-pub fn prepare_accept(ring &C.io_uring, socket_fd int, multishot bool) bool {
-	sqe := C.io_uring_get_sqe(ring)
+pub fn prepare_accept(ring &Ring, socket_fd int, multishot bool) bool {
+	sqe := get_sqe(ring)
 	if unsafe { sqe == nil } {
 		return false
 	}
-	if multishot {
-		C.io_uring_prep_multishot_accept(sqe, socket_fd, unsafe { nil }, unsafe { nil },
-			C.SOCK_NONBLOCK)
-	} else {
-		C.io_uring_prep_accept(sqe, socket_fd, unsafe { nil }, unsafe { nil }, 0)
+	unsafe {
+		*sqe = Sqe{
+			opcode:    ioring_op_accept
+			ioprio:    if multishot { ioring_accept_multishot } else { u16(0) }
+			fd:        socket_fd
+			op_flags:  if multishot { u32(C.SOCK_NONBLOCK) } else { u32(0) }
+			user_data: encode_user_data(op_accept, nil)
+		}
 	}
-	C.io_uring_sqe_set_data64(sqe, encode_user_data(op_accept, unsafe { nil }))
 	return true
 }
 
@@ -468,8 +861,8 @@ pub fn prepare_accept(ring &C.io_uring, socket_fd int, multishot bool) bool {
 // captured now and the connection has exactly one op in flight at a time, so it
 // stays valid for the recv's whole duration. Returns false if the SQ is full.
 @[direct_array_access]
-pub fn prepare_recv(ring &C.io_uring, mut c Connection) bool {
-	sqe := C.io_uring_get_sqe(ring)
+pub fn prepare_recv(ring &Ring, mut c Connection) bool {
+	sqe := get_sqe(ring)
 	if unsafe { sqe == nil } {
 		return false
 	}
@@ -477,9 +870,15 @@ pub fn prepare_recv(ring &C.io_uring, mut c Connection) bool {
 		unsafe { c.read_buf.grow_cap(c.read_buf.cap) }
 	}
 	spare := c.read_buf.cap - c.read_buf.len
-	C.io_uring_prep_recv(sqe, c.fd, unsafe { &u8(c.read_buf.data) + c.read_buf.len }, usize(spare),
-		0)
-	C.io_uring_sqe_set_data64(sqe, encode_user_data(op_read, &c))
+	unsafe {
+		*sqe = Sqe{
+			opcode:    ioring_op_recv
+			fd:        c.fd
+			addr:      u64(&u8(c.read_buf.data) + c.read_buf.len)
+			len:       u32(spare)
+			user_data: encode_user_data(op_read, &c)
+		}
+	}
 	return true
 }
 
@@ -491,8 +890,8 @@ pub fn prepare_recv(ring &C.io_uring, mut c Connection) bool {
 // recv never reads past the body into the next pipelined request. Returns false
 // if the SQ is full.
 @[direct_array_access]
-pub fn prepare_recv_n(ring &C.io_uring, mut c Connection, n usize) bool {
-	sqe := C.io_uring_get_sqe(ring)
+pub fn prepare_recv_n(ring &Ring, mut c Connection, n usize) bool {
+	sqe := get_sqe(ring)
 	if unsafe { sqe == nil } {
 		return false
 	}
@@ -500,20 +899,35 @@ pub fn prepare_recv_n(ring &C.io_uring, mut c Connection, n usize) bool {
 	if want > usize(c.read_buf.cap) {
 		want = usize(c.read_buf.cap)
 	}
-	C.io_uring_prep_recv(sqe, c.fd, c.read_buf.data, want, 0)
-	C.io_uring_sqe_set_data64(sqe, encode_user_data(op_read, &c))
+	unsafe {
+		*sqe = Sqe{
+			opcode:    ioring_op_recv
+			fd:        c.fd
+			addr:      u64(c.read_buf.data)
+			len:       u32(want)
+			user_data: encode_user_data(op_read, &c)
+		}
+	}
 	return true
 }
 
 // prepare_send posts a send for [data, data+data_len). MSG_NOSIGNAL stops a
 // write to a dead peer from raising SIGPIPE (matches the epoll backend).
-pub fn prepare_send(ring &C.io_uring, mut c Connection, data &u8, data_len usize) bool {
-	sqe := C.io_uring_get_sqe(ring)
+pub fn prepare_send(ring &Ring, mut c Connection, data &u8, data_len usize) bool {
+	sqe := get_sqe(ring)
 	if unsafe { sqe == nil } {
 		return false
 	}
-	C.io_uring_prep_send(sqe, c.fd, unsafe { data }, data_len, C.MSG_NOSIGNAL)
-	C.io_uring_sqe_set_data64(sqe, encode_user_data(op_write, &c))
+	unsafe {
+		*sqe = Sqe{
+			opcode:    ioring_op_send
+			fd:        c.fd
+			addr:      u64(data)
+			len:       u32(data_len)
+			op_flags:  u32(C.MSG_NOSIGNAL)
+			user_data: encode_user_data(op_write, &c)
+		}
+	}
 	return true
 }
 
@@ -525,13 +939,24 @@ pub fn prepare_send(ring &C.io_uring, mut c Connection, data &u8, data_len usize
 // already readable completes immediately (no lost wakeup). The CQE's res carries
 // the returned poll mask (or a negative errno). user_data packs the fd itself, not
 // a pointer (see op_poll). Returns false if the SQ is full.
-pub fn prepare_poll(ring &C.io_uring, fd int, poll_mask u32) bool {
-	sqe := C.io_uring_get_sqe(ring)
+pub fn prepare_poll(ring &Ring, fd int, poll_mask u32) bool {
+	sqe := get_sqe(ring)
 	if unsafe { sqe == nil } {
 		return false
 	}
-	C.io_uring_prep_poll_add(sqe, fd, poll_mask)
-	C.io_uring_sqe_set_data64(sqe, encode_user_data(op_poll, voidptr(usize(fd))))
+	mut mask := poll_mask
+	$if big_endian {
+		// poll32_events is word-reversed on big-endian (liburing's __io_uring_prep_poll_mask).
+		mask = (mask << 16) | (mask >> 16)
+	}
+	unsafe {
+		*sqe = Sqe{
+			opcode:    ioring_op_poll_add
+			fd:        fd
+			op_flags:  mask
+			user_data: encode_user_data(op_poll, voidptr(usize(fd)))
+		}
+	}
 	return true
 }
 
@@ -555,17 +980,16 @@ pub fn io_uring_available() bool {
 // Costs a handful of syscalls and leaks nothing; off the hot path.
 pub fn io_uring_available_for(workers int) bool {
 	n := if workers < 1 { 1 } else { workers }
-	mut rings := []C.io_uring{len: n}
+	mut rings := []Ring{len: n}
 	mut ok := 0
 	for i in 0 .. n {
-		mut p := C.io_uring_params{}
-		if C.io_uring_queue_init_params(min_probe_ring_entries, unsafe { &rings[i] }, &p) != 0 {
+		if queue_init(min_probe_ring_entries, unsafe { &rings[i] }, 0) != 0 {
 			break
 		}
 		ok++
 	}
 	for i in 0 .. ok {
-		C.io_uring_queue_exit(unsafe { &rings[i] })
+		queue_exit(unsafe { &rings[i] })
 	}
 	return ok == n
 }
