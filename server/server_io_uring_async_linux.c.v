@@ -50,10 +50,36 @@ import io_uring
 import core
 import http1_1.request_parser
 import http1_1.response
+import sync.stdatomic
 
 // Initial size of the fd-indexed watch table (grows by doubling; same layout as
 // the epoll reactor and the pool's fd-indexed structures).
 const iou_watch_table_min = 1024
+
+// iou_park parks conn on the watched ext_fd (awaiting_fd), and iou_unpark
+// takes it off: the io_uring twin of the epoll park_conn / unpark_conn. A
+// parked connection has no send posted, which is what this worker's
+// in-flight counter otherwise counts, so the park itself holds one count
+// until the connection resumes (or is released: iou_release). Then
+// Server.shutdown() waits for parked requests too. Only the transition
+// counts, so a continuation that re-parks is not counted twice.
+@[inline]
+fn iou_park(worker &io_uring.Worker, mut conn io_uring.Connection, ext_fd int) {
+	if conn.awaiting_fd < 0 && unsafe { worker.inflight != nil } {
+		stdatomic.add_i64(&worker.inflight.n, 1)
+	}
+	conn.awaiting_fd = ext_fd
+}
+
+@[inline]
+fn iou_unpark(worker &io_uring.Worker, mut conn io_uring.Connection) {
+	if conn.awaiting_fd >= 0 {
+		conn.awaiting_fd = -1
+		if unsafe { worker.inflight != nil } {
+			stdatomic.add_i64(&worker.inflight.n, -1)
+		}
+	}
+}
 
 // IouParkSlot is one parked client on a pipelined (multi-client) watched fd: the
 // same (conn, continuation, udata) triple a single IouWatchEntry holds, but queued
@@ -424,7 +450,7 @@ fn iou_drain_requests(mut env IouEnv, mut conn io_uring.Connection, limits Limit
 					// shut a parked connection down as a slow reader (a shutdown with
 					// no op in flight would produce no CQE either). `idle` is already
 					// false: this request's first byte cleared it.
-					conn.awaiting_fd = event_loop.last_watched
+					iou_park(env.worker, mut conn, event_loop.last_watched)
 					conn.read_deadline = 0
 				}
 			}
@@ -571,6 +597,19 @@ fn handle_io_uring_poll(cqe &io_uring.Cqe, mut env IouEnv, limits Limits, active
 	if ext_fd < 0 || ext_fd >= env.watches.len || !env.watches[ext_fd].active {
 		return
 	}
+	// Hold an in-flight count across the resume, as the epoll on_watch_ready
+	// does: the resumed connection's park count is dropped before its
+	// continuation runs, and a .done response is counted only once its send
+	// is posted, so without this a shutdown() could see zero in between.
+	inflight := env.worker.inflight
+	if unsafe { inflight != nil } {
+		stdatomic.add_i64(&inflight.n, 1)
+	}
+	defer {
+		if unsafe { inflight != nil } {
+			stdatomic.add_i64(&inflight.n, -1)
+		}
+	}
 	res := cqe.res
 	ready_err := res < 0 || (u32(res) & (io_uring.pollerr | io_uring.pollhup)) != 0
 	// A pipelined fd (multiple parked clients on one multiplexed pg connection):
@@ -587,7 +626,7 @@ fn handle_io_uring_poll(cqe &io_uring.Cqe, mut env IouEnv, limits Limits, active
 	if unsafe { conn == nil } || unsafe { conn.owner == nil } || conn.fd != parked_fd {
 		return
 	}
-	conn.awaiting_fd = -1
+	iou_unpark(env.worker, mut *conn)
 	env.cur_conn = conn
 	mut event_loop := iou_event_loop(mut env, conn.fd)
 	step := cont(mut conn.response_buffer, ext_fd, ready_err, udata, env.state, mut event_loop)
@@ -613,7 +652,7 @@ fn handle_io_uring_poll(cqe &io_uring.Cqe, mut env IouEnv, limits Limits, active
 				// Stay parked; bytes (if any) stay HELD — no send while parked (see
 				// module comment; epoll's stream-as-you-go on .suspend is a
 				// follow-up here).
-				conn.awaiting_fd = event_loop.last_watched
+				iou_park(env.worker, mut *conn, event_loop.last_watched)
 			}
 		}
 		.close {
@@ -656,7 +695,7 @@ fn drain_pipelined_iou(mut env IouEnv, ext_fd int, ready_err bool, limits Limits
 			env.iou_reactor_clear_if_drained(ext_fd)
 			continue
 		}
-		conn.awaiting_fd = -1
+		iou_unpark(env.worker, mut *conn)
 		env.cur_conn = conn
 		mut event_loop := iou_event_loop(mut env, conn.fd)
 		step := slot.cont(mut conn.response_buffer, ext_fd, ready_err, slot.udata, env.state, mut
@@ -700,7 +739,7 @@ fn drain_pipelined_iou(mut env IouEnv, ext_fd int, ready_err bool, limits Limits
 				// (iou_reactor_watch found it already queued — no duplicate) and
 				// register queued a fresh oneshot poll. Keep it at the head and stop:
 				// nothing behind it is ready.
-				conn.awaiting_fd = ext_fd
+				iou_park(env.worker, mut *conn, ext_fd)
 				break
 			}
 			.close {

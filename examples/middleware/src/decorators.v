@@ -9,10 +9,12 @@ const security_headers = ('X-Content-Type-Options: nosniff\r\n' + 'X-Frame-Optio
 	"Content-Security-Policy: default-src 'self'\r\n").bytes()
 
 // with_security_headers injects the hardening headers into every response, once.
+// Every input reaches `next` unchanged: the wrapped handler may key on its
+// connection (client_fd) or dereference its make_state value (worker_state).
 fn with_security_headers(next Handler) Handler {
 	return fn [next] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 		start := out.len
-		step := next(req_buffer, mut out, -1, unsafe { nil }, mut event_loop)
+		step := next(req_buffer, mut out, client_fd, worker_state, mut event_loop)
 		if step != .done {
 			return step
 		}

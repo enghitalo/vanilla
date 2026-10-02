@@ -66,12 +66,16 @@ const iou_max_pending_write = 8 * 1024 * 1024
 // accounting is active) and returns the connection to its pool. pool_release is
 // idempotent (clears owner), so this is safe to call more than once for the same
 // connection and the counter stays exact: the decrement is guarded by the same
-// owner!=nil check, so it fires exactly once per accepted connection.
+// owner!=nil check, so it fires exactly once per accepted connection. A
+// connection released while parked (it has no op in flight then, so no path
+// is expected to) gives its park count back first (iou_unpark): the release
+// resets awaiting_fd, and the count would otherwise leak into the drain.
 @[inline]
 fn iou_release(worker &io_uring.Worker, mut conn io_uring.Connection, active_conns &core.Counter, track bool) {
 	if track && unsafe { conn.owner != nil } {
 		stdatomic.add_i64(&active_conns.n, -1)
 	}
+	iou_unpark(worker, mut conn)
 	io_uring.pool_release_from_ptr(worker, mut conn)
 }
 
@@ -277,6 +281,18 @@ fn handle_io_uring_read(worker &io_uring.Worker, cqe &io_uring.Cqe, mut env IouE
 	unsafe {
 		conn.read_buf.len += res
 	}
+	// In-flight window for the graceful-shutdown drain while the handlers run,
+	// as on epoll (per-worker counter, own cache line — uncontended): held
+	// until this returns, by which time each answered request is counted by
+	// its posted send, or by its park.
+	if unsafe { worker.inflight != nil } {
+		stdatomic.add_i64(&worker.inflight.n, 1)
+	}
+	defer {
+		if unsafe { worker.inflight != nil } {
+			stdatomic.add_i64(&worker.inflight.n, -1)
+		}
+	}
 	// Answer every complete request now buffered (pipelining), appending each
 	// raw response to response_buffer and compacting the partial leftover. The
 	// drain PARKS the connection at the first .suspend.
@@ -410,10 +426,14 @@ fn handle_io_uring_write(worker &io_uring.Worker, cqe &io_uring.Cqe, mut env Iou
 		iou_arm_send(worker, mut *conn, ptr, usize(pending_total - conn.bytes_sent), limits)
 		return
 	}
-	// Whole response sent — the write is no longer outstanding; release the drain hold.
+	// Whole response sent — the write is no longer outstanding; release the drain
+	// hold on return, not here: the requests pipelined behind it may be answered
+	// below, and their handlers are in flight until their send is posted.
 	conn.write_deadline = 0
-	if unsafe { worker.inflight != nil } {
-		stdatomic.add_i64(&worker.inflight.n, -1)
+	defer {
+		if unsafe { worker.inflight != nil } {
+			stdatomic.add_i64(&worker.inflight.n, -1)
+		}
 	}
 	if conn.close_after_send {
 		iou_release(worker, mut *conn, active_conns, track)

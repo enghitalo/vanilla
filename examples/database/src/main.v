@@ -23,8 +23,12 @@ fn handle_request(req_buffer []u8, mut out []u8, mut pool ConnectionPool) core.S
 			}
 			return .done
 		} else if path.starts_with('/user/') {
-			id := path[6..]
-			out << get_user_controller([id], mut pool) or {
+			// The raw bytes after `/user/` (query string included) are attacker
+			// input; get_user_controller answers 400 to anything but a plain
+			// integer id (`1/**/OR/**/1=1`, `1;DELETE...`, `abc`) before it
+			// touches the database.
+			id := unsafe { tos(path.str + 6, path.len - 6) } // view, no copy
+			out << get_user_controller(id, mut pool) or {
 				out << response.tiny_bad_request_response
 				return .close
 			}
