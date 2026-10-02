@@ -46,12 +46,13 @@ fn new_access_log(path string) !&AccessLog {
 }
 
 // access_log_mw returns a Middleware that logs one line per request. The log is
-// captured by pointer and shared across all workers.
+// captured by pointer and shared across all workers. Every handler input
+// reaches `next` unchanged.
 fn access_log_mw(log &AccessLog) Middleware {
 	return fn [log] (next Handler) Handler {
 		return fn [log, next] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 			start := out.len
-			step := next(req_buffer, mut out, -1, unsafe { nil }, mut event_loop)
+			step := next(req_buffer, mut out, client_fd, worker_state, mut event_loop)
 			if step != .done {
 				return step
 			}
