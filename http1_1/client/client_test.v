@@ -116,3 +116,211 @@ fn test_case_insensitive_content_length() {
 	buf := 'HTTP/1.1 200 OK\r\ncOnTeNt-LeNgTh: 3\r\n\r\nabc'.bytes()
 	assert frame_response(buf) == buf.len
 }
+
+// The field-value view (#186 policy, mirrored from the server's request
+// parser): OWS (SP / HTAB) before and after a value is not part of it
+// (RFC 9112 §5.1, RFC 9110 §5.6.3); whitespace inside the value stays.
+fn test_header_value_trims_ows() {
+	cases := [
+		['X-A: a \r\n', 'a'],
+		['X-A:\ta\t\r\n', 'a'],
+		['X-A: \t a , b \t \r\n', 'a , b'],
+		['X-A:a\r\n', 'a'],
+		['X-A: Bearer x.y \r\n', 'Bearer x.y'],
+	]
+	for c in cases {
+		buf := 'HTTP/1.1 200 OK\r\n${c[0]}Content-Length: 0\r\n\r\n'.bytes()
+		s, l := header_value(buf, 'x-a')
+		assert s >= 0, c[0]
+		assert buf[s..s + l].bytestr() == c[1], c[0]
+	}
+}
+
+// An empty value, with or without OWS, is found with a zero length, not -1.
+fn test_header_value_empty_with_ows() {
+	for line in ['X-Empty:\r\n', 'X-Empty: \t \r\n', 'X-Empty:\t\r\n'] {
+		buf := 'HTTP/1.1 204 No Content\r\n${line}\r\n'.bytes()
+		s, l := header_value(buf, 'x-empty')
+		assert s >= 0, line
+		assert l == 0, line
+	}
+}
+
+// On bytes that never went through frame_response, a value still ends at its
+// own LF: it never contains the LF or the next field line, and a lookup never
+// reads past a blank line.
+fn test_header_value_bounded_by_line() {
+	buf := 'HTTP/1.1 200 OK\r\nX-Foo: a\nX-Bar: b\r\n\r\n'.bytes()
+	s, l := header_value(buf, 'x-foo')
+	assert buf[s..s + l].bytestr() == 'a'
+	b, bl := header_value(buf, 'x-bar')
+	assert buf[b..b + bl].bytestr() == 'b'
+	past := 'HTTP/1.1 200 OK\r\nX-Foo: a\n\nX-Bar: b\r\n\r\n'.bytes()
+	m, _ := header_value(past, 'x-bar')
+	assert m == -1
+}
+
+// OWS around the Content-Length value is valid (RFC 9112 §5.1 + §6.2) and must
+// frame, not be err_malformed. Same for Transfer-Encoding.
+fn test_frame_content_length_with_ows() {
+	for cl in ['Content-Length: 5 ', 'Content-Length:\t5', 'Content-Length: \t5\t ', 'Content-Length:5'] {
+		buf := 'HTTP/1.1 200 OK\r\n${cl}\r\n\r\nhello'.bytes()
+		total := frame_response(buf)
+		assert total == buf.len, cl
+		assert frame_response(buf[..buf.len - 1]) == incomplete, cl
+		mut body := []u8{}
+		assert append_body(mut body, buf, total), cl
+		assert body.bytestr() == 'hello', cl
+	}
+	te := '${chunked_head.replace('Transfer-Encoding: chunked', 'Transfer-Encoding:\tchunked ')}5\r\nhello\r\n0\r\n\r\n'.bytes()
+	assert frame_response(te) == te.len
+	// Only OWS is trimmed: a value that is all OWS is still an empty Content-Length,
+	// and a non-digit inside the value is still rejected.
+	assert frame_response('HTTP/1.1 200 OK\r\nContent-Length: \t \r\n\r\n'.bytes()) == err_malformed
+	assert frame_response('HTTP/1.1 200 OK\r\nContent-Length: 5 5\r\n\r\nhello'.bytes()) == err_malformed
+	// Duplicates compare the trimmed values.
+	dup := 'HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length:\t5 \r\n\r\nhello'.bytes()
+	assert frame_response(dup) == dup.len
+}
+
+// A bare LF in the head is err_malformed (RFC 9112 §2.2 lets a recipient
+// choose; rejecting keeps the client from seeing a field line, or a head end,
+// that another hop does not). Covers the status line, field lines and the blank
+// line, and rejects as soon as the bare LF is buffered: never `incomplete`.
+fn test_frame_bare_lf_rejected() {
+	heads := [
+		'HTTP/1.1 200 OK\nContent-Length: 2\r\n\r\nok',
+		'HTTP/1.1 200 OK\r\nX: a\nContent-Length: 2\r\n\r\nok',
+		'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\nok',
+		'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\nokHTTP/1.1 200 OK\r\n\r\n',
+		'HTTP/1.1 200 OK\r\nContent-Length: 2\n\r\nok',
+		'\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok',
+		'HTTP/1.1 200 OK\r\nX: a\nContent-Length: 2', // head still incomplete
+		// The TE value used to run into the next line and find 'chunked' there.
+		'HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\nX: chunked\r\n\r\n0\r\n\r\n',
+		// Bodyless statuses walk their field lines too.
+		'HTTP/1.1 204 No Content\r\nX: a\n\r\n',
+		'HTTP/1.1 100 Continue\n\r\n',
+	]
+	for h in heads {
+		got := frame_response(h.bytes())
+		assert got == err_malformed, '${h.bytes()} framed to ${got}'
+	}
+}
+
+// chunk-size = 1*HEXDIG [ chunk-ext ] CRLF (RFC 9112 §7.1, §7.1.1): the server
+// framer's rules (#185). Every one of these is err_malformed.
+fn test_frame_chunked_strict_size_line() {
+	bad := [
+		'\r\n\r\n', // empty chunk-size
+		';ext\r\n\r\n', // extension, no size
+		'5\nhello\r\n0\r\n\r\n', // bare LF ends the size line
+		'5\rZZ\nhello\r\n0\r\n\r\n', // junk between CR and LF
+		'5;a\rb\r\nhello\r\n0\r\n\r\n', // bare CR inside an extension
+		'5;a\nXXXXX\r\nhello\r\n0\r\n\r\n', // bare LF after an extension
+		'5\r\nhello\r\n0\n\r\n', // bare LF ends the last-chunk line
+		' 5\r\nhello\r\n0\r\n\r\n', // leading SP
+		'5 \r\nhello\r\n0\r\n\r\n', // trailing SP (BWS only precedes `;`)
+		'+5\r\nhello\r\n0\r\n\r\n',
+		'0x5\r\nhello\r\n0\r\n\r\n',
+		'5;\r\nhello\r\n0\r\n\r\n', // `;` with no name
+		'5;bad[=x\r\nhello\r\n0\r\n\r\n', // non-token name
+		'5;\x00ext\r\nhello\r\n0\r\n\r\n', // NUL in an extension
+		'5;a=\r\nhello\r\n0\r\n\r\n', // `=` with no value
+		'5;a="x\r\nhello\r\n0\r\n\r\n', // unterminated quoted-string
+		'5;a="x\x01"\r\nhello\r\n0\r\n\r\n', // control byte in a quoted-string
+		'5;a \r\nhello\r\n0\r\n\r\n', // trailing BWS after a name
+		'5;a=b c\r\nhello\r\n0\r\n\r\n', // two tokens, no `;`
+		'${'0'.repeat(16)}5\r\nhello\r\n0\r\n\r\n', // 17 digits
+	]
+	for b in bad {
+		buf := (chunked_head + b).bytes()
+		assert frame_response(buf) == err_malformed, 'must be malformed: ${b.bytes()}'
+	}
+}
+
+// Trailer lines follow the same rules: CRLF line ends, field-line syntax. Each
+// of the pipelined shapes used to swallow the next response as trailer lines.
+fn test_frame_chunked_malformed_trailer() {
+	next := 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'
+	bad := [
+		'5\r\nhello\r\n0\r\n\n', // bare LF closes the trailer section
+		'5\r\nhello\r\n0\r\n\n${next}',
+		'5\r\nhello\r\n0\r\nX-A: b\n\r\n', // bare LF ends a trailer line
+		'5\r\nhello\r\n0\r\nX-A: b\rc\r\n\r\n', // bare CR in a value
+		'5\r\nhello\r\n0\r\nX-A: b\r\r\n${next}',
+		'5\r\nhello\r\n0\r\nX-A: b\r\n c\r\n\r\n', // obs-fold
+		'5\r\nhello\r\n0\r\nHTTP/1.1 200 OK\r\n\r\n', // not a field-line
+		'5\r\nhello\r\n0\r\n: b\r\n\r\n', // empty field-name
+		'5\r\nhello\r\n0\r\nX-A : b\r\n\r\n', // SP before the colon
+		'5\r\nhello\r\n0\r\nX-A: b\x00\r\n\r\n', // NUL in a value
+	]
+	for b in bad {
+		buf := (chunked_head + b).bytes()
+		assert frame_response(buf) == err_malformed, 'must be malformed: ${b.bytes()}'
+	}
+}
+
+// What stays accepted, and decodes: extensions (RFC 9112 §7.1.1, incl. BWS and
+// a quoted value), upper- and lower-case hex, leading zeros, trailer fields.
+fn test_frame_chunked_allowed_shapes() {
+	good := [
+		['5;name=value\r\nhello\r\n0\r\n\r\n', 'hello'],
+		['5;a;b=c;d="q"\r\nhello\r\n0\r\n\r\n', 'hello'],
+		['5 ; a = "x \\" y\t" ;b\r\nhello\r\n0\r\n\r\n', 'hello'],
+		['5\t;a\r\nhello\r\n0\r\n\r\n', 'hello'],
+		['A\r\n0123456789\r\n0\r\n\r\n', '0123456789'],
+		['a\r\n0123456789\r\n0\r\n\r\n', '0123456789'],
+		['${'0'.repeat(15)}5\r\nhello\r\n0;last\r\n\r\n', 'hello'],
+		['0\r\n\r\n', ''],
+		['5\r\nhello\r\n000;x=1\r\nX-A: b\r\nX-Sig:\t"a, b" \r\nX-Empty:\r\n\r\n', 'hello'],
+	]
+	for g in good {
+		buf := (chunked_head + g[0]).bytes()
+		total := frame_response(buf)
+		assert total == buf.len, 'must frame: ${g[0]}'
+		mut body := []u8{}
+		assert append_body(mut body, buf, total), g[0]
+		assert body.bytestr() == g[1], g[0]
+	}
+}
+
+// A trailer section ends the message at its closing CRLF: a pipelined response
+// behind it is framed on its own.
+fn test_frame_chunked_trailer_then_pipelined() {
+	first := '${chunked_head}5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n'
+	next := 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'
+	buf := (first + next).bytes()
+	total := frame_response(buf)
+	assert total == first.len
+	assert frame_response(buf[total..]) == next.len
+}
+
+// Every strict prefix of a valid response is `incomplete`: never err_malformed,
+// never framed early. The verdict must not depend on how bytes were segmented.
+fn test_frame_split_fuzz() {
+	responses := [
+		'HTTP/1.1 200 OK\r\nContent-Length: 5 \r\nX-A:\tb\t\r\n\r\nhello',
+		'HTTP/1.1 204 No Content\r\nX-A: b\r\n\r\n',
+		'${chunked_head}${'0'.repeat(15)}4;a="b;c" ;d\r\nWiki\r\n0;z\r\nX-Checksum: abc\r\nX-B: c\r\n\r\n',
+	]
+	for r in responses {
+		full := r.bytes()
+		assert frame_response(full) == full.len, r
+		for cut in 0 .. full.len {
+			got := frame_response(full[..cut])
+			assert got == incomplete, 'prefix ${cut} of ${r.bytes()} framed to ${got}'
+		}
+	}
+}
+
+// The tchar bitmaps match RFC 9110 §5.6.2 for every byte.
+fn test_chunk_tchar_table() {
+	specials := "!#$%&'*+-.^_`|~"
+	for c in 0 .. 256 {
+		b := u8(c)
+		want := (b >= `0` && b <= `9`) || (b >= `a` && b <= `z`) || (b >= `A` && b <= `Z`)
+			|| specials.index_u8(b) >= 0
+		assert chunk_tchar(b) == want, 'byte ${c}'
+	}
+}
