@@ -40,8 +40,11 @@ fn C.close(fd int) int
 fn C.getaddrinfo(node &char, service &char, hints &C.addrinfo, res &&C.addrinfo) int
 fn C.freeaddrinfo(res &C.addrinfo)
 
-// dial resolves host:port (getaddrinfo) and opens a blocking TCP connection.
-fn dial(host string, port int) !int {
+// dial resolves host:port (getaddrinfo) and opens a TCP connection. Blocking,
+// unless `nonblocking`: then the socket is O_NONBLOCK before connect(), which
+// may still be in flight on return (EINPROGRESS) — the re-dial path (redial.v)
+// finishes it without waiting on the network.
+fn dial(host string, port int, nonblocking bool) !int {
 	mut hints := C.addrinfo{}
 	unsafe { vmemset(&hints, 0, int(sizeof(hints))) }
 	hints.ai_family = C.AF_UNSPEC
@@ -58,7 +61,15 @@ fn dial(host string, port int) !int {
 	if fd < 0 {
 		return error('pg: socket() failed')
 	}
-	if C.connect(fd, res.ai_addr, u32(res.ai_addrlen)) != 0 {
+	if nonblocking {
+		flags := C.fcntl(fd, C.F_GETFL, 0)
+		if flags < 0 || C.fcntl(fd, C.F_SETFL, flags | int(C.O_NONBLOCK)) < 0 {
+			C.close(fd)
+			return error('pg: fcntl(O_NONBLOCK) failed')
+		}
+	}
+	if C.connect(fd, res.ai_addr, u32(res.ai_addrlen)) != 0
+		&& !(nonblocking && C.errno == C.EINPROGRESS) {
 		C.close(fd)
 		return error('pg: connect to ${host}:${port} failed')
 	}
@@ -74,9 +85,27 @@ pub:
 	database string
 }
 
+// LinkState is a connection's health. A live connection is .ready. It turns
+// .broken the moment it is known lost: EOF, a socket error, a FATAL/PANIC
+// ErrorResponse, or an exclusive borrower releasing it with a query still in
+// flight (its reply stream can no longer be matched to queries). A broken
+// connection takes no new query and fails what is still in flight — after
+// delivering every reply already buffered — and its pool then re-dials it
+// through .connecting and .starting back to .ready, without blocking
+// (redial.v).
+enum LinkState {
+	ready
+	broken
+	connecting // re-dial: non-blocking connect() in flight
+	starting   // re-dial: StartupMessage sent, authenticating until ReadyForQuery
+}
+
 pub struct PgConn {
 mut:
 	fd       int = -1 // the raw socket fd
+	state    LinkState
+	fatal    PgError // the FATAL/PANIC that ended the session (sqlstate '' if none)
+	loss     string  // why the connection was lost, as seen from this side
 	recv_buf []u8
 	recv_pos int // async read cursor: [recv_pos, recv_buf.len) is received-but-unframed
 	// In-flight non-blocking query state. The connection pipelines up to
@@ -101,6 +130,12 @@ mut:
 	// Allocated once (lazy), reset to len 0 each submit, grows to a high-water mark —
 	// so a submit never allocates a throwaway frame (which would leak under -gc none).
 	submit_scratch []u8
+	// Re-dial bookkeeping (redial.v), touched only while the connection is not
+	// .ready: the SCRAM exchange in progress, the earliest next attempt after a
+	// failed one, and the deadline of the attempt in flight (monotonic ns).
+	scram         ScramClient
+	retry_at      u64
+	dial_deadline u64
 }
 
 struct Msg {
@@ -111,21 +146,58 @@ struct Msg {
 // PgConn.connect opens a TCP connection and runs the startup + SCRAM-SHA-256
 // handshake, returning once the server reports ReadyForQuery.
 pub fn PgConn.connect(cfg ConnConfig) !PgConn {
-	fd := dial(cfg.host, cfg.port)!
+	fd := dial(cfg.host, cfg.port, false)!
 	mut c := PgConn{
 		fd:       fd
 		recv_buf: []u8{cap: 16 * 1024}
 	}
-	c.handshake(cfg)!
+	c.handshake(cfg) or {
+		C.close(fd)
+		return err
+	}
 	return c
 }
 
 // close sends a best-effort Terminate and closes the socket.
 pub fn (mut c PgConn) close() {
-	mut out := []u8{}
-	write_terminate(mut out)
-	c.send(out) or {}
+	if c.fd < 0 {
+		return // lost and not re-dialed: no socket left
+	}
+	if c.state == .ready {
+		mut out := []u8{}
+		write_terminate(mut out)
+		c.send(out) or {}
+	}
 	C.close(c.fd)
+	c.fd = -1
+	c.state = .broken
+}
+
+// is_broken reports whether the connection is unusable: lost (EOF, socket
+// error, a FATAL/PANIC from the server) or still being re-dialed by its pool.
+// After a query error it tells a lost connection — retry on another one; the
+// pool re-dials this one — from a statement error on a healthy connection
+// (see PgError for the SQLSTATE).
+pub fn (c &PgConn) is_broken() bool {
+	return c.state != .ready
+}
+
+// lose marks a live connection broken, recording why. The first cause wins:
+// a later symptom (the EOF after a FATAL) does not overwrite it.
+fn (mut c PgConn) lose(reason string) {
+	if c.state == .ready {
+		c.state = .broken
+		c.loss = reason
+	}
+}
+
+// loss_error is the error a lost connection reports for a query that cannot
+// complete: the FATAL the server ended the session with, when it sent one.
+fn (c &PgConn) loss_error() IError {
+	if c.fatal.sqlstate != '' {
+		return c.fatal
+	}
+	return error('pg: ${c.loss}')
 }
 
 fn (mut c PgConn) send(data []u8) ! {
@@ -170,22 +242,32 @@ fn (mut c PgConn) handshake(cfg ConnConfig) ! {
 	mut scram := ScramClient.new(cfg.user, cfg.password)!
 	for {
 		msg := c.read_msg()!
-		match msg.typ {
-			bt_authentication {
-				c.handle_auth(msg.payload, mut scram)!
-			}
-			bt_error_response {
-				info := parse_error_response(msg.payload)
-				return error('pg: startup failed: ${info.message.bytestr()} (SQLSTATE ${info.code.bytestr()})')
-			}
-			bt_ready_for_query {
-				return
-			}
-			else {
-				// ParameterStatus / BackendKeyData / NoticeResponse — ignored.
-			}
+		if c.on_startup_msg(msg.typ, msg.payload, mut scram)! {
+			return
 		}
 	}
+}
+
+// on_startup_msg handles one backend message of the startup / authentication
+// exchange, answering the SCRAM steps; true once ReadyForQuery arrives. Shared
+// by the blocking handshake and the non-blocking re-dial (redial.v).
+fn (mut c PgConn) on_startup_msg(typ u8, payload []u8, mut scram ScramClient) !bool {
+	match typ {
+		bt_authentication {
+			c.handle_auth(payload, mut scram)!
+		}
+		bt_error_response {
+			info := parse_error_response(payload)
+			return error('pg: startup failed: ${info.message.bytestr()} (SQLSTATE ${info.code.bytestr()})')
+		}
+		bt_ready_for_query {
+			return true
+		}
+		else {
+			// ParameterStatus / BackendKeyData / NoticeResponse — ignored.
+		}
+	}
+	return false
 }
 
 fn (mut c PgConn) handle_auth(payload []u8, mut scram ScramClient) ! {
@@ -232,10 +314,16 @@ pub fn (mut c PgConn) query(query_text string, params []?[]u8) !Result {
 
 	mut frames := []u8{}
 	mut rows_affected := u64(0)
-	mut server_error := ''
-	mut sqlstate := ''
+	mut server_error := PgError{}
+	mut failed := false
 	for {
-		msg := c.read_msg()!
+		msg := c.read_msg() or {
+			c.lose('connection closed by server')
+			if failed {
+				return server_error // the statement's own error came before the close
+			}
+			return err
+		}
 		match msg.typ {
 			bt_ready_for_query {
 				break
@@ -245,8 +333,17 @@ pub fn (mut c PgConn) query(query_text string, params []?[]u8) !Result {
 			}
 			bt_error_response {
 				info := parse_error_response(msg.payload)
-				server_error = info.message.bytestr()
-				sqlstate = info.code.bytestr()
+				server_error = PgError{
+					severity: info.severity.bytestr()
+					sqlstate: info.code.bytestr()
+					message:  info.message.bytestr()
+				}
+				failed = true
+				if ends_session(info.severity) {
+					c.fatal = server_error
+					c.lose('connection closed by server')
+					return server_error // no ReadyForQuery follows a FATAL/PANIC
+				}
 			}
 			else {}
 		}
@@ -258,8 +355,8 @@ pub fn (mut c PgConn) query(query_text string, params []?[]u8) !Result {
 		framed << msg.payload
 		frames << framed
 	}
-	if server_error != '' {
-		return error('pg: query failed: ${server_error} (SQLSTATE ${sqlstate})')
+	if failed {
+		return server_error
 	}
 	return Result{
 		frames:        frames
