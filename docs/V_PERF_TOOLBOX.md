@@ -120,6 +120,50 @@ Already used here for the per-worker epoll fd arrays
   precompute `const` keys, parse ints in place, and append into a reused buffer.
   Corollary: confirm perf changes on a high-core run, not just a laptop.
 
+## Appending a static response
+
+Measured on a 102-byte `200 OK … Hello, World!` response appended to a reused
+`out` (`-prod -gc none`, Ryzen 7 5800H, best of 7 × 100M appends, V 0.5.2 0137eb5):
+
+| const and append | ns/append |
+|---|---|
+| `r = '…'.bytes()`, `out << r` | 5.1 |
+| `r = '…'`, `unsafe { out.push_many(r.str, r.len) }` | 5.1–5.2 |
+| `r = [u8(…), …]!`, `unsafe { out.push_many(&r[0], r.len) }` | 5.2–5.4 |
+| `r = '…'`, `append_static(mut out, r)` (below) | 2.7–2.8 |
+
+- **The call matters, not the storage.** `<<` and `push_many` go through the generic
+  `array__push_many` / `array_push_many_ptr` (`ensure_cap`, a size multiply,
+  `memcpy@plt`), which is never inlined. So a `.bytes()` const, a string const and a
+  fixed `[N]u8` cost the same, and a fixed array's compile-time length buys nothing.
+- **gcc already knows a `const` string's bytes and length.** Inlined, the append is
+  `add $0x66` plus six 16-byte `movups`, the same code as for a fixed `[N]u8`. A
+  `.bytes()` const can't get there: its data is a heap copy made at startup, so even
+  an inlined append calls `memcpy` (4.7–4.9 ns).
+- **Don't slice a fixed array to append it.** `out << fixed[..]` builds a new heap
+  array on every call (`new_array_from_c_array` + `array_slice`), `-prod` included;
+  under `-gc none` that is a per-request leak.
+
+```v
+// append_static appends a const string without a call into the generic array code.
+@[inline]
+fn append_static(mut out []u8, s string) {
+	if out.len + s.len > out.cap {
+		out.grow_cap(s.len)
+	}
+	unsafe {
+		vmemcpy(&u8(out.data) + out.len, s.str, s.len)
+		out.len += s.len
+	}
+}
+```
+
+Scale: ~2.3 ns per response, against 50–150 ns of in-process work per request
+([#239](https://github.com/enghitalo/vanilla/issues/239)) and microseconds once
+syscalls count. Worth it where a fixed response goes out on every request;
+elsewhere `.bytes()` consts are fine. A string → `[N]u8` literal (a
+`$fixed_bytes()`) would add nothing.
+
 ## Pure C escape hatch
 
 Allowed when it doesn't introduce a security problem. Good for: precise
