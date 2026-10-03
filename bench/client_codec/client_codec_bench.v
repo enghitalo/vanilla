@@ -13,6 +13,7 @@ module main
 // (Use -prod: the default debug build is not representative.)
 import benchmark
 import os
+import time
 import http1_1.client
 
 const cl_response = ('HTTP/1.1 200 OK\r\n' + 'Content-Type: application/json\r\n' +
@@ -90,5 +91,89 @@ fn main() {
 	}
 	b.measure('append_body (chunked de-chunk)')
 
+	mut fr := client.Framer{}
+	for _ in 0 .. iterations {
+		fr.reset(false)
+		acc += i64(fr.feed(cl_response, false))
+	}
+	b.measure('Framer.feed (Content-Length)')
+
+	for _ in 0 .. iterations {
+		fr.reset(false)
+		acc += i64(fr.feed(chunked_response, false))
+	}
+	b.measure('Framer.feed (chunked)')
+
+	mut scratch := []u8{cap: chunked_response.len}
+	for _ in 0 .. iterations {
+		scratch.clear()
+		unsafe { scratch.push_many(chunked_response.data, chunked_response.len) }
+		fr.reset(false)
+		fr.feed(scratch, false)
+		acc += fr.body_in_place(mut scratch).len
+	}
+	b.measure('Framer.body_in_place (chunked, copy + de-chunk)')
+
+	acc += reframing_cost()
 	println('\nacc = ${acc} (ignore)')
+}
+
+// reframing_cost frames a ~1.44 MB response of 65,536 16-byte chunks (#229's
+// repro) after every 4 KiB "recv": frame_response from byte 0 each time
+// (quadratic) versus one Framer fed the growing buffer (linear). The best of
+// several runs; the Framer must stay within 2× of one feed on the whole buffer.
+fn reframing_cost() i64 {
+	mut resp := []u8{cap: 1_500_000}
+	resp << 'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n'.bytes()
+	for _ in 0 .. 65536 {
+		resp << '10\r\n0123456789abcdef\r\n'.bytes()
+	}
+	resp << '0\r\n\r\n'.bytes()
+	mut acc := i64(0)
+	mut best_old := i64(-1)
+	mut best_inc := i64(-1)
+	mut best_one := i64(-1)
+	mut fr := client.Framer{}
+	for _ in 0 .. 7 {
+		mut sw := time.new_stopwatch()
+		for cut := 4096; true; cut += 4096 {
+			end := if cut > resp.len { resp.len } else { cut }
+			got := client.frame_response(unsafe { resp[..end] })
+			acc += got
+			if got != client.incomplete || end == resp.len {
+				break
+			}
+		}
+		best_old = min_ns(best_old, sw.elapsed().nanoseconds())
+		sw = time.new_stopwatch()
+		fr.reset(false)
+		for cut := 4096; true; cut += 4096 {
+			end := if cut > resp.len { resp.len } else { cut }
+			got := fr.feed(unsafe { resp[..end] }, false)
+			acc += got
+			if got != client.incomplete || end == resp.len {
+				break
+			}
+		}
+		best_inc = min_ns(best_inc, sw.elapsed().nanoseconds())
+		sw = time.new_stopwatch()
+		fr.reset(false)
+		got := fr.feed(resp, false)
+		best_one = min_ns(best_one, sw.elapsed().nanoseconds())
+		if got != resp.len {
+			panic('reframing fixture does not frame: ${got}')
+		}
+		acc += got
+	}
+	println('\nre-framing ${resp.len} B (65536 chunks) after every 4 KiB, best of 7:')
+	println('  frame_response from byte 0 each time: ${f64(best_old) / 1000.0:10.1f} us')
+	println('  Framer.feed, resumed each time:       ${f64(best_inc) / 1000.0:10.1f} us')
+	println('  Framer.feed, once on the whole:       ${f64(best_one) / 1000.0:10.1f} us')
+	ratio := f64(best_inc) / f64(best_one)
+	println('  resumed / once = ${ratio:.2f}x (#229 bound: <= 2x)')
+	return acc
+}
+
+fn min_ns(best i64, ns i64) i64 {
+	return if best < 0 || ns < best { ns } else { best }
 }
