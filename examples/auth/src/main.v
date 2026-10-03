@@ -22,7 +22,7 @@ module main
 //
 // BYTE DISCIPLINE (docs/BEST_PRACTICES.md §2/§3, docs/V_PERF_TOOLBOX.md):
 //   - NEVER concatenate or interpolate — not even on the slow path. Response
-//     bytes are appended straight into `out` (`ws`/`wi`, §3b); the JWT is
+//     bytes are appended straight into `out` (`core.append_str`/`wi`, §3b); the JWT is
 //     assembled in ONE strings.Builder, no `+`, no `${}`.
 //   - VIEWS, NOT COPIES: password, API key and bearer token are zero-copy
 //     views into the request buffer (`vbytes`); jwt_verify scans view
@@ -197,12 +197,12 @@ fn check_api_key(key []u8) bool {
 }
 
 // ---- static responses (consts — the fast path appends, never builds) -------
-const resp_ok_empty = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const resp_401_bearer = 'HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const resp_401 = 'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const resp_404 = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const resp_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: POST\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const resp_503 = 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const resp_ok_empty = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const resp_401_bearer = 'HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const resp_401 = 'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const resp_404 = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const resp_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: POST\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const resp_503 = 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 // write_token_200 mints a fresh JWT and appends the 200 response. Shared by the
 // synchronous /token path (fallback) and the async resume (token_done) so both
@@ -215,20 +215,14 @@ fn write_token_200(mut out []u8) {
 	payload.write_decimal(time.unix_now() + 3600)
 	payload.write_u8(`}`)
 	token := jwt_sign(payload)
-	ws(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ')
+	core.append_str(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ')
 	wi(mut out, token.len + 12) // len of {"token":""} wrapper = 12
-	ws(mut out, '\r\nConnection: keep-alive\r\n\r\n{"token":"')
+	core.append_str(mut out, '\r\nConnection: keep-alive\r\n\r\n{"token":"')
 	out << token
-	ws(mut out, '"}')
+	core.append_str(mut out, '"}')
 }
 
 // ---- zero-alloc append helpers (BEST_PRACTICES §3b) -------------------------
-// ws appends a string's bytes straight into `out` — no allocation.
-@[inline]
-fn ws(mut out []u8, s string) {
-	unsafe { out.push_many(s.str, s.len) }
-}
-
 // wi appends n's decimal digits into `out` — itoa into a stack scratch, then
 // append. No allocation, no `.str()`.
 fn wi(mut out []u8, n i64) {
@@ -294,11 +288,11 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, m
 		// handle() with worker_state == nil and reads the response on return, so
 		// that path stays synchronous. See offload_nix.c.v.
 		if !slice_eq(req.buffer, req.method, 'POST') {
-			out << resp_405
+			core.append_str(mut out, resp_405)
 			return .done
 		}
 		if req.body.len <= 0 {
-			out << resp_401 // empty password: reject before paying for argon2
+			core.append_str(mut out, resp_401) // empty password: reject before paying for argon2
 			return .done
 		}
 		password := unsafe { (&req.buffer[req.body.start]).vbytes(req.body.len) } // view
@@ -310,42 +304,42 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, m
 				if try_offload(worker_state, password, mut event_loop) {
 					return .suspend
 				}
-				out << resp_503 // pool saturated: shed load rather than block the worker
+				core.append_str(mut out, resp_503) // pool saturated: shed load rather than block the worker
 				return .done
 			}
 		}
 		// Fallback — synchronous verify on this worker. Taken by the unit test
 		// (nil worker_state) and by any backend with no watch reactor (IOCP).
 		if !verify_password(password, demo_password_phc) {
-			out << resp_401
+			core.append_str(mut out, resp_401)
 			return .done
 		}
 		write_token_200(mut out)
 	} else if slice_eq(req.buffer, req.path, '/protected') {
 		// FAST PATH — per-request JWT check over a view, const responses.
 		if !jwt_verify(bearer_token(req)) {
-			out << resp_401_bearer
+			core.append_str(mut out, resp_401_bearer)
 			return .done
 		}
-		out << resp_ok_empty
+		core.append_str(mut out, resp_ok_empty)
 	} else if slice_eq(req.buffer, req.path, '/service') {
 		// FAST PATH — API-key check over a view of the header bytes.
 		s := req.get_header_value_slice('X-API-Key') or {
-			out << resp_401
+			core.append_str(mut out, resp_401)
 			return .done
 		}
 		if s.len <= 0 {
-			out << resp_401
+			core.append_str(mut out, resp_401)
 			return .done
 		}
 		key := unsafe { (&req.buffer[s.start]).vbytes(s.len) } // view
 		if !check_api_key(key) {
-			out << resp_401
+			core.append_str(mut out, resp_401)
 			return .done
 		}
-		out << resp_ok_empty
+		core.append_str(mut out, resp_ok_empty)
 	} else {
-		out << resp_404
+		core.append_str(mut out, resp_404)
 	}
 	return .done
 }

@@ -112,46 +112,49 @@ allocation — to format them. On a per-request response builder that overhead i
 real and adds GC pressure. The core proves the pattern: it never interpolates to
 build responses.
 
-### 3a. Static responses → precompute as `const ... .bytes()`
+### 3a. Static responses → a `const` string, appended with `core.append_str`
 
-If a response never changes, build it **once at compile time** and send the
-bytes directly. This is exactly what the core does
-([response.c.v](../http1_1/response/response.c.v)):
+If a response never changes, write it **once, as a `const` string**, and append
+it with [`core.append_str`](../core/append_str.v):
 
 ```v
-const status_413_response = 'HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
+const resp_404 = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+
+core.append_str(mut out, resp_404)
 ```
 
-No allocation, no formatting — ever.
+No allocation, no formatting — ever. A `const` string is static data, and the
+inlined append compiles to a few fixed-size moves: 2.5 ns for a 102-byte
+response against 4.7 ns for `out << resp` with a `const ... .bytes()`, whose
+bytes are also copied to the heap at startup
+([V_PERF_TOOLBOX.md](V_PERF_TOOLBOX.md#appending-a-static-response)). Keep
+`.bytes()` for a const used as a `[]u8` value — returned, compared, compressed,
+or passed to `C.send` — and for the library's public `[]u8` consts
+(`out << response.status_413_response`).
 
 ### 3b. Dynamic responses → append parts straight into `out`
 
 For responses with dynamic values, append the literal segments and the integers
 **directly into `out`** — no intermediate `strings.Builder`, no return-then-copy.
-Two tiny no-alloc helpers are all you need: one that pushes a string's bytes, and
-one that writes an integer's decimal digits (itoa into a stack scratch).
+`core.append_str` pushes a string's bytes; for integers, `strconv.write_dec` (or a
+small local `wi`, itoa into a stack scratch) writes the decimal digits.
 
 ```v
-@[inline]
-fn ws(mut out []u8, s string) {
-    unsafe { out.push_many(s.str, s.len) } // append bytes, no allocation
-}
-
 fn wi(mut out []u8, n i64) { /* itoa into a stack buffer, append digits */ }
 
 fn write_json(mut out []u8, body string) {
-    ws(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ')
+    core.append_str(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ')
     wi(mut out, i64(body.len)) // no .str(), no alloc
-    ws(mut out, '\r\nConnection: keep-alive\r\n\r\n')
-    ws(mut out, body)
+    core.append_str(mut out, '\r\nConnection: keep-alive\r\n\r\n')
+    core.append_str(mut out, body)
 }
 ```
 
 A `strings.new_builder` (seeded with `header_overhead + body.len`, written via
 `write_string`/`write_decimal`) is still fine where you genuinely need a `string`
 result — but on the response hot path, appending into `out` avoids the builder
-allocation *and* the builder→`out` copy. **Fully static** responses should be a
-precomputed `const ... .bytes()` appended with `out << the_const`.
+allocation *and* the builder→`out` copy. **Fully static** responses are a `const`
+string appended with `core.append_str` (§3a).
 
 Two things that make the builder go further when a dynamic string is
 unavoidable:
@@ -162,7 +165,7 @@ unavoidable:
   the builder directly, then appends the signature: one buffer, zero
   intermediate strings — and `return sb` satisfies a `[]u8` return type.
 - **"Slow route" is not an excuse to concatenate.** A login route that pays
-  ~200 ms of argon2id still frames its response with `ws`/`wi` and builds its
+  ~200 ms of argon2id still frames its response with `core.append_str`/`wi` and builds its
   JWT in one builder. Rules stay simple by having no carve-outs; the only
   place `${}` belongs is off-path diagnostics (below).
 
@@ -200,7 +203,7 @@ sb.write_string('Content-Length: ${body.len}\r\n')
 
 **Worked example — the `Date` header.** `examples/date_header`, `examples/efficient_date`
 and `examples/async_date_timerfd` cache the 1-second-resolution `Date` line and just
-append it. `date_header` now builds the response from two `const ... .bytes()` halves +
+append it. `date_header` now builds the response from two `const` string halves +
 the cached line appended straight into `out` — no per-request `strings.Builder` (which
 also leaked under `-gc none`, §4). `efficient_date` checks the current second with a
 cheap `C.time()` instead of constructing a full calendar `time.utc()` on every request.
@@ -221,7 +224,7 @@ valuable for latency/headroom — **not** raw req/s. Correct, cheap, paid once p
 > **Worked example — auth.** [examples/auth](../examples/auth/src/main.v) applies the
 > same byte discipline where responses *can't* all be consts: argon2id login
 > (slow by design), JWT signed in a single builder, verification over
-> `vbytes`/`tos` views of the token, `ws`/`wi` framing the one dynamic response.
+> `vbytes`/`tos` views of the token, `core.append_str`/`wi` framing the one dynamic response.
 
 ---
 
@@ -247,7 +250,7 @@ The recurring zero-allocation patterns:
 - **Borrow, don't copy** — return `tos`/slice views into the read buffer; defer
   `.clone()`/`.bytes()` until bytes must outlive the buffer (they rarely do —
   responses are built synchronously before the buffer is recycled).
-- **Append bytes directly** — `unsafe { out.push_many(s.str, s.len) }`; never
+- **Append bytes directly** — `core.append_str(mut out, s)`; never
   build an intermediate `string`/`[]u8` just to append it.
 - **Pool structs on a free-list** — reuse a heap object across requests, resetting
   its fields on release (the per-worker `ConnState` and per-request `Stash` pools

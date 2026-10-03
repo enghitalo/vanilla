@@ -783,12 +783,6 @@ fn finish_snap(v &Variant, prev &Snap, sig C.vanilla_sa_sig, mut resp []u8, tag_
 
 // ---- response construction (no Builder, no interpolation) -------------------
 
-// put appends a string's bytes.
-@[inline]
-fn put(mut out []u8, s string) {
-	unsafe { out.push_many(s.str, s.len) }
-}
-
 // put_dec appends the decimal digits of `n`, written in place (no allocation
 // once `out` has the room).
 @[inline]
@@ -815,25 +809,25 @@ fn put_hex16(mut b []u8, at int, x u64) {
 // write_200_head writes a representation's 200 header block for a body of
 // `size` bytes, with an ETag placeholder, and returns the placeholder's offset.
 fn write_200_head(mut b []u8, v &Variant, size i64) int {
-	put(mut b, 'HTTP/1.1 200 OK\r\nContent-Type: ')
-	put(mut b, v.ctype)
-	put(mut b, '\r\nContent-Length: ')
+	core.append_str(mut b, 'HTTP/1.1 200 OK\r\nContent-Type: ')
+	core.append_str(mut b, v.ctype)
+	core.append_str(mut b, '\r\nContent-Length: ')
 	put_dec(mut b, size)
-	put(mut b, '\r\n')
+	core.append_str(mut b, '\r\n')
 	if v.encoding != '' {
-		put(mut b, 'Content-Encoding: ')
-		put(mut b, v.encoding)
-		put(mut b, '\r\n')
+		core.append_str(mut b, 'Content-Encoding: ')
+		core.append_str(mut b, v.encoding)
+		core.append_str(mut b, '\r\n')
 	}
 	if v.vary {
-		put(mut b, 'Vary: Accept-Encoding\r\n')
+		core.append_str(mut b, 'Vary: Accept-Encoding\r\n')
 	}
-	put(mut b, 'Cache-Control: ')
-	put(mut b, v.cache)
-	put(mut b, '\r\nETag: ')
+	core.append_str(mut b, 'Cache-Control: ')
+	core.append_str(mut b, v.cache)
+	core.append_str(mut b, '\r\nETag: ')
 	tag_at := b.len
-	put(mut b, etag_placeholder)
-	put(mut b, '\r\nAccept-Ranges: bytes\r\nConnection: keep-alive\r\n\r\n')
+	core.append_str(mut b, etag_placeholder)
+	core.append_str(mut b, '\r\nAccept-Ranges: bytes\r\nConnection: keep-alive\r\n\r\n')
 	return tag_at
 }
 
@@ -841,15 +835,15 @@ fn write_200_head(mut b []u8, v &Variant, size i64) int {
 // the ETag, Cache-Control and Vary the 200 would have carried.
 fn build_304(etag string, cache string, vary bool) []u8 {
 	mut b := []u8{cap: head_room + cache.len}
-	put(mut b, 'HTTP/1.1 304 Not Modified\r\nETag: ')
-	put(mut b, etag)
-	put(mut b, '\r\nCache-Control: ')
-	put(mut b, cache)
-	put(mut b, '\r\n')
+	core.append_str(mut b, 'HTTP/1.1 304 Not Modified\r\nETag: ')
+	core.append_str(mut b, etag)
+	core.append_str(mut b, '\r\nCache-Control: ')
+	core.append_str(mut b, cache)
+	core.append_str(mut b, '\r\n')
 	if vary {
-		put(mut b, 'Vary: Accept-Encoding\r\n')
+		core.append_str(mut b, 'Vary: Accept-Encoding\r\n')
 	}
-	put(mut b, 'Connection: keep-alive\r\n\r\n')
+	core.append_str(mut b, 'Connection: keep-alive\r\n\r\n')
 	return b
 }
 
@@ -858,25 +852,25 @@ fn build_304(etag string, cache string, vary bool) []u8 {
 // §15.3.7: it carries the ETag, Cache-Control and Vary the 200 would have
 // carried.
 fn write_206_head(mut out []u8, asset &Asset, snap &Snap, start i64, end i64) {
-	put(mut out, 'HTTP/1.1 206 Partial Content\r\nContent-Type: ')
-	put(mut out, asset.content_type)
-	put(mut out, '\r\nContent-Range: bytes ')
+	core.append_str(mut out, 'HTTP/1.1 206 Partial Content\r\nContent-Type: ')
+	core.append_str(mut out, asset.content_type)
+	core.append_str(mut out, '\r\nContent-Range: bytes ')
 	put_dec(mut out, start)
 	out << `-`
 	put_dec(mut out, end)
 	out << `/`
 	put_dec(mut out, snap.body_len)
-	put(mut out, '\r\nContent-Length: ')
+	core.append_str(mut out, '\r\nContent-Length: ')
 	put_dec(mut out, end - start + 1)
-	put(mut out, '\r\nAccept-Ranges: bytes\r\nETag: ')
-	put(mut out, snap.etag)
-	put(mut out, '\r\nCache-Control: ')
-	put(mut out, asset.cache_control)
-	put(mut out, '\r\n')
+	core.append_str(mut out, '\r\nAccept-Ranges: bytes\r\nETag: ')
+	core.append_str(mut out, snap.etag)
+	core.append_str(mut out, '\r\nCache-Control: ')
+	core.append_str(mut out, asset.cache_control)
+	core.append_str(mut out, '\r\n')
 	if asset.negotiable {
-		put(mut out, 'Vary: Accept-Encoding\r\n')
+		core.append_str(mut out, 'Vary: Accept-Encoding\r\n')
 	}
-	put(mut out, 'Connection: keep-alive\r\n\r\n')
+	core.append_str(mut out, 'Connection: keep-alive\r\n\r\n')
 }
 
 // append_body appends bytes [off, off+length) of a disk-backed snapshot's body

@@ -73,10 +73,10 @@ fn (c &DateCache) date_line() []u8 {
 // The two STATIC halves of the response — everything except the Date line, which
 // is the only per-request-varying part (and is already pre-built in the cache).
 // Built once as consts so the hot path allocates nothing.
-const status_head = 'HTTP/1.1 200 OK\r\n'.bytes()
+const status_head = 'HTTP/1.1 200 OK\r\n'
 
 // Content-Length: 2 is the 'ok' body.
-const resp_tail = 'Content-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
+const resp_tail = 'Content-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'
 
 fn main() {
 	mut cache := &DateCache{}
@@ -107,9 +107,9 @@ fn main() {
 			// pre-built cached Date line (one atomic load, zero-copy slice) straight
 			// into the server-owned `out` buffer — no per-request strings.Builder, no
 			// copy-through an intermediate.
-			out << status_head
+			core.append_str(mut out, status_head)
 			out << cache.date_line()
-			out << resp_tail
+			core.append_str(mut out, resp_tail)
 			return .done
 		}
 	})!

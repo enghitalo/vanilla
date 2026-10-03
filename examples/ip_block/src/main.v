@@ -51,17 +51,17 @@ fn (mut b Blocklist) is_blocked(ip string) bool {
 	return blocked
 }
 
-const forbidden_response = 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
-const ok_response = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\nConnection: keep-alive\r\n\r\nallowed'.bytes()
+const forbidden_response = 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
+const ok_response = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\nConnection: keep-alive\r\n\r\nallowed'
 
 fn handle(_req_buffer []u8, mut out []u8, client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop, mut blocklist Blocklist) core.Step {
 	ip := socket.peer_addr(client_fd)
 	if blocklist.is_blocked(ip) {
 		eprintln('[ip-block] denied ${ip}')
-		out << forbidden_response
+		core.append_str(mut out, forbidden_response)
 		return .done
 	}
-	out << ok_response
+	core.append_str(mut out, ok_response)
 	return .done
 }
 

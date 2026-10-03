@@ -24,7 +24,7 @@ module main
 //   - The sid reaches the store lookup as a `tos` VIEW of the request buffer;
 //     the map only hashes/compares the key bytes and never retains them.
 //   - Static responses are consts; /login and /me frame their one dynamic part
-//     with ws/wi straight into `out` — no `${}`, no `+`, no body string.
+//     with core.append_str/wi straight into `out` — no `${}`, no `+`, no body string.
 //   - The only per-request-path allocations left are Store.create's owned
 //     strings, and those run per LOGIN, not per request (see new_token).
 import server
@@ -134,24 +134,18 @@ fn cookie_value(buf []u8, start int, len int, name string) (int, int) {
 }
 
 // ---- static responses (consts — the handler appends, never builds) ---------
-const resp_401 = 'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n'.bytes()
-const resp_404 = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n'.bytes()
+const resp_401 = 'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n'
+const resp_404 = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n'
 // /logout is FULLY static — expiring the cookie is the same bytes every time,
 // so the complete response is one const (BEST_PRACTICES §3a).
-const resp_logout = 'HTTP/1.1 200 OK\r\nSet-Cookie: sid=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0\r\nContent-Length: 0\r\n\r\n'.bytes()
+const resp_logout = 'HTTP/1.1 200 OK\r\nSet-Cookie: sid=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0\r\nContent-Length: 0\r\n\r\n'
 // /login is const-around-dynamic: everything except the 64-hex sid is literal.
 // Set-Cookie precedes Content-Length, so the length header stays a literal 0.
-const resp_login_prefix = 'HTTP/1.1 200 OK\r\nSet-Cookie: sid='.bytes()
-const resp_login_suffix = '; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400\r\nContent-Length: 0\r\n\r\n'.bytes()
-const resp_me_prefix = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '.bytes()
+const resp_login_prefix = 'HTTP/1.1 200 OK\r\nSet-Cookie: sid='
+const resp_login_suffix = '; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400\r\nContent-Length: 0\r\n\r\n'
+const resp_me_prefix = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '
 
 // ---- zero-alloc append helpers (BEST_PRACTICES §3b) -------------------------
-// ws appends a string's bytes straight into `out` — no allocation.
-@[inline]
-fn ws(mut out []u8, s string) {
-	unsafe { out.push_many(s.str, s.len) }
-}
-
 // wi appends n's decimal digits into `out` — itoa into a stack scratch, then
 // append. No allocation, no `.str()`.
 fn wi(mut out []u8, n i64) {
@@ -192,39 +186,39 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 		sid := store.create('user-42')
 		// Note ALL the security attributes on the Set-Cookie: two consts with
 		// the sid appended between them — the only dynamic bytes in the reply.
-		out << resp_login_prefix
-		ws(mut out, sid)
-		out << resp_login_suffix
+		core.append_str(mut out, resp_login_prefix)
+		core.append_str(mut out, sid)
+		core.append_str(mut out, resp_login_suffix)
 	} else if slice_eq(req.buffer, req.path, '/me') {
 		c := req.get_header_value_slice('Cookie') or {
-			out << resp_401
+			core.append_str(mut out, resp_401)
 			return .done
 		}
 		vstart, vlen := cookie_value(req.buffer, c.start, c.len, 'sid')
 		if vlen <= 0 { // absent or empty sid — also guards &buf[vstart] below
-			out << resp_401
+			core.append_str(mut out, resp_401)
 			return .done
 		}
 		// Zero-copy lookup key: a string VIEW into the request buffer. Only
 		// valid because get() never retains it — see the Store.get comment.
 		sid := unsafe { tos(&req.buffer[vstart], vlen) }
 		sess := store.get(sid) or {
-			out << resp_401
+			core.append_str(mut out, resp_401)
 			return .done
 		}
 		// {"user":"<id>"} — const head, computed Content-Length via wi, then
-		// the three body parts via ws. No intermediate body string (§3b).
-		out << resp_me_prefix
+		// the three body parts via core.append_str. No intermediate body string (§3b).
+		core.append_str(mut out, resp_me_prefix)
 		wi(mut out, i64(sess.user_id.len + 11)) // 11 = len('{"user":"') + len('"}')
-		ws(mut out, '\r\n\r\n{"user":"')
-		ws(mut out, sess.user_id)
-		ws(mut out, '"}')
+		core.append_str(mut out, '\r\n\r\n{"user":"')
+		core.append_str(mut out, sess.user_id)
+		core.append_str(mut out, '"}')
 	} else if slice_eq(req.buffer, req.path, '/logout') {
 		// Expire the cookie (Max-Age=0). A real impl also deletes the
 		// server-side session — the cookie alone is just the client half.
-		out << resp_logout
+		core.append_str(mut out, resp_logout)
 	} else {
-		out << resp_404
+		core.append_str(mut out, resp_404)
 	}
 	return .done
 }

@@ -20,7 +20,7 @@ module main
 //   - Routing compares method/path bytes IN PLACE by offsets (slice_eq) — no
 //     `.to_string()` on the hot path.
 //   - Static responses are consts appended with `out <<`; dynamic responses
-//     are framed straight into `out` with ws/wi — no `${}`, no `+`.
+//     are framed straight into `out` with core.append_str/wi — no `${}`, no `+`.
 //   - Multipart parts are VIEWS into the request buffer (tos/vbytes): parsing
 //     allocates nothing per part, and CRLF is matched as numeric bytes (13/10).
 //     The views must not outlive `req.buffer` — safe here because the response
@@ -79,12 +79,6 @@ const lf = u8(10)
 
 // ----- zero-alloc append helpers (BEST_PRACTICES §3b) -------------------------
 
-// ws appends a string's bytes straight into `out` — no allocation.
-@[inline]
-fn ws(mut out []u8, s string) {
-	unsafe { out.push_many(s.str, s.len) }
-}
-
 // wi appends n's decimal digits into `out` — itoa into a stack scratch, then
 // append. No allocation, no `.str()`.
 fn wi(mut out []u8, n i64) {
@@ -118,13 +112,13 @@ fn create_user_json(req request_parser.HttpRequest, mut out []u8) {
 		email: input.email
 	}
 	// json.encode escapes the user-controlled strings (§8 — never reflect raw
-	// input); ws/wi frame it straight into `out` — no intermediate response
+	// input); core.append_str/wi frame it straight into `out` — no intermediate response
 	// buffer, no `${}`.
 	payload := json2.encode(created, escape_unicode: true)
-	ws(mut out, 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: ')
+	core.append_str(mut out, 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: ')
 	wi(mut out, payload.len)
-	ws(mut out, '\r\nConnection: keep-alive\r\n\r\n')
-	ws(mut out, payload)
+	core.append_str(mut out, '\r\nConnection: keep-alive\r\n\r\n')
+	core.append_str(mut out, payload)
 }
 
 // ----- multipart endpoint: POST /upload ---------------------------------------
@@ -385,9 +379,9 @@ fn upload(req request_parser.HttpRequest, mut out []u8) {
 		summary.write_u8(`}`)
 	}
 	summary.write_string(']}')
-	ws(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ')
+	core.append_str(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ')
 	wi(mut out, summary.len)
-	ws(mut out, '\r\nConnection: keep-alive\r\n\r\n')
+	core.append_str(mut out, '\r\nConnection: keep-alive\r\n\r\n')
 	out << summary // Builder IS []u8 — appended directly, never re-stringified
 }
 

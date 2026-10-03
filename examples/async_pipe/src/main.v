@@ -19,14 +19,14 @@ fn C.write(fd int, buf voidptr, n usize) int
 fn C.read(fd int, buf voidptr, n usize) int
 fn C.close(fd int) int
 
-const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
+const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'
 
 // handle parks /async on a pipe read-end and answers everything else immediately.
 fn handle(req []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if req.bytestr().contains('/async') {
 		mut fds := [2]i32{} // C ints: V int is 64-bit
 		if C.pipe(unsafe { &fds[0] }) != 0 {
-			out << resp_ok
+			core.append_str(mut out, resp_ok)
 			return .done
 		}
 		// Stand in for "async work finished": make the read end readable. A real
@@ -38,7 +38,7 @@ fn handle(req []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut eve
 		event_loop.watch_fd(int(fds[0]), .readable, pipe_done, unsafe { nil })
 		return .suspend
 	}
-	out << resp_ok
+	core.append_str(mut out, resp_ok)
 	return .done
 }
 

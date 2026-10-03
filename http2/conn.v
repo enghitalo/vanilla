@@ -1,5 +1,7 @@
 module http2
 
+import core
+
 // Server-side HTTP/2 connection state machine (RFC 9113), designed to sit
 // behind the engine's connection-takeover seam (issue #136): `consume` has
 // exactly a ConnHandler's shape — bytes in, response bytes appended to the
@@ -486,7 +488,7 @@ fn (mut s StreamState) hdr_copy(v string) string {
 		return ''
 	}
 	off := s.hdr_bytes.len
-	unsafe { s.hdr_bytes.push_many(v.str, v.len) }
+	core.append_str(mut s.hdr_bytes, v)
 	return unsafe { tos(&s.hdr_bytes[off], v.len) }
 }
 

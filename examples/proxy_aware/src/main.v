@@ -171,22 +171,16 @@ fn real_client_ip(req request_parser.HttpRequest, peer string) string {
 	return if leftmost.len > 0 { leftmost } else { peer }
 }
 
-// ---- response (consts + ws/wi — BEST_PRACTICES §3b) -------------------------
+// ---- response (consts + core.append_str/wi — BEST_PRACTICES §3b) ------------
 // Only two fields vary (client, scheme). Content-Length = const overhead plus
 // their lengths, so the body is framed ONCE, straight into `out` — never built
 // as an intermediate string.
-const response_prefix = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '.bytes()
+const response_prefix = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '
 const body_pre = '{"client_ip":"'
 const body_mid = '","scheme":"'
 const body_tail = '"}'
 const body_overhead = body_pre.len + body_mid.len + body_tail.len
 const default_proto = 'http'
-
-// ws appends a string's bytes straight into `out` — no allocation.
-@[inline]
-fn ws(mut out []u8, s string) {
-	unsafe { out.push_many(s.str, s.len) }
-}
 
 // wi appends n's decimal digits into `out` — itoa into a stack scratch, then
 // append. No allocation, no `.str()` (BEST_PRACTICES §3b).
@@ -216,14 +210,14 @@ fn handle(req_buffer []u8, mut out []u8, client_fd int, _worker_state voidptr, m
 			proto = unsafe { tos(&req.buffer[p.start], p.len) } // view
 		}
 	}
-	out << response_prefix
+	core.append_str(mut out, response_prefix)
 	wi(mut out, body_overhead + client.len + proto.len)
-	ws(mut out, '\r\n\r\n')
-	ws(mut out, body_pre)
-	ws(mut out, client) // views land in `out` now, before the buffer recycles
-	ws(mut out, body_mid)
-	ws(mut out, proto)
-	ws(mut out, body_tail)
+	core.append_str(mut out, '\r\n\r\n')
+	core.append_str(mut out, body_pre)
+	core.append_str(mut out, client) // views land in `out` now, before the buffer recycles
+	core.append_str(mut out, body_mid)
+	core.append_str(mut out, proto)
+	core.append_str(mut out, body_tail)
 	return .done
 }
 

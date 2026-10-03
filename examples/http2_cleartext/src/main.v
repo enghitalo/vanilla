@@ -45,16 +45,16 @@ import server
 import strconv
 
 const home_response = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 23\r\nConnection: keep-alive\r\n\r\nhello over one handler\n'.bytes()
-const not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 // 501: this worker/backend cannot take connections over (queue_takeover
 // returned false) — answering the preface with h1 bytes the client can see
 // beats leaving it to time out on a half-spoken protocol.
 const cannot_takeover_response = 'HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
-const echo_head_prefix = 'HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: '.bytes()
-const echo_head_suffix = '\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const echo_head_prefix = 'HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: '
+const echo_head_suffix = '\r\nConnection: keep-alive\r\n\r\n'
 
-const slow_response = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 10\r\nConnection: keep-alive\r\n\r\nslow done\n'.bytes()
-const slow_unavailable_response = 'HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const slow_response = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 10\r\nConnection: keep-alive\r\n\r\nslow done\n'
+const slow_unavailable_response = 'HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 const get_method = 'GET'.bytes()
 const post_method = 'POST'.bytes()
@@ -64,13 +64,13 @@ const echo_path = '/echo'.bytes()
 const slow_path = '/slow'.bytes()
 const star_target = '*'.bytes()
 
-const h1_line_suffix = ' HTTP/1.1\r\n'.bytes()
+const h1_line_suffix = ' HTTP/1.1\r\n'
 const http11_version = 'HTTP/1.1'.bytes()
 const http10_version = 'HTTP/1.0'.bytes()
-const h1_host_prefix = 'host: '.bytes()
-const h1_content_length_prefix = 'content-length: '.bytes()
-const h1_header_sep = ': '.bytes()
-const crlf = '\r\n'.bytes()
+const h1_host_prefix = 'host: '
+const h1_content_length_prefix = 'content-length: '
+const h1_header_sep = ': '
+const crlf = '\r\n'
 
 // slice_eq compares a request Slice against a small const byte pattern.
 @[direct_array_access]
@@ -144,15 +144,15 @@ fn app_route(hr request_parser.HttpRequest, mut res []u8, mut event_loop core.Ev
 		return slow_route(mut res, mut event_loop)
 	}
 	if slice_eq(hr.buffer, hr.method, post_method) && slice_eq(hr.buffer, hr.path, echo_path) {
-		res << echo_head_prefix
+		core.append_str(mut res, echo_head_prefix)
 		write_int(mut res, i64(hr.body.len))
-		res << echo_head_suffix
+		core.append_str(mut res, echo_head_suffix)
 		if hr.body.len > 0 {
 			unsafe { res.push_many(&hr.buffer[hr.body.start], hr.body.len) }
 		}
 		return .done
 	}
-	res << not_found_response
+	core.append_str(mut res, not_found_response)
 	return .done
 }
 
@@ -280,13 +280,13 @@ fn serve_http2_request(mut bridge BridgeState, req http2.Http2Request, mut out [
 	}
 	// Translate to h1 request bytes in the reused per-connection buffer.
 	bridge.h1_req.clear()
-	unsafe { bridge.h1_req.push_many(method.str, method.len) }
+	core.append_str(mut bridge.h1_req, method)
 	bridge.h1_req << u8(` `)
-	unsafe { bridge.h1_req.push_many(path.str, path.len) }
-	bridge.h1_req << h1_line_suffix
-	bridge.h1_req << h1_host_prefix
-	unsafe { bridge.h1_req.push_many(authority.str, authority.len) }
-	bridge.h1_req << crlf
+	core.append_str(mut bridge.h1_req, path)
+	core.append_str(mut bridge.h1_req, h1_line_suffix)
+	core.append_str(mut bridge.h1_req, h1_host_prefix)
+	core.append_str(mut bridge.h1_req, authority)
+	core.append_str(mut bridge.h1_req, crlf)
 	for f in req.headers {
 		if f.name.len == 0 || f.name[0] == `:` {
 			continue
@@ -296,17 +296,17 @@ fn serve_http2_request(mut bridge BridgeState, req http2.Http2Request, mut out [
 		if f.name == 'host' || f.name == 'te' || is_connection_specific(f.name) {
 			continue
 		}
-		unsafe { bridge.h1_req.push_many(f.name.str, f.name.len) }
-		bridge.h1_req << h1_header_sep
-		unsafe { bridge.h1_req.push_many(f.value.str, f.value.len) }
-		bridge.h1_req << crlf
+		core.append_str(mut bridge.h1_req, f.name)
+		core.append_str(mut bridge.h1_req, h1_header_sep)
+		core.append_str(mut bridge.h1_req, f.value)
+		core.append_str(mut bridge.h1_req, crlf)
 	}
 	if req.body.len > 0 {
-		bridge.h1_req << h1_content_length_prefix
+		core.append_str(mut bridge.h1_req, h1_content_length_prefix)
 		write_int(mut bridge.h1_req, i64(req.body.len))
-		bridge.h1_req << crlf
+		core.append_str(mut bridge.h1_req, crlf)
 	}
-	bridge.h1_req << crlf
+	core.append_str(mut bridge.h1_req, crlf)
 	if req.body.len > 0 {
 		unsafe { bridge.h1_req.push_many(&req.body[0], req.body.len) }
 	}
@@ -449,7 +449,7 @@ fn slow_route(mut res []u8, mut event_loop core.EventLoop) core.Step {
 	$if linux {
 		return slow_route_linux(mut res, mut event_loop)
 	}
-	res << slow_unavailable_response
+	core.append_str(mut res, slow_unavailable_response)
 	return .done
 }
 

@@ -14,6 +14,7 @@ module main
 // holds one complete JPEG, so there is nothing to parse — we broadcast it as-is.
 import sync
 import time
+import core
 
 #include <errno.h>
 
@@ -99,7 +100,7 @@ fn (mut v Viewers) broadcast_frame(jpeg []u8, mut scratch []u8) {
 	scratch.clear() // len = 0, capacity kept — no realloc after the first frame
 	scratch << part_prefix
 	wi(mut scratch, jpeg.len)
-	ws(mut scratch, '\r\n\r\n')
+	core.append_str(mut scratch, '\r\n\r\n')
 	for fd in v.snapshot() {
 		if !send_all(fd, scratch) || !send_all(fd, jpeg) || !send_all(fd, part_trailer) {
 			v.drop(fd)
