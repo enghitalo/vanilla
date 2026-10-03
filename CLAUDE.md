@@ -44,8 +44,9 @@ registry.
   `buf[a..b]` (it marks the source buffer every call).
 - **Never concatenate (`+`) or interpolate (`${}`) in request-serving code** —
   not even on deliberately slow routes. Each one allocates (ints also pay
-  `.str()`). Use `const ... .bytes()` for static responses, append parts
-  straight into `out` (`push_many` + `strconv.write_dec`), and a single
+  `.str()`). Write static responses as `const` strings appended with
+  `core.append_str`, append parts straight into `out` (`core.append_str` +
+  `strconv.write_dec`), and a single
   `strings.Builder` (`write_string` / `write_decimal` / `write_u8`) when a
   dynamic string is unavoidable. `${}` is fine in `eprintln`/`error()`
   diagnostics off the request path.

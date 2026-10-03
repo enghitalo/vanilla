@@ -1,5 +1,7 @@
 module http2
 
+import core
+
 // HPACK — RFC 7541 header compression for HTTP/2, the codec half the dormant
 // module was missing (issue #122's http2 story). Pure functions + one decoder
 // struct over bytes: no I/O, no vanilla imports — same discipline as the
@@ -482,7 +484,7 @@ fn encode_int(mut out []u8, flags u8, prefix int, value u32) {
 fn encode_str(mut out []u8, s string) {
 	encode_int(mut out, 0x00, 7, u32(s.len))
 	if s.len > 0 {
-		unsafe { out.push_many(s.str, s.len) }
+		core.append_str(mut out, s)
 	}
 }
 

@@ -27,7 +27,7 @@ fn C.read(fd int, buf voidptr, count usize) int
 
 const budget_ms = i64(300)
 
-const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 // Job is the per-request state carried across ticks via watch_payload.
 struct Job {
@@ -61,7 +61,7 @@ fn parse_steps(req []u8) int {
 
 fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if !req.bytestr().contains('/job') {
-		out << not_found
+		core.append_str(mut out, not_found)
 		return .done
 	}
 	tfd := C.timerfd_create(C.CLOCK_MONOTONIC, 0)

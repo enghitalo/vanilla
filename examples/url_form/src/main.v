@@ -31,7 +31,7 @@ module main
 //     sequence (escapes collapsed), and it lives in a map that must outlive
 //     the request buffer. That one `bytestr()` per key/value is the copy this
 //     example exists to demonstrate; everything around it stays zero-copy.
-//   - The response is framed with a const prefix + `wi`/`ws` appends; the JSON
+//   - The response is framed with a const prefix + `wi`/`core.append_str` appends; the JSON
 //     body is genuinely dynamic (map echo), so it gets ONE strings.Builder.
 import server
 import core
@@ -134,12 +134,6 @@ fn parse_form(s []u8) map[string]string {
 }
 
 // ---- zero-alloc append helpers (BEST_PRACTICES §3b) -------------------------
-// ws appends a string's bytes straight into `out` — no allocation.
-@[inline]
-fn ws(mut out []u8, s string) {
-	unsafe { out.push_many(s.str, s.len) }
-}
-
 // wi appends n's decimal digits into `out` — itoa into a stack scratch, then
 // append. No allocation, no `.str()`.
 fn wi(mut out []u8, n i64) {
@@ -210,7 +204,7 @@ fn write_json_escaped(mut sb strings.Builder, s string) {
 	}
 }
 
-const resp_prefix = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '.bytes()
+const resp_prefix = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '
 
 @[direct_array_access]
 fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
@@ -255,9 +249,9 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 	body.write_u8(`}`)
 	// Frame: const prefix + decimal length + blank line + the builder's bytes
 	// (Builder IS []u8 — it appends into `out` directly, no bytestr()).
-	out << resp_prefix
+	core.append_str(mut out, resp_prefix)
 	wi(mut out, body.len)
-	ws(mut out, '\r\n\r\n')
+	core.append_str(mut out, '\r\n\r\n')
 	out << body
 	return .done
 }

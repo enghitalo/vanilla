@@ -26,7 +26,7 @@ module main
 // BYTE DISCIPLINE (docs/BEST_PRACTICES.md §2/§3, docs/V_PERF_TOOLBOX.md):
 //   - NEVER concatenate or interpolate — not even on the slow path. Every
 //     response is split into compile-time consts around the one dynamic part
-//     (the echoed origin), appended with `out <<` / `push_many`.
+//     (the echoed origin), appended with `core.append_str` / `out <<`.
 //   - VIEWS, NOT COPIES: the Origin value stays in the request buffer. The
 //     allowlist check wraps it in a read-only `tos` view (`in` on an array
 //     only compares, never retains — same blessing as the §2 map-key views);
@@ -52,9 +52,9 @@ fn origin_allowed(origin string) bool {
 // compile-time const, so the `{"ok":true}` body's Content-Length is the known
 // constant 11 (keep the two in sync if you ever change the body).
 const resp_403 = 'HTTP/1.1 403 Forbidden\r\nVary: Origin\r\nContent-Length: 0\r\n\r\n'.bytes()
-const preflight_head = 'HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: '.bytes()
+const preflight_head = 'HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: '
 const preflight_tail = '\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-CSRF-Token\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Max-Age: 86400\r\nVary: Origin\r\nContent-Length: 0\r\n\r\n'.bytes()
-const ok_cors_head = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: '.bytes()
+const ok_cors_head = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: '
 const ok_cors_tail = '\r\nAccess-Control-Allow-Credentials: true\r\nVary: Origin\r\nContent-Length: 11\r\n\r\n{"ok":true}'.bytes()
 const resp_ok_plain = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nVary: Origin\r\nContent-Length: 11\r\n\r\n{"ok":true}'.bytes()
 
@@ -104,7 +104,7 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 			out << resp_403
 			return .done
 		}
-		out << preflight_head
+		core.append_str(mut out, preflight_head)
 		unsafe { out.push_many(&req.buffer[o_start], o_len) } // echo the allowlisted origin
 		out << preflight_tail
 		return .done
@@ -114,7 +114,7 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 	// origins; other requests still get the resource, just without the CORS
 	// grant (the browser blocks the cross-origin read, not the server).
 	if allowed {
-		out << ok_cors_head
+		core.append_str(mut out, ok_cors_head)
 		unsafe { out.push_many(&req.buffer[o_start], o_len) } // echo the allowlisted origin
 		out << ok_cors_tail
 		return .done

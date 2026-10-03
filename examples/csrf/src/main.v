@@ -43,15 +43,15 @@ import crypto.rand
 import crypto.hmac
 
 // ---- static responses (consts — the handler appends, never builds) ----------
-const resp_403 = 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const resp_403 = 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 // GET /form response = const head + 64 hex token bytes + const tail. The token
 // cookie is readable by same-origin JS (to copy into the request header), so
 // NOT HttpOnly for the double-submit variant; the synchronizer variant keeps
 // it server-side instead.
-const form_head = 'HTTP/1.1 200 OK\r\nSet-Cookie: csrf='.bytes()
-const form_tail = '; Secure; SameSite=Strict; Path=/\r\nContent-Type: text/html\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const form_head = 'HTTP/1.1 200 OK\r\nSet-Cookie: csrf='
+const form_tail = '; Secure; SameSite=Strict; Path=/\r\nContent-Type: text/html\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 const hex_digits = '0123456789abcdef'
 
@@ -140,9 +140,9 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 			out << response.tiny_bad_request_response
 			return .close
 		}
-		out << form_head
+		core.append_str(mut out, form_head)
 		write_hex(mut out, token)
-		out << form_tail
+		core.append_str(mut out, form_tail)
 		return .done
 	}
 
@@ -152,16 +152,16 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 	// `vbytes` needs len > 0 to index the buffer.
 	if is_unsafe(req.buffer, req.method) {
 		chdr := req.get_header_value_slice('Cookie') or {
-			out << resp_403
+			core.append_str(mut out, resp_403)
 			return .done
 		}
 		cstart, clen := cookie_value(req.buffer, chdr, 'csrf')
 		hdr := req.get_header_value_slice('X-CSRF-Token') or {
-			out << resp_403
+			core.append_str(mut out, resp_403)
 			return .done
 		}
 		if clen <= 0 || hdr.len <= 0 {
-			out << resp_403
+			core.append_str(mut out, resp_403)
 			return .done
 		}
 		// Zero-copy views of both tokens; hmac.equal only reads them, in
@@ -169,16 +169,16 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 		cookie_token := unsafe { (&req.buffer[cstart]).vbytes(clen) }
 		header_token := unsafe { (&req.buffer[hdr.start]).vbytes(hdr.len) }
 		if !hmac.equal(cookie_token, header_token) {
-			out << resp_403
+			core.append_str(mut out, resp_403)
 			return .done
 		}
-		out << resp_ok
+		core.append_str(mut out, resp_ok)
 		return .done
 	}
 
 	// Safe method (GET/HEAD/...): no token required — they must be side-effect
 	// free anyway.
-	out << resp_ok
+	core.append_str(mut out, resp_ok)
 	return .done
 }
 

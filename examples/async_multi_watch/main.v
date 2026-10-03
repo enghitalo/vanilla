@@ -23,7 +23,7 @@ fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
 fn C.read(fd int, buf voidptr, count usize) int
 
-const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 // one_shot_timer returns a timerfd that fires once after `ms`.
 fn one_shot_timer(ms int) int {
@@ -45,7 +45,7 @@ fn drain_close(fd int) {
 
 fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if !req.bytestr().contains('/chain') {
-		out << not_found
+		core.append_str(mut out, not_found)
 		return .done
 	}
 	event_loop.watch_fd(one_shot_timer(80), .readable, after_a, unsafe { nil }) // stage A

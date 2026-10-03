@@ -131,7 +131,7 @@ fn token_done(mut out []u8, ready_fd int, _ready_fd_error bool, _watch_payload v
 	nread := C.read(ready_fd, &verdict, 1)
 	C.close(ready_fd) // the request owns the read-end
 	if nread != 1 || verdict != 1 {
-		out << resp_401
+		core.append_str(mut out, resp_401)
 		return .done
 	}
 	write_token_200(mut out)

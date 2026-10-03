@@ -122,7 +122,7 @@ fn test_internal_error_answers_500_and_counts_5xx() {
 	mut event_loop := core.EventLoop{}
 	assert handler('GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), mut out, -1, unsafe { nil }, mut
 		event_loop) == .close
-	assert out.bytestr() == earlier + resp_internal_error_500.bytestr()
+	assert out.bytestr() == earlier + resp_internal_error_500
 	mut body := []u8{cap: 160}
 	m.prometheus_body(mut body)
 	exposition := body.bytestr()

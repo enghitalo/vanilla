@@ -18,7 +18,7 @@ module main
 //   - Method routing, the query strip and the If-None-Match check compare
 //     bytes IN PLACE by offsets — no `.to_string()`, no `buf[a..b]`
 //     slice-marking, no `${}` interpolation per request.
-//   - Responses append straight into `out`: consts for 404/405; `ws`/`wi`
+//   - Responses append straight into `out`: consts for 404/405; `core.append_str`/`wi`
 //     framing for 200/206/304; the file bytes and the range window are
 //     appended as direct pointer copies, never via `content[a..b]`.
 //   - The ETag is a 64-bit wyhash hex-encoded into a STACK scratch (`hex16`) —
@@ -48,16 +48,10 @@ import hash as wyhash
 const web_root = './public'
 
 // ---- static responses (consts — the error paths append, never build) --------
-const resp_404 = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const resp_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\n\r\n'.bytes()
+const resp_404 = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const resp_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\n\r\n'
 
 // ---- zero-alloc append helpers (BEST_PRACTICES §3b) --------------------------
-// ws appends a string's bytes straight into `out` — no allocation.
-@[inline]
-fn ws(mut out []u8, s string) {
-	unsafe { out.push_many(s.str, s.len) }
-}
-
 // wi appends n's decimal digits into `out` — itoa into a stack scratch, then
 // append. No allocation, no `.str()`.
 fn wi(mut out []u8, n i64) {
@@ -283,7 +277,7 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 	// Method routing IN PLACE over the request buffer — no `.to_string()`.
 	is_get := slice_eq(req.buffer, req.method, 'GET')
 	if !is_get && !slice_eq(req.buffer, req.method, 'HEAD') {
-		out << resp_405
+		core.append_str(mut out, resp_405)
 		return .done
 	}
 
@@ -301,15 +295,15 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 	}
 
 	fs_path := safe_path(url_path) or {
-		out << resp_404
+		core.append_str(mut out, resp_404)
 		return .done
 	}
 	if !os.is_file(fs_path) {
-		out << resp_404
+		core.append_str(mut out, resp_404)
 		return .done
 	}
 	content := os.read_bytes(fs_path) or {
-		out << resp_404
+		core.append_str(mut out, resp_404)
 		return .done
 	}
 	ctype := mime_type(fs_path)
@@ -321,9 +315,9 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 	// Conditional GET: if the client's cached ETag matches, save the bytes.
 	if inm := req.get_header_value_slice('If-None-Match') {
 		if etag_matches(req.buffer, inm, etag) {
-			ws(mut out, 'HTTP/1.1 304 Not Modified\r\nETag: "')
+			core.append_str(mut out, 'HTTP/1.1 304 Not Modified\r\nETag: "')
 			unsafe { out.push_many(&etag[0], 16) }
-			ws(mut out, '"\r\n\r\n')
+			core.append_str(mut out, '"\r\n\r\n')
 			return .done
 		}
 	}
@@ -333,19 +327,19 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 		if rng.len > 0 {
 			rview := unsafe { (&req.buffer[rng.start]).vbytes(rng.len) } // view
 			if start, end := parse_range(rview, content.len) {
-				ws(mut out, 'HTTP/1.1 206 Partial Content\r\nContent-Type: ')
-				ws(mut out, ctype)
-				ws(mut out, '\r\nContent-Range: bytes ')
+				core.append_str(mut out, 'HTTP/1.1 206 Partial Content\r\nContent-Type: ')
+				core.append_str(mut out, ctype)
+				core.append_str(mut out, '\r\nContent-Range: bytes ')
 				wi(mut out, start)
 				out << u8(`-`)
 				wi(mut out, end)
 				out << u8(`/`)
 				wi(mut out, content.len)
-				ws(mut out, '\r\nAccept-Ranges: bytes\r\nContent-Length: ')
+				core.append_str(mut out, '\r\nAccept-Ranges: bytes\r\nContent-Length: ')
 				wi(mut out, end + 1 - start)
-				ws(mut out, '\r\nETag: "')
+				core.append_str(mut out, '\r\nETag: "')
 				unsafe { out.push_many(&etag[0], 16) }
-				ws(mut out, '"\r\n\r\n')
+				core.append_str(mut out, '"\r\n\r\n')
 				if is_get {
 					// The range window is appended as a direct pointer copy —
 					// no content[start..end+1] slice-marking. In-bounds and
@@ -357,13 +351,13 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 		}
 	}
 
-	ws(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: ')
-	ws(mut out, ctype)
-	ws(mut out, '\r\nContent-Length: ')
+	core.append_str(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: ')
+	core.append_str(mut out, ctype)
+	core.append_str(mut out, '\r\nContent-Length: ')
 	wi(mut out, content.len)
-	ws(mut out, '\r\nAccept-Ranges: bytes\r\nETag: "') // advertise range support
+	core.append_str(mut out, '\r\nAccept-Ranges: bytes\r\nETag: "') // advertise range support
 	unsafe { out.push_many(&etag[0], 16) }
-	ws(mut out, '"\r\nCache-Control: public, max-age=3600\r\nConnection: keep-alive\r\n\r\n')
+	core.append_str(mut out, '"\r\nCache-Control: public, max-age=3600\r\nConnection: keep-alive\r\n\r\n')
 	if is_get {
 		out << content // HEAD gets the headers only
 	}

@@ -34,9 +34,9 @@ mut:
 	max  int // stop (and close) after this many
 }
 
-const sse_headers = 'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const sse_headers = 'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n'
 
-const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 // arm_periodic programs a timerfd to fire every `ms` (it_value = it_interval).
 fn arm_periodic(tfd int, ms int) {
@@ -51,7 +51,7 @@ fn arm_periodic(tfd int, ms int) {
 
 fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if !req.bytestr().contains('/events') {
-		out << not_found
+		core.append_str(mut out, not_found)
 		return .done
 	}
 	tfd := C.timerfd_create(C.CLOCK_MONOTONIC, 0)
@@ -63,7 +63,7 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
 	}
 	// Headers go out NOW: async_serve flushes the write buffer after the initial
 	// .suspend, so the client sees `200 text/event-stream` before any tick.
-	out << sse_headers
+	core.append_str(mut out, sse_headers)
 	event_loop.watch_fd(tfd, .readable, sse_tick, voidptr(st))
 	return .suspend
 }

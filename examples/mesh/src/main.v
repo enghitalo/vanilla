@@ -32,9 +32,9 @@ const edge_port = 8095
 const backend_body = '{"svc":"backend","msg":"hello from the mesh"}'
 const backend_response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${backend_body.len}\r\nConnection: keep-alive\r\n\r\n${backend_body}'.bytes()
 
-const edge_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\nedge'.bytes()
-const edge_bad_gateway = 'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const edge_busy = 'HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const edge_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\nedge'
+const edge_bad_gateway = 'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const edge_busy = 'HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 const edge_mesh_head = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '.bytes()
 const edge_mesh_sep = '\r\nConnection: keep-alive\r\n\r\n'.bytes()
@@ -43,7 +43,7 @@ const edge_mesh_post = '}'.bytes()
 
 const mesh_route = 'GET /mesh '.bytes()
 
-// ws/wi — the zero-alloc append helpers (docs/BEST_PRACTICES.md §3b).
+// wb/wi — the zero-alloc append helpers (docs/BEST_PRACTICES.md §3b).
 @[inline]
 fn wb(mut out []u8, b []u8) {
 	unsafe { out.push_many(b.data, b.len) }
@@ -143,13 +143,13 @@ fn is_mesh_route(req []u8) bool {
 
 fn edge_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if !is_mesh_route(req) {
-		res << edge_ok
+		core.append_str(mut res, edge_ok)
 		return .done
 	}
 	mut st := unsafe { &EdgeState(worker_state) }
 	ci := st.acquire()
 	if ci < 0 {
-		res << edge_busy // whole pool in flight on THIS worker
+		core.append_str(mut res, edge_busy) // whole pool in flight on THIS worker
 		return .done
 	}
 	fd := st.conns[ci].fd
@@ -165,7 +165,7 @@ fn edge_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut
 			C.send(fd, unsafe { &u8(st.req_scratch.data) + off }, usize(st.req_scratch.len - off), 0)
 		if n <= 0 {
 			st.drop_conn(ci) // stale pooled conn (backend restarted) — fail this one
-			res << edge_bad_gateway
+			core.append_str(mut res, edge_bad_gateway)
 			return .done
 		}
 		off += n
@@ -186,7 +186,7 @@ fn on_backend_reply(mut out []u8, ready_fd int, ready_fd_error bool, watch_paylo
 	mut st := unsafe { &EdgeState(worker_state) }
 	ci := st.conn_by_fd(ready_fd)
 	if ci < 0 {
-		out << edge_bad_gateway // conn vanished from the pool (defensive)
+		core.append_str(mut out, edge_bad_gateway) // conn vanished from the pool (defensive)
 		return .done
 	}
 	mut c := &st.conns[ci]
@@ -198,7 +198,7 @@ fn on_backend_reply(mut out []u8, ready_fd int, ready_fd_error bool, watch_paylo
 		if c.resp_buf.cap - c.resp_buf.len < 4096 {
 			if c.resp_buf.cap >= max_backend_response {
 				st.drop_conn(ci)
-				out << edge_bad_gateway
+				core.append_str(mut out, edge_bad_gateway)
 				return .done
 			}
 			unsafe { c.resp_buf.grow_cap(c.resp_buf.cap) }
@@ -218,7 +218,7 @@ fn on_backend_reply(mut out []u8, ready_fd int, ready_fd_error bool, watch_paylo
 			eof = true // the backend closed the connection
 		} else if C.errno != C.EAGAIN && C.errno != C.EWOULDBLOCK {
 			st.drop_conn(ci) // reset: never a clean end of a response
-			out << edge_bad_gateway
+			core.append_str(mut out, edge_bad_gateway)
 			return .done
 		} else if ready_fd_error {
 			eof = true // hung up, nothing more to read
@@ -232,11 +232,11 @@ fn on_backend_reply(mut out []u8, ready_fd int, ready_fd_error bool, watch_paylo
 	}
 	if end < 0 {
 		st.drop_conn(ci) // unframeable or cut short — drop the (desynced) conn too
-		out << edge_bad_gateway
+		core.append_str(mut out, edge_bad_gateway)
 		return .done
 	}
 	if c.framer.status != 200 {
-		out << edge_bad_gateway
+		core.append_str(mut out, edge_bad_gateway)
 	} else {
 		// The decoded body as a view into the slot buffer: a chunked body is
 		// de-chunked in place, so there is no second buffer to fill.
