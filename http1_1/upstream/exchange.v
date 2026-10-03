@@ -20,8 +20,8 @@ import http1_1.client
 // starts the exchange: on a kept connection the request is written at once,
 // otherwise a connect starts. .pending: a watch is armed, return .suspend and
 // call advance() from `cont`, which gets `payload` back. .failed: release()
-// and answer. (.ready only for a response already complete, never in
-// practice.)
+// and answer. Never .ready: an answer complete already (an early 413) is
+// handed to the continuation like any other.
 pub fn (mut x Exchange) send(mut el core.EventLoop, cont core.WakeFn, payload voidptr) Poll {
 	if !x.busy || x.phase != .idle {
 		return x.fail(.invalid)
@@ -47,7 +47,13 @@ pub fn (mut x Exchange) send(mut el core.EventLoop, cont core.WakeFn, payload vo
 	if x.fd >= 0 {
 		x.phase = .sending
 		x.deadline = now + ms_ns(x.pool.origin.response_timeout_ms)
-		return x.drive(false, mut el, cont, payload)
+		r := x.drive(false, mut el, cont, payload)
+		if r == .ready {
+			// Wake the continuation at once (the socket is writable, or hung
+			// up): it finds the exchange .ready, as on every other path.
+			return x.park(true, mut el, cont, payload)
+		}
+		return r
 	}
 	return x.dial(mut el, cont, payload)
 }
@@ -187,7 +193,7 @@ fn (mut x Exchange) drive(woke_err bool, mut el core.EventLoop, cont core.WakeFn
 				// A server that answers before reading the whole request (a 401,
 				// a 413) and stops reading leaves the socket full: read that
 				// answer instead of waiting for room that never comes.
-				if x.answer_waiting() {
+				if x.answer_waiting(false) {
 					x.no_reuse = true
 					break
 				}
@@ -195,7 +201,7 @@ fn (mut x Exchange) drive(woke_err bool, mut el core.EventLoop, cont core.WakeFn
 			}
 			// The send failed. An early answer may be waiting behind it; a kept
 			// connection that died before answering is retried when that is safe.
-			if x.answer_waiting() {
+			if x.answer_waiting(true) {
 				x.no_reuse = true
 				break
 			}
@@ -246,6 +252,7 @@ fn (mut x Exchange) read(mut el core.EventLoop, cont core.WakeFn, payload voidpt
 			x.eof = true
 		} else {
 			failed = true
+			x.no_reuse = true // reset: whatever was framed, never reuse it
 		}
 		break
 	}
@@ -254,6 +261,10 @@ fn (mut x Exchange) read(mut el core.EventLoop, cont core.WakeFn, payload voidpt
 	// the close is then never complete.
 	clean_eof := x.eof && (!x.sess.active() || x.sess.close_notify())
 	end := x.framer.feed(x.resp, clean_eof)
+	if end > max || (end < 0 && x.resp.len > max) {
+		x.no_reuse = true
+		return x.fail(.too_large)
+	}
 	if end > 0 {
 		x.end = end
 		x.phase = .ready
@@ -262,10 +273,6 @@ fn (mut x Exchange) read(mut el core.EventLoop, cont core.WakeFn, payload voidpt
 	if end == client.err_malformed {
 		x.no_reuse = true
 		return x.fail(.malformed)
-	}
-	if x.resp.len > max {
-		x.no_reuse = true
-		return x.fail(.too_large)
 	}
 	if x.eof || failed || end == client.err_truncated {
 		if x.resp.len == 0 {
@@ -315,7 +322,8 @@ fn (mut x Exchange) write_some() int {
 		// through its handshake path, which first flushes pending output, so
 		// behind a stuck record of ours neither a ticket nor the answer after
 		// it could be read.
-		if x.read_early() {
+		x.read_early()
+		if x.final_started() {
 			return io_answered
 		}
 	}
@@ -367,24 +375,42 @@ fn (mut x Exchange) read_some(p &u8, max int) int {
 }
 
 // answer_waiting reports, while the request is still being sent, whether the
-// server has begun to answer: then the rest of the request is not sent, the
-// answer is read, and the connection is not reused.
-fn (mut x Exchange) answer_waiting() bool {
-	if x.resp.len > 0 {
-		return true
-	}
+// server has begun its final answer: then the rest of the request is not sent,
+// the answer is read, and the connection is not reused. A 100 Continue (or any
+// 1xx) alone is no answer: the upload goes on. `failed`: the send failed, so
+// nothing more will be written on this connection.
+fn (mut x Exchange) answer_waiting(failed bool) bool {
 	if x.sess.active() {
-		// Ciphertext may sit in the session's read-ahead already, so read
-		// through the session whatever a raw peek says.
-		return x.read_early()
+		// Never read through the session while a record of ours is pending
+		// (tls_wlen): a TLS 1.3 ticket read now would flush that record from
+		// inside the read, and the same-length retry that must follow would
+		// then encrypt the bytes a second time. Once the send failed nothing
+		// more is written, so the read is safe. Ciphertext may also sit in
+		// the session's read-ahead already, so a raw peek decides nothing.
+		if failed || x.tls_wlen == 0 {
+			x.read_early()
+		}
+	} else {
+		x.recv_early()
 	}
-	return C.upstream_peek(x.fd) == 1
+	return x.final_started()
+}
+
+// final_started frames what arrived so far: true once the final response has
+// begun (its status line is in: 2xx-5xx, or 101), or the bytes are malformed
+// (read() reports it).
+fn (mut x Exchange) final_started() bool {
+	if x.resp.len == 0 {
+		return false
+	}
+	end := x.framer.feed(x.resp, false)
+	return end > 0 || end == client.err_malformed || x.framer.status >= 200
+		|| x.framer.status == 101
 }
 
 // read_early reads what the server sent through the TLS session while the
-// request is going out: true when it is (the start of) the answer, false when
-// it was only TLS 1.3 session tickets, consumed, or nothing could be read.
-fn (mut x Exchange) read_early() bool {
+// request is going out (TLS 1.3 session tickets are consumed on the way).
+fn (mut x Exchange) read_early() {
 	x.sess.mark_readable()
 	if x.resp.cap - x.resp.len < 4096 {
 		unsafe { x.resp.grow_cap(4096) }
@@ -394,9 +420,27 @@ fn (mut x Exchange) read_early() bool {
 		unsafe {
 			x.resp.len += n
 		}
-		return true
 	}
-	return false
+}
+
+// recv_early takes what the server sent on a plain socket while the request
+// is going out, without waiting.
+fn (mut x Exchange) recv_early() {
+	for {
+		if x.resp.cap - x.resp.len < 4096 {
+			if x.resp.len > x.pool.origin.max_response_bytes {
+				return
+			}
+			unsafe { x.resp.grow_cap(x.resp.cap) }
+		}
+		r := C.upstream_recv(x.fd, unsafe { &u8(x.resp.data) + x.resp.len }, usize(x.resp.cap - x.resp.len))
+		if r <= 0 {
+			return
+		}
+		unsafe {
+			x.resp.len += int(r)
+		}
+	}
 }
 
 // can_retry: the request may be sent once more on a fresh connection — only

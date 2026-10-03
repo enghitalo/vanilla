@@ -36,6 +36,7 @@ const failure_head = 'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nX-Upstrea
 const timeout_head = 'HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nX-Upstream-Failure: '.bytes()
 const crlf2 = '\r\n\r\n'.bytes()
 const up_prefix = '/up/'
+const user_agent = 'vanilla-https-upstream/1'.bytes()
 const fill_prefix = '/fill/'
 
 // failure_names[int(f)] names an upstream.Failure in X-Upstream-Failure.
@@ -136,6 +137,7 @@ fn edge(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut el core
 	}
 	// /up/<path> → /<path>: the target from its '/' on, still a view.
 	x.request(view(req, 0, sp1), view(req, up_start, sp2 - up_start))
+	x.header('User-Agent', user_agent) // many APIs refuse a request without one
 	if fill > 0 {
 		mut b := x.body()
 		for i in 0 .. fill {

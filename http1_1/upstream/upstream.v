@@ -54,6 +54,11 @@ module upstream
 // thread can follow DNS changes. Nothing is allocated per exchange once the
 // slot buffers reach their high-water mark.
 //
+// One exchange per parked request: do not start a second exchange from a
+// continuation (on a client that disconnected meanwhile, the runtime only
+// re-arms the fd the continuation woke on, so a watch on another pool's fd
+// would never fire).
+//
 // Platform: the Linux epoll plaintext worker (the one that parks requests and
 // runs on_worker_start). Run TLS-terminating workers in front, as for
 // pg_async. TLS needs the `-d vanilla_tls` build.

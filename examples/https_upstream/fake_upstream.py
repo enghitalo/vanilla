@@ -21,6 +21,8 @@ pg_async/testdata/gen_test_ca.sh). Keep-alive HTTP/1.1; the path picks the answe
   /delay/<ms>   200, after <ms> milliseconds
   /big/<n>      200, an n-byte body
   /e413         413 + Connection: close right after the head; reads nothing more for 1 s
+  /cont100      100 Continue right after the head, then as /echo once the body is in
+  /tickets      (TLS) stops reading, sends 2 TLS 1.3 session tickets mid-upload, then as /echo
 
 The stats file holds key=value lines: accepted, handshakes, requests, and
 path:<path>=<count>.
@@ -80,6 +82,26 @@ def content_length(head):
     return 0
 
 
+def new_session_tickets(conn, n):
+    """Makes OpenSSL send n TLS 1.3 NewSessionTicket messages now, mid-request
+    (pg_async/testdata/fake_pg.py has the same helper): the ssl module has no
+    call for it, so SSL_new_session_ticket is reached through ctypes, and
+    do_handshake() flushes the tickets out."""
+    import ctypes
+    lib = ctypes.CDLL(ssl._ssl.__file__)
+    for name in ('SSL_version', 'SSL_is_server', 'SSL_new_session_ticket'):
+        getattr(lib, name).argtypes = [ctypes.c_void_p]
+    off = object.__basicsize__ + ctypes.sizeof(ctypes.c_void_p)
+    ptr = ctypes.c_void_p.from_address(id(conn._sslobj) + off).value
+    if not ptr or lib.SSL_version(ptr) != 0x0304 or lib.SSL_is_server(ptr) != 1:
+        raise RuntimeError('fake_upstream: cannot reach the SSL* of this connection')
+    for _ in range(n):
+        if lib.SSL_new_session_ticket(ptr) != 1:
+            raise RuntimeError('fake_upstream: SSL_new_session_ticket failed')
+    conn.do_handshake()
+    bump("tickets")
+
+
 def wait_closed(s, secs):
     """Block until the peer closes (or secs pass), answering nothing."""
     end = time.time() + secs
@@ -120,6 +142,15 @@ def serve(raw):
             bump("requests")
             bump("path:" + path)
             n = content_length(head)
+            if path == "/tickets" and isinstance(s, ssl.SSLSocket):
+                # Let the upload fill the socket (a record of the client's left
+                # pending), then send TLS 1.3 tickets into it, then read on.
+                time.sleep(0.2)
+                new_session_tickets(s, 2)
+                time.sleep(0.2)
+            if path == "/cont100":
+                # An interim answer right after the head, then the whole body.
+                s.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
             if path == "/e413":
                 s.sendall(b"HTTP/1.1 413 Content Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
                 time.sleep(1.0)
@@ -176,7 +207,7 @@ def serve(raw):
                 wait_closed(s, 60)
                 s.close()
                 return
-            elif path == "/echo":
+            elif path == "/echo" or path == "/cont100" or path == "/tickets":
                 b = b"%d %s" % (len(body), hashlib.sha256(body).hexdigest().encode())
                 s.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(b) + b)
             elif path.startswith("/delay/"):

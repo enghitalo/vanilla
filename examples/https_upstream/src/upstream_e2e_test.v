@@ -405,6 +405,27 @@ fn test_early_response() {
 		assert ms < 3000 * slack()
 		assert status_of(get(p, '/ok')) == 200
 		assert e.fake.stat('accepted') == 2
+		// The same on a kept connection, where the handler itself writes the
+		// request and may meet the whole answer before it returns.
+		r2, _ := call(p, 'POST /fill/${4 << 20}/e413 HTTP/1.1\r\nHost: edge\r\n\r\n', 10_000)
+		assert status_of(r2) == 413, r2
+	}
+}
+
+// A 100 Continue arriving mid-upload is no early answer: the body goes on in
+// full, and the final answer is relayed.
+fn test_interim_answer_mid_upload() {
+	for https in variants() {
+		mut e := setup(https, 'server', upstream.Origin{
+			max_request_bytes: 8 << 20
+		}) or { panic(err) }
+		defer {
+			e.stop()
+		}
+		n := 2 << 20
+		r, _ := call(e.h.port(), 'POST /fill/${n}/cont100 HTTP/1.1\r\nHost: edge\r\n\r\n', 20_000)
+		assert status_of(r) == 200, r
+		assert body_of(r).starts_with('${n} '), r
 	}
 }
 
@@ -429,6 +450,35 @@ fn test_large_request_body() {
 	}
 }
 
+// TLS 1.3 session tickets sent mid-upload, while the upstream stops reading:
+// they are consumed and the body still arrives byte-exact. (The exchange never
+// reads through the session while a record of its own is pending, or a ticket
+// read then would flush that record and the same-length retry would send its
+// bytes twice; loopback timing cannot force that exact interleaving, so this
+// covers tickets mid-upload in general.)
+fn test_tickets_mid_upload() {
+	if true !in variants() {
+		return
+	}
+	mut e := setup(true, 'server', upstream.Origin{
+		max_request_bytes: 8 << 20
+	}) or { panic(err) }
+	defer {
+		e.stop()
+	}
+	n := 4 << 20
+	mut body := []u8{len: n}
+	for i in 0 .. n {
+		body[i] = u8(`a` + i % 26)
+	}
+	for round in 0 .. 3 {
+		r, _ := call(e.h.port(), 'POST /fill/${n}/tickets HTTP/1.1\r\nHost: edge\r\n\r\n', 20_000)
+		assert status_of(r) == 200, 'round ${round}: ${r}'
+		assert body_of(r) == '${n} ${sha256.sum(body).hex()}', 'round ${round}: ${r}'
+	}
+	assert e.fake.stat('tickets') == 3
+}
+
 // A response over max_response_bytes fails with .too_large.
 fn test_response_too_large() {
 	for https in variants() {
@@ -443,6 +493,19 @@ fn test_response_too_large() {
 		assert status_of(r) == 502 && failure_of(r) == 'too_large', r
 		r2 := get(p, '/big/60000')
 		assert status_of(r2) == 200 && body_of(r2).len == 60000
+	}
+	// A limit below the slot's initial 16 KiB buffer holds too, for a response
+	// that arrives whole in one read.
+	for https in variants() {
+		mut e := setup(https, 'server', upstream.Origin{
+			max_response_bytes: 4096
+		}) or { panic(err) }
+		defer {
+			e.stop()
+		}
+		r := get(e.h.port(), '/big/10000')
+		assert status_of(r) == 502 && failure_of(r) == 'too_large', r
+		assert status_of(get(e.h.port(), '/big/1000')) == 200
 	}
 }
 
