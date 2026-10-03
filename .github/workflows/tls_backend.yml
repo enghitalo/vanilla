@@ -64,6 +64,13 @@ env:
   # Bump to move to a newer Mbed TLS 4 release; the cache key follows it.
   MBEDTLS_TAG: v4.2.0
 
+# A new push to a pull request cancels that PR's run still in progress, so
+# superseded commits don't queue for the account's runners; on main every
+# commit is its own group and runs to the end.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   tls-tests:
     runs-on: ubuntu-latest

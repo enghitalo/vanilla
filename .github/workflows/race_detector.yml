@@ -50,6 +50,13 @@ on:
       - 'examples/https_upstream/**'
       - '.github/workflows/race_detector.yml'
 
+# A new push to a pull request cancels that PR's run still in progress, so
+# superseded commits don't queue for the account's runners; on main every
+# commit is its own group and runs to the end.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   race:
     runs-on: ubuntu-latest
