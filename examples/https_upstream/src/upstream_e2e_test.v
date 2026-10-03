@@ -2,8 +2,9 @@
 module main
 
 // End-to-end tests of the http1_1/upstream pooled client (#229), through this
-// example's edge server (epoll, one worker) against fake_upstream.py — a
-// scriptable fake third-party API, over plain HTTP and, built with
+// example's edge server (epoll, one worker) against
+// http1_1/upstream/testdata/fake_upstream.py — a scriptable fake third-party
+// API, over plain HTTP and, built with
 // `-d vanilla_tls`, over TLS 1.3 with the test CA (verify-full + SNI). Each
 // test skips without python3 (and openssl, for TLS) unless
 // VANILLA_REQUIRE_FAKE_PG is set (CI).
@@ -26,7 +27,7 @@ fn C.recv(fd int, buf voidptr, n usize, flags int) int
 fn C.send(fd int, buf voidptr, n usize, flags int) int
 fn C.listen(fd int, backlog int) int
 
-const fake_script = os.join_path(@DIR, '..', 'fake_upstream.py')
+const fake_script = os.join_path(@VMODROOT, 'http1_1', 'upstream', 'testdata', 'fake_upstream.py')
 
 // Fake is one fake_upstream.py process.
 struct Fake {

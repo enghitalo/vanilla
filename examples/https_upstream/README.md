@@ -97,9 +97,11 @@ the epoll plain worker behind it, as with `pg_async`.
 
 ## Tests
 
-`src/upstream_e2e_test.v` drives the edge against `fake_upstream.py`, a
-scriptable fake API (python3; with `-d vanilla_tls`, TLS 1.3 with a throwaway
-test CA from `pg_async/testdata/gen_test_ca.sh`, which needs openssl):
+`src/upstream_e2e_test.v` drives the edge against a scriptable fake API that
+lives with the module's test data, `http1_1/upstream/testdata/fake_upstream.py`
+(python3, like `pg_async/testdata/fake_pg.py`; with `-d vanilla_tls`, TLS 1.3
+with a throwaway test CA from `pg_async/testdata/gen_test_ca.sh`, which needs
+openssl):
 
 ```sh
 v test examples/https_upstream/src                         # plain HTTP

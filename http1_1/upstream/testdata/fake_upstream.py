@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""A scriptable fake third-party HTTP(S) API for examples/https_upstream's tests.
+"""A scriptable fake third-party HTTP(S) API for the http1_1/upstream client's
+end-to-end tests (examples/https_upstream/src/upstream_e2e_test.v): the
+counterpart of pg_async/testdata/fake_pg.py, stdlib only.
 
 usage: fake_upstream.py --port-file F --stats-file S [--tls CERTDIR] [--cert server|wronghost]
 
