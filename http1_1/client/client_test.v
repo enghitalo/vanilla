@@ -1,5 +1,7 @@
 module client
 
+import core
+
 // Pure codec tests — no sockets (docs/BEST_PRACTICES.md §9): serialize
 // requests byte-exactly, frame canned/split responses, and reject the
 // unframeable shapes with their distinct codes.
@@ -48,9 +50,9 @@ fn test_frame_pipelined_keepalive() {
 fn test_frame_bodyless_statuses() {
 	for st in ['204 No Content', '304 Not Modified', '100 Continue'] {
 		mut buf := []u8{}
-		ws(mut buf, 'HTTP/1.1 ')
-		ws(mut buf, st)
-		ws(mut buf, '\r\nDate: x\r\n\r\n')
+		core.append_str(mut buf, 'HTTP/1.1 ')
+		core.append_str(mut buf, st)
+		core.append_str(mut buf, '\r\nDate: x\r\n\r\n')
 		assert frame_response(buf) == buf.len, st
 	}
 }

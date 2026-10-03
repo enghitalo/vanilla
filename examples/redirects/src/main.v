@@ -21,9 +21,10 @@ module main
 //
 // BYTE DISCIPLINE (docs/BEST_PRACTICES.md §2/§3, docs/V_PERF_TOOLBOX.md):
 //   - Every fully static response (301, 308, empty 200) is a module const —
-//     the handler only APPENDS (`out << resp_...`), it never builds.
+//     the handler only APPENDS (`core.append_str(mut out, resp_...)`), it
+//     never builds.
 //   - The ONE dynamic response (303: Location echoes a validated `?next=`) is
-//     framed with `ws` (push_many) around a zero-copy VIEW of the query value
+//     framed with `core.append_str` around a zero-copy VIEW of the query value
 //     — no `${}`, no `+`, no `.to_string()`.
 //   - Routing compares bytes IN PLACE by offsets (`slice_eq`). req.path
 //     INCLUDES the query string (the parser ends the request-target at the
@@ -37,22 +38,16 @@ import http1_1.request_parser
 import http1_1.response
 
 // ---- static responses (consts — the fast path appends, never builds) --------
-const resp_301_old = 'HTTP/1.1 301 Moved Permanently\r\nLocation: /new\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const resp_308_api = 'HTTP/1.1 308 Permanent Redirect\r\nLocation: /api/v2/resource\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const resp_200_empty = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const resp_301_old = 'HTTP/1.1 301 Moved Permanently\r\nLocation: /new\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const resp_308_api = 'HTTP/1.1 308 Permanent Redirect\r\nLocation: /api/v2/resource\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const resp_200_empty = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 // Byte keys/targets allocated ONCE at init — never `'lit'.bytes()` per request.
 const next_key = 'next'.bytes()
 const slash_bytes = '/'.bytes() // safe_next's reject target
 const dashboard_bytes = '/dashboard'.bytes() // default post-login landing page
 
-// ws appends a string's bytes straight into `out` — no allocation
 // (BEST_PRACTICES §3b).
-@[inline]
-fn ws(mut out []u8, s string) {
-	unsafe { out.push_many(s.str, s.len) }
-}
-
 // slice_eq compares a request Slice against a literal IN PLACE by offsets —
 // no `.to_string()`, no `buf[a..b]` (V array slicing marks the source buffer
 // on every call; see docs/V_PERF_TOOLBOX.md). In-bounds by construction: the
@@ -110,13 +105,13 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 
 	if slice_eq(req.buffer, route, '/old') {
 		// Canonical move: permanent, cacheable.
-		out << resp_301_old
+		core.append_str(mut out, resp_301_old)
 	} else if slice_eq(req.buffer, route, '/login') {
 		if slice_eq(req.buffer, req.method, 'POST') {
 			// Post/Redirect/Get: after handling the POST, send to a GET page.
 			// The ONE dynamic response: Location is a validated VIEW of the
 			// `?next=` value, appended before the request buffer is recycled.
-			ws(mut out, 'HTTP/1.1 303 See Other\r\nLocation: ')
+			core.append_str(mut out, 'HTTP/1.1 303 See Other\r\nLocation: ')
 			if s := req.get_query_slice(next_key) {
 				if s.len > 0 {
 					out << safe_next(unsafe { (&req.buffer[s.start]).vbytes(s.len) })
@@ -126,15 +121,15 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 			} else {
 				out << dashboard_bytes // no `next`: default landing page
 			}
-			ws(mut out, '\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n')
+			core.append_str(mut out, '\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n')
 			return .done
 		}
-		out << resp_200_empty // GET /login: the form page (empty stand-in)
+		core.append_str(mut out, resp_200_empty) // GET /login: the form page (empty stand-in)
 	} else if slice_eq(req.buffer, route, '/api/v1/resource') {
 		// API redirect: preserve method + body.
-		out << resp_308_api
+		core.append_str(mut out, resp_308_api)
 	} else {
-		out << resp_200_empty
+		core.append_str(mut out, resp_200_empty)
 	}
 	return .done
 }

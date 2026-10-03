@@ -2,6 +2,7 @@ module pg_async
 
 import encoding.binary
 import time
+import core
 
 // PostgreSQL frontend/backend wire protocol v3 — framing, message builders, and
 // result iteration. Pure and I/O-free: builders append bytes to a caller-owned
@@ -687,13 +688,13 @@ fn put_u32(mut buf []u8, v u32) {
 }
 
 // put_cstr_s appends a NUL-terminated C string by copying the string's bytes
-// DIRECTLY (push_many from s.str/s.len), never `s.bytes()` — `.bytes()` allocates a
+// DIRECTLY (core.append_str), never `s.bytes()` — `.bytes()` allocates a
 // throwaway []u8 copy on every call, which leaks under `-gc none` (the SQL text + the
 // empty portal/stmt names are serialized on every async_submit). Wire output is
 // byte-identical: the same bytes followed by a NUL.
 @[direct_array_access]
 fn put_cstr_s(mut buf []u8, s string) {
-	unsafe { buf.push_many(s.str, s.len) }
+	core.append_str(mut buf, s)
 	buf << u8(0)
 }
 

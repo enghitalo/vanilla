@@ -121,8 +121,8 @@ fn math_min(a f64, b f64) f64 {
 // splits into two consts around one decimal write. The body `{"ok":true}` is
 // fixed (11 bytes), which makes Content-Length a compile-time constant too.
 const response_429 = 'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nRateLimit-Limit: 10\r\nRateLimit-Remaining: 0\r\nContent-Length: 0\r\n\r\n'.bytes()
-const response_200_prefix = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nRateLimit-Remaining: '.bytes()
-const response_200_tail = '\r\nContent-Length: 11\r\n\r\n{"ok":true}'.bytes()
+const response_200_prefix = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nRateLimit-Remaining: '
+const response_200_tail = '\r\nContent-Length: 11\r\n\r\n{"ok":true}'
 
 // wi appends n's decimal digits into `out` — itoa into a stack scratch, then
 // append. No allocation, no `.str()` (BEST_PRACTICES §3b).
@@ -285,9 +285,9 @@ fn handle(req_buffer []u8, mut out []u8, client_fd int, _worker_state voidptr, m
 		out << response_429
 		return .done
 	}
-	out << response_200_prefix
+	core.append_str(mut out, response_200_prefix)
 	wi(mut out, remaining)
-	out << response_200_tail
+	core.append_str(mut out, response_200_tail)
 	return .done
 }
 

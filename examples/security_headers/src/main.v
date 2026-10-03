@@ -31,7 +31,7 @@ const security_headers = ('Strict-Transport-Security: max-age=63072000; includeS
 	'Permissions-Policy: geolocation=(), camera=(), microphone=()\r\n').bytes()
 
 // Content-Length 15 = len('<h1>secure</h1>').
-const app_response = 'HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 15\r\n\r\n<h1>secure</h1>'.bytes()
+const app_response = 'HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 15\r\n\r\n<h1>secure</h1>'
 
 // with_security_headers wraps any handler and injects the headers into its
 // response, right after the status line. Composition, not inheritance. Every
@@ -83,7 +83,7 @@ fn app(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut
 		out << response.tiny_bad_request_response
 		return .close
 	}
-	out << app_response
+	core.append_str(mut out, app_response)
 	return .done
 }
 

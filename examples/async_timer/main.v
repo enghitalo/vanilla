@@ -25,7 +25,7 @@ fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
 fn C.read(fd int, buf voidptr, count usize) int
 
-const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
+const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'
 
 // handle is the request handler. For /delay it arms a one-shot timerfd and
 // parks the request on it (returns .suspend); the worker resumes `timer_done`
@@ -42,7 +42,7 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
 		event_loop.watch_fd(tfd, .readable, timer_done, unsafe { nil })
 		return .suspend
 	}
-	out << resp_ok
+	core.append_str(mut out, resp_ok)
 	return .done
 }
 

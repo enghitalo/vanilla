@@ -28,24 +28,24 @@ fn C.fileno(stream voidptr) int
 fn C.fcntl(fd int, cmd int, arg int) int
 fn C.read(fd int, buf voidptr, count usize) int
 
-const chunk_headers = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const chunk_headers = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n'
 
-const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if !req.bytestr().contains('/stream') {
-		out << not_found
+		core.append_str(mut out, not_found)
 		return .done
 	}
 	// A producer whose output is spread over time — the whole point of streaming.
 	fp := C.popen(c'for i in 1 2 3 4 5; do echo "line $i"; sleep 0.2; done', c'r')
 	if fp == unsafe { nil } {
-		out << not_found
+		core.append_str(mut out, not_found)
 		return .done
 	}
 	fd := C.fileno(fp)
 	C.fcntl(fd, C.F_SETFL, C.O_NONBLOCK) // so read() returns EAGAIN instead of blocking
-	out << chunk_headers // flushed after the initial .suspend
+	core.append_str(mut out, chunk_headers) // flushed after the initial .suspend
 	event_loop.watch_fd(fd, .readable, on_chunk, fp) // carry FILE* so we can pclose at EOF
 	return .suspend
 }

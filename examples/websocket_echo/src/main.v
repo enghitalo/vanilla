@@ -19,15 +19,15 @@ import http1_1.response
 import server
 import websocket
 
-const switching_prefix = 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: '.bytes()
-const head_end = '\r\n\r\n'.bytes()
+const switching_prefix = 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: '
+const head_end = '\r\n\r\n'
 
-const home_response = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 47\r\nConnection: keep-alive\r\n\r\nWebSocket echo: connect a ws:// client to /ws\r\n'.bytes()
-const not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const home_response = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 47\r\nConnection: keep-alive\r\n\r\nWebSocket echo: connect a ws:// client to /ws\r\n'
+const not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 // 501: this worker/backend cannot take connections over (queue_takeover
 // returned false) — upgrading would leave the peer speaking unparsed frames.
-const cannot_upgrade_response = 'HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
-const bad_upgrade_response = 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
+const cannot_upgrade_response = 'HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
+const bad_upgrade_response = 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
 
 // slice_eq compares a request Slice against a small const byte pattern.
 @[direct_array_access]
@@ -56,15 +56,15 @@ fn handle(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event
 		return .close
 	}
 	if !slice_eq(hr.buffer, hr.method, get_method) {
-		res << not_found_response
+		core.append_str(mut res, not_found_response)
 		return .done
 	}
 	if slice_eq(hr.buffer, hr.path, root_path) {
-		res << home_response
+		core.append_str(mut res, home_response)
 		return .done
 	}
 	if !slice_eq(hr.buffer, hr.path, ws_path) {
-		res << not_found_response
+		core.append_str(mut res, not_found_response)
 		return .done
 	}
 	// GET /ws — validate the RFC 6455 §4.2.1 client handshake: an Upgrade:
@@ -72,27 +72,27 @@ fn handle(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event
 	// would also check Sec-WebSocket-Version: 13; the echo demo keeps the
 	// checks to what the response depends on.)
 	upgrade := hr.get_header_value_slice('Upgrade') or {
-		res << bad_upgrade_response
+		core.append_str(mut res, bad_upgrade_response)
 		return .close
 	}
 	if !slice_eq(hr.buffer, upgrade, upgrade_websocket) {
-		res << bad_upgrade_response
+		core.append_str(mut res, bad_upgrade_response)
 		return .close
 	}
 	key := hr.get_header_value_slice('Sec-WebSocket-Key') or {
-		res << bad_upgrade_response
+		core.append_str(mut res, bad_upgrade_response)
 		return .close
 	}
 	// The takeover FIRST: only append the 101 if this worker can actually flip
 	// the connection's mode (queue_takeover is false on non-epoll backends and
 	// tcc dev builds — the peer must then get a clear error, not a dead 101).
 	if !core.queue_takeover(ws_echo_conn, unsafe { nil }) {
-		res << cannot_upgrade_response
+		core.append_str(mut res, cannot_upgrade_response)
 		return .close
 	}
-	res << switching_prefix
+	core.append_str(mut res, switching_prefix)
 	websocket.append_accept_key(mut res, unsafe { tos(&hr.buffer[key.start], key.len) })
-	res << head_end
+	core.append_str(mut res, head_end)
 	return .done
 }
 

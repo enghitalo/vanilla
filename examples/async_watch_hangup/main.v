@@ -23,7 +23,7 @@ import core
 fn C.pipe(fds &i32) int
 fn C.close(fd int) int
 
-const resp = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
+const resp = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'
 
 // on_start arms a clientless watch on a pipe read-end, then closes the write-end
 // so the read-end immediately reports a hangup (the "producer" is gone). Composes
@@ -52,7 +52,7 @@ fn on_source_event(mut out []u8, ready_fd int, ready_fd_error bool, watch_payloa
 }
 
 fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
-	out << resp
+	core.append_str(mut out, resp)
 	return .done
 }
 

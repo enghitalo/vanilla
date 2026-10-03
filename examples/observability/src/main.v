@@ -26,10 +26,10 @@ module main
 //
 // BYTE DISCIPLINE (docs/BEST_PRACTICES.md §2/§3, docs/V_PERF_TOOLBOX.md):
 //   - Handlers APPEND into `out` (§1) — no return-a-buffer, no copy.
-//   - Fixed responses are compile-time `const ... .bytes()`, sent with `out <<`.
+//   - Fixed responses are `const` strings appended with `core.append_str`.
 //   - Routing compares the path IN PLACE by offsets (`slice_eq`) — no
 //     `.to_string()`, no match-on-string.
-//   - The /metrics body is framed with `ws`/`wi`/`wu` (push_many + write_dec
+//   - The /metrics body is framed with `core.append_str`/`wi`/`wu` (append_str + write_dec
 //     into a stack scratch) — zero `${}` in request-serving code.
 //   - The wrapper reads the status straight from the three digit bytes already
 //     in `out` — no slice expression, no `.bytestr()`, no re-parse.
@@ -80,32 +80,26 @@ fn (mut m Metrics) prometheus_body(mut body []u8) {
 	s4 := m.status_4xx
 	s5 := m.status_5xx
 	m.mu.unlock()
-	ws(mut body, 'http_requests_total ')
+	core.append_str(mut body, 'http_requests_total ')
 	wu(mut body, requests_total)
-	ws(mut body, '\nhttp_responses_total{class="2xx"} ')
+	core.append_str(mut body, '\nhttp_responses_total{class="2xx"} ')
 	wu(mut body, s2)
-	ws(mut body, '\nhttp_responses_total{class="4xx"} ')
+	core.append_str(mut body, '\nhttp_responses_total{class="4xx"} ')
 	wu(mut body, s4)
-	ws(mut body, '\nhttp_responses_total{class="5xx"} ')
+	core.append_str(mut body, '\nhttp_responses_total{class="5xx"} ')
 	wu(mut body, s5)
-	ws(mut body, '\n')
+	core.append_str(mut body, '\n')
 }
 
 // ---- static responses (consts — the handler appends, never builds) ----------
-const resp_healthz = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'.bytes()
-const resp_ready = 'HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nready'.bytes()
-const resp_not_ready_503 = 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n'.bytes()
-const resp_ok_empty = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'.bytes()
-const resp_internal_error_500 = 'HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
-const metrics_head = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: '.bytes()
+const resp_healthz = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'
+const resp_ready = 'HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nready'
+const resp_not_ready_503 = 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n'
+const resp_ok_empty = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'
+const resp_internal_error_500 = 'HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
+const metrics_head = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: '
 
 // ---- zero-alloc append helpers (BEST_PRACTICES §3b) -------------------------
-// ws appends a string's bytes straight into `out` — no allocation.
-@[inline]
-fn ws(mut out []u8, s string) {
-	unsafe { out.push_many(s.str, s.len) }
-}
-
 // wi appends n's decimal digits into `out` — itoa into a stack scratch, then
 // append. No allocation, no `.str()`.
 fn wi(mut out []u8, n i64) {
@@ -155,7 +149,7 @@ fn app(req_buffer []u8, mut m Metrics, mut out []u8) !core.Step {
 		return .close
 	}
 	if slice_eq(req.buffer, req.path, '/healthz') {
-		out << resp_healthz
+		core.append_str(mut out, resp_healthz)
 		return .done
 	}
 	if slice_eq(req.buffer, req.path, '/readyz') {
@@ -164,10 +158,10 @@ fn app(req_buffer []u8, mut m Metrics, mut out []u8) !core.Step {
 		// a const it costs nothing.
 		ready := true
 		if ready {
-			out << resp_ready
+			core.append_str(mut out, resp_ready)
 			return .done
 		}
-		out << resp_not_ready_503
+		core.append_str(mut out, resp_not_ready_503)
 		return .done
 	}
 	if slice_eq(req.buffer, req.path, '/metrics') {
@@ -176,15 +170,15 @@ fn app(req_buffer []u8, mut m Metrics, mut out []u8) !core.Step {
 		// polls every 15-60s — this never runs per client request.
 		mut body := []u8{cap: 160}
 		m.prometheus_body(mut body)
-		out << metrics_head
+		core.append_str(mut out, metrics_head)
 		wi(mut out, i64(body.len))
-		ws(mut out, '\r\n\r\n')
+		core.append_str(mut out, '\r\n\r\n')
 		out << body
 		return .done
 	}
 	// Unknown path: this demo answers an empty 200 (kept from day one — a real
 	// service would 404 here).
-	out << resp_ok_empty
+	core.append_str(mut out, resp_ok_empty)
 	return .done
 }
 
@@ -289,7 +283,7 @@ fn observed(next fn (req []u8, mut out []u8) !core.Step, mut m Metrics) core.Han
 			// error diagnostics, not request serving.
 			eprintln('level=error err=${err}')
 			out.trim(start_len)
-			out << resp_internal_error_500
+			core.append_str(mut out, resp_internal_error_500)
 			core.Step.close
 		}
 		status := status_of(out, start_len)

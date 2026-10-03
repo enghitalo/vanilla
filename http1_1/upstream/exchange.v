@@ -33,11 +33,11 @@ pub fn (mut x Exchange) send(mut el core.EventLoop, cont core.WakeFn, payload vo
 	// POST / PUT / PATCH without (0), so the server never waits for a body.
 	m0 := x.head[0]
 	if x.body.len > 0 || m0 == `P` {
-		ws(mut x.head, 'Content-Length: ')
+		core.append_str(mut x.head, 'Content-Length: ')
 		wi(mut x.head, x.body.len)
-		ws(mut x.head, '\r\n')
+		core.append_str(mut x.head, '\r\n')
 	}
-	ws(mut x.head, '\r\n')
+	core.append_str(mut x.head, '\r\n')
 	if x.head.len + x.body.len > x.pool.origin.max_request_bytes {
 		return x.fail(.invalid)
 	}

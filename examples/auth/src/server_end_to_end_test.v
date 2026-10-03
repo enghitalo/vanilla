@@ -32,13 +32,13 @@ const hol_login_req = 'POST /token HTTP/1.1\r\nHost: x\r\nContent-Length: 28\r\n
 fn hol_sync_handler(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
 	if req_buffer.bytestr().contains('/token') {
 		if !verify_password('correct horse battery staple'.bytes(), demo_password_phc) {
-			out << resp_401
+			core.append_str(mut out, resp_401)
 			return .done
 		}
 		write_token_200(mut out)
 		return .done
 	}
-	out << resp_ok_empty
+	core.append_str(mut out, resp_ok_empty)
 	return .done
 }
 

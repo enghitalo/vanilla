@@ -21,11 +21,11 @@ import pg_async
 
 const pool_size = 4
 
-const resp_500 = 'HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const resp_500 = 'HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
-const resp_503 = 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const resp_503 = 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
-const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
+const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'
 
 const resp_json_head = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '.bytes()
 
@@ -85,30 +85,30 @@ fn targets_db(req []u8) bool {
 // other path replies synchronously.
 fn handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if !targets_db(req) {
-		out << resp_ok
+		core.append_str(mut out, resp_ok)
 		return .done
 	}
 	mut st := unsafe { &DbState(worker_state) }
 	idx := st.pool.acquire() or {
-		out << resp_503
+		core.append_str(mut out, resp_503)
 		return .done
 	}
 	mut conn := st.pool.conn(idx)
 	if !conn.async_submit(r'select id, name from pg_async_demo order by id', []?[]u8{}) {
 		// Connection saturated (pipeline full) — shed.
 		st.pool.release(idx)
-		out << resp_503
+		core.append_str(mut out, resp_503)
 		return .done
 	}
 	flushed := conn.async_flush() or {
 		st.pool.release(idx)
-		out << resp_500
+		core.append_str(mut out, resp_500)
 		return .done
 	}
 	if !flushed {
 		// Tiny queries flush in one write; a partial send is a v1 edge we don't handle.
 		st.pool.release(idx)
-		out << resp_500
+		core.append_str(mut out, resp_500)
 		return .done
 	}
 	// The pool owns this socket and reuses it, so park with watch_fd_persistent,
@@ -131,7 +131,7 @@ fn on_db_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload vo
 	mut conn := st.pool.conn(idx)
 	poll := conn.async_on_readable() or {
 		st.pool.release(idx)
-		out << resp_500
+		core.append_str(mut out, resp_500)
 		return .done
 	}
 	if !poll.ready {
@@ -139,7 +139,7 @@ fn on_db_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload vo
 			// Error/hangup with the reply still incomplete: the socket is dead.
 			// Re-arming a dead level-triggered fd would busy-spin the worker.
 			st.pool.release(idx)
-			out << resp_500
+			core.append_str(mut out, resp_500)
 			return .done
 		}
 		event_loop.watch_fd_persistent(ready_fd, .readable, on_db_ready, watch_payload) // more bytes to come

@@ -10,6 +10,7 @@ module client
 // POOL connections per worker (make_state — a dial costs ~4× a request) and
 // prefer unix_socket_path transports (2.3–2.7× TCP loopback).
 import strconv
+import core
 
 // no_body is the empty-body argument for write_request, allocated once.
 pub const no_body = []u8{}
@@ -23,11 +24,6 @@ pub const err_malformed = -2
 // no Content-Length and a body-bearing status: the body is delimited by
 // connection close (RFC 9112 §6.3 fallback) — not frameable in advance
 pub const err_until_close = -4
-
-@[inline]
-fn ws(mut out []u8, s string) {
-	unsafe { out.push_many(s.str, s.len) }
-}
 
 // wi appends n's decimal digits — itoa into a stack scratch, no `.str()`.
 fn wi(mut out []u8, n i64) {
@@ -46,21 +42,21 @@ fn wi(mut out []u8, n i64) {
 // pass 'Connection: close\r\n' in extra_headers for one-shot requests.
 // A Content-Length header is emitted whenever body is non-empty.
 pub fn write_request(mut out []u8, method string, target string, host string, extra_headers string, body []u8) {
-	ws(mut out, method)
-	ws(mut out, ' ')
-	ws(mut out, target)
-	ws(mut out, ' HTTP/1.1\r\nHost: ')
-	ws(mut out, host)
-	ws(mut out, '\r\n')
+	core.append_str(mut out, method)
+	core.append_str(mut out, ' ')
+	core.append_str(mut out, target)
+	core.append_str(mut out, ' HTTP/1.1\r\nHost: ')
+	core.append_str(mut out, host)
+	core.append_str(mut out, '\r\n')
 	if extra_headers.len > 0 {
-		ws(mut out, extra_headers)
+		core.append_str(mut out, extra_headers)
 	}
 	if body.len > 0 {
-		ws(mut out, 'Content-Length: ')
+		core.append_str(mut out, 'Content-Length: ')
 		wi(mut out, i64(body.len))
-		ws(mut out, '\r\n')
+		core.append_str(mut out, '\r\n')
 	}
-	ws(mut out, '\r\n')
+	core.append_str(mut out, '\r\n')
 	if body.len > 0 {
 		out << body
 	}

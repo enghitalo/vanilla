@@ -110,16 +110,16 @@ fn date_tick(mut _out []u8, ready_fd int, _ready_fd_error bool, _watch_payload v
 	return .suspend
 }
 
-const head = 'HTTP/1.1 200 OK\r\n'.bytes()
+const head = 'HTTP/1.1 200 OK\r\n'
 
-const tail = 'Content-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
+const tail = 'Content-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'
 
 // handle is a plain sync handler: zero time work — just append the cached Date.
 fn handle(_req []u8, mut out []u8, _client_fd int, worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
 	dc := unsafe { &DateCache(worker_state) }
-	out << head
+	core.append_str(mut out, head)
 	unsafe { out.push_many(&dc.line[0], date_line_len) }
-	out << tail
+	core.append_str(mut out, tail)
 	return .done
 }
 

@@ -140,12 +140,6 @@ fn decode_chunked_into(buf []u8, start int, len int, mut dst []u8) ! {
 
 // ---- response side: frame views as chunks, no allocation --------------------
 
-// ws appends a string's bytes straight into `out` (BEST_PRACTICES §3b).
-@[inline]
-fn ws(mut out []u8, s string) {
-	unsafe { out.push_many(s.str, s.len) }
-}
-
 // wx appends n's lowercase hex digits into `out` — the chunk-size line —
 // via a stack scratch. No allocation, no `${n:x}`.
 fn wx(mut out []u8, n int) {
@@ -169,13 +163,13 @@ fn wx(mut out []u8, n int) {
 // view is appended directly — never copied through an intermediate.
 fn write_chunk(mut out []u8, data []u8) {
 	wx(mut out, data.len)
-	ws(mut out, '\r\n')
+	core.append_str(mut out, '\r\n')
 	out << data
-	ws(mut out, '\r\n')
+	core.append_str(mut out, '\r\n')
 }
 
-const resp_head_chunked = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const last_chunk = '0\r\n\r\n'.bytes()
+const resp_head_chunked = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n'
+const last_chunk = '0\r\n\r\n'
 
 // The no-body demo pieces — three separate frames on the wire.
 const demo_pieces = ['first piece\n'.bytes(), 'second piece\n'.bytes(), 'third piece\n'.bytes()]
@@ -208,7 +202,7 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 		out << response.tiny_bad_request_response
 		return .close
 	}
-	out << resp_head_chunked
+	core.append_str(mut out, resp_head_chunked)
 	if req.body.len > 0 && is_chunked(req) {
 		// ECHO: walk the request's chunk frames and re-frame each data window
 		// into the response — request payload bytes are appended exactly once.
@@ -231,7 +225,7 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 			write_chunk(mut out, piece)
 		}
 	}
-	out << last_chunk
+	core.append_str(mut out, last_chunk)
 	return .done
 }
 

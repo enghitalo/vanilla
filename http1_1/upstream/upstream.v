@@ -66,6 +66,7 @@ import tls
 import time
 import transport
 import http1_1.client
+import core
 
 #include "@VMODROOT/http1_1/upstream/upstream_shim.h"
 
@@ -435,10 +436,10 @@ pub fn (mut x Exchange) request(method string, target string) bool {
 		x.invalid = true
 		return false
 	}
-	ws(mut x.head, method)
+	core.append_str(mut x.head, method)
 	x.head << ` `
-	ws(mut x.head, target)
-	ws(mut x.head, ' HTTP/1.1\r\n')
+	core.append_str(mut x.head, target)
+	core.append_str(mut x.head, ' HTTP/1.1\r\n')
 	x.head << x.pool.host_hdr
 	x.is_head = method == 'HEAD'
 	x.idempotent = method in idempotent_methods
@@ -460,10 +461,10 @@ pub fn (mut x Exchange) header(name string, value []u8) bool {
 	if eq_ci(name, 'connection') && has_ci(value, 'close') {
 		x.conn_close = true
 	}
-	ws(mut x.head, name)
-	ws(mut x.head, ': ')
+	core.append_str(mut x.head, name)
+	core.append_str(mut x.head, ': ')
 	x.head << value
-	ws(mut x.head, '\r\n')
+	core.append_str(mut x.head, '\r\n')
 	return true
 }
 
@@ -534,11 +535,6 @@ pub fn (mut x Exchange) release() {
 	x.phase = .idle
 	x.deadline = 0
 	x.limit = 0
-}
-
-@[inline]
-fn ws(mut out []u8, s string) {
-	unsafe { out.push_many(s.str, s.len) }
 }
 
 // eq_ci reports whether s equals `lower` (lowercase), ignoring ASCII case.

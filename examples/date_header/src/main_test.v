@@ -1,5 +1,7 @@
 module main
 
+import core
+
 // The cache logic is pure/in-memory, so the format, the publish, and the response
 // composition are all unit-testable without a clock-dependent assertion on the
 // exact value. seed() must run before refresh() (it lays the static "Date: " /
@@ -31,9 +33,9 @@ fn test_response_includes_date_header() {
 	// Reproduce exactly what the handler closure writes into `out`:
 	// the two static halves plus the cached, zero-copy Date line.
 	mut out := []u8{}
-	out << status_head
+	core.append_str(mut out, status_head)
 	out << c.date_line()
-	out << resp_tail
+	core.append_str(mut out, resp_tail)
 	resp := out.bytestr()
 	assert resp.contains('HTTP/1.1 200 OK\r\n')
 	assert resp.contains('Date: ')
