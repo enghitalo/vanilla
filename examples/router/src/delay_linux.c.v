@@ -14,14 +14,14 @@ fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) in
 fn C.read(fd int, buf voidptr, count usize) int
 
 const delayed_response = fixed_json(json_200_head, '{"delayed":true}')
-const delay_unavailable_response = 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const delay_unavailable_response = 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 // start_delay parks the request on a timerfd that fires in `ms` milliseconds;
 // delay_done answers it.
 fn start_delay(ms int, mut out []u8, mut event_loop core.EventLoop) core.Step {
 	tfd := C.timerfd_create(C.CLOCK_MONOTONIC, C.TFD_CLOEXEC)
 	if tfd < 0 {
-		out << delay_unavailable_response
+		core.append_str(mut out, delay_unavailable_response)
 		return .done
 	}
 	// struct itimerspec = { it_interval{sec,nsec}, it_value{sec,nsec} } = 4×i64.
@@ -40,6 +40,6 @@ fn delay_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voi
 	mut tmp := [8]u8{}
 	C.read(ready_fd, &tmp[0], 8)
 	C.close(ready_fd)
-	out << delayed_response
+	core.append_str(mut out, delayed_response)
 	return .done
 }

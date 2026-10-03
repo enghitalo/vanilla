@@ -23,13 +23,13 @@ import http1_1.router { Method, Path }
 
 const users_list_response = fixed_json(json_200_head, '[]')
 const user_created_response = fixed_json(json_201_head, '{"id":1}')
-const not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const not_implemented_response = 'HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const not_implemented_response = 'HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 // The 405 of each leaf, listing exactly what its branches serve.
-const users_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD, POST\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const user_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD, PUT, DELETE, PATCH\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const get_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const users_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD, POST\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const user_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD, PUT, DELETE, PATCH\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const get_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 // route is the server's core.Handler and the root node. It reads only the
 // request line: no route here needs a header (one that did would decode the
@@ -59,9 +59,9 @@ fn route(req_buffer []u8, mut out []u8, _ int, _ voidptr, mut event_loop core.Ev
 fn users(m Method, mut path Path, mut out []u8) core.Step {
 	if path.done() { // /users
 		match m {
-			.get, .head { out << users_list_response }
-			.post { out << user_created_response }
-			else { out << users_405 }
+			.get, .head { core.append_str(mut out, users_list_response) }
+			.post { core.append_str(mut out, user_created_response) }
+			else { core.append_str(mut out, users_405) }
 		}
 		return .done
 	}
@@ -75,7 +75,7 @@ fn users(m Method, mut path Path, mut out []u8) core.Step {
 			.put { json_field(mut out, '{"replaced":', id, '}') }
 			.patch { json_field(mut out, '{"updated":', id, '}') }
 			.delete { json_field(mut out, '{"deleted":', id, '}') }
-			else { out << user_405 }
+			else { core.append_str(mut out, user_405) }
 		}
 		return .done
 	}
@@ -85,7 +85,7 @@ fn users(m Method, mut path Path, mut out []u8) core.Step {
 				return not_found(mut out)
 			}
 			if m != .get && m != .head {
-				out << get_405
+				core.append_str(mut out, get_405)
 				return .done
 			}
 			json_field(mut out, '{"id":', id, ',"section":"profile"}')
@@ -108,15 +108,15 @@ fn posts(m Method, user_id string, mut path Path, mut out []u8) core.Step {
 	}
 	if path.done() {
 		if m != .get && m != .head {
-			out << get_405
+			core.append_str(mut out, get_405)
 			return .done
 		}
 		b := begin_json(mut out)
-		ws(mut out, '{"user":')
+		core.append_str(mut out, '{"user":')
 		json_string(mut out, user_id)
-		ws(mut out, ',"post":')
+		core.append_str(mut out, ',"post":')
 		json_string(mut out, post_id)
-		ws(mut out, '}')
+		core.append_str(mut out, '}')
 		end_json(mut out, b)
 		return .done
 	}
@@ -128,17 +128,17 @@ fn posts(m Method, user_id string, mut path Path, mut out []u8) core.Step {
 		return not_found(mut out)
 	}
 	if m != .get && m != .head {
-		out << get_405
+		core.append_str(mut out, get_405)
 		return .done
 	}
 	b := begin_json(mut out)
-	ws(mut out, '{"user":')
+	core.append_str(mut out, '{"user":')
 	json_string(mut out, user_id)
-	ws(mut out, ',"post":')
+	core.append_str(mut out, ',"post":')
 	json_string(mut out, post_id)
-	ws(mut out, ',"comment":')
+	core.append_str(mut out, ',"comment":')
 	json_string(mut out, comment_id)
-	ws(mut out, '}')
+	core.append_str(mut out, '}')
 	end_json(mut out, b)
 	return .done
 }
@@ -152,17 +152,17 @@ fn tags(m Method, mut path Path, mut out []u8) core.Step {
 		return not_found(mut out)
 	}
 	if m != .get && m != .head {
-		out << get_405
+		core.append_str(mut out, get_405)
 		return .done
 	}
 	body := begin_json(mut out)
-	ws(mut out, '{"a":')
+	core.append_str(mut out, '{"a":')
 	json_string(mut out, a)
-	ws(mut out, ',"b":')
+	core.append_str(mut out, ',"b":')
 	json_string(mut out, b)
-	ws(mut out, ',"c":')
+	core.append_str(mut out, ',"c":')
 	json_string(mut out, c)
-	ws(mut out, '}')
+	core.append_str(mut out, '}')
 	end_json(mut out, body)
 	return .done
 }
@@ -175,7 +175,7 @@ fn search(m Method, mut path Path, mut out []u8) core.Step {
 		return not_found(mut out)
 	}
 	if m != .get && m != .head {
-		out << get_405
+		core.append_str(mut out, get_405)
 		return .done
 	}
 	json_field(mut out, '{"term":', term, '}')
@@ -189,7 +189,7 @@ fn catch_all(m Method, mut path Path, mut out []u8, key string) core.Step {
 		return not_found(mut out)
 	}
 	if m != .get && m != .head {
-		out << get_405
+		core.append_str(mut out, get_405)
 		return .done
 	}
 	json_field(mut out, key, path.rest(), '}')
@@ -206,17 +206,17 @@ fn delay(m Method, mut path Path, mut out []u8, mut event_loop core.EventLoop) c
 		return not_found(mut out)
 	}
 	if m != .get && m != .head {
-		out << get_405
+		core.append_str(mut out, get_405)
 		return .done
 	}
 	ms := parse_ms(text) or {
-		out << delay_bad_ms_response
+		core.append_str(mut out, delay_bad_ms_response)
 		return .done
 	}
 	$if linux {
 		return start_delay(ms, mut out, mut event_loop)
 	} $else {
-		out << not_implemented_response
+		core.append_str(mut out, not_implemented_response)
 		return .done
 	}
 }
@@ -238,6 +238,6 @@ fn parse_ms(s string) ?int {
 
 @[inline]
 fn not_found(mut out []u8) core.Step {
-	out << not_found_response
+	core.append_str(mut out, not_found_response)
 	return .done
 }

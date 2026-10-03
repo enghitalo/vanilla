@@ -146,7 +146,7 @@ fn test_both_shapes_and_extra_attributes() {
 
 fn test_custom_not_found() {
 	mut r := new[ShapesApp](&ShapesApp{})!
-	r.not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n\r\nnope'.bytes()
+	r.not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n\r\nnope'
 	assert body(run(r, get('/missing'))) == 'nope'
 }
 

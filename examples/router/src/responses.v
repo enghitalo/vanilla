@@ -1,18 +1,20 @@
 module main
 
+import core
 import strconv
 
 fn C.memchr(s voidptr, c int, n usize) voidptr
 
 // Response framing, appended straight into the connection's write buffer: a
-// const head, the body written in place, then its Content-Length digits
-// patched into the head. No intermediate body buffer, no copy into `out`, no
-// `${}` — nothing allocated per response (BEST_PRACTICES §1, §3).
+// const head (a string, appended with core.append_str), the body written in
+// place, then its Content-Length digits patched into the head. No intermediate
+// body buffer, no copy into `out`, no `${}` — nothing allocated per response
+// (BEST_PRACTICES §1, §3).
 
-const json_200_head = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '.bytes()
-const json_201_head = 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: '.bytes()
-const json_400_head = 'HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: '.bytes()
-const keep_alive_tail = '\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const json_200_head = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '
+const json_201_head = 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: '
+const json_400_head = 'HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: '
+const keep_alive_tail = '\r\nConnection: keep-alive\r\n\r\n'
 
 // Body remembers where, in `out`, the open Content-Length value and the body
 // of the response being written start.
@@ -25,9 +27,9 @@ struct Body {
 // Append the body, then close it with end_json.
 @[inline]
 fn begin_json(mut out []u8) Body {
-	out << json_200_head
+	core.append_str(mut out, json_200_head)
 	digits_at := out.len
-	out << keep_alive_tail
+	core.append_str(mut out, keep_alive_tail)
 	return Body{digits_at, out.len}
 }
 
@@ -51,28 +53,22 @@ fn end_json(mut out []u8, b Body) {
 // JSON string, then `post`: `{"id":"42"}` from ('{"id":', '42', '}').
 fn json_field(mut out []u8, pre string, value string, post string) {
 	b := begin_json(mut out)
-	ws(mut out, pre)
+	core.append_str(mut out, pre)
 	json_string(mut out, value)
-	ws(mut out, post)
+	core.append_str(mut out, post)
 	end_json(mut out, b)
 }
 
 // fixed_json frames a body that never changes, once at init, for a const.
-fn fixed_json(head []u8, body string) []u8 {
+fn fixed_json(head string, body string) string {
 	mut out := []u8{cap: head.len + 24 + keep_alive_tail.len + body.len}
-	out << head
+	core.append_str(mut out, head)
 	digits_at := out.len
-	out << keep_alive_tail
+	core.append_str(mut out, keep_alive_tail)
 	start := out.len
-	ws(mut out, body)
+	core.append_str(mut out, body)
 	end_json(mut out, Body{digits_at, start})
-	return out
-}
-
-// ws appends a string's bytes.
-@[inline]
-fn ws(mut out []u8, s string) {
-	unsafe { out.push_many(s.str, s.len) }
+	return out.bytestr()
 }
 
 // json_string appends `s` as a quoted JSON string. Params come raw from the
@@ -86,15 +82,15 @@ fn json_string(mut out []u8, s string) {
 	for i in 0 .. s.len {
 		c := s[i]
 		match c {
-			34 { ws(mut out, '\\"') }
-			92 { ws(mut out, '\\\\') }
-			10 { ws(mut out, '\\n') }
-			13 { ws(mut out, '\\r') }
-			9 { ws(mut out, '\\t') }
+			34 { core.append_str(mut out, '\\"') }
+			92 { core.append_str(mut out, '\\\\') }
+			10 { core.append_str(mut out, '\\n') }
+			13 { core.append_str(mut out, '\\r') }
+			9 { core.append_str(mut out, '\\t') }
 			else {
 				if c < 0x20 {
 					// other control bytes: \u00XX (RFC 8259)
-					ws(mut out, '\\u00')
+					core.append_str(mut out, '\\u00')
 					out << hex_digit(c >> 4)
 					out << hex_digit(c & 0x0f)
 				} else {

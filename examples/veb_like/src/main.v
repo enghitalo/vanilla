@@ -35,13 +35,13 @@ const user_created_response = fixed_json(json_201_head, '{"id":1}')
 
 @['GET /users']
 fn (app &App) list_users(_ HttpRequest, _ &Params, mut out []u8) core.Step {
-	out << users_list_response
+	core.append_str(mut out, users_list_response)
 	return .done
 }
 
 @['POST /users']
 fn (app &App) create_user(_ HttpRequest, _ &Params, mut out []u8) core.Step {
-	out << user_created_response
+	core.append_str(mut out, user_created_response)
 	return .done
 }
 
@@ -88,11 +88,11 @@ fn (app &App) user_profile(_ HttpRequest, p &Params, mut out []u8) core.Step {
 @['GET /users/:user_id/posts/:post_id']
 fn (app &App) user_post(_ HttpRequest, p &Params, mut out []u8) core.Step {
 	b := begin_json(mut out)
-	ws(mut out, '{"user":')
+	core.append_str(mut out, '{"user":')
 	json_string(mut out, p.get('user_id'))
-	ws(mut out, ',"post":')
+	core.append_str(mut out, ',"post":')
 	json_string(mut out, p.get('post_id'))
-	ws(mut out, '}')
+	core.append_str(mut out, '}')
 	end_json(mut out, b)
 	return .done
 }
@@ -102,13 +102,13 @@ fn (app &App) user_post(_ HttpRequest, p &Params, mut out []u8) core.Step {
 @['GET /users/:user_id/posts/:post_id/comments/:comment_id']
 fn (app &App) post_comment(_ HttpRequest, p &Params, mut out []u8) core.Step {
 	b := begin_json(mut out)
-	ws(mut out, '{"user":')
+	core.append_str(mut out, '{"user":')
 	json_string(mut out, p.get('user_id'))
-	ws(mut out, ',"post":')
+	core.append_str(mut out, ',"post":')
 	json_string(mut out, p.get('post_id'))
-	ws(mut out, ',"comment":')
+	core.append_str(mut out, ',"comment":')
 	json_string(mut out, p.get('comment_id'))
-	ws(mut out, '}')
+	core.append_str(mut out, '}')
 	end_json(mut out, b)
 	return .done
 }
@@ -118,13 +118,13 @@ fn (app &App) post_comment(_ HttpRequest, p &Params, mut out []u8) core.Step {
 @['GET /tags/:a/:b/:c']
 fn (app &App) tags(_ HttpRequest, p &Params, mut out []u8) core.Step {
 	b := begin_json(mut out)
-	ws(mut out, '{"a":')
+	core.append_str(mut out, '{"a":')
 	json_string(mut out, p.get('a'))
-	ws(mut out, ',"b":')
+	core.append_str(mut out, ',"b":')
 	json_string(mut out, p.get('b'))
-	ws(mut out, ',"c":')
+	core.append_str(mut out, ',"c":')
 	json_string(mut out, p.get('c'))
-	ws(mut out, '}')
+	core.append_str(mut out, '}')
 	end_json(mut out, b)
 	return .done
 }
@@ -159,18 +159,18 @@ fn (app &App) proxy(_ HttpRequest, p &Params, mut out []u8) core.Step {
 // connections until the timer fires (delay_linux.c.v; elsewhere: 501).
 
 const delay_bad_ms_response = fixed_json(json_400_head, '{"error":"ms must be 0..10000"}')
-const not_implemented_response = 'HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const not_implemented_response = 'HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 @['GET /delay/:ms']
 fn (app &App) delay(_ HttpRequest, p &Params, mut out []u8, _ int, _ voidptr, mut event_loop core.EventLoop) core.Step {
 	ms := parse_ms(p.get('ms')) or {
-		out << delay_bad_ms_response
+		core.append_str(mut out, delay_bad_ms_response)
 		return .done
 	}
 	$if linux {
 		return start_delay(ms, mut out, mut event_loop)
 	} $else {
-		out << not_implemented_response
+		core.append_str(mut out, not_implemented_response)
 		return .done
 	}
 }

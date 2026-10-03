@@ -55,8 +55,8 @@ fn C.memchr(s voidptr, c int, n usize) voidptr
 // max_params caps the :name and *name segments of one route.
 pub const max_params = 8
 
-const not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const not_implemented_response = 'HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const not_implemented_response = 'HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 const method_not_allowed_head = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: '
 const method_not_allowed_tail = '\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
@@ -75,7 +75,7 @@ pub struct Router[T] {
 pub mut:
 	// not_found is the complete response for a path no route matches. Replace
 	// it before the server starts (a custom 404 page); never during serving.
-	not_found []u8 = not_found_response
+	not_found string = not_found_response
 }
 
 // new reads the route attributes of T's handler methods and compiles them.
@@ -117,13 +117,13 @@ pub fn (r &Router[T]) handle(req_buffer []u8, mut out []u8, client_fd int, worke
 	}
 	m := method_index(req)
 	if m < 0 {
-		out << not_implemented_response
+		core.append_str(mut out, not_implemented_response)
 		return .done
 	}
 	mut p := Params{}
 	ni := r.table.lookup(req, mut p)
 	if ni < 0 {
-		out << r.not_found
+		core.append_str(mut out, r.not_found)
 		return .done
 	}
 	node := unsafe { &r.table.nodes[ni] }
@@ -133,7 +133,7 @@ pub fn (r &Router[T]) handle(req_buffer []u8, mut out []u8, client_fd int, worke
 		rid = node.route[m_get]
 	}
 	if rid < 0 {
-		out << node.allow
+		core.append_str(mut out, node.allow)
 		return .done
 	}
 	route := unsafe { &r.table.routes[rid] }
@@ -254,7 +254,7 @@ mut:
 	param   int    = -1 // the :name child
 	wild    int    = -1 // the *name child
 	route   [9]int = [-1, -1, -1, -1, -1, -1, -1, -1, -1]! // route id per method slot
-	allow   []u8 // complete 405 response; empty when no route ends here
+	allow   string // complete 405 response; empty when no route ends here
 }
 
 struct Route {
@@ -360,7 +360,7 @@ fn (mut t Table) finish() {
 			}
 		}
 		if allow.len > 0 {
-			n.allow = (method_not_allowed_head + allow.join(', ') + method_not_allowed_tail).bytes()
+			n.allow = method_not_allowed_head + allow.join(', ') + method_not_allowed_tail
 		}
 	}
 }

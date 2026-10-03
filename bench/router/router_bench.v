@@ -44,19 +44,17 @@ fn reply(mut out []u8, name string, a string, b string, c string) {
 			n += 1 + v.len
 		}
 	}
-	unsafe { out.push_many(ok_head.str, ok_head.len) }
+	core.append_str(mut out, ok_head)
 	mut digits := [20]u8{}
 	mut view := unsafe { (&digits[0]).vbytes(digits.len) }
 	w := strconv.write_dec(n, mut view)
-	unsafe {
-		out.push_many(&digits[0], w)
-		out.push_many(ok_tail.str, ok_tail.len)
-		out.push_many(name.str, name.len)
-	}
+	unsafe { out.push_many(&digits[0], w) }
+	core.append_str(mut out, ok_tail)
+	core.append_str(mut out, name)
 	for v in [a, b, c]! {
 		if v.len > 0 {
 			out << ` `
-			unsafe { out.push_many(v.str, v.len) }
+			core.append_str(mut out, v)
 		}
 	}
 }
@@ -145,10 +143,10 @@ fn (app &App) proxy(_ HttpRequest, p &Params, mut out []u8) core.Step {
 
 // ── explicit: the router module ──────────────────────────────────────────────
 
-const not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const users_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD, POST\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const user_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD, PUT, DELETE, PATCH\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const get_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const users_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD, POST\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const user_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD, PUT, DELETE, PATCH\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const get_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 // handle is the core.Handler: routing reads the request line, no header.
 fn handle(req_buffer []u8, mut out []u8, _ int, _ voidptr, mut _event_loop core.EventLoop) core.Step {
@@ -225,7 +223,7 @@ fn users(m Method, mut path Path, mut out []u8) core.Step {
 		match m {
 			.get, .head { reply(mut out, 'list_users', '', '', '') }
 			.post { reply(mut out, 'create_user', '', '', '') }
-			else { out << users_405 }
+			else { core.append_str(mut out, users_405) }
 		}
 		return .done
 	}
@@ -239,7 +237,7 @@ fn users(m Method, mut path Path, mut out []u8) core.Step {
 			.put { reply(mut out, 'replace_user', id, '', '') }
 			.patch { reply(mut out, 'update_user', id, '', '') }
 			.delete { reply(mut out, 'delete_user', id, '', '') }
-			else { out << user_405 }
+			else { core.append_str(mut out, user_405) }
 		}
 		return .done
 	}
@@ -276,7 +274,7 @@ fn users(m Method, mut path Path, mut out []u8) core.Step {
 @[inline]
 fn get_leaf(m Method, mut out []u8, name string, a string, b string, c string) core.Step {
 	if m != .get && m != .head {
-		out << get_405
+		core.append_str(mut out, get_405)
 	} else {
 		reply(mut out, name, a, b, c)
 	}
@@ -285,7 +283,7 @@ fn get_leaf(m Method, mut out []u8, name string, a string, b string, c string) c
 
 @[inline]
 fn not_found(mut out []u8) core.Step {
-	out << not_found_response
+	core.append_str(mut out, not_found_response)
 	return .done
 }
 
