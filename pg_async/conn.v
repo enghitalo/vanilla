@@ -2,6 +2,7 @@ module pg_async
 
 import tls
 import time
+import transport
 
 // PgConn is a single PostgreSQL connection: the TCP socket (optionally TLS over
 // it, see SslMode) plus the v3 startup / SCRAM-SHA-256 handshake and
@@ -47,22 +48,12 @@ fn C.close(fd int) int
 fn C.getaddrinfo(node &char, service &char, hints &C.addrinfo, res &&C.addrinfo) int
 fn C.freeaddrinfo(res &C.addrinfo)
 fn C.pg_async_wait(fd int, events int, timeout_ms int) int
-fn C.pg_async_tune(fd int, nodelay int, ka_idle int, ka_intvl int, ka_cnt int, user_timeout_ms int)
 fn C.pg_async_gai_strerror(rc int) &char
 fn C.pg_async_getsockopt_int(fd int, level int, name int) int
 
-// Addr is one resolved address of the server: a sockaddr copied out of
-// getaddrinfo's list, so the list can be freed right away.
-struct Addr {
-mut:
-	family int
-	len    u32
-	data   [128]u8 // sizeof(struct sockaddr_storage)
-}
-
 // resolve returns every address getaddrinfo gives for host:port, in its order
 // (IPv6 and IPv4 alike); dial tries them in turn. Blocking: DNS.
-fn resolve(host string, port int) ![]Addr {
+fn resolve(host string, port int) ![]transport.Addr {
 	mut hints := C.addrinfo{}
 	unsafe { vmemset(&hints, 0, int(sizeof(hints))) }
 	hints.ai_family = C.AF_UNSPEC
@@ -77,11 +68,11 @@ fn resolve(host string, port int) ![]Addr {
 	defer {
 		C.freeaddrinfo(res)
 	}
-	mut out := []Addr{}
+	mut out := []transport.Addr{}
 	mut ai := res
 	for ai != unsafe { nil } {
 		if ai.ai_addrlen > 0 && ai.ai_addrlen <= 128 {
-			mut a := Addr{
+			mut a := transport.Addr{
 				family: ai.ai_family
 				len:    u32(ai.ai_addrlen)
 			}
@@ -96,44 +87,35 @@ fn resolve(host string, port int) ![]Addr {
 	return out
 }
 
-// connect_addr opens a TCP socket to `a`. The connect() is always started
-// non-blocking. With `nonblocking` the socket is returned as is (the connect
-// may still be in flight: the re-dial path, redial.v, finishes it without
-// waiting on the network). Otherwise this waits up to timeout_ms (0 = no
-// bound) for the connect to complete, then returns a blocking socket. On
-// error the socket is closed and the errno is the error code.
-fn connect_addr(a &Addr, nonblocking bool, timeout_ms int) !int {
-	fd := C.socket(a.family, C.SOCK_STREAM, 0)
+// connect_addr opens a TCP socket to `a` with transport.dial_addr (the connect
+// always starts non-blocking, on a close-on-exec socket tuned per cfg). With
+// `nonblocking` the socket is returned as is (the connect may still be in
+// flight: the re-dial path, redial.v, finishes it without waiting on the
+// network). Otherwise this waits up to cfg.connect_timeout_ms (0 = no bound)
+// for the connect to complete, then returns a blocking socket. On error the
+// socket is closed and the errno is the error code.
+fn connect_addr(a &transport.Addr, cfg &ConnConfig, nonblocking bool) !int {
+	fd := transport.dial_addr(a, tcp_opts(cfg))
 	if fd < 0 {
-		return error_with_code('socket() failed', C.errno)
+		return error_with_code('connect failed (errno ${-fd})', -fd)
+	}
+	if nonblocking {
+		return fd
+	}
+	timeout_ms := cfg.connect_timeout_ms
+	r := C.pg_async_wait(fd, C.POLLOUT, if timeout_ms > 0 { timeout_ms } else { -1 })
+	if r == 0 {
+		C.close(fd)
+		return error_with_code('connect timed out after ${timeout_ms} ms', C.ETIMEDOUT)
+	}
+	so_error := transport.socket_error(fd)
+	if r < 0 || so_error != 0 {
+		C.close(fd)
+		code := if so_error > 0 { so_error } else { C.errno }
+		return error_with_code('connect failed (errno ${code})', code)
 	}
 	flags := C.fcntl(fd, C.F_GETFL, 0)
-	if flags < 0 || C.fcntl(fd, C.F_SETFL, flags | int(C.O_NONBLOCK)) < 0 {
-		e := C.errno
-		C.close(fd)
-		return error_with_code('fcntl(O_NONBLOCK) failed', e)
-	}
-	if C.connect(fd, voidptr(&a.data[0]), a.len) != 0 {
-		e := C.errno
-		if e != C.EINPROGRESS {
-			C.close(fd)
-			return error_with_code('connect failed (errno ${e})', e)
-		}
-		if !nonblocking {
-			r := C.pg_async_wait(fd, C.POLLOUT, if timeout_ms > 0 { timeout_ms } else { -1 })
-			if r == 0 {
-				C.close(fd)
-				return error_with_code('connect timed out after ${timeout_ms} ms', C.ETIMEDOUT)
-			}
-			so_error := C.pg_async_getsockopt_int(fd, C.SOL_SOCKET, C.SO_ERROR)
-			if r < 0 || so_error != 0 {
-				C.close(fd)
-				code := if so_error > 0 { so_error } else { C.errno }
-				return error_with_code('connect failed (errno ${code})', code)
-			}
-		}
-	}
-	if !nonblocking && C.fcntl(fd, C.F_SETFL, flags) < 0 {
+	if flags < 0 || C.fcntl(fd, C.F_SETFL, flags & ~int(C.O_NONBLOCK)) < 0 {
 		e := C.errno
 		C.close(fd)
 		return error_with_code('fcntl(restore blocking) failed', e)
@@ -141,31 +123,40 @@ fn connect_addr(a &Addr, nonblocking bool, timeout_ms int) !int {
 	return fd
 }
 
+// tcp_opts is the socket tuning cfg asks for: TCP_NODELAY, so a small
+// pipelined query is not held back by Nagle waiting on the server's delayed
+// ACK; keepalive and TCP_USER_TIMEOUT, so a peer that vanished without a FIN
+// or RST is noticed.
+fn tcp_opts(cfg &ConnConfig) transport.TcpOpts {
+	return transport.TcpOpts{
+		nodelay:           cfg.tcp_nodelay
+		keepalive_idle_s:  cfg.tcp_keepalive_idle_s
+		keepalive_intvl_s: cfg.tcp_keepalive_interval_s
+		keepalive_cnt:     cfg.tcp_keepalive_count
+		user_timeout_ms:   cfg.tcp_user_timeout_ms
+	}
+}
+
 // dial resolves cfg.host:cfg.port and connects to the first address that
 // accepts, starting at address `start` (mod the count) and trying each in
-// turn. Every socket it returns is tuned (pg_async_tune): TCP_NODELAY, so a
-// small pipelined query is not held back by Nagle waiting on the server's
-// delayed ACK; keepalive and TCP_USER_TIMEOUT, so a peer that vanished
-// without a FIN or RST is noticed. Blocking (each connect bounded by
-// connect_timeout_ms), unless `nonblocking`: then the first address whose
-// connect() starts is returned with the connect possibly still in flight.
+// turn. Every socket it returns is tuned (tcp_opts). Blocking (each connect
+// bounded by connect_timeout_ms), unless `nonblocking`: then the first address
+// whose connect() starts is returned with the connect possibly still in
+// flight.
 fn dial(cfg &ConnConfig, nonblocking bool, start int) !int {
 	addrs := resolve(cfg.host, cfg.port)!
 	return dial_addrs(addrs, cfg, nonblocking, start)
 }
 
 // dial_addrs is dial over an already resolved address list.
-fn dial_addrs(addrs []Addr, cfg &ConnConfig, nonblocking bool, start int) !int {
+fn dial_addrs(addrs []transport.Addr, cfg &ConnConfig, nonblocking bool, start int) !int {
 	mut last := ''
 	for i in 0 .. addrs.len {
 		a := &addrs[(start + i) % addrs.len]
-		fd := connect_addr(a, nonblocking, cfg.connect_timeout_ms) or {
+		fd := connect_addr(a, cfg, nonblocking) or {
 			last = err.msg()
 			continue
 		}
-		C.pg_async_tune(fd, if cfg.tcp_nodelay { 1 } else { 0 }, cfg.tcp_keepalive_idle_s,
-			cfg.tcp_keepalive_interval_s,
-			cfg.tcp_keepalive_count, cfg.tcp_user_timeout_ms)
 		return fd
 	}
 	return error('pg: connect to ${cfg.host}:${cfg.port} failed on all ${addrs.len} address(es): ${last}')

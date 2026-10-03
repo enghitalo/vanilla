@@ -316,6 +316,16 @@ their request.
   without blocking, so `release` it on every path, error or not. Decide retries
   on the typed error — `err is pg_async.PgError && err.sqlstate == '40001'` —
   and on `conn.is_broken()` for a lost connection, never on the message text.
+- Call third-party HTTP APIs through `http1_1.upstream`, the same shape for
+  HTTP: a per-worker `Pool` per origin (built in `make_state`, maintenance
+  started in `on_worker_start`), `acquire()` / `send()` + `.suspend` in the
+  handler, `advance()` in the continuation, `release()` on every path. Shed
+  with 503 when `acquire()` has nothing, answer 502 / 504 from `failure()`
+  with `.done`. Its views (`body_view`, `header_value`) borrow the exchange's
+  buffer until `release()`. Request heads are validated (a CR/LF/NUL in a
+  target or a header fails the exchange instead of injecting a line); share one
+  `tls.new_client` config across workers. See
+  [examples/https_upstream](../examples/https_upstream/src/main.v).
 - Talk TLS to any database that is not on the same host: `ssl_mode:
   .verify_full` (with `ssl_root_cert` for a private CA; the system bundle
   otherwise) is what managed PostgreSQL needs (Aurora DSQL, RDS with

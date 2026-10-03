@@ -264,6 +264,7 @@ fn test_client_sessions_against_the_server() {
 				if want_err != '' {
 					assert cr == closed, '${verify} ${host}: the handshake must fail'
 					assert cli.handshake_error().contains(want_err), cli.handshake_error()
+					assert cli.verify_failed()
 				} else {
 					assert cr == 0, '${verify} ${host}: ${cli.handshake_error()}'
 					// Exact-size C buffers: under AddressSanitizer a read or
@@ -285,11 +286,17 @@ fn test_client_sessions_against_the_server() {
 						C.free(inb)
 					}
 				}
-				srv.free() // sends close_notify
+				// Round 0 ends with the server's close_notify (srv.free sends one);
+				// round 1 with a bare EOF first, which is not a clean TLS close.
+				if round == 1 {
+					C.shutdown(fds[0], C.SHUT_WR)
+				}
+				srv.free()
 				if want_err == '' {
 					cli.mark_readable()
 					assert cli.read_into(buf_scratch().data, 16) == closed
 					assert cli.peer_closed()
+					assert cli.close_notify() == (round == 0), '${verify} ${host} round ${round}'
 				}
 				assert cli.reset(-1) // detach before the fd is closed
 				C.close(fds[0])
@@ -300,6 +307,8 @@ fn test_client_sessions_against_the_server() {
 		}
 	}
 }
+
+fn C.shutdown(fd int, how int) int
 
 struct ClientCase {
 	verify   Verify

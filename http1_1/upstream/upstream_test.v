@@ -1,0 +1,277 @@
+// vtest build: linux
+module upstream
+
+// Unit tests without a server: request building and validation, the Host
+// header, origin validation, the resolver hand-off, and deadline expiry. The
+// exchange over real sockets is examples/https_upstream's e2e suite.
+import time
+import sync.stdatomic
+import tls
+import transport
+
+fn plain_pool(o Origin) &Pool {
+	return Pool.new(Origin{
+		...o
+		https: false
+	}, unsafe { nil }) or { panic(err) }
+}
+
+fn head_of(mut x Exchange) string {
+	return x.head.bytestr()
+}
+
+// The request head is built from validated parts only: a CR, LF or NUL in the
+// method, target, a field name or value is refused (header injection), the
+// exchange is marked invalid, and nothing of the bad part is written.
+fn test_request_validation() {
+	mut p := plain_pool(Origin{
+		host: '127.0.0.1'
+		port: 8080
+	})
+	mut x := p.acquire() or { panic('slot') }
+	assert x.request('GET', '/v1/charges?q=a')
+	assert x.header('Authorization', 'Bearer abc'.bytes())
+	assert head_of(mut x) == 'GET /v1/charges?q=a HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAuthorization: Bearer abc\r\n'
+	assert !x.invalid
+	// The #229 repro's target: refused, nothing written.
+	assert !x.request('GET', '/v1/charges?q=a\r\nX-Injected: 1')
+	assert x.invalid
+	assert !head_of(mut x).contains('X-Injected')
+	x.release()
+
+	for bad in [['GE T', '/'], ['GET', ''], ['GET', '/a b'], ['GET\r\n', '/'], ['GET', '/\x00']] {
+		mut y := p.acquire() or { panic('slot') }
+		assert !y.request(bad[0], bad[1]), bad.str()
+		y.release()
+	}
+	mut z := p.acquire() or { panic('slot') }
+	assert z.request('POST', '/v1')
+	for bad in [['X-A', 'a\r\nX-Injected: 1'], ['X-A', 'a\nb'], ['X-A', 'a\x00'], ['X A', 'v'],
+		['X-A\r\n', 'v'], ['Host', 'evil'], ['content-length', '0'], ['Transfer-Encoding', 'chunked']] {
+		mut w := p.acquire() or { panic('slot') }
+		assert w.request('POST', '/v1')
+		before := head_of(mut w)
+		assert !w.header(bad[0], bad[1].bytes()), bad.str()
+		assert w.invalid
+		assert head_of(mut w) == before, bad.str() // nothing written
+		w.release()
+	}
+	z.release()
+}
+
+// Host = uri-host [ ":" port ]: the port only when it is not the scheme's
+// default, an IPv6 literal in brackets (RFC 9110 §7.2).
+fn test_host_header() {
+	cases := [
+		['127.0.0.1', '80', 'Host: 127.0.0.1\r\n'],
+		['127.0.0.1', '8080', 'Host: 127.0.0.1:8080\r\n'],
+		['::1', '80', 'Host: [::1]\r\n'],
+		['::1', '3000', 'Host: [::1]:3000\r\n'],
+	]
+	for c in cases {
+		p := plain_pool(Origin{
+			host: c[0]
+			port: c[1].int()
+		})
+		assert p.host_hdr.bytestr() == c[2], c.str()
+	}
+	// HTTPS: 443 is the default.
+	mut a := transport.ip_addr('127.0.0.1', 443) or { panic('addr') }
+	p := Pool.new(Origin{
+		host:    'api.example.com'
+		port:    443
+		resolve: fn [a] (host string, port int) []transport.Addr {
+			return [a]
+		}
+	}, tls_stub()) or { panic(err) }
+	assert p.host_hdr.bytestr() == 'Host: api.example.com\r\n'
+}
+
+// tls_stub is a non-nil stand-in for a client TLS config: Pool.new only
+// checks that one is set (no handshake runs here).
+fn tls_stub() &tls.Config {
+	return &tls.Config{}
+}
+
+fn test_origin_validation() {
+	for bad in [Origin{
+		host:  ''
+		https: false
+	}, Origin{
+		host:  'a b'
+		https: false
+	}, Origin{
+		host:  'a/b'
+		https: false
+	}, Origin{
+		host:  'user@host'
+		https: false
+	}, Origin{
+		host:  '127.0.0.1'
+		port:  0
+		https: false
+	}, Origin{
+		host:      '127.0.0.1'
+		https:     false
+		max_conns: 0
+	}, Origin{
+		host: 'api.example.com' // HTTPS without a TLS config
+	}] {
+		if _ := Pool.new(bad, unsafe { nil }) {
+			assert false, bad.host
+		}
+	}
+	// HTTPS to an IP literal would be sent as SNI: refused for now.
+	if _ := Pool.new(Origin{
+		host: '127.0.0.1'
+	}, tls_stub()) {
+		assert false
+	}
+	// A name the resolver does not know.
+	if _ := Pool.new(Origin{
+		host:    'nowhere.invalid'
+		https:   false
+		resolve: fn (host string, port int) []transport.Addr {
+			return []
+		}
+	}, unsafe { nil }) {
+		assert false
+	}
+}
+
+// acquire hands out at most max_conns exchanges; release gives the slot back.
+fn test_acquire_sheds_past_max_conns() {
+	mut p := plain_pool(Origin{
+		host:      '127.0.0.1'
+		max_conns: 2
+	})
+	mut a := p.acquire() or { panic('a') }
+	mut b := p.acquire() or { panic('b') }
+	if _ := p.acquire() {
+		assert false, 'a third exchange past max_conns: 2'
+	}
+	a.release()
+	mut c := p.acquire() or { panic('c') }
+	c.release()
+	b.release()
+}
+
+fn (mut p Pool) take(r Record) {
+	p.take_record(&r)
+}
+
+// The resolver's records swap the pool's address table only once a whole
+// update has arrived in order; a broken update is dropped.
+fn test_resolver_records_swap_the_table() {
+	mut p := plain_pool(Origin{
+		host: '127.0.0.1'
+		port: 80
+	})
+	assert p.addrs.len == 1
+	a1 := transport.ip_addr('10.0.0.1', 80) or { panic('a1') }
+	a2 := transport.ip_addr('::1', 80) or { panic('a2') }
+	rec := fn (seq u32, idx int, count int, a transport.Addr) Record {
+		return Record{
+			seq:    seq
+			idx:    u16(idx)
+			count:  u16(count)
+			family: i32(a.family)
+			len:    a.len
+			data:   a.data
+		}
+	}
+	p.take(rec(1, 0, 2, a1))
+	assert p.addrs.len == 1 // not yet
+	p.take(rec(1, 1, 2, a2))
+	assert p.addrs.len == 2
+	assert p.addrs[0].data == a1.data && p.addrs[1].family == a2.family
+	// Out of order (a record lost on a full pipe): the update is dropped.
+	p.take(rec(2, 0, 3, a2))
+	p.take(rec(2, 2, 3, a2))
+	p.take(rec(3, 1, 1, a1))
+	assert p.addrs.len == 2 && p.addrs[0].data == a1.data
+	// A whole update replaces it.
+	p.take(rec(4, 0, 1, a2))
+	assert p.addrs.len == 1 && p.addrs[0].family == a2.family
+}
+
+// Port is the test resolver's answer, read on the resolver thread.
+@[heap]
+struct Port {
+mut:
+	n i64
+}
+
+// The resolver thread hands updates to a following pool through its pipe.
+fn test_resolver_thread_hands_off() {
+	mut port := &Port{
+		n: 1111
+	}
+	pp := port
+	mut p := plain_pool(Origin{
+		host:    'svc.test'
+		port:    80
+		resolve: fn [pp] (host string, port int) []transport.Addr {
+			a := transport.ip_addr('127.0.0.1', int(stdatomic.load_i64(&pp.n))) or { return [] }
+			return [a]
+		}
+	})
+	mut r := Resolver.new(20) or { panic(err) }
+	p.follow(mut r) or { panic(err) }
+	r.start()
+	defer {
+		r.stop()
+	}
+	stdatomic.store_i64(&port.n, 2222)
+	mut rec := Record{}
+	sw := time.new_stopwatch()
+	for sw.elapsed().milliseconds() < 2000 {
+		if C.read(p.feed_fd, &rec, sizeof(Record)) == int(sizeof(Record)) {
+			p.take_record(&rec)
+			if p.addrs.len == 1 && (int(p.addrs[0].data[2]) << 8 | int(p.addrs[0].data[3])) == 2222 {
+				break
+			}
+		}
+		time.sleep(5 * time.millisecond)
+	}
+	assert (int(p.addrs[0].data[2]) << 8 | int(p.addrs[0].data[3])) == 2222
+}
+
+// maintain() shuts down the socket of an exchange past its deadline (its
+// watch then wakes, and advance() reports .timeout), and closes idle
+// connections past idle_timeout_ms.
+fn test_maintain_enforces_deadlines() {
+	mut p := plain_pool(Origin{
+		host:            '127.0.0.1'
+		idle_timeout_ms: 50
+	})
+	mut fds := [2]i32{}
+	assert C.socketpair(C.AF_UNIX, C.SOCK_STREAM, 0, &fds[0]) == 0
+	mut x := p.acquire() or { panic('slot') }
+	x.fd = int(fds[0])
+	x.phase = .reading
+	x.deadline = time.sys_mono_now() - 1
+	p.maintain()
+	assert x.timed_out
+	assert C.upstream_peek(int(fds[0])) == 0 // shut down: reads see EOF
+	x.release() // timed out: closed
+	assert x.fd == -1
+	C.close(int(fds[1]))
+	// An idle kept connection past idle_timeout_ms is closed.
+	assert C.socketpair(C.AF_UNIX, C.SOCK_STREAM, 0, &fds[0]) == 0
+	mut y := p.acquire() or { panic('slot') }
+	y.fd = int(fds[0])
+	y.born = time.sys_mono_now()
+	y.phase = .ready
+	y.framer.keep_alive = true
+	y.release()
+	assert y.fd >= 0 // kept
+	next := p.maintain()
+	assert y.fd >= 0 && next <= 51
+	time.sleep(60 * time.millisecond)
+	p.maintain()
+	assert y.fd == -1
+	C.close(int(fds[1]))
+}
+
+fn C.socketpair(domain int, typ int, protocol int, sv &i32) int

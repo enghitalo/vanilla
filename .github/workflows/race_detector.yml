@@ -32,6 +32,7 @@ on:
       - 'tests/**'
       - 'static_assets/**'
       - 'tls/**'
+      - 'examples/https_upstream/**'
       - '.github/workflows/race_detector.yml'
   pull_request:
     branches: [ main ]
@@ -46,6 +47,7 @@ on:
       - 'tests/**'
       - 'static_assets/**'
       - 'tls/**'
+      - 'examples/https_upstream/**'
       - '.github/workflows/race_detector.yml'
 
 jobs:
@@ -111,6 +113,11 @@ jobs:
         run: |
           v -race -cc "$RACE_CC" -no-parallel -run-only 'test_uds_epoll,test_dial_*,test_uds_vtest_scripts,test_uds_peer_cred,test_peer_cred_none_on_tcp' test tests/uds_test.v
           v -race -cc "$RACE_CC" -no-parallel test tests/vtest_smoke_test.v
+      # The pooled upstream client (plain HTTP; its HTTPS run is in
+      # tls_backend.yml): four workers' pools and the resolver thread.
+      - name: http1_1/upstream pooled client
+        run: |
+          v -race -cc "$RACE_CC" -no-parallel test http1_1/upstream examples/https_upstream/src
       - name: Reactor unit tests
         shell: bash
         run: |

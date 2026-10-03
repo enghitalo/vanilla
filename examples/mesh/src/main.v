@@ -7,7 +7,7 @@
 //   transport.dial_unix (pooled per worker via make_state — a dial costs
 //   ~4× a request, so dial-per-request would dominate) → client.write_get
 //   into a reused scratch → send → event_loop.watch_fd_persistent(.readable)
-//   + .suspend → recv → client.frame_response → answer from the continuation.
+//   + .suspend → recv → client.Framer.feed → answer from the continuation.
 //
 // UDS is the mesh transport on purpose: 2.3–2.7× the throughput of TCP
 // loopback at ~half the CPU per request (issue #122 client study).
@@ -58,15 +58,22 @@ fn wi(mut out []u8, n i64) {
 	}
 }
 
-// MeshConn is one pooled upstream connection: its fd, its in-flight flag and
-// its own response-accumulation buffer (each in-flight exchange needs a
-// private buffer — responses interleave across connections).
+// MeshConn is one pooled upstream connection: its fd, its in-flight flag, its
+// own response-accumulation buffer (each in-flight exchange needs a private
+// buffer — responses interleave across connections) and the resumable framer
+// for that buffer: each recv frames only the new bytes, and the framer says
+// whether the connection may carry the next request.
 struct MeshConn {
 mut:
 	fd       int = -1
 	busy     bool
 	resp_buf []u8
+	framer   client.Framer
 }
+
+// max_backend_response bounds one backend response: past it the exchange
+// fails (502) instead of growing the slot's buffer without limit.
+const max_backend_response = 1 << 20
 
 // EdgeState is THIS worker's private mesh client: a small FIXED pool of
 // keep-alive UDS connections plus a reused request scratch. Lock-free by
@@ -164,6 +171,7 @@ fn edge_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut
 		off += n
 	}
 	st.conns[ci].busy = true
+	st.conns[ci].framer.reset(false) // a GET: its response may have a body
 	// A pooled fd parks with watch_fd_persistent: if the client disconnects
 	// mid-call, a plain watch_fd would close the pooled connection and drop
 	// the continuation, leaving the slot busy forever (503 once all leak).
@@ -181,53 +189,74 @@ fn on_backend_reply(mut out []u8, ready_fd int, ready_fd_error bool, watch_paylo
 		out << edge_bad_gateway // conn vanished from the pool (defensive)
 		return .done
 	}
-	if ready_fd_error {
-		st.drop_conn(ci)
-		out << edge_bad_gateway
-		return .done
+	mut c := &st.conns[ci]
+	// recv straight into the slot buffer's spare capacity (no scratch copy).
+	// On an error/hangup wake, take whatever the backend sent before it went
+	// away: a response delimited by the close is complete exactly then.
+	mut eof := false
+	for {
+		if c.resp_buf.cap - c.resp_buf.len < 4096 {
+			if c.resp_buf.cap >= max_backend_response {
+				st.drop_conn(ci)
+				out << edge_bad_gateway
+				return .done
+			}
+			unsafe { c.resp_buf.grow_cap(c.resp_buf.cap) }
+		}
+		n := C.recv(ready_fd, unsafe { &u8(c.resp_buf.data) + c.resp_buf.len },
+			usize(c.resp_buf.cap - c.resp_buf.len), 0)
+		if n > 0 {
+			unsafe {
+				c.resp_buf.len += n
+			}
+			if !ready_fd_error {
+				break // one recv per readable wake; the framer says if more is due
+			}
+			continue
+		}
+		if n == 0 {
+			eof = true // the backend closed the connection
+		} else if C.errno != C.EAGAIN && C.errno != C.EWOULDBLOCK {
+			st.drop_conn(ci) // reset: never a clean end of a response
+			out << edge_bad_gateway
+			return .done
+		} else if ready_fd_error {
+			eof = true // hung up, nothing more to read
+		}
+		break
 	}
-	mut chunk := [4096]u8{}
-	n := C.recv(ready_fd, &chunk[0], usize(4096), 0)
-	if n <= 0 {
-		st.drop_conn(ci) // EOF/reset mid-response
-		out << edge_bad_gateway
-		return .done
-	}
-	unsafe { st.conns[ci].resp_buf.push_many(&chunk[0], n) }
-	total := client.frame_response(st.conns[ci].resp_buf)
-	if total == client.incomplete {
+	end := c.framer.feed(c.resp_buf, eof)
+	if end == client.incomplete {
 		event_loop.watch_fd_persistent(ready_fd, .readable, on_backend_reply, unsafe { nil })
 		return .suspend
 	}
-	if total < 0 {
-		st.drop_conn(ci) // unframeable upstream — drop the (desynced) conn too
+	if end < 0 {
+		st.drop_conn(ci) // unframeable or cut short — drop the (desynced) conn too
 		out << edge_bad_gateway
 		return .done
 	}
-	if client.status_code(st.conns[ci].resp_buf) != 200 {
-		st.conns[ci].busy = false
-		st.conns[ci].resp_buf.clear()
+	if c.framer.status != 200 {
 		out << edge_bad_gateway
-		return .done
+	} else {
+		// The decoded body as a view into the slot buffer: a chunked body is
+		// de-chunked in place, so there is no second buffer to fill.
+		body := c.framer.body_in_place(mut c.resp_buf)
+		wb(mut out, edge_mesh_head)
+		wi(mut out, i64(edge_mesh_pre.len + body.len + edge_mesh_post.len))
+		wb(mut out, edge_mesh_sep)
+		wb(mut out, edge_mesh_pre)
+		wb(mut out, body)
+		wb(mut out, edge_mesh_post)
 	}
-	// Frame the edge reply around the DECODED backend body without `${}`/`+`
-	// — append_body handles Content-Length and chunked upstreams alike, so a
-	// scratch assembly is needed to know the decoded length first.
-	st.req_scratch.clear()
-	if !client.append_body(mut st.req_scratch, st.conns[ci].resp_buf, total) {
+	// Exchange complete. The connection carries the next call only when the
+	// framer says so (HTTP/1.1 without `Connection: close`, framed by length)
+	// and nothing arrived behind the response; otherwise re-dial next time.
+	if !c.framer.keep_alive || eof || end != c.resp_buf.len {
 		st.drop_conn(ci)
-		out << edge_bad_gateway
 		return .done
 	}
-	wb(mut out, edge_mesh_head)
-	wi(mut out, i64(edge_mesh_pre.len + st.req_scratch.len + edge_mesh_post.len))
-	wb(mut out, edge_mesh_sep)
-	wb(mut out, edge_mesh_pre)
-	wb(mut out, st.req_scratch)
-	wb(mut out, edge_mesh_post)
-	// Exchange complete — the pooled keep-alive conn is free for the next call.
-	st.conns[ci].busy = false
-	st.conns[ci].resp_buf.clear()
+	c.busy = false
+	c.resp_buf.clear()
 	return .done
 }
 

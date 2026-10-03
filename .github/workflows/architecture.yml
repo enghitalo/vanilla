@@ -55,6 +55,7 @@ jobs:
           import vanilla.core
           import vanilla.http1_1.response
           import vanilla.http1_1.request_parser
+          import vanilla.http1_1.upstream
 
           fn handle(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
           	request_parser.decode_http_request(req) or {
@@ -72,6 +73,14 @@ jobs:
           	})!
           	println('external consumer resolves vanilla.server — ephemeral port ${srv.port} bound')
           	srv.shutdown(0)
+          	// The pooled upstream client (#229) builds from outside the tree too
+          	// (its C shim through @VMODROOT); an IP-literal origin needs no DNS.
+          	mut pool := upstream.Pool.new(upstream.Origin{
+          		host:  '127.0.0.1'
+          		port:  9
+          		https: false
+          	}, unsafe { nil })!
+          	pool.close()
           }
           EOF
           v -cc gcc -no-parallel -o consumer main.v

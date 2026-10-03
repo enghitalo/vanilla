@@ -41,6 +41,8 @@ fn C.vtls_ktls_abort(sess voidptr)
 fn C.vtls_set_ktls(ctx voidptr, enabled int)
 fn C.vtls_set_ktls_rx_no_pad(ctx voidptr, enabled int)
 fn C.vtls_peer_closed(sess voidptr) int
+fn C.vtls_peer_close_notify(sess voidptr) int
+fn C.vtls_verify_failed(sess voidptr) int
 fn C.vtls_client_setup(ctx voidptr, ca_file &char, verify int) int
 fn C.vtls_client_session_new(ctx voidptr, fd int, host &char) voidptr
 fn C.vtls_session_reset(sess voidptr, fd int) int
@@ -312,6 +314,13 @@ pub fn (s &Session) peer_closed() bool {
 	return C.vtls_peer_closed(s.sess) == 1
 }
 
+// close_notify reports whether the peer ended the session with a close_notify
+// alert, not a bare transport EOF: only then is a body delimited by the close
+// complete (RFC 9112 §9.8: a FIN alone can be a truncation attack).
+pub fn (s &Session) close_notify() bool {
+	return C.vtls_peer_close_notify(s.sess) == 1
+}
+
 // ---- client ------------------------------------------------------------------
 
 // system_ca_file is the system's bundle of trusted CA certificates (PEM):
@@ -383,6 +392,14 @@ pub fn (c &Config) new_client_session(fd int, host string) ?Session {
 // reach that fd number once the kernel reuses it.
 pub fn (s &Session) reset(fd int) bool {
 	return C.vtls_session_reset(s.sess, fd) == 0
+}
+
+// verify_failed reports, after handshake() returned `closed`, whether the
+// server's certificate failed verification (untrusted, wrong name, expired)
+// rather than the handshake failing otherwise. Allocation-free, unlike
+// handshake_error.
+pub fn (s &Session) verify_failed() bool {
+	return C.vtls_verify_failed(s.sess) == 1
 }
 
 // handshake_error says why handshake() returned `closed`: the certificate
