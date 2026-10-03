@@ -130,7 +130,7 @@ Measured on a 102-byte `200 OK … Hello, World!` response appended to a reused
 | `r = '…'.bytes()`, `out << r` | 5.1 |
 | `r = '…'`, `unsafe { out.push_many(r.str, r.len) }` | 5.1–5.2 |
 | `r = [u8(…), …]!`, `unsafe { out.push_many(&r[0], r.len) }` | 5.2–5.4 |
-| `r = '…'`, `append_static(mut out, r)` (below) | 2.7–2.8 |
+| `r = '…'`, `core.append_str(mut out, r)` (below) | 2.4–2.8 |
 
 - **The call matters, not the storage.** `<<` and `push_many` go through the generic
   `array__push_many` / `array_push_many_ptr` (`ensure_cap`, a size multiply,
@@ -144,25 +144,19 @@ Measured on a 102-byte `200 OK … Hello, World!` response appended to a reused
   array on every call (`new_array_from_c_array` + `array_slice`), `-prod` included;
   under `-gc none` that is a per-request leak.
 
-```v
-// append_static appends a const string without a call into the generic array code.
-@[inline]
-fn append_static(mut out []u8, s string) {
-	if out.len + s.len > out.cap {
-		out.grow_cap(s.len)
-	}
-	unsafe {
-		vmemcpy(&u8(out.data) + out.len, s.str, s.len)
-		out.len += s.len
-	}
-}
-```
+The helper is [`core.append_str`](../core/append_str.v): the inlined fast path
+is a capacity check plus `vmemcpy`, and growing `out` or appending to a slice
+view goes to a `noinline` `push_many`, so it behaves exactly like `push_many`.
+Keeping that fallback out of line is what keeps the fast path at 2.4–2.7 ns
+(4.6–4.8 ns for `out << r` in the same run); inlined, the check alone cost
+~0.7 ns.
 
 Scale: ~2.3 ns per response, against 50–150 ns of in-process work per request
 ([#239](https://github.com/enghitalo/vanilla/issues/239)) and microseconds once
-syscalls count. Worth it where a fixed response goes out on every request;
-elsewhere `.bytes()` consts are fine. A string → `[N]u8` literal (a
-`$fixed_bytes()`) would add nothing.
+syscalls count. It is still the default for static responses (see
+[BEST_PRACTICES §3a](BEST_PRACTICES.md#3a-static-responses--a-const-string-appended-with-coreappend_str)):
+free, and it drops the startup heap copy of every `.bytes()` const. A string →
+`[N]u8` literal (a `$fixed_bytes()`) would add nothing.
 
 ## Pure C escape hatch
 
