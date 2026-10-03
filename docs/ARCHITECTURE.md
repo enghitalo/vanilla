@@ -21,7 +21,7 @@ import and says nothing). Protocols are **siblings** over one engine:
 | `websocket/` | RFC 6455 codec (accept-key, frame head parse, unmask, server frame writers) — pure bytes, zero vanilla imports; an app's `ConnHandler` composes it over the takeover seam (`examples/websocket_echo`). |
 | `grpc/` | reserved sibling (length-prefixed messages over http2). Future protocols land as siblings here. |
 | `static_assets/` `testkit/` `vtest/` `pg_async/` | reusable handler-side and test-side modules. |
-| `transport/` | client-side dialing (`dial_tcp`, `dial_unix`) — bytes + non-blocking fds ONLY; protocol clients compose it (handler → `dial_*` → `event_loop.watch_fd` → `.suspend`), they don't live in it. |
+| `transport/` | client-side dialing (`dial_addr` for IPv4/IPv6 `Addr`s — close-on-exec, TCP-tuned, `-errno` on failure, no allocation; `dial_tcp`, `dial_unix`) — bytes + non-blocking fds ONLY, no name resolution; protocol clients compose it (handler → `dial_*` → `event_loop.watch_fd` → `.suspend`), they don't live in it. |
 
 ## Dependency rule (grep-enforceable, one direction)
 

@@ -1,8 +1,8 @@
 // pg_async_shim.h — the socket calls pg_async's dialer makes that need
-// platform constants or structs (pollfd, keepalive option names), as static
-// inline helpers. In C so V does not bind `struct pollfd` program-wide: vtest
-// already binds it, and two modules must not bind the same C tag (see
-// testkit_shim.h).
+// platform constants or structs (pollfd), as static inline helpers; the
+// connect itself and the TCP tuning are transport.dial_addr's. In C so V does
+// not bind `struct pollfd` program-wide: vtest already binds it, and two
+// modules must not bind the same C tag (see testkit_shim.h).
 #ifndef VANILLA_PG_ASYNC_SHIM_H
 #define VANILLA_PG_ASYNC_SHIM_H
 
@@ -26,38 +26,6 @@ static inline int pg_async_wait(int fd, int events, int timeout_ms) {
 		r = poll(&p, 1, timeout_ms);
 	} while (r < 0 && errno == EINTR);
 	return r <= 0 ? r : p.revents;
-}
-
-// pg_async_tune sets a connection's TCP options (0 leaves one at the OS
-// default): TCP_NODELAY, keepalive (idle seconds, probe interval, probe count)
-// and TCP_USER_TIMEOUT (Linux: how long sent data may stay unacknowledged
-// before the kernel drops the connection). Best effort: an option the
-// platform lacks is skipped.
-static inline void pg_async_tune(int fd, int nodelay, int ka_idle, int ka_intvl, int ka_cnt, int user_timeout_ms) {
-	int one = 1;
-	if (nodelay) setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-	if (ka_idle > 0) {
-		setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-#if defined(TCP_KEEPIDLE)
-		setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &ka_idle, sizeof(ka_idle));
-#elif defined(TCP_KEEPALIVE)
-		setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &ka_idle, sizeof(ka_idle));
-#endif
-#if defined(TCP_KEEPINTVL)
-		if (ka_intvl > 0) setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &ka_intvl, sizeof(ka_intvl));
-#endif
-#if defined(TCP_KEEPCNT)
-		if (ka_cnt > 0) setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &ka_cnt, sizeof(ka_cnt));
-#endif
-	}
-#if defined(TCP_USER_TIMEOUT)
-	if (user_timeout_ms > 0) {
-		unsigned int t = (unsigned int)user_timeout_ms;
-		setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &t, sizeof(t));
-	}
-#else
-	(void)user_timeout_ms;
-#endif
 }
 
 // pg_async_gai_strerror is getaddrinfo's reason for a non-zero result.

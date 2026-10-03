@@ -124,3 +124,11 @@ jobs:
         shell: bash
         run: |
           v -cc gcc -no-parallel test http2/
+      # transport/: dial_addr over IPv4 and IPv6 loopback (tuning and
+      # close-on-exec read back), and under -gc none, where mallinfo2 sees
+      # every allocation, that a failed dial allocates nothing.
+      - name: Run transport module tests
+        shell: bash
+        run: |
+          v -cc gcc -no-parallel test transport/
+          v -cc gcc -no-parallel -gc none test transport/
