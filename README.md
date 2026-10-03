@@ -235,6 +235,7 @@ fn main() {
 | `examples/ip_block/` | IP allowlist / blocklist |
 | `examples/json_api/` | JSON API with multipart upload |
 | `examples/mesh/` | Local mesh: edge on TCP calling a backend on UDS via `http1_1.client` + a pooled per-worker connection + watch/suspend |
+| `examples/https_upstream/` | A handler calling a third-party HTTPS API without blocking its worker: the `http1_1.upstream` pooled client (TLS 1.3 verify-full, keep-alive reuse, deadlines, retries, a resolver thread) |
 | `examples/middleware/` | Middleware chain (auth, RBAC, 404) |
 | `examples/observability/` | `/healthz`, `/readyz`, `/metrics` |
 | `examples/proxy_aware/` | `X-Forwarded-For` / real-IP extraction |
@@ -460,6 +461,7 @@ See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark 
 - [x] TLS/HTTPS — epoll backend via `ServerConfig.tls_config`; `tls.new_self_signed()` issues a localhost/loopback certificate with proper SANs, `sans: ['IP:203.0.113.5']` targets a real host and `persist_dir:` keeps the identity across restarts (or `tls.new_from_pem` for CA-issued certs); the handshake is bounded from accept by `read_timeout_ms` (or, without one, `idle_timeout_ms`); other backends are plaintext
 - [x] PostgreSQL over TLS — `pg_async.ConnConfig.ssl_mode` (`.require` / `.verify_ca` / `.verify_full`, with `ssl_root_cert` or the system CA bundle), TLS 1.3 through the same Mbed TLS 4 shim as the server (`-d vanilla_tls`); pooled connections re-dial over TLS without blocking, zero allocations per query
 - [ ] HTTPS example (`examples/https/`)
+- [x] Outbound HTTP/1.1 + HTTPS client for handlers ([#229](https://github.com/enghitalo/vanilla/issues/229)) — `http1_1.upstream`: a per-worker pool parked on the reactor (`watch_fd_persistent`), TLS 1.3 verify-full + SNI, resumable framing (`client.Framer`: HEAD, 1xx, close-delimited bodies, keep-alive), pre-use liveness probe + one safe retry, connect/response deadlines from a maintenance timer, DNS off the workers (`Resolver`), IPv4/IPv6 dialing (`transport.dial_addr`), zero allocations per exchange; `examples/https_upstream/`
 - [x] Body-size cap + max-connections via `Limits` (`max_body_bytes` → 413, `max_request_bytes`, `max_connections`); pair `max_connections` with a read or idle timeout — reaping silent and idle connections is what frees their slots. A per-connection request-count limit is still open
 - [ ] Response caching layer (ETag + `Last-Modified` auto-generation)
 - [ ] Logging middleware example (`examples/logging/`)

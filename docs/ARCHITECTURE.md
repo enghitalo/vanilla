@@ -16,12 +16,12 @@ import and says nothing). Protocols are **siblings** over one engine:
 | `tls/` | mbedTLS split (`-d vanilla_tls` / stub) — the HTTPS server, and the client side `pg_async` uses for TLS to PostgreSQL. |
 | `epoll/` `io_uring/` `kqueue/` `iocp/` | thin per-mechanism syscall wrappers, one dir-module each (`poll/` joins them as the portability floor). |
 | `server/` | **the engine** (was `http_server`) — one engine, N protocols via conn modes: the takeover seam (issue #136) lets a handler hand a connection to a `core.ConnHandler` (`core.queue_takeover`, epoll-first), so upgrades change the framing authority without changing buffers or backpressure. OS facades (`server_linux.c.v`, …) select an `IOBackend`; `server/backend_*` are the reactors. |
-| `http1_1/` | HTTP/1.1 codecs: `request_parser/`, `response/`; `client/` is the client codec (request serializer + response parser). |
+| `http1_1/` | HTTP/1.1 codecs: `request_parser/`, `response/`; `client/` is the client codec (request serializer + response parser, `Framer` for responses read over many recvs). `upstream/` is the one stateful module here: the pooled outbound client for handlers (#229), which composes `client/` with `transport/`, `tls/` and the watch API — it owns sockets and parks on the worker's reactor, like `pg_async/` does for PostgreSQL, but sits next to its codec. |
 | `http2/` | frame/hpack/types grow in place: stream mux, flow control, settings. |
 | `websocket/` | RFC 6455 codec (accept-key, frame head parse, unmask, server frame writers) — pure bytes, zero vanilla imports; an app's `ConnHandler` composes it over the takeover seam (`examples/websocket_echo`). |
 | `grpc/` | reserved sibling (length-prefixed messages over http2). Future protocols land as siblings here. |
 | `static_assets/` `testkit/` `vtest/` `pg_async/` | reusable handler-side and test-side modules. |
-| `transport/` | client-side dialing (`dial_tcp`, `dial_unix`) — bytes + non-blocking fds ONLY; protocol clients compose it (handler → `dial_*` → `event_loop.watch_fd` → `.suspend`), they don't live in it. |
+| `transport/` | client-side dialing (`dial_addr` for IPv4/IPv6 `Addr`s — close-on-exec, TCP-tuned, `-errno` on failure, no allocation; `dial_tcp`, `dial_unix`) — bytes + non-blocking fds ONLY, no name resolution; protocol clients compose it (handler → `dial_*` → `event_loop.watch_fd` → `.suspend`), they don't live in it. |
 
 ## Dependency rule (grep-enforceable, one direction)
 

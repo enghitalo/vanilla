@@ -45,8 +45,10 @@ for d in socket transport tls epoll io_uring kqueue iocp poll; do
     check_no_import "$d" "server|$protocols|static_assets|testkit|vtest|pg_async"
 done
 
-# protocol modules: never the engine; protocol imports downward only.
-check_no_import http1_1 'server|http2|websocket|grpc'
+# protocol modules: never the engine; protocol imports downward only. http1_1/
+# hosts a stateful client too (http1_1/upstream, #229): it composes core,
+# transport and tls, never the app-side modules.
+check_no_import http1_1 'server|http2|websocket|grpc|pg_async|testkit|vtest|static_assets'
 check_no_import http2 'server|websocket|grpc'
 check_no_import websocket 'server|http2|grpc'
 check_no_import grpc 'server|websocket|http1_1'

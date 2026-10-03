@@ -5,6 +5,10 @@ module transport
 // (`event_loop.watch_fd(fd, .writable, ...)` + `.suspend` — the existing
 // DB/upstream pattern; pg_async is the in-repo precedent).
 //
+// dial_addr is the general form: IPv4 or IPv6, close-on-exec, TCP-tuned, and
+// allocation-free (-errno, never an error string). dial_tcp / dial_unix are
+// the IPv4-literal and unix-socket shorthands.
+//
 // SCOPE GUARD: bytes + non-blocking fds ONLY. The day this module grows its
 // own event loop or an HTTP client, it has become a second framework.
 // Protocol clients (request serializers / response parsers) live inside
@@ -121,6 +125,78 @@ pub fn dial_unix(path string) !int {
 		return error('dial_unix: connect to unix:${path} failed (errno ${e})')
 	}
 	return fd
+}
+
+fn C.transport_dial(family int, sa voidptr, len u32, nodelay int, ka_idle int, ka_intvl int, ka_cnt int, user_timeout_ms int) int
+fn C.transport_ip_addr(ip &char, port int, out voidptr, family &i32) u32
+fn C.transport_socket_error(fd int) int
+
+// Addr is one socket address to dial: an IPv4 or IPv6 sockaddr (sockaddr_in /
+// sockaddr_in6) held in sockaddr_storage-sized bytes, with its family and
+// length. Fixed size and pointer-free: a table of them is copied, compared
+// and handed between threads as plain bytes. Fill one with ip_addr, or copy a
+// getaddrinfo result into it (family, ai_addrlen, the ai_addr bytes).
+pub struct Addr {
+pub mut:
+	family int
+	len    u32
+	data   [128]u8 // sizeof(struct sockaddr_storage)
+}
+
+// TcpOpts tunes a dialed TCP socket. 0 (false for nodelay) leaves an option
+// at the OS default.
+pub struct TcpOpts {
+pub:
+	// nodelay sets TCP_NODELAY, so a small request is not held back by Nagle
+	// waiting on the peer's delayed ACK (an HTTPS call on loopback: ~88 ms
+	// without it, ~45 ms with it, #229).
+	nodelay bool = true
+	// keepalive_idle_s > 0 enables keepalive: probes start after this many
+	// idle seconds, keepalive_intvl_s apart, and keepalive_cnt unanswered ones
+	// drop the connection — a peer that vanished without a FIN or RST is noticed.
+	keepalive_idle_s  int = 30
+	keepalive_intvl_s int = 10
+	keepalive_cnt     int = 3
+	// user_timeout_ms sets TCP_USER_TIMEOUT (Linux): how long sent data may
+	// stay unacknowledged before the kernel drops the connection.
+	user_timeout_ms int = 30_000
+}
+
+// dial_addr starts a NON-BLOCKING connect to `a` (IPv4 or IPv6) on a new
+// close-on-exec socket tuned per `o`, and returns the fd, or -errno. The
+// connect is usually still in flight: park on the fd with
+// `event_loop.watch_fd_persistent(fd, .writable, ...)` + `.suspend`; once it
+// is writable, socket_error(fd) is 0 if it connected. Nothing is allocated,
+// on success or failure, so a dial on a request path costs no heap even under
+// `-gc none`. Name resolution is the caller's: dial_addr never blocks on DNS.
+pub fn dial_addr(a &Addr, o TcpOpts) int {
+	return C.transport_dial(a.family, voidptr(&a.data[0]), a.len, if o.nodelay { 1 } else { 0 },
+		o.keepalive_idle_s, o.keepalive_intvl_s, o.keepalive_cnt, o.user_timeout_ms)
+}
+
+// ip_addr parses an IPv4 (`127.0.0.1`) or IPv6 (`::1`, no brackets or zone)
+// literal into an Addr for `port`; none if `ip` is neither (a host name needs
+// a resolver). No allocation.
+pub fn ip_addr(ip string, port int) ?Addr {
+	mut z := [64]u8{} // NUL-terminated copy: `ip` may be a view into a longer string
+	if ip.len == 0 || ip.len >= z.len {
+		return none
+	}
+	unsafe { vmemcpy(&z[0], ip.str, ip.len) }
+	mut a := Addr{}
+	mut family := i32(0) // a C int
+	a.len = C.transport_ip_addr(&char(&z[0]), port, voidptr(&a.data[0]), &family)
+	if a.len == 0 {
+		return none
+	}
+	a.family = int(family)
+	return a
+}
+
+// socket_error is SO_ERROR on `fd`: 0 once a non-blocking connect has
+// completed, else the errno it failed with.
+pub fn socket_error(fd int) int {
+	return C.transport_socket_error(fd)
 }
 
 // close_fd closes a dialed fd — here so callers need no C declarations.

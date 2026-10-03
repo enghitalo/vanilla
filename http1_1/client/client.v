@@ -5,7 +5,8 @@ module client
 // pure bytes-in/bytes-out. No sockets, no event loop, no allocation — the
 // same discipline as the server-side codecs. Composition happens in the
 // caller: transport.dial_* → send → event_loop.watch_fd + .suspend → recv →
-// frame_response (see examples/mesh). Per the #122 client study, callers
+// Framer.feed (framer.v; see examples/mesh), or frame_response for a response
+// that is buffered whole. Per the #122 client study, callers
 // POOL connections per worker (make_state — a dial costs ~4× a request) and
 // prefer unix_socket_path transports (2.3–2.7× TCP loopback).
 import strconv
@@ -97,23 +98,30 @@ pub fn head_len(buf []u8) int {
 
 // status_code parses the status line ('HTTP/1.x NNN ...') and returns the
 // 3-digit code, or -1 if the line is not a valid HTTP/1 status line.
-@[direct_array_access]
+@[inline]
 pub fn status_code(buf []u8) int {
+	return status_at(buf, 0)
+}
+
+// status_at is status_code for the status line that starts at buf[p].
+@[direct_array_access; inline]
+fn status_at(buf []u8, p int) int {
 	// 'HTTP/1.x ' is 9 bytes; the code is 3 more.
-	if buf.len < 12 {
+	if buf.len - p < 12 {
 		return -1
 	}
-	if buf[0] != `H` || buf[1] != `T` || buf[2] != `T` || buf[3] != `P` || buf[4] != `/`
-		|| buf[5] != `1` || buf[6] != `.` || buf[7] < `0` || buf[7] > `9` || buf[8] != ` ` {
+	if buf[p] != `H` || buf[p + 1] != `T` || buf[p + 2] != `T` || buf[p + 3] != `P`
+		|| buf[p + 4] != `/` || buf[p + 5] != `1` || buf[p + 6] != `.` || buf[p + 7] < `0`
+		|| buf[p + 7] > `9` || buf[p + 8] != ` ` {
 		return -1
 	}
-	d0, d1, d2 := buf[9], buf[10], buf[11]
+	d0, d1, d2 := buf[p + 9], buf[p + 10], buf[p + 11]
 	if d0 < `1` || d0 > `9` || d1 < `0` || d1 > `9` || d2 < `0` || d2 > `9` {
 		return -1
 	}
 	// status-code is exactly 3 digits, then SP (or the line's CR when an
 	// upstream omits the empty reason-phrase).
-	if buf.len > 12 && buf[12] != ` ` && buf[12] != `\r` {
+	if buf.len - p > 12 && buf[p + 12] != ` ` && buf[p + 12] != `\r` {
 		return -1
 	}
 	return int(d0 - `0`) * 100 + int(d1 - `0`) * 10 + int(d2 - `0`)
@@ -226,19 +234,9 @@ pub fn frame_response(buf []u8) int {
 		if !bodyless {
 			v, vlen := field_value(buf, pos, line_end, 'content-length')
 			if v >= 0 {
-				// 1*DIGIT: OWS around it is already trimmed (#186).
-				if vlen == 0 {
+				n := parse_content_length(buf, v, vlen)
+				if n < 0 {
 					return err_malformed
-				}
-				mut n := i64(0)
-				for d in v .. v + vlen {
-					if buf[d] < `0` || buf[d] > `9` {
-						return err_malformed // non-numeric value
-					}
-					n = n * 10 + i64(buf[d] - `0`)
-					if n > 0x7fff_0000 {
-						return err_malformed
-					}
 				}
 				if content_length >= 0 && content_length != n {
 					return err_malformed // conflicting duplicates
@@ -275,6 +273,26 @@ pub fn frame_response(buf []u8) int {
 		return incomplete
 	}
 	return int(total)
+}
+
+// parse_content_length reads the Content-Length value buf[v..v + vlen) (OWS
+// already trimmed, #186): 1*DIGIT, capped at 0x7fff0000. -1 when it is not one.
+@[direct_array_access; inline]
+fn parse_content_length(buf []u8, v int, vlen int) i64 {
+	if vlen == 0 {
+		return -1
+	}
+	mut n := i64(0)
+	for d in v .. v + vlen {
+		if buf[d] < `0` || buf[d] > `9` {
+			return -1 // non-numeric value
+		}
+		n = n * 10 + i64(buf[d] - `0`)
+		if n > 0x7fff_0000 {
+			return -1
+		}
+	}
+	return n
 }
 
 // value_has_chunked reports whether the final transfer coding of the
@@ -445,42 +463,111 @@ fn trailer_line_ok(buf []u8, start int, end int) bool {
 	return true
 }
 
+// trailer_line frames one line of the trailer section (RFC 9112 §7.1.2) at
+// `pos`: the offset just past it, `incomplete` until it has arrived, or
+// err_malformed for a line that does not end in CRLF or is not a field-line.
+// The bool is true for the empty line that ends the message.
+@[direct_array_access; inline]
+fn trailer_line(buf []u8, pos int) (int, bool) {
+	if pos >= buf.len {
+		return incomplete, false
+	}
+	// The empty line ends the body: checked in place, so the common case
+	// (no trailer at all) costs two byte compares, not a memchr.
+	if buf[pos] == `\r` {
+		if pos + 1 >= buf.len {
+			return incomplete, false
+		}
+		if buf[pos + 1] == `\n` {
+			return pos + 2, true
+		}
+	}
+	lf := lf_idx(buf, pos)
+	if lf < 0 {
+		return incomplete, false
+	}
+	line_end := lf - 1 // the CR before the LF
+	if lf == pos || buf[line_end] != `\r` {
+		return err_malformed, false // bare LF
+	}
+	if !trailer_line_ok(buf, pos, line_end) {
+		return err_malformed, false
+	}
+	return lf + 1, false
+}
+
 // frame_trailer_section frames the trailer section after the last chunk, from
 // `start` (RFC 9112 §7.1.2): `*( field-line CRLF ) CRLF`. It returns the
 // offset just past the closing empty line (the message total), `incomplete`
-// until that line has arrived, or err_malformed for a line that does not end
-// in CRLF or is not a field-line.
-@[direct_array_access]
+// until that line has arrived, or err_malformed (see trailer_line).
 fn frame_trailer_section(buf []u8, start int) int {
 	mut pos := start
 	for {
-		if pos >= buf.len {
-			return incomplete
+		next, last := trailer_line(buf, pos)
+		if next < 0 || last {
+			return next
 		}
-		// The empty line ends the body: checked in place, so the common case
-		// (no trailer at all) costs two byte compares, not a memchr.
-		if buf[pos] == `\r` {
-			if pos + 1 >= buf.len {
-				return incomplete
-			}
-			if buf[pos + 1] == `\n` {
-				return pos + 2
-			}
-		}
-		lf := lf_idx(buf, pos)
-		if lf < 0 {
-			return incomplete
-		}
-		line_end := lf - 1 // the CR before the LF
-		if lf == pos || buf[line_end] != `\r` {
-			return err_malformed // bare LF
-		}
-		if !trailer_line_ok(buf, pos, line_end) {
-			return err_malformed
-		}
-		pos = lf + 1
+		pos = next
 	}
 	return incomplete
+}
+
+// chunk_size_line frames the chunk-size line at `pos` (RFC 9112 §7.1):
+// `chunk-size [ chunk-ext ] CRLF`. It returns the offset of the chunk data
+// (just past the line's CRLF) and the chunk size, or (`incomplete` /
+// err_malformed, 0). chunk-size = 1*HEXDIG, at most 16 digits (leading zeros
+// included), checked per digit so the verdict never depends on how the line
+// was segmented. The accumulator is i64 with a hard cap so a hostile size can
+// neither wrap negative nor hijack the zero-chunk branch (the request_parser
+// #109 lessons, applied here too).
+@[direct_array_access; inline]
+fn chunk_size_line(buf []u8, pos int) (int, i64) {
+	mut size := i64(0)
+	mut j := pos
+	for j < buf.len {
+		d := hex_digit(buf[j])
+		if d < 0 {
+			break
+		}
+		size = size * 16 + i64(d)
+		if size > 0x7fff_0000 || j - pos >= 16 {
+			return err_malformed, 0
+		}
+		j++
+	}
+	if j >= buf.len {
+		return incomplete, 0 // the size line has not fully arrived
+	}
+	// At least one digit: an empty or extension-only (`;ext`) size line is
+	// not a last chunk.
+	if j == pos {
+		return err_malformed, 0
+	}
+	// The size line ends in CRLF, right after the digits or after a
+	// well-formed chunk-ext. A bare LF, a bare CR or junk is never a line
+	// end (`5\n`, `5\rZZ\n`, `5;a\nX`). Only an extension needs the memchr
+	// for its LF; a plain size line is checked in place.
+	mut line_end := j // the line's CR
+	if buf[j] != `\r` {
+		if buf[j] != `;` && buf[j] != ` ` && buf[j] != `\t` {
+			return err_malformed, 0
+		}
+		lf := lf_idx(buf, j)
+		if lf < 0 {
+			return incomplete, 0
+		}
+		line_end = lf - 1
+		if buf[line_end] != `\r` || !chunk_ext_ok(buf, j, line_end) {
+			return err_malformed, 0
+		}
+	}
+	if line_end + 1 >= buf.len {
+		return incomplete, 0
+	}
+	if buf[line_end + 1] != `\n` {
+		return err_malformed, 0
+	}
+	return line_end + 2, size
 }
 
 // frame_chunked_body frames a chunked body from `body_start` (RFC 9112 §7.1):
@@ -493,63 +580,15 @@ fn frame_trailer_section(buf []u8, start int) int {
 // trailer section is buffered, `incomplete` while more bytes are needed, or
 // err_malformed. Every line must end in CRLF: a bare LF, or a bare CR anywhere
 // in a chunk-size or trailer line, is err_malformed, never a line end — the
-// rules the server's chunked framer applies (#185). The chunk-size
-// accumulator is i64 with a hard cap so a hostile size can neither wrap
-// negative nor hijack the zero-chunk branch (the request_parser #109
-// lessons, applied here too).
+// rules the server's chunked framer applies (#185).
 @[direct_array_access]
 fn frame_chunked_body(buf []u8, body_start int) int {
 	mut pos := body_start
 	for {
-		// chunk-size = 1*HEXDIG, at most 16 digits (leading zeros included),
-		// checked per digit so the verdict never depends on how the line was
-		// segmented.
-		mut size := i64(0)
-		mut j := pos
-		for j < buf.len {
-			d := hex_digit(buf[j])
-			if d < 0 {
-				break
-			}
-			size = size * 16 + i64(d)
-			if size > 0x7fff_0000 || j - pos >= 16 {
-				return err_malformed
-			}
-			j++
+		data_start, size := chunk_size_line(buf, pos)
+		if data_start < 0 {
+			return data_start
 		}
-		if j >= buf.len {
-			return incomplete // the size line has not fully arrived
-		}
-		// At least one digit: an empty or extension-only (`;ext`) size line is
-		// not a last chunk.
-		if j == pos {
-			return err_malformed
-		}
-		// The size line ends in CRLF, right after the digits or after a
-		// well-formed chunk-ext. A bare LF, a bare CR or junk is never a line
-		// end (`5\n`, `5\rZZ\n`, `5;a\nX`). Only an extension needs the memchr
-		// for its LF; a plain size line is checked in place.
-		mut line_end := j // the line's CR
-		if buf[j] != `\r` {
-			if buf[j] != `;` && buf[j] != ` ` && buf[j] != `\t` {
-				return err_malformed
-			}
-			lf := lf_idx(buf, j)
-			if lf < 0 {
-				return incomplete
-			}
-			line_end = lf - 1
-			if buf[line_end] != `\r` || !chunk_ext_ok(buf, j, line_end) {
-				return err_malformed
-			}
-		}
-		if line_end + 1 >= buf.len {
-			return incomplete
-		}
-		if buf[line_end + 1] != `\n` {
-			return err_malformed
-		}
-		data_start := line_end + 2
 		if size == 0 {
 			// last-chunk: frame past the trailer section to the closing CRLF.
 			return frame_trailer_section(buf, data_start)
@@ -608,10 +647,17 @@ pub fn header_value(buf []u8, name string) (int, int) {
 // `hl` comes from head_len, which only returns a length when every line of the
 // head ends in CRLF, so each value ends at its own line's CR and never runs
 // into the next field line (#186).
-@[direct_array_access]
+@[inline]
 fn header_value_from(buf []u8, hl int, name string) (int, int) {
-	mut pos := lf_idx(buf, 0) + 1 // past the status line
-	for pos > 0 && pos < hl - 2 {
+	return header_value_in(buf, 0, hl, name)
+}
+
+// header_value_in is header_value_from for the head buf[start..end): a framed
+// head (every line ends in CRLF) that need not start at offset 0.
+@[direct_array_access]
+fn header_value_in(buf []u8, start int, end int, name string) (int, int) {
+	mut pos := lf_idx(buf, start) + 1 // past the status line
+	for pos > 0 && pos < end - 2 {
 		lf := lf_idx(buf, pos)
 		s, l := field_value(buf, pos, lf - 1, name)
 		if s >= 0 {

@@ -31,6 +31,7 @@ jobs:
           - examples/graceful_shutdown/src
           - examples/hexagonal/src
           - examples/http2_cleartext/src
+          - examples/https_upstream/src # the pooled upstream client (plain HTTP here; HTTPS in tls_backend.yml), against its fake upstream (V)
           - examples/io_uring_demo/src
           - examples/json_api/src
           - examples/mesh/src
@@ -124,3 +125,11 @@ jobs:
         shell: bash
         run: |
           v -cc gcc -no-parallel test http2/
+      # transport/: dial_addr over IPv4 and IPv6 loopback (tuning and
+      # close-on-exec read back), and under -gc none, where mallinfo2 sees
+      # every allocation, that a failed dial allocates nothing.
+      - name: Run transport module tests
+        shell: bash
+        run: |
+          v -cc gcc -no-parallel test transport/
+          v -cc gcc -no-parallel -gc none test transport/
