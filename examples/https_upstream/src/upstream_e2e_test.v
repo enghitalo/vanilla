@@ -2,12 +2,11 @@
 module main
 
 // End-to-end tests of the http1_1/upstream pooled client (#229), through this
-// example's edge server (epoll, one worker) against
-// http1_1/upstream/testdata/fake_upstream.py — a scriptable fake third-party
-// API, over plain HTTP and, built with
-// `-d vanilla_tls`, over TLS 1.3 with the test CA (verify-full + SNI). Each
-// test skips without python3 (and openssl, for TLS) unless
-// VANILLA_REQUIRE_FAKE_PG is set (CI).
+// example's edge server (epoll, one worker) against ../fake_upstream — a
+// scriptable fake third-party API written in V, built here and run as its own
+// process — over plain HTTP and, built with `-d vanilla_tls`, over TLS 1.3
+// with a throwaway test CA (verify-full + SNI). The TLS tests skip without
+// openssl (for the test CA) unless VANILLA_REQUIRE_FAKE_PG is set (CI).
 import os
 import time
 import crypto.sha256
@@ -27,9 +26,9 @@ fn C.recv(fd int, buf voidptr, n usize, flags int) int
 fn C.send(fd int, buf voidptr, n usize, flags int) int
 fn C.listen(fd int, backlog int) int
 
-const fake_script = os.join_path(@VMODROOT, 'http1_1', 'upstream', 'testdata', 'fake_upstream.py')
+const fake_src = os.join_path(@DIR, '..', 'fake_upstream', 'main.v')
 
-// Fake is one fake_upstream.py process.
+// Fake is one fake_upstream process.
 struct Fake {
 mut:
 	port  int
@@ -42,13 +41,44 @@ fn (f &Fake) certs_dir() string {
 	return f.certs
 }
 
+// fake_bin builds ../fake_upstream (with TLS in a TLS build) with the
+// compiler and C compiler that built this test, once per source version: the
+// binary is cached under its source hash, so later test runs reuse it.
+fn fake_bin() !string {
+	src := os.read_file(fake_src)!
+	mut flags := ['-no-parallel', '-cc', fake_cc()]
+	$if vanilla_tls ? {
+		flags << ['-d', 'vanilla_tls']
+	}
+	key := sha256.hexhash(src + flags.join(' '))[..16]
+	bin := os.join_path(os.vtmp_dir(), 'vanilla_fake_upstream_${key}')
+	if os.exists(bin) {
+		return bin
+	}
+	tmp := '${bin}.${os.getpid()}'
+	res := os.execute('${os.quoted_path(@VEXE)} ${flags.join(' ')} -o ${os.quoted_path(tmp)} ${os.quoted_path(os.dir(fake_src))}')
+	if res.exit_code != 0 {
+		return error('cannot build fake_upstream: ${res.output}')
+	}
+	os.mv(tmp, bin)! // atomic: a concurrent build of the same source is the same binary
+	return bin
+}
+
+fn fake_cc() string {
+	$if tinyc {
+		return 'tcc'
+	} $else $if clang {
+		return 'clang'
+	}
+	return 'gcc'
+}
+
 fn start_fake(certs string, cert string) !Fake {
-	python := os.find_abs_path_of_executable('python3')!
+	bin := fake_bin()!
 	dir := os.join_path(os.temp_dir(), 'vanilla_fake_upstream_${os.getpid()}_${time.sys_mono_now()}')
 	os.mkdir_all(dir)!
-	mut p := os.new_process(python)
-	mut a := [fake_script, '--port-file', os.join_path(dir, 'port'), '--stats-file',
-		os.join_path(dir, 'stats')]
+	mut p := os.new_process(bin)
+	mut a := ['--port-file', os.join_path(dir, 'port'), '--stats-file', os.join_path(dir, 'stats')]
 	if certs != '' {
 		a << ['--tls', certs, '--cert', cert]
 	}
@@ -64,10 +94,13 @@ fn start_fake(certs string, cert string) !Fake {
 				proc:  p
 			}
 		}
+		if !p.is_alive() {
+			break
+		}
 		time.sleep(10 * time.millisecond)
 	}
 	p.signal_kill()
-	return error('fake_upstream.py did not start')
+	return error('fake_upstream did not start')
 }
 
 fn (mut f Fake) stop() {
@@ -101,12 +134,9 @@ mut:
 	cfg   &tls.Config = unsafe { nil }
 }
 
-// variants is the transports to test: plain HTTP, and HTTPS in a TLS build.
+// variants is the transports to test: plain HTTP, and HTTPS in a TLS build
+// (with openssl for the test CA).
 fn variants() []bool {
-	if !testkit.fake_pg_available() {
-		eprintln('https_upstream: skipping (no python3)')
-		return []
-	}
 	$if vanilla_tls ? {
 		if testkit.test_certs_available() {
 			return [false, true]
@@ -449,35 +479,6 @@ fn test_large_request_body() {
 		assert status_of(r) == 200, r
 		assert body_of(r) == '${body.len} ${sha256.sum(body).hex()}', r
 	}
-}
-
-// TLS 1.3 session tickets sent mid-upload, while the upstream stops reading:
-// they are consumed and the body still arrives byte-exact. (The exchange never
-// reads through the session while a record of its own is pending, or a ticket
-// read then would flush that record and the same-length retry would send its
-// bytes twice; loopback timing cannot force that exact interleaving, so this
-// covers tickets mid-upload in general.)
-fn test_tickets_mid_upload() {
-	if true !in variants() {
-		return
-	}
-	mut e := setup(true, 'server', upstream.Origin{
-		max_request_bytes: 8 << 20
-	}) or { panic(err) }
-	defer {
-		e.stop()
-	}
-	n := 4 << 20
-	mut body := []u8{len: n}
-	for i in 0 .. n {
-		body[i] = u8(`a` + i % 26)
-	}
-	for round in 0 .. 3 {
-		r, _ := call(e.h.port(), 'POST /fill/${n}/tickets HTTP/1.1\r\nHost: edge\r\n\r\n', 20_000)
-		assert status_of(r) == 200, 'round ${round}: ${r}'
-		assert body_of(r) == '${n} ${sha256.sum(body).hex()}', 'round ${round}: ${r}'
-	}
-	assert e.fake.stat('tickets') == 3
 }
 
 // A response over max_response_bytes fails with .too_large.

@@ -205,12 +205,13 @@ jobs:
         run: |
           v -cc gcc -no-parallel -d vanilla_tls test tests/tls_workers_test.v
       # The pooled HTTPS client (http1_1/upstream, #229) through
-      # examples/https_upstream's edge, against a python3 fake upstream with
-      # the test CA: response shapes, keep-alive reuse, stale connections,
-      # retries, close_notify vs a bare FIN, certificate failures, early
-      # answers, 4 MiB bodies, deadlines, shedding, client disconnects, the
-      # resolver thread. VANILLA_REQUIRE_FAKE_PG turns a missing python3 or
-      # openssl into a failure instead of a skip.
+      # examples/https_upstream's edge, against its fake upstream (a V
+      # program the test builds, serving TLS with the test CA): response
+      # shapes, keep-alive reuse, stale connections, retries, close_notify vs
+      # a bare FIN, certificate failures, early answers, 4 MiB bodies,
+      # deadlines, shedding, client disconnects, the resolver thread.
+      # VANILLA_REQUIRE_FAKE_PG turns a missing openssl (the test CA) into a
+      # failure instead of a skip.
       - name: Pooled HTTPS client (http1_1/upstream) e2e
         shell: bash
         env:

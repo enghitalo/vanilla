@@ -31,7 +31,7 @@ jobs:
           - examples/graceful_shutdown/src
           - examples/hexagonal/src
           - examples/http2_cleartext/src
-          - examples/https_upstream/src # the pooled upstream client (plain HTTP here; HTTPS in tls_backend.yml), against a python3 fake
+          - examples/https_upstream/src # the pooled upstream client (plain HTTP here; HTTPS in tls_backend.yml), against its fake upstream (V)
           - examples/io_uring_demo/src
           - examples/json_api/src
           - examples/mesh/src
