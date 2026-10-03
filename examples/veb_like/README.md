@@ -1,112 +1,175 @@
 # veb-like router (production reference)
 
-A small, fast HTTP router declared with method attributes and dispatched by a
-comptime-unrolled matcher — kept faithful to the project values (no magic,
-bytes-in/bytes-out handlers, static dispatch allocation-free, and responses
-framed from consts — never `${}`-interpolated) while being safe to put in
-front of real traffic.
+Declarative routing for vanilla: annotate the methods of your `App` with
+`@['METHOD /path']` and the router dispatches to them. It keeps the project
+values — the handler is still the core contract (append the raw response into
+`out`, return a `core.Step`), responses are framed from consts, and a request
+**allocates nothing**, whatever its outcome.
+
+The router itself is the generic module
+[`http1_1.veb_like`](../../http1_1/veb_like/), written to be extracted into its
+own library; `src/` is an app that uses it. Like `http1_1.router`, it routes
+HTTP/1.x requests.
 
 ## Declaring routes
 
-Annotate `App` methods with `@['METHOD /path']`. The router supports two kinds of
-dynamic segment:
-
-- **`:param`** — matches exactly one path segment (stops at the next `/`).
-- **`*name`** — a **catch-all**: matches the rest of the path, slashes included.
-  Must be the last segment.
-
 ```v
-@['GET /users/:id/posts/:post_id']        // two params
-@['GET /files/*path']                      // catch-all: /files/css/app.css -> "css/app.css"
-fn (app App) get(req HttpRequest, params map[string]Slice) []u8 { ... }
+import http1_1.veb_like { Params }
+
+@['GET /users/:id/posts/:post_id']
+fn (app &App) user_post(req HttpRequest, p &Params, mut out []u8) core.Step {
+	// p.get('id'), p.get('post_id'): zero-copy views of the request bytes
+	return .done
+}
+
+@['GET /files/*path']   // catch-all: /files/css/app.css -> p.get('path') == 'css/app.css'
+fn (app &App) serve_file(req HttpRequest, p &Params, mut out []u8) core.Step { ... }
+
+fn main() {
+	router := veb_like.new[App](&App{})!   // compiles the routes; a routing mistake fails here
+	mut srv := server.new_server(server.ServerConfig{
+		handler: fn [router] (req []u8, mut out []u8, fd int, ws voidptr, mut el core.EventLoop) core.Step {
+			return router.handle(req, mut out, fd, ws, mut el)
+		}
+		// ...
+	})!
+	srv.run()
+}
 ```
 
-`params[':id']` (or `params['*path']` for a catch-all) is a `Slice` into the
-request buffer (zero-copy). The handlers here read it as a byte **view** (see
-`p()` in `main.v`) and JSON-escape it straight into the response — call
-`.to_string(req.buffer)` only when the bytes must outlive the request buffer.
-Query values come from `req.get_query('name')`.
+- **`:name`** matches one non-empty path segment; **`*name`** (last segment
+  only) matches the rest of the path, slashes included, possibly empty.
+- Static segments win over `:name`, which wins over `*name`; a dead end
+  backtracks (`/a/b/c` and `/a/:x/d` both work, `/a/b/d` reaches the second).
+- A param's name belongs to its route: `/users/:id` and
+  `/users/:user_id/posts/:post_id` share a trie node without conflict.
+- Matching is byte-exact (case-sensitive, not percent-decoded) and stops at `?`;
+  query values come from `req.get_query('name')`.
+- `p.get(name)` returns a view into the request buffer, valid until the handler
+  returns — `.clone()` what must outlive it. Up to 8 params per route.
 
-### Every route shape, exercised
+### Two handler shapes
 
-The example registers the full variety (see `main.v` and the tests):
+```v
+fn (app &App) short(req HttpRequest, p &Params, mut out []u8) core.Step
+fn (app &App) long(req HttpRequest, p &Params, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step
+```
+
+The long shape is the whole `core.Handler` contract, so a route can park the
+request on an fd (`event_loop.watch_fd` + `.suspend`: an async DB query, a
+timer, an upstream), read its worker's state, or `.close`. `GET /delay/:ms` in
+[main.v](src/main.v) suspends on a timerfd ([delay_linux.c.v](src/delay_linux.c.v)).
+
+Every method of `App` that returns `core.Step` is a handler, routed or not, so
+it must have one of these shapes (a clear compile error says so otherwise).
+
+### Routes in this example
 
 | Pattern | Kind |
 |---------|------|
 | `GET /users`, `POST /users` | static |
-| `GET\|PUT\|PATCH\|DELETE /users/:id` | one param at the end, many verbs (→ 405 lists all) |
+| `GET\|PUT\|PATCH\|DELETE /users/:id` | one param, many verbs (→ 405 lists them) |
 | `GET /users/:id/profile` | param + literal tail |
 | `GET /users/:user_id/posts/:post_id` | two params |
 | `GET /users/:user_id/posts/:post_id/comments/:comment_id` | three params, deep |
 | `GET /tags/:a/:b/:c` | three consecutive params |
 | `GET /search/:term` | single param |
 | `GET /files/*path`, `GET /proxy/*upstream` | catch-all (captures slashes) |
+| `GET /delay/:ms` | suspends on a timer (long handler shape) |
 
-Matching is positional and case-sensitive; a `:param` never spans `/` (use `*` for
-that), and the query string is ignored for matching (`/users/42?x=/y` still hits
-`/users/:id`). The router is a linear comptime-unrolled scan — O(routes) per
-request, simple, and lean on allocation: a static hit allocates nothing for
-routing; a dynamic or wildcard hit allocates only the `params` map it hands the
-handler, created only **after** the match is validated (a non-match allocates
-nothing). A trie would trade that for O(path-length) at the cost of "no magic".
+## How it works
+
+Everything that can be decided before the first request is decided once, in
+`veb_like.new`:
+
+1. **Compile.** One `$for` over `App`'s methods reads each `@['METHOD /path']`
+   attribute into a segment trie (static children, one `:name` child, one
+   `*name` child per node; a route id per method slot). Malformed routes and
+   two handlers for the same method + path are errors, at startup.
+2. **Prebuild the 405s.** Each node a route ends at gets its complete
+   `405 Method Not Allowed` response, `Allow` header included.
+
+Per request: `decode_into` → method to a slot index → walk the trie (O(path
+depth), independent of the number of routes) → one direct call. The dispatch
+is a `$for` over the methods comparing an integer; GCC turns it into a jump
+table and inlines the handlers.
+
+**Nothing is allocated per request** — not for a hit, a 404, a 405, a 501 or a
+400 (`test_routing_allocates_nothing`). Under `-gc none`, vanilla's production
+build, any per-request allocation would be a permanent leak. Three V traps had
+to be avoided to get there (see [docs/V_PERF_TOOLBOX.md](../../docs/V_PERF_TOOLBOX.md)):
+
+- `for attr in method.attrs` inside `$for` builds a new heap array on every
+  pass, so attributes are only read in `new`, never per request;
+- a struct holding a fixed array (`[8]Slice`) is copied to the heap when passed
+  by `&`/`mut`, so `Params` stores its eight slots as plain fields;
+- params live in that stack struct, not a `map[string]Slice` (a map plus a
+  clone of every key, per request).
+
+## Performance
+
+Measured on an AMD Ryzen 7 5800H (8 cores / 16 threads), `-prod -gc none`,
+`VANILLA_WORKERS=8`, wrk on the same machine (`-t6 -c256`), this rewrite
+against the previous `examples/veb_like` (a linear attribute scan with a
+`map` of params and a returned `[]u8` per response):
+
+| | before | after |
+|---|---:|---:|
+| memory per request (`-gc none`, RSS slope) | **+1,179 B** (a leak: 6.9 → 17.7 GiB over 9.6M requests) | **0 B** (flat 7 MiB over 31.6M) |
+| `GET /users/7/posts/99`, keep-alive | 256k req/s | 390k req/s |
+| `GET /users/7/posts/99`, pipelined ×16 | 0.95M req/s | 2.60M req/s |
+| `GET /nope/x` (404), pipelined ×16 | 0.47M req/s | 2.67M req/s |
+
+In process ([`bench/router/router_bench.v`](../../bench/router/router_bench.v):
+route + a small reply, one core), next to the hand-written tree of
+[`examples/router`](../router/) on the same routes:
+
+| request | veb_like | router |
+|---|---:|---:|
+| `GET /users` | 80 ns | 39 ns |
+| `GET /users/42` | 103 ns | 51 ns |
+| `GET /users/7/posts/99/comments/5` | 170 ns | 94 ns |
+| `GET /files/css/app.css` | 104 ns | 50 ns |
+| `POST /users/42` (405) | 68 ns | 22 ns |
+| `GET /nope/x` (404) | 59 ns | 17 ns |
+
+`router` reads only the request line. `veb_like` parses the whole request,
+because its handlers receive it, then walks a trie instead of compiled
+branches and looks params up by name. Over a socket the two are level (≈380k
+req/s keep-alive, ≈2.6M pipelined ×16): the kernel path dominates.
+
+## HTTP behavior
+
+- **400 + close** for a request the parser rejects — never a panic, which would
+  end the whole server process (every worker).
+- **404** when no route matches the path (`router.not_found` can be replaced
+  before the server starts, e.g. with a page); **405** with `Allow` when the
+  path exists under other methods.
+- **HEAD** is served by the GET route when no HEAD route exists: the router
+  drops the body the handler wrote (not for a handler that suspends — it answers
+  later; check `req.method` there if it matters).
+- **501** for a method outside RFC 9110's nine (methods are case-sensitive).
+- Only origin-form targets (`/…`) are routed; `*` and absolute-form get a 404.
+
+The app adds: accurate `Content-Length` (computed while framing), JSON-escaped
+URL values (no injection), `Limits` (header/body size, connection cap,
+read/write/idle timeouts) and graceful shutdown on SIGTERM/SIGINT.
 
 ## Files
 
 | File | Role |
 |------|------|
-| `main.v` | `App`, the route handlers, and the production server config |
-| `router.v` | dispatch (hot path) + 404/405 resolution (cold path) |
-| `router_static.v` | exact `METHOD /path` matcher |
-| `router_dynamic.v` | `:param` matcher + extraction, `*` catch-all matcher, attr scan |
-| `responses.v` | const-framed JSON responses (computed `Content-Length`) + JSON escaping straight into the body builder |
-
-## Production properties
-
-- **Never crashes on bad input** — a request the parser rejects is answered
-  `400`, not `panic`ked. A panic would end the whole server process (every
-  worker and every open connection, not just one worker thread), so run it
-  under a supervisor that restarts it.
-- **Correct HTTP status** — `404` for an unknown path; `405 Method Not Allowed`
-  (with an `Allow` header) when the path exists under another method.
-- **Accurate `Content-Length`** — computed from the body, never hand-typed.
-- **`application/json`** for JSON bodies.
-- **Safe output** — URL-derived values (`:params`, query) are JSON-escaped, so a
-  `"` or `\` can't break or forge the response (no JSON injection).
-- **Query-string–correct matching** — the path is matched up to `?`, so neither a
-  query nor a `/` inside it (e.g. `?redirect=/home`) can cause a false `404`.
-- **Bounded** — `Limits` cap header/body size and concurrent connections, and
-  read/write/idle timeouts reap slow or stalled peers, connections that never
-  send a byte, and idle keep-alive connections — which is what keeps the
-  connection cap from filling up with dead peers.
-- **Graceful shutdown** — `SIGTERM`/`SIGINT` stop new accepts and drain in-flight
-  requests before exit (clean rolling deploys). The signal handler only wakes a
-  normal thread through a pipe, and that thread calls `shutdown()` (see
-  [Graceful Shutdown](../../README.md#3-graceful-shutdown)).
+| [`http1_1/veb_like/router.v`](../../http1_1/veb_like/router.v) | `new` (compile), `handle` (match + dispatch), the trie |
+| [`http1_1/veb_like/params.v`](../../http1_1/veb_like/params.v) | `Params`: the matched values, on the stack |
+| [`http1_1/veb_like/router_test.v`](../../http1_1/veb_like/router_test.v) | the router's own contract: priority, backtracking, startup errors |
+| `src/main.v` | `App`, its handlers, the production server config |
+| `src/responses.v` | zero-allocation response framing straight into `out` |
+| `src/delay_linux.c.v` | the timerfd behind `/delay/:ms` |
+| `src/main_test.v` | every route type, HTTP edge cases, suspend/resume, zero allocation |
 
 ## Run
 
 ```sh
-v -prod run examples/veb_like
-# GET  /users
-# POST /users
-# GET  /users/:id            (also PUT/PATCH/DELETE)
-# GET  /users/:id/profile
-# GET  /users/:user_id/posts/:post_id
-# GET  /search/:term?format=json
-# GET  /files/*path
+v -prod run examples/veb_like/src
+v test examples/veb_like/src
 ```
-
-## Benchmarks (pre-rewrite records)
-
-Historical numbers (wrk -t8 -c128, loopback), measured **before** the
-const-framing / lazy-params-map rewrite — re-measure with `-prod` before
-quoting:
-
-| Route | Req/sec |
-|-------|---------|
-| `GET /users` (static) | ~383k |
-| `GET /users/1/posts/2` (dynamic) | ~327k |
-
-Hardening added no measurable hot-path cost: the malformed→400 / 405 / escaping
-logic lives on the cold path, and the per-request slash count is hoisted out of
-the route loop.

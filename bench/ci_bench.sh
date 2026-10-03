@@ -46,6 +46,7 @@ BENCHES=(
 	"middleware|bench/middleware/middleware_bench.v"
 	"etag_hash|bench/etag_hash/etag_hash.v"
 	"static_assets|bench/static_assets_bench/static_assets_bench.v"
+	"router|bench/router/router_bench.v"
 	"pg_async_submit|bench/pg_async/codec_bench.v|-d pg_async_bench|submit|800000"
 	"pg_async_frame|bench/pg_async/codec_bench.v|-d pg_async_bench|frame|400000"
 	"pg_async_rows|bench/pg_async/codec_bench.v|-d pg_async_bench|rows|3000000"

@@ -127,12 +127,47 @@ fn bytes_equal(a &u8, a_len int, b &u8, b_len int) bool {
 // REQUEST-TARGET is the path or resource being requested
 // HTTP-VERSION is the version of HTTP being used (e.g., HTTP/1.1)
 // CRLF is a carriage return followed by a line feed
-@[direct_array_access]
 pub fn parse_http1_request_line(mut req HttpRequest) !int {
+	end := request_line_end(mut req)
+	if end < 0 {
+		return error(request_line_error(end))
+	}
+	return end
+}
+
+// Why request_line_end rejected a request line. Plain ints, not error()s: the
+// hot path (decode_into) runs it on every request, and an error() boxes a
+// MessageError even when the caller discards it — under -gc none, a leak per
+// malformed request.
+const rl_too_short = -1
+const rl_no_space_after_method = -2
+const rl_empty_method = -3
+const rl_no_target = -4
+const rl_no_space_after_target = -5
+const rl_no_cr = -6
+const rl_no_lf = -7
+
+fn request_line_error(code int) string {
+	return match code {
+		rl_too_short { 'request line too short' }
+		rl_no_space_after_method { 'Missing space after method' }
+		rl_empty_method { 'empty method' }
+		rl_no_target { 'missing request-target' }
+		rl_no_space_after_target { 'Missing space after request-target' }
+		rl_no_cr { 'Missing CR' }
+		else { 'expected LF after CR' }
+	}
+}
+
+// request_line_end parses the request line into `req` and returns the index
+// just past its CRLF, or a negative rl_* code. The no-Result twin of
+// parse_http1_request_line (see find_byte_idx).
+@[direct_array_access]
+fn request_line_end(mut req HttpRequest) int {
 	buf := req.buffer
 	len := buf.len
 	if len < 12 {
-		return error('request line too short')
+		return rl_too_short
 	}
 
 	unsafe {
@@ -141,10 +176,10 @@ pub fn parse_http1_request_line(mut req HttpRequest) !int {
 		// Find first SP: end of method
 		method_len := find_byte_idx(b, len, empty_space)
 		if method_len < 0 {
-			return error('Missing space after method')
+			return rl_no_space_after_method
 		}
 		if method_len == 0 {
-			return error('empty method')
+			return rl_empty_method
 		}
 		req.method = Slice{0, method_len}
 		// Skip spaces after method
@@ -153,17 +188,17 @@ pub fn parse_http1_request_line(mut req HttpRequest) !int {
 			pos++
 		}
 		if pos == len {
-			return error('missing request-target')
+			return rl_no_target
 		}
 
 		// Find next SP or CR (whichever comes first)
 		sp_pos := find_byte_idx(&buf[pos], len - pos, empty_space)
 		if sp_pos < 0 {
-			return error('Missing space after request-target')
+			return rl_no_space_after_target
 		}
 		cr_pos := find_byte_idx(&buf[pos], len - pos, cr_char)
 		if cr_pos < 0 {
-			return error('Missing CR')
+			return rl_no_cr
 		}
 
 		path_end := if sp_pos < cr_pos { pos + sp_pos } else { pos + cr_pos }
@@ -172,7 +207,7 @@ pub fn parse_http1_request_line(mut req HttpRequest) !int {
 		// If we hit CR directly after path → HTTP/0.9 style (no version)
 		if sp_pos > cr_pos {
 			if path_end + 1 >= len || buf[path_end + 1] != lf_char {
-				return error('expected LF after CR')
+				return rl_no_lf
 			}
 			req.version = Slice{0, 0}
 			return path_end + 2
@@ -182,13 +217,13 @@ pub fn parse_http1_request_line(mut req HttpRequest) !int {
 		version_start := path_end + 1
 		cr_after_version := find_byte_idx(&buf[version_start], len - version_start, cr_char)
 		if cr_after_version < 0 {
-			return error('Missing CR')
+			return rl_no_cr
 		}
 		req.version = Slice{version_start, cr_after_version}
 
 		end_of_line := version_start + cr_after_version
 		if end_of_line + 1 >= len || buf[end_of_line + 1] != lf_char {
-			return error('expected LF after CR')
+			return rl_no_lf
 		}
 
 		return end_of_line + 2 // position after \r\n
@@ -205,7 +240,10 @@ pub fn decode_into(mut req HttpRequest) bool {
 	buffer := req.buffer // caller sets req.buffer (it is immutable after construction)
 
 	// header_start is the byte index immediately after the request line's \r\n
-	header_start := parse_http1_request_line(mut req) or { return false }
+	header_start := request_line_end(mut req)
+	if header_start < 0 {
+		return false
+	}
 
 	// RFC 9112 §2.1: the header section is `*( field-line CRLF )` and MAY be
 	// empty. An empty section means the terminating blank-line CRLF sits right

@@ -38,9 +38,11 @@ jobs:
           - examples/per_server_workers/src
           - examples/rate_limit/src
           - examples/request_limits/src
+          - examples/router/src
           - examples/simple/src
           - examples/simple2/src
           - examples/sse/src
+          - examples/veb_like/src
           - examples/websocket_echo/src
     steps:
       - uses: actions/checkout@v4
