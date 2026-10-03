@@ -7,7 +7,7 @@ module main
 // a worker's per-request work minus the socket.
 //
 //   veb_like  declarative: `@['GET /users/:id']` methods compiled into a trie
-//             at startup (examples/veb_like/src/veb_like)
+//             at startup (http1_1/veb_like)
 //   router    explicit: the handler is the router, `match` over the path's
 //             segments with the router module's zero-copy cursor; it reads
 //             only the request line (veb_like parses the whole request: its
@@ -25,8 +25,8 @@ import os
 import strconv
 import core
 import http1_1.request_parser { HttpRequest }
-import router { Method, Path }
-import examples.veb_like.src.veb_like { Params }
+import http1_1.router { Method, Path }
+import http1_1.veb_like { Params }
 
 fn C.memchr(s voidptr, c int, n usize) voidptr
 

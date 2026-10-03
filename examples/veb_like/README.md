@@ -6,14 +6,15 @@ values — the handler is still the core contract (append the raw response into
 `out`, return a `core.Step`), responses are framed from consts, and a request
 **allocates nothing**, whatever its outcome.
 
-The router itself is a small generic module, [`src/veb_like/`](src/veb_like/),
-written to be extracted into its own library; the rest of `src/` is an app that
-uses it.
+The router itself is the generic module
+[`http1_1.veb_like`](../../http1_1/veb_like/), written to be extracted into its
+own library; `src/` is an app that uses it. Like `http1_1.router`, it routes
+HTTP/1.x requests.
 
 ## Declaring routes
 
 ```v
-import veb_like { Params }
+import http1_1.veb_like { Params }
 
 @['GET /users/:id/posts/:post_id']
 fn (app &App) user_post(req HttpRequest, p &Params, mut out []u8) core.Step {
@@ -158,9 +159,9 @@ read/write/idle timeouts) and graceful shutdown on SIGTERM/SIGINT.
 
 | File | Role |
 |------|------|
-| [`src/veb_like/router.v`](src/veb_like/router.v) | `new` (compile), `handle` (match + dispatch), the trie |
-| [`src/veb_like/params.v`](src/veb_like/params.v) | `Params`: the matched values, on the stack |
-| [`src/veb_like/router_test.v`](src/veb_like/router_test.v) | the router's own contract: priority, backtracking, startup errors |
+| [`http1_1/veb_like/router.v`](../../http1_1/veb_like/router.v) | `new` (compile), `handle` (match + dispatch), the trie |
+| [`http1_1/veb_like/params.v`](../../http1_1/veb_like/params.v) | `Params`: the matched values, on the stack |
+| [`http1_1/veb_like/router_test.v`](../../http1_1/veb_like/router_test.v) | the router's own contract: priority, backtracking, startup errors |
 | `src/main.v` | `App`, its handlers, the production server config |
 | `src/responses.v` | zero-allocation response framing straight into `out` |
 | `src/delay_linux.c.v` | the timerfd behind `/delay/:ms` |

@@ -33,8 +33,6 @@ on:
       - 'tls/**'
       - 'pg_async/**'
       - 'static_assets/**'
-      - 'router/**'
-      - 'examples/veb_like/src/veb_like/**'
       - 'testkit/**'
       - 'vtest/**'
       - 'tests/**'

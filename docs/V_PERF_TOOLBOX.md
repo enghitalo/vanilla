@@ -135,7 +135,7 @@ Found while making the routers allocation-free; verified in the emitted C on V
   array per method, per execution. In a per-request dispatch that is one
   allocation per route scanned (the old `examples/veb_like` paid 13 to reach its
   last route and 26 for a 404). Read attributes once, at startup, into a table
-  ([`veb_like.new`](../examples/veb_like/src/veb_like/router.v)). A `$for` that only
+  ([`veb_like.new`](../http1_1/veb_like/router.v)). A `$for` that only
   calls `app.$method(...)` reads no attributes and allocates nothing; GCC folds
   its integer compares into a jump table and inlines the handlers.
 - **A struct holding a fixed array moves to the heap when referenced.** A local

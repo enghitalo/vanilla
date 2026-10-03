@@ -22,7 +22,7 @@ import server
 import core
 import http1_1.request_parser { HttpRequest }
 import os
-import veb_like { Params }
+import http1_1.veb_like { Params }
 
 struct App {}
 

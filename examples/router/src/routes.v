@@ -19,7 +19,7 @@ module main
 //
 // GET branches also take HEAD: route() drops the body afterwards.
 import core
-import router { Method, Path }
+import http1_1.router { Method, Path }
 
 const users_list_response = fixed_json(json_200_head, '[]')
 const user_created_response = fixed_json(json_201_head, '{"id":1}')

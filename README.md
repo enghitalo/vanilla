@@ -8,7 +8,7 @@ A minimalist, high-performance HTTP server written in [V](https://vlang.io).
 
 - **Fast**: Multi-threaded, non-blocking I/O, lock-free, copy-free, I/O multiplexing, `SO_REUSEPORT` (native load balancing on Linux)
 - **Modular**: Easy to extend with custom controllers and handlers.
-- **Routing without allocation**: route by `match` over the path's segments with the [`router`](router/router.v) module, which reads the method and a zero-copy path cursor straight from the request line (the fastest, [`examples/router/`](examples/router/)), or declare `@['GET /users/:id']` methods and let [`veb_like`](examples/veb_like/) compile them into a trie at startup. Either way routing allocates nothing — a hit, a 404 or a 405 — and handlers keep the full contract (`.suspend` included).
+- **Routing without allocation**: route by `match` over the path's segments with [`http1_1.router`](http1_1/router/router.v), which reads the method and a zero-copy path cursor straight from the request line (the fastest, [`examples/router/`](examples/router/)), or declare `@['GET /users/:id']` methods and let [`http1_1.veb_like`](http1_1/veb_like/router.v) compile them into a trie at startup ([`examples/veb_like/`](examples/veb_like/)). Either way routing allocates nothing — a hit, a 404 or a 405 — and handlers keep the full contract (`.suspend` included).
 - **Memory Safety**: No race conditions.
 - **No Magic**: Transparent and straightforward.
 - **E2E Testing**: Test handlers in-process by passing raw requests directly to `handle_request()`, or drive a running server — TCP or unix socket — with the `vtest` scripted client (raw fds via `transport.dial_tcp`/`dial_unix`; see [`tests/backend_behaviors_test.v`](tests/backend_behaviors_test.v)).
@@ -248,8 +248,8 @@ fn main() {
 | `examples/spa_static_assets/` | CSR/WASM SPA bundle (`application/wasm`, `.br`/`.gz`, immutable caching, SPA fallback) |
 | `examples/static_files/` | Static file serving (MIME, Range, ETag, traversal safety) |
 | `examples/url_form/` | Query-string and URL-encoded form parsing |
-| `examples/router/` | Routing as code: `match` over path segments with the `router` module's zero-copy cursor — the fastest option |
-| `examples/veb_like/` | Declarative routing: `@['GET /users/:id']` methods compiled into a trie at startup, zero allocations per request |
+| `examples/router/` | Routing as code: `match` over path segments with `http1_1.router`'s zero-copy cursor — the fastest option |
+| `examples/veb_like/` | Declarative routing with `http1_1.veb_like`: `@['GET /users/:id']` methods compiled into a trie at startup, zero allocations per request |
 | `examples/websocket_echo/` | RFC 6455 WebSocket echo over the connection-takeover seam (`core.queue_takeover` — one engine, two protocols on one connection) |
 | `examples/http2_cleartext/` | HTTP/2 (cleartext, prior-knowledge, RFC 9113) over the same seam — the `PRI *` preface flips the connection, then the SAME handler serves h1 and http2 requests |
 | `examples/video_stream/` | HTTP video streaming |

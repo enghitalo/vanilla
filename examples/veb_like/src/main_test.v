@@ -2,7 +2,7 @@ module main
 
 import core
 import time
-import veb_like
+import http1_1.veb_like
 
 // Every route TYPE the router supports, driven through the real router with
 // the same call ServerConfig.handler makes (BEST_PRACTICES §9: handlers are

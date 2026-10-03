@@ -1,11 +1,13 @@
 # router — routing as code (the fastest option)
 
 The router is your `core.Handler` itself, written as `match` statements over
-the request's path segments. The [`router`](../../router/router.v) module only
-reads the request line, straight from the raw request: nothing is registered,
-looked up, parsed or allocated to route, every branch is plain code the
-compilers see whole, and params are typed locals the V compiler checks. Every
-response, 404 and 405 included, is the app's.
+the request's path segments. The
+[`http1_1.router`](../../http1_1/router/router.v) module only reads the request
+line, straight from the raw request: nothing is registered, looked up, parsed
+or allocated to route, every branch is plain code the compilers see whole, and
+params are typed locals the V compiler checks. Every response, 404 and 405
+included, is the app's. It routes HTTP/1.x requests (an h2 request reaches it
+rebuilt as HTTP/1 bytes, as in `examples/http2_cleartext`).
 
 Same routes as [`examples/veb_like`](../veb_like/) — the declarative
 alternative — with byte-identical responses, so the two are directly
@@ -14,7 +16,7 @@ comparable.
 ## The module
 
 ```v
-import router { Method, Path }
+import http1_1.router { Method, Path }
 
 m := router.method(req_buffer)      // Method enum: a switch on the first space, one compare
 mut path := router.path(req_buffer) // zero-copy cursor over the path; never fails
