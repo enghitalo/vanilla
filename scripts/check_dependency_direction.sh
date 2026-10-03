@@ -3,7 +3,7 @@
 # between vanilla's top-level modules (docs/ARCHITECTURE.md):
 #
 #   core <- { socket, transport, tls, epoll, io_uring, kqueue, iocp, poll,
-#             http1_1, http2, websocket, grpc, static_assets } <- server
+#             http1_1, http2, websocket, grpc, static_assets, router } <- server
 #
 #   - core imports no other vanilla module.
 #   - socket/, transport/, tls/ and the event wrappers (epoll, io_uring,
@@ -53,6 +53,9 @@ check_no_import grpc 'server|websocket|http1_1'
 
 # static_assets serves through the handler contract: core + http1_1 only.
 check_no_import static_assets 'server|http2|websocket|grpc'
+
+# router builds handlers, like static_assets: core + http1_1 only.
+check_no_import router "server|socket|transport|tls|$wrappers|http2|websocket|grpc|static_assets|testkit|vtest|pg_async"
 
 # testkit stays dependency-free towards vanilla (docs it relies only on net/time).
 check_no_import testkit "server|socket|transport|tls|$wrappers|$protocols|static_assets|vtest|pg_async"
