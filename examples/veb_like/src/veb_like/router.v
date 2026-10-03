@@ -48,13 +48,13 @@ module veb_like
 // for a request the parser rejects.
 import core
 import http1_1.request_parser { HttpRequest, Slice }
+import http1_1.response
 
 fn C.memchr(s voidptr, c int, n usize) voidptr
 
 // max_params caps the :name and *name segments of one route.
 pub const max_params = 8
 
-const bad_request_response = 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 const not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 const not_implemented_response = 'HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 const method_not_allowed_head = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: '
@@ -112,7 +112,7 @@ pub fn (r &Router[T]) handle(req_buffer []u8, mut out []u8, client_fd int, worke
 		buffer: req_buffer
 	}
 	if !request_parser.decode_into(mut req) {
-		out << bad_request_response
+		out << response.tiny_bad_request_response
 		return .close
 	}
 	m := method_index(req)
