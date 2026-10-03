@@ -108,6 +108,11 @@ void vtls_mark_readable(void *sess);
 // VTLS_ERROR from vtls_read is then a clean close, not a failure.
 int vtls_peer_closed(void *sess);
 
+// 1 if the peer ended the session with a close_notify alert; 0 for a bare
+// transport EOF (or no close at all). A body delimited by the close is
+// complete only after a close_notify (RFC 9112 §9.8).
+int vtls_peer_close_notify(void *sess);
+
 // ---- client (pg_async's TLS; the server side never calls these) -----------
 
 // How a client checks the server's certificate.
@@ -139,6 +144,11 @@ int vtls_session_reset(void *sess, int fd);
 // After vtls_handshake returned VTLS_ERROR: why, NUL-terminated in buf (the
 // certificate verification failure, or the Mbed TLS error).
 void vtls_handshake_error(void *sess, char *buf, size_t len);
+
+// After vtls_handshake returned VTLS_ERROR: 1 if the server's certificate
+// failed verification (untrusted chain, wrong name, expired), 0 for any other
+// failure. Allocation-free, unlike vtls_handshake_error.
+int vtls_verify_failed(void *sess);
 
 // The text of a negative Mbed TLS error code, NUL-terminated in buf.
 void vtls_error_string(int err, char *buf, size_t len);

@@ -108,6 +108,7 @@ typedef struct {
     int deferred;    // ...and a record is encrypted and waiting to be sent
     int bio_want;    // the receive callback answered WANT_READ in this Mbed TLS call
     int peer_closed; // the peer ended the session: EOF or close_notify (vtls_peer_closed)
+    int close_notify; // ...with a close_notify alert, not a bare EOF (vtls_peer_close_notify)
     int last_err;    // the Mbed TLS error that failed the handshake (vtls_handshake_error)
     size_t ra_off, ra_len; // unread ciphertext is ra[ra_off..ra_len]
     unsigned char ra[VTLS_READAHEAD];
@@ -625,13 +626,18 @@ int vtls_read(void *sess, unsigned char *buf, size_t len) {
     } while (vtls_retry(s, ret) && ++n < VTLS_RETRIES);
     if (ret > 0) return ret;
     if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) { // closed
+        // mbedtls_ssl_read answers 0 for a transport EOF without close_notify,
+        // which a truncation attack can produce (RFC 9112 §9.8).
         s->peer_closed = 1;
+        if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) s->close_notify = 1;
         return VTLS_ERROR;
     }
     return map_ret(ret); // VTLS_WANT (-2) or VTLS_ERROR (-1)
 }
 
 int vtls_peer_closed(void *sess) { return ((vtls_session *)sess)->peer_closed; }
+
+int vtls_peer_close_notify(void *sess) { return ((vtls_session *)sess)->close_notify; }
 
 int vtls_write(void *sess, const unsigned char *buf, size_t len) {
     vtls_session *s = (vtls_session *)sess;
@@ -721,6 +727,7 @@ static void client_rearm(vtls_session *s, int fd) {
     s->readahead = 1;
     s->closed = 0;
     s->peer_closed = 0;
+    s->close_notify = 0;
     s->last_err = 0;
     s->defer_send = 0;
     s->deferred = 0;
@@ -758,6 +765,10 @@ int vtls_session_reset(void *sess, int fd) {
     VTLS_UNLOCK();
     client_rearm(s, fd);
     return ret;
+}
+
+int vtls_verify_failed(void *sess) {
+    return ((vtls_session *)sess)->last_err == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED;
 }
 
 void vtls_handshake_error(void *sess, char *buf, size_t len) {

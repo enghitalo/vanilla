@@ -84,6 +84,14 @@ pub fn (s &Session) peer_closed() bool {
 	return false
 }
 
+pub fn (s &Session) close_notify() bool {
+	return false
+}
+
+pub fn (s &Session) verify_failed() bool {
+	return false
+}
+
 pub fn system_ca_file() string {
 	return ''
 }
