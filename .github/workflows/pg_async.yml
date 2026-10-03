@@ -79,6 +79,13 @@ env:
   # run on epoll.
   VANILLA_NO_IOURING: '1'
 
+# A new push to a pull request cancels that PR's run still in progress, so
+# superseded commits don't queue for the account's runners; on main every
+# commit is its own group and runs to the end.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   fake:
     runs-on: ubuntu-latest
