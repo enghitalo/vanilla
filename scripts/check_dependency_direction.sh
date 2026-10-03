@@ -56,8 +56,8 @@ check_no_import grpc 'server|websocket|http1_1'
 # static_assets serves through the handler contract: core + http1_1 only.
 check_no_import static_assets 'server|http2|websocket|grpc'
 
-# router builds handlers, like static_assets: core + http1_1 only.
-check_no_import router "server|socket|transport|tls|$wrappers|http2|websocket|grpc|static_assets|testkit|vtest|pg_async"
+# router reads the raw request line: no vanilla imports at all, like core.
+check_no_import router "core|server|socket|transport|tls|$wrappers|$protocols|static_assets|testkit|vtest|pg_async"
 
 # testkit stays dependency-free towards vanilla (docs it relies only on net/time).
 check_no_import testkit "server|socket|transport|tls|$wrappers|$protocols|static_assets|vtest|pg_async"

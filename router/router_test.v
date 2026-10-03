@@ -1,23 +1,12 @@
 module router
 
-import http1_1.request_parser { HttpRequest }
-
-fn parse(raw string) HttpRequest {
-	mut req := HttpRequest{
-		buffer: raw.bytes()
-	}
-	parsed := request_parser.decode_into(mut req) // not inside the assert: -prod drops asserts
-	assert parsed, 'test request must parse: ${raw}'
-	return req
-}
-
-fn get(target string) HttpRequest {
-	return parse('GET ${target} HTTP/1.1\r\nHost: x\r\n\r\n')
+fn get(target string) []u8 {
+	return 'GET ${target} HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 }
 
 // segments pops every segment, then checks the cursor stays spent.
-fn segments(target string) []string {
-	mut p := path(get(target)) or { return ['<none>'] }
+fn segments(req []u8) []string {
+	mut p := path(req)
 	mut segs := []string{}
 	for !p.done() {
 		segs << p.next()
@@ -27,95 +16,105 @@ fn segments(target string) []string {
 }
 
 fn test_method() {
-	for i, name in method_names[..int(Method.unknown)] {
-		assert method(parse('${name} / HTTP/1.1\r\n\r\n')) == unsafe { Method(i) }
+	names := ['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'CONNECT', 'OPTIONS', 'TRACE', 'PATCH']
+	for i, name in names {
+		assert method('${name} / HTTP/1.1\r\n\r\n'.bytes()) == unsafe { Method(i) }
 	}
-	assert method(parse('get / HTTP/1.1\r\n\r\n')) == .unknown // case-sensitive
-	assert method(parse('BREW / HTTP/1.1\r\n\r\n')) == .unknown
-	assert method(parse('GETS / HTTP/1.1\r\n\r\n')) == .unknown
-	assert method(parse('PROPFIND / HTTP/1.1\r\n\r\n')) == .unknown
+	assert method('get / HTTP/1.1\r\n\r\n'.bytes()) == .unknown // case-sensitive
+	assert method('BREW / HTTP/1.1\r\n\r\n'.bytes()) == .unknown
+	assert method('GETS / HTTP/1.1\r\n\r\n'.bytes()) == .unknown
+	assert method('PROPFIND / HTTP/1.1\r\n\r\n'.bytes()) == .unknown
+	// no method token
+	assert method('GET\r\n\r\n'.bytes()) == .unknown
+	assert method(' GET / HTTP/1.1\r\n\r\n'.bytes()) == .unknown
+	assert method('GE'.bytes()) == .unknown
+	assert method([]u8{}) == .unknown
 }
 
 fn test_segments() {
-	assert segments('/') == ['']
-	assert segments('/users') == ['users']
-	assert segments('/users/') == ['users', '']
-	assert segments('/users/42') == ['users', '42']
-	assert segments('/a//b') == ['a', '', 'b']
-	assert segments('/users/42?x=/y/z') == ['users', '42'] // the query is not path
-	assert segments('/?q=1') == ['']
+	assert segments(get('/')) == ['']
+	assert segments(get('/users')) == ['users']
+	assert segments(get('/users/')) == ['users', '']
+	assert segments(get('/users/42')) == ['users', '42']
+	assert segments(get('/a//b')) == ['a', '', 'b']
+	assert segments(get('/users/42?x=/y/z')) == ['users', '42'] // the query is not path
+	assert segments(get('/?q=1')) == ['']
+}
+
+fn test_path_reads_the_request_line_only() {
+	// no HTTP-version: the target ends at the line break, not in a header
+	assert segments('GET /users/42\r\nHost: a b\r\n\r\n'.bytes()) == ['users', '42']
+	// extra spaces after the method, as request_parser tolerates them
+	assert segments('GET  /users HTTP/1.1\r\n\r\n'.bytes()) == ['users']
+	// the cursor does not care about the method
+	assert segments('BREW /pot HTTP/1.1\r\n\r\n'.bytes()) == ['pot']
 }
 
 fn test_done_tells_a_trailing_slash_apart() {
-	mut p := path(get('/users'))?
+	mut p := path(get('/users'))
 	assert p.next() == 'users' && p.done()
-	mut q := path(get('/users/'))?
+	mut q := path(get('/users/'))
 	assert q.next() == 'users' && !q.done()
 	assert q.next() == '' && q.done()
 }
 
 fn test_rest_is_the_catch_all() {
-	mut p := path(get('/files/css/app.css?v=2'))?
+	mut p := path(get('/files/css/app.css?v=2'))
 	assert p.rest() == 'files/css/app.css'
 	assert p.next() == 'files'
 	assert p.rest() == 'css/app.css'
-	mut q := path(get('/files/'))?
+	mut q := path(get('/files/'))
 	q.next()
 	assert q.rest() == '' && !q.done()
 }
 
-fn test_only_origin_form_targets_have_a_path() {
-	if _ := path(parse('OPTIONS * HTTP/1.1\r\n\r\n')) {
-		assert false, 'asterisk-form must not route'
-	}
-	if _ := path(get('http://example.com/users')) {
-		assert false, 'absolute-form must not route'
-	}
-	if _ := path(get('users')) {
-		assert false, 'a target without a leading / must not route'
+// A request with no path to route gets one segment that no route matches:
+// not '' (the root's), so not even `/` answers it.
+fn test_no_path_matches_no_route() {
+	for raw in [
+		'OPTIONS * HTTP/1.1\r\n\r\n', // asterisk-form
+		'GET http://example.com/users HTTP/1.1\r\n\r\n', // absolute-form
+		'GET users HTTP/1.1\r\n\r\n', // no leading /
+		'GARBAGE\r\n\r\n', // no target
+		'GET\r\n\r\n',
+		'GET \r\n\r\n',
+		'GET ',
+		'',
+	] {
+		mut p := path(raw.bytes())
+		assert !p.done(), raw
+		seg := p.next()
+		assert seg != '' && seg.contains(' '), raw
+		assert p.done() && p.next() == '', raw
 	}
 }
 
 fn test_segments_are_views_into_the_request() {
 	req := get('/users/42')
-	mut p := path(req)?
+	mut p := path(req)
 	p.next()
 	id := p.next()
 	assert id == '42'
-	assert voidptr(id.str) == unsafe { voidptr(&u8(req.buffer.data) + req.path.start + 7) }
+	assert voidptr(id.str) == unsafe { voidptr(&u8(req.data) + 'GET /users/'.len) }
 }
 
-fn test_allow() {
-	assert allow(.get, .head, .post).bytestr() == 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD, POST\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
-	// listed in RFC order whatever the argument order; .unknown is never listed
-	assert allow(.patch, .unknown, .get).bytestr().contains('Allow: GET, PATCH\r\n')
-}
-
-fn test_drop_body() {
-	mut out := 'previous'.bytes()
-	start := out.len
-	out << 'HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello'.bytes()
-	drop_body(mut out, start)
-	assert out.bytestr() == 'previousHTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n'
-	mut none_yet := 'no head here'.bytes()
-	drop_body(mut none_yet, 0)
-	assert none_yet.bytestr() == 'no head here'
-}
-
-fn test_cursor_allocates_nothing() {
+fn test_routing_allocates_nothing() {
 	$if gcboehm ? {
 		req := get('/users/42/posts/99?x=1')
+		star := 'OPTIONS * HTTP/1.1\r\n\r\n'.bytes()
 		before := gc_heap_usage().total_bytes
 		mut n := 0
 		for _ in 0 .. 50_000 {
 			m := method(req)
-			mut p := path(req) or { panic('unreachable') }
+			mut p := path(req)
 			for !p.done() {
 				n += p.next().len
 			}
 			n += int(m) + p.rest().len
+			mut q := path(star)
+			n += q.next().len
 		}
-		assert n == 50_000 * 14
+		assert n == 50_000 * 15
 		assert gc_heap_usage().total_bytes - before < 1024
 	}
 }

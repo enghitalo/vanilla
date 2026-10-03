@@ -9,7 +9,9 @@ module main
 //   veb_like  declarative: `@['GET /users/:id']` methods compiled into a trie
 //             at startup (examples/veb_like/src/veb_like)
 //   router    explicit: the handler is the router, `match` over the path's
-//             segments with the router module's zero-copy cursor
+//             segments with the router module's zero-copy cursor; it reads
+//             only the request line (veb_like parses the whole request: its
+//             handlers receive it)
 //
 // Both must answer every request byte-identically (checked before timing),
 // so the clock only sees how each one gets there. Handlers do minimal work —
@@ -25,6 +27,8 @@ import core
 import http1_1.request_parser { HttpRequest }
 import router { Method, Path }
 import examples.veb_like.src.veb_like { Params }
+
+fn C.memchr(s voidptr, c int, n usize) voidptr
 
 // ── shared reply framing ─────────────────────────────────────────────────────
 
@@ -141,33 +145,40 @@ fn (app &App) proxy(_ HttpRequest, p &Params, mut out []u8) core.Step {
 
 // ── explicit: the router module ──────────────────────────────────────────────
 
-const users_405 = router.allow(.get, .head, .post)
-const user_405 = router.allow(.get, .head, .put, .delete, .patch)
-const get_405 = router.allow(.get, .head)
+const not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const users_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD, POST\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const user_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD, PUT, DELETE, PATCH\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const get_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 
+// handle is the core.Handler: routing reads the request line, no header.
 fn handle(req_buffer []u8, mut out []u8, _ int, _ voidptr, mut _event_loop core.EventLoop) core.Step {
-	mut req := HttpRequest{
-		buffer: req_buffer
-	}
-	if !request_parser.decode_into(mut req) {
-		out << router.bad_request
-		return .close
-	}
-	m := router.method(req)
-	if m == .unknown {
-		out << router.not_implemented
-		return .done
-	}
-	mut path := router.path(req) or {
-		out << router.not_found
-		return .done
-	}
+	m := router.method(req_buffer)
+	mut path := router.path(req_buffer)
 	start := out.len
 	step := route(m, mut path, mut out)
 	if m == .head {
-		router.drop_body(mut out, start)
+		drop_body(mut out, start)
 	}
 	return step
+}
+
+// drop_body keeps the head of the response appended from `start` (HEAD).
+fn drop_body(mut out []u8, start int) {
+	unsafe {
+		mut i := start
+		for i + 3 < out.len {
+			q := C.memchr(&u8(out.data) + i, `\r`, usize(out.len - 3 - i))
+			if q == nil {
+				return
+			}
+			i = int(&u8(q) - &u8(out.data))
+			if out[i + 1] == `\n` && out[i + 2] == `\r` && out[i + 3] == `\n` {
+				out.len = i + 4
+				return
+			}
+			i++
+		}
+	}
 }
 
 fn route(m Method, mut path Path, mut out []u8) core.Step {
@@ -274,7 +285,7 @@ fn get_leaf(m Method, mut out []u8, name string, a string, b string, c string) c
 
 @[inline]
 fn not_found(mut out []u8) core.Step {
-	out << router.not_found
+	out << not_found_response
 	return .done
 }
 

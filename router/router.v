@@ -6,33 +6,30 @@ module router
 // core.Handler, written as `match` statements over the request's path
 // segments. Branches are ordinary code the C compiler sees whole, params are
 // typed locals the V compiler checks, and nothing is allocated or looked up
-// at runtime that the code does not spell out. This module provides the
-// pieces that make that fast and correct:
+// at runtime that the code does not spell out. This module only reads the
+// request line, straight from the raw request; every response (404 and 405
+// included) is the app's:
 //
-//   m := router.method(req)                       // one length switch, an enum
-//   mut path := router.path(req) or { ... 404 }   // zero-copy segment cursor
-//   match path.next() {                           // each segment a view: no copy
-//       'users' { return users(req, m, mut path, mut out) }
-//       else {}
+//   fn route(req_buffer []u8, mut out []u8, ...) core.Step {  // the core.Handler
+//       m := router.method(req_buffer)       // a switch on the first space, an enum
+//       mut path := router.path(req_buffer)  // zero-copy segment cursor
+//       match path.next() {                  // each segment a view: no copy
+//           'users' { return users(m, mut path, mut out) }
+//           else {}
+//       }
+//       out << not_found                     // the app's own response
+//       return .done
 //   }
-//   out << router.not_found
 //
-//   const users_405 = router.allow(.get, .head, .post)   // a 405 + Allow, built once
-//
-// A sub-router is just a function that takes the cursor and keeps popping.
-// The whole path is walked once; each segment costs one memchr and is
-// compared by the `match` (length first, then bytes).
-import http1_1.request_parser { HttpRequest }
+// Routing parses no headers: a route that needs them decodes the request
+// itself (request_parser.decode_into). A sub-router is just a function that
+// takes the cursor and keeps popping. The path is walked once; each segment
+// costs one memchr and is compared by the `match` (length first, then bytes).
 
 fn C.memchr(s voidptr, c int, n usize) voidptr
 
-// Canned responses for the outcomes every router has.
-pub const bad_request = 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
-pub const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-pub const not_implemented = 'HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-
-// Method is the request method: RFC 9110's nine, in the order allow() lists
-// them, or .unknown for any other token (answer it with not_implemented).
+// Method is the request method: RFC 9110's nine, or .unknown for any other
+// token, including a request line without one.
 pub enum Method {
 	get
 	head
@@ -46,82 +43,109 @@ pub enum Method {
 	unknown
 }
 
-const method_names = ['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'CONNECT', 'OPTIONS', 'TRACE', 'PATCH',
-	'']!
-
-// method returns the request's method: a switch on its length, then one
-// fixed-size compare. Methods are case-sensitive (RFC 9110 §9.1).
-pub fn method(req HttpRequest) Method {
+// method reads the request's method, the token before the request line's
+// first space: a switch on where that space is, then one fixed-size compare.
+// Methods are case-sensitive (RFC 9110 §9.1).
+pub fn method(req_buffer []u8) Method {
+	n := req_buffer.len
 	unsafe {
-		b := &u8(req.buffer.data) + req.method.start
-		match req.method.len {
-			3 {
-				if C.memcmp(b, c'GET', 3) == 0 {
-					return .get
-				}
-				if C.memcmp(b, c'PUT', 3) == 0 {
-					return .put
-				}
+		b := &u8(req_buffer.data)
+		if n > 3 && b[3] == ` ` {
+			if C.memcmp(b, c'GET', 3) == 0 {
+				return .get
 			}
-			4 {
-				if C.memcmp(b, c'POST', 4) == 0 {
-					return .post
-				}
-				if C.memcmp(b, c'HEAD', 4) == 0 {
-					return .head
-				}
+			if C.memcmp(b, c'PUT', 3) == 0 {
+				return .put
 			}
-			5 {
-				if C.memcmp(b, c'PATCH', 5) == 0 {
-					return .patch
-				}
-				if C.memcmp(b, c'TRACE', 5) == 0 {
-					return .trace
-				}
+		} else if n > 4 && b[4] == ` ` {
+			if C.memcmp(b, c'POST', 4) == 0 {
+				return .post
 			}
-			6 {
-				if C.memcmp(b, c'DELETE', 6) == 0 {
-					return .delete
-				}
+			if C.memcmp(b, c'HEAD', 4) == 0 {
+				return .head
 			}
-			7 {
-				if C.memcmp(b, c'OPTIONS', 7) == 0 {
-					return .options
-				}
-				if C.memcmp(b, c'CONNECT', 7) == 0 {
-					return .connect
-				}
+		} else if n > 5 && b[5] == ` ` {
+			if C.memcmp(b, c'PATCH', 5) == 0 {
+				return .patch
 			}
-			else {}
+			if C.memcmp(b, c'TRACE', 5) == 0 {
+				return .trace
+			}
+		} else if n > 6 && b[6] == ` ` {
+			if C.memcmp(b, c'DELETE', 6) == 0 {
+				return .delete
+			}
+		} else if n > 7 && b[7] == ` ` {
+			if C.memcmp(b, c'OPTIONS', 7) == 0 {
+				return .options
+			}
+			if C.memcmp(b, c'CONNECT', 7) == 0 {
+				return .connect
+			}
 		}
 	}
 	return .unknown
 }
+
+// no_path is the single segment of a request with no path to route: a
+// request line without an origin-form target (`OPTIONS *`, absolute-form, or
+// malformed). A path segment never contains a space, so it matches no route,
+// not even `/`: the app's fallback, its 404, answers.
+const no_path = ' '
 
 // Path is a cursor over the request path's segments, excluding any `?query`.
 // It points into the request buffer and copies nothing: every segment it
 // hands out is a view, valid until the handler returns (`.clone()` what must
 // outlive the request). Segments are raw bytes: not percent-decoded.
 pub struct Path {
-	base &u8 = unsafe { nil } // first byte of the path
+	base &u8 = unsafe { nil } // the path's leading `/`
 	len  int // path length, query excluded
 mut:
 	pos int // first byte of the next segment
 }
 
-// path returns the cursor for an origin-form target (`/...`), positioned
-// before its first segment; none for any other form (`*`, absolute-form),
-// which the app answers itself (usually not_found).
-pub fn path(req HttpRequest) ?Path {
-	base := unsafe { &u8(req.buffer.data) + req.path.start }
-	if req.path.len == 0 || unsafe { base[0] } != `/` {
-		return none
-	}
-	q := C.memchr(base, `?`, usize(req.path.len))
-	return Path{
-		base: base
-		len:  if q == unsafe { nil } { req.path.len } else { int(unsafe { &u8(q) - base }) }
-		pos:  1
+// path returns the cursor over the request's path, read from the request
+// line and positioned before its first segment. It never fails: a request
+// with no path to route yields one segment that no route matches (no_path).
+pub fn path(req_buffer []u8) Path {
+	n := req_buffer.len
+	unsafe {
+		b := &u8(req_buffer.data)
+		// The target starts after the method's space (and any extra spaces, as
+		// request_parser tolerates them). A line break first: no target at all.
+		mut i := 0
+		for i < n && b[i] != ` ` {
+			if b[i] == `\r` || b[i] == `\n` {
+				return Path{
+					base: no_path.str
+					len:  1
+				}
+			}
+			i++
+		}
+		for i < n && b[i] == ` ` {
+			i++
+		}
+		if i == n || b[i] != `/` {
+			return Path{
+				base: no_path.str
+				len:  1
+			}
+		}
+		start := i
+		i++
+		for i < n {
+			c := b[i]
+			if c == ` ` || c == `?` || c == `\r` || c == `\n` {
+				break
+			}
+			i++
+		}
+		return Path{
+			base: b + start
+			len:  i - start
+			pos:  1
+		}
 	}
 }
 
@@ -156,39 +180,4 @@ pub fn (p &Path) rest() string {
 		return ''
 	}
 	return unsafe { tos(p.base + p.pos, p.len - p.pos) }
-}
-
-// allow builds the complete `405 Method Not Allowed` response listing
-// `methods` in its Allow header (RFC 9110 §15.5.6). Call it once, for a const:
-// a leaf's `else` branch then answers 405 with one append.
-pub fn allow(methods ...Method) []u8 {
-	mut names := []string{}
-	for i in 0 .. int(Method.unknown) {
-		if unsafe { Method(i) } in methods {
-			names << method_names[i]
-		}
-	}
-	return ('HTTP/1.1 405 Method Not Allowed\r\nAllow: ' + names.join(', ') +
-		'\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n').bytes()
-}
-
-// drop_body truncates the response appended into `out` from `start` to its
-// head: a HEAD request served by a GET branch gets GET's headers (its
-// Content-Length included) and no body (RFC 9110 §9.3.2).
-pub fn drop_body(mut out []u8, start int) {
-	unsafe {
-		mut i := start
-		for i + 3 < out.len {
-			q := C.memchr(&u8(out.data) + i, 13, usize(out.len - 3 - i))
-			if q == nil {
-				return
-			}
-			i = int(&u8(q) - &u8(out.data))
-			if out[i + 1] == 10 && out[i + 2] == 13 && out[i + 3] == 10 {
-				out.len = i + 4
-				return
-			}
-			i++
-		}
-	}
 }

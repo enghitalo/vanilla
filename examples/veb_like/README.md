@@ -120,20 +120,22 @@ against the previous `examples/veb_like` (a linear attribute scan with a
 | `GET /nope/x` (404), pipelined ×16 | 0.47M req/s | 2.67M req/s |
 
 In process ([`bench/router/router_bench.v`](../../bench/router/router_bench.v):
-parse + route + a small reply, one core), next to the hand-written tree of
+route + a small reply, one core), next to the hand-written tree of
 [`examples/router`](../router/) on the same routes:
 
 | request | veb_like | router |
 |---|---:|---:|
-| `GET /users` | 77 ns | 68 ns |
-| `GET /users/42` | 95 ns | 80 ns |
-| `GET /users/7/posts/99/comments/5` | 156 ns | 121 ns |
-| `GET /files/css/app.css` | 98 ns | 77 ns |
-| `POST /users/42` (405) | 60 ns | 52 ns |
-| `GET /nope/x` (404) | 54 ns | 49 ns |
+| `GET /users` | 80 ns | 39 ns |
+| `GET /users/42` | 103 ns | 51 ns |
+| `GET /users/7/posts/99/comments/5` | 170 ns | 94 ns |
+| `GET /files/css/app.css` | 104 ns | 50 ns |
+| `POST /users/42` (405) | 68 ns | 22 ns |
+| `GET /nope/x` (404) | 59 ns | 17 ns |
 
-The remaining 11–30% is the price of the table: a trie walk instead of
-compiled branches, and params looked up by name instead of being locals.
+`router` reads only the request line. `veb_like` parses the whole request,
+because its handlers receive it, then walks a trie instead of compiled
+branches and looks params up by name. Over a socket the two are level (≈380k
+req/s keep-alive, ≈2.6M pipelined ×16): the kernel path dominates.
 
 ## HTTP behavior
 

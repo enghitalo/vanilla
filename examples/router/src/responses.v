@@ -2,6 +2,8 @@ module main
 
 import strconv
 
+fn C.memchr(s voidptr, c int, n usize) voidptr
+
 // Response framing, appended straight into the connection's write buffer: a
 // const head, the body written in place, then its Content-Length digits
 // patched into the head. No intermediate body buffer, no copy into `out`, no
@@ -107,4 +109,25 @@ fn json_string(mut out []u8, s string) {
 @[inline]
 fn hex_digit(n u8) u8 {
 	return if n < 10 { `0` + n } else { `a` + (n - 10) }
+}
+
+// drop_body truncates the response appended into `out` from `start` to its
+// head: a HEAD request served by a GET branch gets GET's headers (its
+// Content-Length included) and no body (RFC 9110 §9.3.2).
+fn drop_body(mut out []u8, start int) {
+	unsafe {
+		mut i := start
+		for i + 3 < out.len {
+			q := C.memchr(&u8(out.data) + i, `\r`, usize(out.len - 3 - i))
+			if q == nil {
+				return
+			}
+			i = int(&u8(q) - &u8(out.data))
+			if out[i + 1] == `\n` && out[i + 2] == `\r` && out[i + 3] == `\n` {
+				out.len = i + 4
+				return
+			}
+			i++
+		}
+	}
 }

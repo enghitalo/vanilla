@@ -2,45 +2,18 @@ module main
 
 // The fastest way to route in vanilla: the router is the core.Handler itself,
 // written as `match` statements over the path's segments (routes.v), with the
-// `router` module's zero-copy cursor and method enum. Nothing is registered,
-// looked up or allocated at runtime; each branch is plain code the compilers
-// see whole, and params are typed locals.
+// `router` module reading the method and path straight from the request line.
+// Nothing is registered, looked up or allocated at runtime, and no header is
+// parsed to route; each branch is plain code the compilers see whole, and
+// params are typed locals.
 //
-// Same routes, same responses, same production properties as
-// examples/veb_like (the declarative alternative): 400 + close for a request
-// the parser rejects, 404 vs 405 + Allow, HEAD served by GET, 501 for unknown
-// methods, JSON-escaped URL values, Limits, graceful shutdown.
+// The app owns every response: its 404 when no route matches the path (a
+// malformed request line, `*` and absolute-form included), a 405 + Allow per
+// leaf (an unknown method gets it too), HEAD answered by the GET branches.
+// Same routes as examples/veb_like (the declarative alternative), plus
+// JSON-escaped URL values, Limits and graceful shutdown.
 import server
-import core
-import http1_1.request_parser { HttpRequest }
 import os
-import router
-
-// handle is the server's core.Handler: parse, then walk the route tree.
-fn handle(req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
-	mut req := HttpRequest{
-		buffer: req_buffer
-	}
-	if !request_parser.decode_into(mut req) {
-		out << router.bad_request
-		return .close
-	}
-	m := router.method(req)
-	if m == .unknown {
-		out << router.not_implemented
-		return .done
-	}
-	mut path := router.path(req) or {
-		out << router.not_found // `*` or absolute-form: nothing here routes those
-		return .done
-	}
-	start := out.len
-	step := route(m, mut path, mut out, mut event_loop)
-	if m == .head && step != .suspend {
-		router.drop_body(mut out, start)
-	}
-	return step
-}
 
 fn main() {
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
@@ -54,7 +27,7 @@ fn main() {
 	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
-		handler:         handle
+		handler:         route
 		// Production limits: bound resource use so a single client can't exhaust
 		// the server (see examples/veb_like for the reasoning behind each).
 		limits:          server.Limits{

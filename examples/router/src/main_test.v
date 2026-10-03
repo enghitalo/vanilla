@@ -3,10 +3,13 @@ module main
 import core
 import time
 
-// The same assertions as examples/veb_like/src/main_test.v — the two apps serve
-// the same routes with byte-identical responses — driven through handle(),
-// the exact core.Handler the server calls (BEST_PRACTICES §9: handlers are
-// pure, so tests feed raw request bytes — no listening socket needed).
+// The assertions of examples/veb_like/src/main_test.v — the two apps serve the
+// same routes with byte-identical responses — except where they differ by
+// design: routing here reads only the request line, so a line it cannot route
+// gets the 404 (veb_like parses it: 400 + close) and an unknown method gets the
+// route's 405 (veb_like: 501). Driven through route(), the exact core.Handler
+// the server calls (BEST_PRACTICES §9: handlers are pure, so tests feed raw
+// request bytes — no listening socket needed).
 // `${}` interpolation is fine HERE: tests are scaffolding, not hot-path code.
 //
 // Routes under test (see routes.v):
@@ -25,7 +28,7 @@ import time
 fn serve(raw string) string {
 	mut out := []u8{}
 	mut event_loop := core.EventLoop{}
-	handle(raw.bytes(), mut out, -1, unsafe { nil }, mut event_loop)
+	route(raw.bytes(), mut out, -1, unsafe { nil }, mut event_loop)
 	return out.bytestr()
 }
 
@@ -162,9 +165,12 @@ fn test_head_is_served_by_get_without_a_body() {
 	assert serve(req('HEAD', '/users')).ends_with('Connection: keep-alive\r\n\r\n')
 }
 
-fn test_unknown_method_is_501() {
-	assert status('BREW', '/users') == 'HTTP/1.1 501 Not Implemented'
-	assert status('get', '/users') == 'HTTP/1.1 501 Not Implemented' // methods are case-sensitive
+fn test_unknown_method_gets_the_routes_405() {
+	r := serve(req('BREW', '/users'))
+	assert r.starts_with('HTTP/1.1 405 Method Not Allowed')
+	assert r.contains('Allow: GET, HEAD, POST\r\n')
+	assert status('get', '/users') == 'HTTP/1.1 405 Method Not Allowed' // methods are case-sensitive
+	assert status('BREW', '/nope') == 'HTTP/1.1 404 Not Found'
 }
 
 // ── query string: params come from the path, values from ?… ──────────────────
@@ -192,31 +198,20 @@ fn test_injection_escaped_backslash_and_controls() {
 	assert body_of('GET', '/search/a\tb') == '{"term":"a\\tb"}'
 }
 
-// ── crash safety: every malformed shape is a 400 + close, never a panic ───────
+// ── a request line with no path to route: the 404, never a panic ─────────────
+//
+// Routing does not validate the request line. The server answers malformed
+// framing (a bare LF, a bad length) with 400 before any handler runs; whatever
+// else arrives, a line without an origin-form path matches no route.
 
-fn test_malformed_is_400() {
-	assert serve('GARBAGE\r\n\r\n').contains('400 Bad Request')
-}
-
-fn test_malformed_empty_buffer_is_400() {
-	assert serve('').contains('400 Bad Request')
-}
-
-fn test_malformed_truncated_head_is_400() {
-	// head never terminated with the blank line
-	assert serve('GET / HTTP/1.1\r\nHost: x').contains('400 Bad Request')
-}
-
-fn test_malformed_method_only_line_is_400() {
-	assert serve('GET\r\n\r\n').contains('400 Bad Request')
-}
-
-fn test_malformed_closes_the_connection() {
+fn test_unroutable_request_lines_are_404() {
+	for raw in ['GARBAGE\r\n\r\n', '', 'GET\r\n\r\n', '\r\nGET /users HTTP/1.1\r\n\r\n'] {
+		assert serve(raw).starts_with('HTTP/1.1 404 Not Found'), raw
+	}
 	mut out := []u8{}
 	mut event_loop := core.EventLoop{}
-	step := handle('GARBAGE\r\n\r\n'.bytes(), mut out, -1, unsafe { nil }, mut
-		event_loop)
-	assert step == .close
+	step := route('GARBAGE\r\n\r\n'.bytes(), mut out, -1, unsafe { nil }, mut event_loop)
+	assert step == .done // keep-alive: nothing about the connection is wrong
 }
 
 // ── the full handler shape: park on an fd, resume later ───────────────────────
@@ -249,7 +244,7 @@ fn test_delay_parks_the_request_and_resumes() {
 			register:  capture_register
 		}
 		mut out := []u8{}
-		step := handle(req('GET', '/delay/5').bytes(), mut out, 7, unsafe { nil }, mut
+		step := route(req('GET', '/delay/5').bytes(), mut out, 7, unsafe { nil }, mut
 			el)
 		assert step == .suspend
 		assert out.len == 0 // nothing yet: the answer comes from the continuation
@@ -272,10 +267,11 @@ fn test_delay_rejects_a_bad_duration() {
 
 // ── the point of the design: routing allocates nothing ───────────────────────
 
-// Every outcome — static hit, params, catch-all, HEAD, 404, 405, 501, 400 —
-// runs 20k times through one reused buffer, as a worker would serve them; the
-// collector's lifetime allocation counter must not move. (Under `-gc none`,
-// vanilla's production build, the same allocation would be a permanent leak.)
+// Every outcome — static hit, params, catch-all, HEAD, 404, 405, an unknown
+// method, a line with nothing to route — runs 20k times through one reused
+// buffer, as a worker would serve them; the collector's lifetime allocation
+// counter must not move. (Under `-gc none`, vanilla's production build, the
+// same allocation would be a permanent leak.)
 fn test_routing_allocates_nothing() {
 	$if gcboehm ? {
 		reqs := [
@@ -297,7 +293,7 @@ fn test_routing_allocates_nothing() {
 			unsafe {
 				out.len = 0
 			}
-			handle(r, mut out, -1, unsafe { nil }, mut event_loop)
+			route(r, mut out, -1, unsafe { nil }, mut event_loop)
 		}
 		rounds := 20_000
 		before := gc_heap_usage().total_bytes
@@ -306,7 +302,7 @@ fn test_routing_allocates_nothing() {
 				unsafe {
 					out.len = 0
 				}
-				handle(r, mut out, -1, unsafe { nil }, mut event_loop)
+				route(r, mut out, -1, unsafe { nil }, mut event_loop)
 			}
 		}
 		grown := gc_heap_usage().total_bytes - before

@@ -21,7 +21,7 @@ import and says nothing). Protocols are **siblings** over one engine:
 | `websocket/` | RFC 6455 codec (accept-key, frame head parse, unmask, server frame writers) — pure bytes, zero vanilla imports; an app's `ConnHandler` composes it over the takeover seam (`examples/websocket_echo`). |
 | `grpc/` | reserved sibling (length-prefixed messages over http2). Future protocols land as siblings here. |
 | `static_assets/` `testkit/` `vtest/` `pg_async/` | reusable handler-side and test-side modules. |
-| `router/` | request routing for handlers you write as `match` over the path: a zero-copy segment cursor, a method enum, prebuilt 405s — pure bytes over `http1_1.request_parser` (`examples/router`). The declarative alternative, `veb_like` (attribute routes compiled into a trie), lives with its example (`examples/veb_like/src/veb_like`) until it moves to its own repository. |
+| `router/` | request routing for handlers you write as `match` over the path: the method and a zero-copy segment cursor, read straight from the raw request line — pure bytes, zero vanilla imports, no responses (the app owns them; `examples/router`). The declarative alternative, `veb_like` (attribute routes compiled into a trie), lives with its example (`examples/veb_like/src/veb_like`) until it moves to its own repository. |
 | `transport/` | client-side dialing (`dial_addr` for IPv4/IPv6 `Addr`s — close-on-exec, TCP-tuned, `-errno` on failure, no allocation; `dial_tcp`, `dial_unix`) — bytes + non-blocking fds ONLY, no name resolution; protocol clients compose it (handler → `dial_*` → `event_loop.watch_fd` → `.suspend`), they don't live in it. |
 
 ## Dependency rule (grep-enforceable, one direction)

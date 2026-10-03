@@ -17,29 +17,42 @@ module main
 //   GET  /files/*path, /proxy/*upstream                       catch-all
 //   GET  /delay/:ms                                           suspends on a timer
 //
-// GET branches also take HEAD: handle() drops the body afterwards.
+// GET branches also take HEAD: route() drops the body afterwards.
 import core
 import router { Method, Path }
 
 const users_list_response = fixed_json(json_200_head, '[]')
 const user_created_response = fixed_json(json_201_head, '{"id":1}')
+const not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const not_implemented_response = 'HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 
-// The 405 of each leaf, built once.
-const users_405 = router.allow(.get, .head, .post)
-const user_405 = router.allow(.get, .head, .put, .delete, .patch)
-const get_405 = router.allow(.get, .head)
+// The 405 of each leaf, listing exactly what its branches serve.
+const users_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD, POST\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const user_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD, PUT, DELETE, PATCH\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const get_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
 
-// route is the root node.
-fn route(m Method, mut path Path, mut out []u8, mut event_loop core.EventLoop) core.Step {
-	match path.next() {
-		'users' { return users(m, mut path, mut out) }
-		'tags' { return tags(m, mut path, mut out) }
-		'search' { return search(m, mut path, mut out) }
-		'files' { return catch_all(m, mut path, mut out, '{"file":') }
-		'proxy' { return catch_all(m, mut path, mut out, '{"upstream":') }
-		'delay' { return delay(m, mut path, mut out, mut event_loop) }
-		else { return not_found(mut out) }
+// route is the server's core.Handler and the root node. It reads only the
+// request line: no route here needs a header (one that did would decode the
+// request itself, with request_parser.decode_into).
+fn route(req_buffer []u8, mut out []u8, _ int, _ voidptr, mut event_loop core.EventLoop) core.Step {
+	m := router.method(req_buffer)
+	mut path := router.path(req_buffer)
+	start := out.len
+	step := match path.next() {
+		'users' { users(m, mut path, mut out) }
+		'tags' { tags(m, mut path, mut out) }
+		'search' { search(m, mut path, mut out) }
+		'files' { catch_all(m, mut path, mut out, '{"file":') }
+		'proxy' { catch_all(m, mut path, mut out, '{"upstream":') }
+		'delay' { delay(m, mut path, mut out, mut event_loop) }
+		else { not_found(mut out) }
 	}
+	// HEAD gets the GET answer's headers, Content-Length included, and no body
+	// (RFC 9110 §9.3.2). Not for a suspended request: it answers later.
+	if m == .head && step != .suspend {
+		drop_body(mut out, start)
+	}
+	return step
 }
 
 // /users, /users/:id, /users/:id/profile, /users/:user_id/posts/...
@@ -154,7 +167,8 @@ fn tags(m Method, mut path Path, mut out []u8) core.Step {
 	return .done
 }
 
-// /search/:term — one segment; richer queries belong in ?q=… (req.get_query).
+// /search/:term — one segment; a richer query would come from ?q=… (decode the
+// request with request_parser.decode_into, then req.get_query).
 fn search(m Method, mut path Path, mut out []u8) core.Step {
 	term := path.next()
 	if term == '' || !path.done() {
@@ -202,7 +216,7 @@ fn delay(m Method, mut path Path, mut out []u8, mut event_loop core.EventLoop) c
 	$if linux {
 		return start_delay(ms, mut out, mut event_loop)
 	} $else {
-		out << router.not_implemented
+		out << not_implemented_response
 		return .done
 	}
 }
@@ -224,6 +238,6 @@ fn parse_ms(s string) ?int {
 
 @[inline]
 fn not_found(mut out []u8) core.Step {
-	out << router.not_found
+	out << not_found_response
 	return .done
 }

@@ -8,7 +8,7 @@ A minimalist, high-performance HTTP server written in [V](https://vlang.io).
 
 - **Fast**: Multi-threaded, non-blocking I/O, lock-free, copy-free, I/O multiplexing, `SO_REUSEPORT` (native load balancing on Linux)
 - **Modular**: Easy to extend with custom controllers and handlers.
-- **Routing without allocation**: route by `match` over the path's segments with the [`router`](router/router.v) module's zero-copy cursor (the fastest, [`examples/router/`](examples/router/)), or declare `@['GET /users/:id']` methods and let [`veb_like`](examples/veb_like/) compile them into a trie at startup. Either way a request — hit, 404, 405 or 400 — allocates nothing, and handlers keep the full contract (`.suspend` included).
+- **Routing without allocation**: route by `match` over the path's segments with the [`router`](router/router.v) module, which reads the method and a zero-copy path cursor straight from the request line (the fastest, [`examples/router/`](examples/router/)), or declare `@['GET /users/:id']` methods and let [`veb_like`](examples/veb_like/) compile them into a trie at startup. Either way routing allocates nothing — a hit, a 404 or a 405 — and handlers keep the full contract (`.suspend` included).
 - **Memory Safety**: No race conditions.
 - **No Magic**: Transparent and straightforward.
 - **E2E Testing**: Test handlers in-process by passing raw requests directly to `handle_request()`, or drive a running server — TCP or unix socket — with the `vtest` scripted client (raw fds via `transport.dial_tcp`/`dial_unix`; see [`tests/backend_behaviors_test.v`](tests/backend_behaviors_test.v)).
