@@ -128,7 +128,7 @@ pub fn dial_unix(path string) !int {
 }
 
 fn C.transport_dial(family int, sa voidptr, len u32, nodelay int, ka_idle int, ka_intvl int, ka_cnt int, user_timeout_ms int) int
-fn C.transport_ip_addr(ip &char, port int, out voidptr, family &int) u32
+fn C.transport_ip_addr(ip &char, port int, out voidptr, family &i32) u32
 fn C.transport_socket_error(fd int) int
 
 // Addr is one socket address to dial: an IPv4 or IPv6 sockaddr (sockaddr_in /
@@ -184,12 +184,12 @@ pub fn ip_addr(ip string, port int) ?Addr {
 	}
 	unsafe { vmemcpy(&z[0], ip.str, ip.len) }
 	mut a := Addr{}
-	mut family := 0
+	mut family := i32(0) // a C int
 	a.len = C.transport_ip_addr(&char(&z[0]), port, voidptr(&a.data[0]), &family)
 	if a.len == 0 {
 		return none
 	}
-	a.family = family
+	a.family = int(family)
 	return a
 }
 

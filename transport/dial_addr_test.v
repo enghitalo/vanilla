@@ -30,12 +30,12 @@ fn listener(ip string) ?(int, Addr) {
 }
 
 fn opt(fd int, level int, name int) int {
-	mut v := 0
+	mut v := i32(0) // a C int
 	mut l := u32(4)
 	if C.getsockopt(fd, level, name, voidptr(&v), &l) != 0 {
 		return -1
 	}
-	return v
+	return int(v)
 }
 
 // wait_writable polls fd for POLLOUT (a connect completing) up to 2 s.
