@@ -22,13 +22,13 @@ cd "$ROOT" || exit 2
 
 # Baselines recorded in the repo (wrk -t16 -c512, keep-alive):
 #   tiny/simple       510,197 req/s  (README.md)
-#   veb_like static   393,008 req/s  (examples/veb_like/router_static.v)
-#   veb_like dynamic  310,602 req/s  (examples/veb_like/router_dynamic.v)
+#   veb_like static   393,008 req/s  (recorded before the zero-allocation
+#   veb_like dynamic  310,602 req/s   rewrite of examples/veb_like; a floor)
 # Format: name | server source | port | path | baseline_req_per_s
 WORKLOADS=(
 	"tiny|./examples/tiny/src|3000|/|510197"
-	"veb_static|./examples/veb_like|3000|/users|393008"
-	"veb_dynamic|./examples/veb_like|3000|/users/1/posts/2|310602"
+	"veb_static|./examples/veb_like/src|3000|/users|393008"
+	"veb_dynamic|./examples/veb_like/src|3000|/users/1/posts/2|310602"
 )
 
 command -v wrk  >/dev/null || { echo "ERROR: wrk not installed";  exit 2; }

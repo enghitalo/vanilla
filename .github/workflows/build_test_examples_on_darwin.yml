@@ -37,6 +37,7 @@ jobs:
           # - examples/simple/src
           - examples/simple2/src
           - examples/sse/src
+          - examples/veb_like/src
     steps:
       - uses: actions/checkout@v4
       # Cache the V toolchain so setup-v restores a prebuilt compiler instead of

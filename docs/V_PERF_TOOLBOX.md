@@ -39,6 +39,11 @@ only safe where the hot path is **literally allocation-free** (otherwise it leak
 - `v -prod -o out.c ./examples/<name>` — write the C without compiling; `grep` it.
 - `v -show-c-output …` — full C-compiler output on error.
 - `v -showcc …` — the exact C compiler command.
+- `v -warn-about-allocs …` — a warning per allocation site (array/struct/string
+  building, locals moved to the heap). It cannot tell startup code from the request
+  path, and it misses arrays the compiler synthesizes (the `method.attrs` array below),
+  so confirm a hot path with a counter: a `gc_heap_usage().total_bytes` delta over N
+  requests in a test (`test_routing_allocates_nothing` in examples/veb_like).
 
 This is how we found (a) the `epoll_data` union GC-codegen bug and (b) that
 `[]u8{cap:N}` is already noscan/uninit (so a big-cap regression was GC pressure,
@@ -119,6 +124,31 @@ Already used here for the per-worker epoll fd arrays
   `[]u8` / `string` / `.bytes()` / `all_before()` / builder as a scaling tax:
   precompute `const` keys, parse ints in place, and append into a reused buffer.
   Corollary: confirm perf changes on a high-core run, not just a laptop.
+
+## Comptime and struct traps (open upstream)
+
+Found while making the routers allocation-free; verified in the emitted C on V
+0.5.2 (`0137eb5`). Each has a workaround in the tree.
+
+- **`method.attrs` allocates on every pass of a `$for`.** `for attr in method.attrs`
+  inside `$for method in T.methods` emits `new_array_from_c_array(...)` — a heap
+  array per method, per execution. In a per-request dispatch that is one
+  allocation per route scanned (the old `examples/veb_like` paid 13 to reach its
+  last route and 26 for a 404). Read attributes once, at startup, into a table
+  ([`veb_like.new`](../examples/veb_like/src/veb_like/router.v)). A `$for` that only
+  calls `app.$method(...)` reads no attributes and allocates nothing; GCC folds
+  its integer compares into a jump table and inlines the handlers.
+- **A struct holding a fixed array moves to the heap when referenced.** A local
+  `struct { vals [8]Slice }` (even `[2]Slice`) is `memdup`'d as soon as it is
+  passed by `mut` or `&` — `unsafe { &x }` included. The same data as plain
+  fields stays on the stack (`veb_like.Params` keeps `v0`…`v7` and indexes them
+  through the first one's address). A bare fixed-array local is fine — `[20]u8`
+  digits behind `(&a[0]).vbytes(n)`, a `[4]i64` itimerspec behind `&spec[0]`.
+- **A forwarded `mut` parameter in a comptime call.** `app.$method(req, mut out)`,
+  where `out` is itself a `mut` parameter, fails ("cannot use `&[]u8` as
+  `&&[]u8`"); write `app.$method(req, out)` — it is still the caller's buffer.
+- **`T.$method` is not a value** (the emitted C names an undeclared `T`);
+  `app.$method` is, as a closure bound to `app`.
 
 ## Pure C escape hatch
 

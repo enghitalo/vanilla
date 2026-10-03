@@ -41,6 +41,7 @@ jobs:
           - examples/simple/src
           - examples/simple2/src
           - examples/sse/src
+          - examples/veb_like/src
           - examples/websocket_echo/src
     steps:
       - uses: actions/checkout@v4

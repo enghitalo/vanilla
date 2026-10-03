@@ -1,11 +1,12 @@
 module main
 
 import core
+import time
+import veb_like
 
-// Exhaustive coverage of every route TYPE the router supports. Each case drives
-// the real router() through the same closure shape as ServerConfig.handler
-// (BEST_PRACTICES §9: handlers are pure, so tests feed raw request bytes — no
-// listening socket needed) and checks status / headers / body.
+// Every route TYPE the router supports, driven through the real router with
+// the same call ServerConfig.handler makes (BEST_PRACTICES §9: handlers are
+// pure, so tests feed raw request bytes — no listening socket needed).
 // `${}` interpolation is fine HERE: tests are scaffolding, not hot-path code.
 //
 // Routes under test (see main.v):
@@ -19,22 +20,14 @@ import core
 //   GET  /search/:term                                        single param
 //   GET  /files/*path                                         catch-all (wildcard)
 //   GET  /proxy/*upstream                                     catch-all (wildcard)
+//   GET  /delay/:ms                                           suspends on a timer
 
-// serve adapts the unified handler contract (writes into a caller-owned
-// buffer) to the return-a-string shape the assertions expect — the closure
-// below is the exact handler wired in main().
+const test_router = veb_like.new[App](&App{}) or { panic(err) }
+
 fn serve(raw string) string {
-	app := App{}
-	handler := fn [app] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
-		out << router(req_buffer, client_fd, app) or {
-			out << bad_request_response
-			return .close
-		}
-		return .done
-	}
 	mut out := []u8{}
 	mut event_loop := core.EventLoop{}
-	handler(raw.bytes(), mut out, -1, unsafe { nil }, mut event_loop)
+	test_router.handle(raw.bytes(), mut out, -1, unsafe { nil }, mut event_loop)
 	return out.bytestr()
 }
 
@@ -66,6 +59,7 @@ fn test_content_length_is_computed() {
 	assert serve(req('GET', '/users')).contains('Content-Length: 2') // '[]'
 	assert serve(req('POST', '/users')).contains('Content-Length: 8') // '{"id":1}'
 	assert serve(req('GET', '/users/42')).contains('Content-Length: 11') // '{"id":"42"}'
+	assert serve(req('GET', '/users/1234567890')).contains('Content-Length: 19')
 }
 
 // ── one param at the end, across verbs ───────────────────────────────────────
@@ -79,10 +73,14 @@ fn test_param_end_verbs() {
 
 fn test_param_end_405_lists_every_verb() {
 	r := serve(req('POST', '/users/42')) // POST not defined on /users/:id
-	assert r.contains('405 Method Not Allowed')
-	for m in ['GET', 'PUT', 'PATCH', 'DELETE'] {
-		assert r.contains(m), 'Allow should list ${m}'
-	}
+	assert r.starts_with('HTTP/1.1 405 Method Not Allowed')
+	assert r.contains('Allow: GET, HEAD, PUT, DELETE, PATCH\r\n')
+}
+
+fn test_static_405() {
+	r := serve(req('DELETE', '/users'))
+	assert r.starts_with('HTTP/1.1 405 Method Not Allowed')
+	assert r.contains('Allow: GET, HEAD, POST\r\n')
 }
 
 // ── param + literal tail ─────────────────────────────────────────────────────
@@ -107,6 +105,13 @@ fn test_three_consecutive_params() {
 
 fn test_single_param() {
 	assert body_of('GET', '/search/vlang') == '{"term":"vlang"}'
+}
+
+fn test_empty_param_segment_does_not_match() {
+	// `:name` needs at least one byte: an empty segment is not a value.
+	assert status('GET', '/users/') == 'HTTP/1.1 404 Not Found'
+	assert status('GET', '/search/') == 'HTTP/1.1 404 Not Found'
+	assert status('GET', '/tags/a//c') == 'HTTP/1.1 404 Not Found'
 }
 
 // ── catch-all / wildcard ─────────────────────────────────────────────────────
@@ -141,14 +146,36 @@ fn test_404s() {
 	assert status('GET', '/users/7/posts') == 'HTTP/1.1 404 Not Found' // partial
 	assert status('GET', '/USERS/7') == 'HTTP/1.1 404 Not Found' // case-sensitive
 	assert status('GET', '/tags/a/b') == 'HTTP/1.1 404 Not Found' // needs 3 segs
+	assert status('GET', '/users/7/profile/x') == 'HTTP/1.1 404 Not Found' // too deep
+}
+
+fn test_404_for_non_origin_form_targets() {
+	assert status('OPTIONS', '*') == 'HTTP/1.1 404 Not Found'
+	assert status('GET', 'users') == 'HTTP/1.1 404 Not Found'
+}
+
+// ── HEAD, unknown methods ────────────────────────────────────────────────────
+
+fn test_head_is_served_by_get_without_a_body() {
+	r := serve(req('HEAD', '/users/42'))
+	assert r.starts_with('HTTP/1.1 200 OK\r\n')
+	assert r.contains('Content-Length: 11\r\n') // what GET would send
+	assert r.ends_with('\r\n\r\n') // ...but no body
+	assert serve(req('HEAD', '/users')).ends_with('Connection: keep-alive\r\n\r\n')
+}
+
+fn test_unknown_method_is_501() {
+	assert status('BREW', '/users') == 'HTTP/1.1 501 Not Implemented'
+	assert status('get', '/users') == 'HTTP/1.1 501 Not Implemented' // methods are case-sensitive
 }
 
 // ── query string: params come from the path, values from ?… ──────────────────
 
 fn test_query_does_not_break_matching() {
 	assert body_of('GET', '/users/42?foo=bar') == '{"id":"42"}'
-	// a '/' inside the query must not inflate the path's slash count
+	// a '/' inside the query must not create segments
 	assert status('GET', '/users/42?next=/home') == 'HTTP/1.1 200 OK'
+	assert body_of('GET', '/users/42?next=/home') == '{"id":"42"}'
 }
 
 // ── security: URL-derived values are JSON-escaped (params AND wildcards) ──────
@@ -167,7 +194,7 @@ fn test_injection_escaped_backslash_and_controls() {
 	assert body_of('GET', '/search/a\tb') == '{"term":"a\\tb"}'
 }
 
-// ── crash safety: every malformed shape is a 400, never a panic ───────────────
+// ── crash safety: every malformed shape is a 400 + close, never a panic ───────
 
 fn test_malformed_is_400() {
 	assert serve('GARBAGE\r\n\r\n').contains('400 Bad Request')
@@ -184,4 +211,107 @@ fn test_malformed_truncated_head_is_400() {
 
 fn test_malformed_method_only_line_is_400() {
 	assert serve('GET\r\n\r\n').contains('400 Bad Request')
+}
+
+fn test_malformed_closes_the_connection() {
+	mut out := []u8{}
+	mut event_loop := core.EventLoop{}
+	step := test_router.handle('GARBAGE\r\n\r\n'.bytes(), mut out, -1, unsafe { nil }, mut
+		event_loop)
+	assert step == .close
+}
+
+// ── the full handler shape: park on an fd, resume later ───────────────────────
+
+// WatchCapture records the watch a handler arms instead of arming it: the
+// test plays the event loop (el.reactor smuggles the capture).
+struct WatchCapture {
+mut:
+	fd       int = -1
+	interest core.WatchInterest
+	cont     core.WakeFn = unsafe { nil }
+	udata    voidptr
+}
+
+fn capture_register(mut el core.EventLoop, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
+	mut capture := unsafe { &WatchCapture(el.reactor) }
+	capture.fd = ext_fd
+	capture.interest = interest
+	capture.cont = cont
+	capture.udata = udata
+	el.last_watched = ext_fd
+}
+
+fn test_delay_parks_the_request_and_resumes() {
+	$if linux {
+		mut capture := WatchCapture{}
+		mut el := core.EventLoop{
+			client_fd: 7
+			reactor:   unsafe { voidptr(&capture) }
+			register:  capture_register
+		}
+		mut out := []u8{}
+		step := test_router.handle(req('GET', '/delay/5').bytes(), mut out, 7, unsafe { nil }, mut
+			el)
+		assert step == .suspend
+		assert out.len == 0 // nothing yet: the answer comes from the continuation
+		assert capture.fd >= 0 && capture.interest == .readable
+		time.sleep(30 * time.millisecond) // let the 5 ms timer fire
+		mut resumed := []u8{}
+		mut el2 := core.EventLoop{}
+		rstep := capture.cont(mut resumed, capture.fd, false, capture.udata, unsafe { nil }, mut
+			el2)
+		assert rstep == .done
+		assert resumed.bytestr().starts_with('HTTP/1.1 200 OK')
+		assert resumed.bytestr().ends_with('{"delayed":true}')
+	}
+}
+
+fn test_delay_rejects_a_bad_duration() {
+	assert status('GET', '/delay/abc') == 'HTTP/1.1 400 Bad Request'
+	assert status('GET', '/delay/10001') == 'HTTP/1.1 400 Bad Request'
+}
+
+// ── the point of the design: routing allocates nothing ───────────────────────
+
+// Every outcome — static hit, params, catch-all, HEAD, 404, 405, 501, 400 —
+// runs 20k times through one reused buffer, as a worker would serve them; the
+// collector's lifetime allocation counter must not move. (Under `-gc none`,
+// vanilla's production build, the same allocation would be a permanent leak.)
+fn test_routing_allocates_nothing() {
+	$if gcboehm ? {
+		reqs := [
+			req('GET', '/users'),
+			req('POST', '/users'),
+			req('GET', '/users/42'),
+			req('GET', '/users/7/posts/99/comments/5'),
+			req('GET', '/tags/red/green/blue'),
+			req('GET', '/files/css/app.css?v=2'),
+			req('HEAD', '/users/42'),
+			req('GET', '/nope'),
+			req('POST', '/users/42'),
+			req('BREW', '/users'),
+			'GARBAGE\r\n\r\n',
+		].map(it.bytes())
+		mut out := []u8{cap: 4096}
+		mut event_loop := core.EventLoop{}
+		for r in reqs { // warm-up: `out` reaches its high-water mark
+			unsafe {
+				out.len = 0
+			}
+			test_router.handle(r, mut out, -1, unsafe { nil }, mut event_loop)
+		}
+		rounds := 20_000
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. rounds {
+			for r in reqs {
+				unsafe {
+					out.len = 0
+				}
+				test_router.handle(r, mut out, -1, unsafe { nil }, mut event_loop)
+			}
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert grown < 4096, 'routing allocated ${grown} bytes over ${rounds * reqs.len} requests'
+	}
 }
