@@ -33,6 +33,7 @@ jobs:
           - examples/etag/src
           - examples/hexagonal/src
           - examples/io_uring_demo/src
+          - examples/router/src
           # - examples/simple/src
           - examples/simple2/src
           - examples/sse/src
