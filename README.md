@@ -8,6 +8,7 @@ A minimalist, high-performance HTTP server written in [V](https://vlang.io).
 
 - **Fast**: Multi-threaded, non-blocking I/O, lock-free, copy-free, I/O multiplexing, `SO_REUSEPORT` (native load balancing on Linux)
 - **Modular**: Easy to extend with custom controllers and handlers.
+- **Routing without allocation**: route by `match` over the path's segments with the [`router`](router/router.v) module's zero-copy cursor (the fastest, [`examples/router/`](examples/router/)), or declare `@['GET /users/:id']` methods and let [`veb_like`](examples/veb_like/) compile them into a trie at startup. Either way a request — hit, 404, 405 or 400 — allocates nothing, and handlers keep the full contract (`.suspend` included).
 - **Memory Safety**: No race conditions.
 - **No Magic**: Transparent and straightforward.
 - **E2E Testing**: Test handlers in-process by passing raw requests directly to `handle_request()`, or drive a running server — TCP or unix socket — with the `vtest` scripted client (raw fds via `transport.dial_tcp`/`dial_unix`; see [`tests/backend_behaviors_test.v`](tests/backend_behaviors_test.v)).
@@ -246,7 +247,8 @@ fn main() {
 | `examples/spa_static_assets/` | CSR/WASM SPA bundle (`application/wasm`, `.br`/`.gz`, immutable caching, SPA fallback) |
 | `examples/static_files/` | Static file serving (MIME, Range, ETag, traversal safety) |
 | `examples/url_form/` | Query-string and URL-encoded form parsing |
-| `examples/veb_like/` | veb-style declarative routing |
+| `examples/router/` | Routing as code: `match` over path segments with the `router` module's zero-copy cursor — the fastest option |
+| `examples/veb_like/` | Declarative routing: `@['GET /users/:id']` methods compiled into a trie at startup, zero allocations per request |
 | `examples/websocket_echo/` | RFC 6455 WebSocket echo over the connection-takeover seam (`core.queue_takeover` — one engine, two protocols on one connection) |
 | `examples/http2_cleartext/` | HTTP/2 (cleartext, prior-knowledge, RFC 9113) over the same seam — the `PRI *` preface flips the connection, then the SAME handler serves h1 and http2 requests |
 | `examples/video_stream/` | HTTP video streaming |
@@ -447,7 +449,7 @@ See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark 
 ### vanilla — future improvements
 
 - [ ] Per-worker `SO_REUSEPORT` accept on epoll — eliminate the single central accept thread (the io_uring backend already does per-worker accept; epoll still round-robins fds from one acceptor). Blocked by clean multi-server shutdown lifecycle.
-- [ ] Dynamic route matching (`/user/:id`) with a trie or radix tree
+- [x] Dynamic route matching (`/user/:id`) — `router` (segment cursor + `match`) and `veb_like` (attribute routes compiled into a segment trie); zero allocations per request, 404/405/HEAD handled
 - [ ] Query-string parser (`?key=value&…`) as a zero-copy slice view
 - [x] Case-insensitive header lookup (IANA registry compliance) — `get_header_value_slice` / `count_header` fold ASCII case
 - [x] `Host` header validation (RFC 9112 §3.2) — `validate_http1()` (exactly-one Host); demonstrated end-to-end in `examples/conformance/`
