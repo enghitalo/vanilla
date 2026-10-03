@@ -126,7 +126,7 @@ pub fn decode_ext_fd(data u64) int {
 // to build nor liburing.so to start (#189). The structs are the kernel ABI from
 // include/uapi/linux/io_uring.h, declared here rather than taken from
 // <linux/io_uring.h> so the build does not depend on the kernel-header version;
-// io_uring_abi_test.v checks every size, offset and constant against the
+// io_uring_abi_linux_test.v checks every size, offset and constant against the
 // header. Function names and semantics follow liburing's (2.x), which this
 // replaces, for the subset vanilla uses. SQPOLL is never set, so the kernel
 // touches the SQ only inside io_uring_enter, on the ring's own thread.
