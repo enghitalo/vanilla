@@ -280,14 +280,17 @@ pub fn Pool.new(o Origin, tls_cfg &tls.Config) !&Pool {
 		}
 	}
 	// Host = uri-host [ ":" port ] (RFC 9110 §7.2): the port only when it is
-	// not the scheme's default, an IPv6 literal in brackets.
-	mut h := []u8{cap: 16 + o.host.len}
-	h << 'Host: '.bytes()
+	// not the scheme's default, an IPv6 literal in brackets and without its
+	// zone (`fe80::1%eth0`): the zone only means something on this host, so
+	// it is dialed with but never sent (RFC 6874 §4).
 	v6 := o.host.contains(':')
+	host := if v6 { o.host.all_before('%') } else { o.host }
+	mut h := []u8{cap: 16 + host.len}
+	h << 'Host: '.bytes()
 	if v6 {
 		h << `[`
 	}
-	h << o.host.bytes()
+	h << host.bytes()
 	if v6 {
 		h << `]`
 	}
