@@ -122,6 +122,23 @@ fn test_symlink_out_of_root_refused() {
 	assert p.ends_with('index.html')
 }
 
+// A path that does not resolve is refused, never handed back unresolved, as
+// os.real_path does: under an absolute root that unresolved path would pass
+// the containment check.
+fn test_unresolvable_path_refused() {
+	$if windows {
+		return
+	}
+	abs := os.join_path(test_root, 'public', 'missing.html')
+	assert os.real_path(abs) == abs // what resolve must not do
+	assert resolve(abs) == none
+	os.symlink('loop.html', os.join_path('public', 'loop.html')) or { panic(err) }
+	assert resolve(os.join_path(test_root, 'public', 'loop.html')) == none // ELOOP
+	assert safe_path('/loop.html') == none
+	root := resolve('public') or { '' }
+	assert root.len > 0 && os.is_abs_path(root)
+}
+
 // ---- raw-request E2E (serve adapter) -------------------------------------------
 
 fn test_get_index() {
