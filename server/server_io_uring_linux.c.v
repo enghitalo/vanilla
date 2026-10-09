@@ -222,19 +222,23 @@ fn handle_io_uring_accept(worker &io_uring.Worker, cqe &io_uring.Cqe, limits Lim
 				C.close(fd) // pool exhausted
 			}
 		}
-	} else if socket.accept_starved(-res) {
-		// Out of fds (or socket buffers, or memory). An error CQE ends the
-		// accept (no F_MORE), and re-arming it now would spin this worker: the
-		// kernel allocates the fd before it looks at the backlog, so the new
-		// accept fails the same way at once (#256). Re-arm it from a timer
-		// instead (op_accept_resume → iou_resume_accept).
+	} else if (cqe.flags & io_uring.ioring_cqe_f_more) == 0 && socket.accept_starved(-res) {
+		// Out of fds (or socket buffers, or memory), and the accept has ended.
+		// Re-arming it now would spin this worker: the kernel allocates the fd
+		// before it looks at the backlog, so the new accept fails the same way
+		// at once (#256). Re-arm it from a timer instead (op_accept_resume →
+		// iou_resume_accept).
 		mut w := unsafe { &io_uring.Worker(worker) }
-		w.accept_log = socket.note_accept_pause('[io_uring]', -res, w.accept_log)
-		if io_uring.prepare_timeout(&worker.ring, &worker.accept_pause_ts, io_uring.encode_user_data(io_uring.op_accept_resume,
-			unsafe { nil })) {
+		w.accept_log = socket.note_accept_pause(-res, w.accept_log)
+		resume := io_uring.encode_user_data(io_uring.op_accept_resume, unsafe { nil })
+		if io_uring.prepare_timeout(&worker.ring, &worker.accept_pause_ts, resume) {
 			return
 		}
-		// SQ full: no timer, so re-arm below as before.
+		// SQ full: flush it and retry once; failing that, re-arm below as before.
+		io_uring.submit(&worker.ring)
+		if io_uring.prepare_timeout(&worker.ring, &worker.accept_pause_ts, resume) {
+			return
+		}
 	}
 	// Graceful shutdown: once Server.shutdown() has set the draining flag (and
 	// shut the listener, which is what completed this accept with an error), do
@@ -258,7 +262,12 @@ fn iou_resume_accept(worker &io_uring.Worker) {
 	if unsafe { worker.draining != nil } && stdatomic.load_i64(&worker.draining.n) != 0 {
 		return
 	}
-	io_uring.prepare_accept(&worker.ring, worker.socket_fd, worker.use_multishot)
+	if !io_uring.prepare_accept(&worker.ring, worker.socket_fd, worker.use_multishot) {
+		// SQ full: flush it and retry once. Nothing else would ever re-arm the
+		// accept, and this worker would stop accepting for good.
+		io_uring.submit(&worker.ring)
+		io_uring.prepare_accept(&worker.ring, worker.socket_fd, worker.use_multishot)
+	}
 }
 
 fn handle_io_uring_read(worker &io_uring.Worker, cqe &io_uring.Cqe, mut env IouEnv, limits Limits, active_conns &core.Counter) {

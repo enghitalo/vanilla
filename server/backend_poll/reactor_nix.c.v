@@ -667,7 +667,7 @@ fn poll_worker(listener int, handler core.Handler, make_state fn () voidptr, lim
 						err := C.errno
 						if socket.accept_starved(err) {
 							w.accept_resume = time.sys_mono_now() + u64(socket.accept_pause)
-							w.accept_log = socket.note_accept_pause('[poll]', err, w.accept_log)
+							w.accept_log = socket.note_accept_pause(err, w.accept_log)
 						}
 						break
 					}

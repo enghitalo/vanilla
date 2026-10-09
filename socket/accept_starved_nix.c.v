@@ -14,6 +14,19 @@ pub const accept_pause = time.Duration(50 * time.millisecond)
 // shortage leaves a trace in the log without flooding it.
 const accept_pause_log_every = time.Duration(10 * time.second)
 
+// The notices are whole lines built once, at startup: printing one allocates
+// nothing (the epoll build runs with -gc none, where nothing is ever freed) and
+// calls no strerror, which is not thread-safe while workers may log at once.
+// The tail quotes accept_pause and accept_pause_log_every: keep them in step.
+const accept_pause_tail = ' New connections wait in the listen backlog; accepting pauses 50 ms at a time while this lasts (noted at most every 10 s per acceptor).'
+const accept_emfile_note = '[vanilla] accept: EMFILE, the process is out of file descriptors (RLIMIT_NOFILE).' +
+	accept_pause_tail
+const accept_enfile_note = '[vanilla] accept: ENFILE, the system is out of file descriptors.' +
+	accept_pause_tail
+const accept_enobufs_note = '[vanilla] accept: ENOBUFS, out of socket buffer memory.' +
+	accept_pause_tail
+const accept_enomem_note = '[vanilla] accept: ENOMEM, out of memory.' + accept_pause_tail
+
 // accept_starved reports whether accept() failed because the process or the
 // system is out of a resource: file descriptors (EMFILE, ENFILE), socket
 // buffers (ENOBUFS) or memory (ENOMEM), not because of the one connection it
@@ -27,15 +40,22 @@ pub fn accept_starved(err int) bool {
 	return err == C.EMFILE || err == C.ENFILE || err == C.ENOBUFS || err == C.ENOMEM
 }
 
-// note_accept_pause tells why `who` stopped accepting, at most once every 10 s.
-// `next_log` is that acceptor's own rate-limit state (start it at 0); store the
-// value returned in its place.
-pub fn note_accept_pause(who string, err int, next_log u64) u64 {
+// note_accept_pause tells why an acceptor stopped accepting, at most once
+// every 10 s. `next_log` is that acceptor's own rate-limit state (start it at
+// 0); store the value returned in its place.
+pub fn note_accept_pause(err int, next_log u64) u64 {
 	now := time.sys_mono_now()
 	if now < next_log {
 		return next_log
 	}
-	reason := unsafe { cstring_to_vstring(C.strerror(err)) }
-	eprintln('${who} accept: ${reason} (errno ${err}). New connections wait in the backlog; retrying every ${accept_pause.milliseconds()} ms (this notice repeats at most every ${i64(accept_pause_log_every / time.second)} s).')
+	eprintln(if err == C.EMFILE {
+		accept_emfile_note
+	} else if err == C.ENFILE {
+		accept_enfile_note
+	} else if err == C.ENOBUFS {
+		accept_enobufs_note
+	} else {
+		accept_enomem_note
+	})
 	return now + u64(accept_pause_log_every)
 }
