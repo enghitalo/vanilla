@@ -61,20 +61,31 @@ fn test_request_validation() {
 }
 
 // Host = uri-host [ ":" port ]: the port only when it is not the scheme's
-// default, an IPv6 literal in brackets (RFC 9110 §7.2).
+// default, an IPv6 literal in brackets (RFC 9110 §7.2) and without its zone
+// (RFC 6874 §4).
 fn test_host_header() {
 	cases := [
 		['127.0.0.1', '80', 'Host: 127.0.0.1\r\n'],
 		['127.0.0.1', '8080', 'Host: 127.0.0.1:8080\r\n'],
 		['::1', '80', 'Host: [::1]\r\n'],
 		['::1', '3000', 'Host: [::1]:3000\r\n'],
+		['fe80::1%eth0', '8080', 'Host: [fe80::1]:8080\r\n'],
+		['fe80::1%no-such-interface', '80', 'Host: [fe80::1]\r\n'], // longer than an interface name can be
 	]
+	// A zoned literal is resolved (transport.ip_addr takes no zone), and
+	// getaddrinfo fails for an interface the machine lacks (eth0, on many):
+	// this resolver answers instead. The other literals never reach it.
+	link_local := transport.ip_addr('fe80::1', 80) or { panic('addr') }
 	for c in cases {
 		p := plain_pool(Origin{
-			host: c[0]
-			port: c[1].int()
+			host:    c[0]
+			port:    c[1].int()
+			resolve: fn [link_local] (host string, port int) []transport.Addr {
+				return [link_local]
+			}
 		})
 		assert p.host_hdr.bytestr() == c[2], c.str()
+		assert p.origin.host == c[0], c.str() // the zone stays: it is dialed with
 	}
 	// HTTPS: 443 is the default.
 	mut a := transport.ip_addr('127.0.0.1', 443) or { panic('addr') }
