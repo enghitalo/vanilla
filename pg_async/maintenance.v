@@ -78,7 +78,10 @@ fn (mut c PgConn) probe_idle() {
 // queries is left alone: its reader finds out on its own. One whose
 // release-time ROLLBACK is in flight has nobody to read the reply but the pool:
 // maintain() reads what arrived (finish_rollback), at the busy tick until the
-// ROLLBACK is answered. Never blocks on the network.
+// ROLLBACK is answered. An idle, unheld connection left in a transaction (a
+// BEGIN that went through acquire_pipelined(), which nobody will release) gets
+// the same ROLLBACK — so a pipelined sender that keeps a transaction open
+// across a maintenance tick loses it. Never blocks on the network.
 pub fn (mut p PgPool) maintain() int {
 	mut next := maintenance_idle_ms
 	now := time.sys_mono_now()
@@ -98,6 +101,17 @@ pub fn (mut p PgPool) maintain() int {
 			continue
 		}
 		p.conns[i].probe_idle()
+		if p.conns[i].state == .ready && p.conns[i].ready_status != tx_idle {
+			// Unheld, nothing in flight, yet in a transaction: a BEGIN sent
+			// through acquire_pipelined(), whose sender has no release() to
+			// call. Both acquire paths skip such a connection, so without this
+			// the slot would be lost: roll it back as release() would.
+			p.start_rollback(i)
+			if maintenance_busy_ms < next {
+				next = maintenance_busy_ms
+			}
+			continue
+		}
 		if p.conns[i].state == .ready || p.conns[i].redial(p.cfg) {
 			continue
 		}

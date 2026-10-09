@@ -131,6 +131,50 @@ fn test_fake_pipelined_never_shares_a_transaction() {
 	assert fake.stat('rollbacks') == 0
 }
 
+// A BEGIN sent through acquire_pipelined() (what the docs forbid) leaves an
+// unheld connection in a transaction, which both acquire paths skip and
+// nobody will release: maintain() rolls it back, and the slot comes back.
+fn test_fake_maintain_rolls_back_an_unheld_transaction() {
+	if !testkit.fake_pg_available() {
+		return
+	}
+	mut fake := testkit.start_fake_pg([])!
+	defer {
+		fake.stop()
+	}
+	mut pool := new_pool(tx_cfg(fake.port), 1)!
+	defer {
+		pool.close()
+	}
+	j := pool.acquire_pipelined() or { panic('free') }
+	mut c := pool.conn(j)
+	run_sql(mut c, 'begin')!
+	assert c.in_transaction()
+	assert pool.idle[j], 'nobody holds a pipelined connection'
+	if k := pool.acquire_pipelined() {
+		assert false, 'acquire_pipelined() shared a session in a transaction (${k})'
+	}
+	if k := pool.acquire() {
+		assert false, 'acquire() took a session in a transaction (${k})'
+	}
+	assert pool.maintain() == maintenance_busy_ms, 'a ROLLBACK started: fast tick'
+	for _ in 0 .. 2000 {
+		if pool.idle[j] && pool.conns[j].rollback_deadline == 0 {
+			break
+		}
+		pool.maintain()
+		time.sleep(time.millisecond)
+	}
+	assert pool.idle[j]
+	assert pool.conns[j].tx_status() == tx_idle
+	assert !pool.conns[j].is_broken()
+	assert fake.stat('rollbacks') == 1
+	assert fake.stat('authenticated') == 1, 'rolled back, not re-dialed'
+	assert pool.maintain() == maintenance_idle_ms
+	k := pool.acquire_pipelined() or { panic('the slot did not come back') }
+	assert k == j
+}
+
 fn test_fake_release_rolls_back_before_reuse() {
 	if !testkit.fake_pg_available() {
 		return

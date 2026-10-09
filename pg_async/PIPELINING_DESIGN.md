@@ -116,6 +116,9 @@ ROLLBACK undoes it, and after a failed statement every one of them fails with
   for BEGIN … COMMIT across park/resume. `acquire_pipelined()` also skips a
   connection whose status is not `I`, and `acquire()` skips one nobody holds
   (a BEGIN that went through `acquire_pipelined()`, which the docs forbid).
+  Nobody will release such a connection, so `maintain()` rolls it back as
+  `release()` would, and the slot comes back; a pipelined sender that keeps a
+  transaction open across a maintenance tick loses it.
 - **Safe release.** `release()` of a connection not in `I` queues a ROLLBACK
   and keeps the slot out of the idle set (`rollback_deadline` set). Nobody is
   parked on the connection any more, so the pool reads the reply itself: the

@@ -132,7 +132,7 @@ pub fn (p &PgPool) idx_of_fd(fd int) ?int {
 // borrower's release() would find those queries in flight and retire the
 // connection, failing the requests they belong to. Nor is one whose session
 // is in a transaction nobody holds (a BEGIN sent through acquire_pipelined):
-// the borrower would run inside it.
+// the borrower would run inside it. maintain() rolls such a connection back.
 //
 // acquire() is the borrow for an explicit transaction (BEGIN … COMMIT across
 // park/resume): the connection is the borrower's alone until release(), and
