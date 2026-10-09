@@ -42,6 +42,7 @@ mut:
 	started     bool
 	tmp         [max_addrs]C.upstream_addr
 	found       []transport.Addr // the thread's resolve answer, reused
+	rec         Record           // the record write_update sends, reused
 }
 
 // Sub is one pool following the resolver.
@@ -111,7 +112,7 @@ pub fn (mut r Resolver) start() {
 }
 
 // stop ends the resolver thread and waits for it. Pools keep the addresses
-// they have.
+// they have, and their workers stop watching the pipes it closes.
 pub fn (mut r Resolver) stop() {
 	if !r.started {
 		return
@@ -232,7 +233,8 @@ fn (mut r Resolver) refresh() {
 fn (mut r Resolver) write_update(fd int) {
 	n := if r.found.len > max_addrs { max_addrs } else { r.found.len }
 	for k in 0 .. n {
-		rec := Record{
+		// r.rec, not a local: a local Record goes to the heap (see on_feed).
+		r.rec = Record{
 			seq:    r.seq
 			idx:    u16(k)
 			count:  u16(n)
@@ -240,7 +242,7 @@ fn (mut r Resolver) write_update(fd int) {
 			len:    r.found[k].len
 			data:   r.found[k].data
 		}
-		if C.write(fd, &rec, sizeof(Record)) != int(sizeof(Record)) {
+		if C.write(fd, &r.rec, sizeof(Record)) != int(sizeof(Record)) {
 			return // the pipe is full (a stalled worker): it gets the next round
 		}
 	}
@@ -291,15 +293,23 @@ pub fn resolve_system(host string, port int) []transport.Addr {
 
 // on_feed takes the resolver's records on the worker (a clientless watch on
 // the pool's pipe) into the pool's address table.
-fn on_feed(mut _ []u8, ready_fd int, _ bool, watch_payload voidptr, _ voidptr, mut el core.EventLoop) core.Step {
+fn on_feed(mut _ []u8, ready_fd int, fd_err bool, watch_payload voidptr, _ voidptr, mut el core.EventLoop) core.Step {
 	mut p := unsafe { &Pool(watch_payload) }
 	if p.closed {
 		p.feed_fd = -1
 		return .done // the runtime closes the read end
 	}
-	mut rec := Record{}
-	for C.read(ready_fd, &rec, sizeof(Record)) == int(sizeof(Record)) {
-		p.take_record(&rec)
+	// Into the pool's record, not a local: V moves a local Record (its fixed
+	// array) to the heap, an allocation per wake under -gc none.
+	for C.read(ready_fd, &p.feed_rec, sizeof(Record)) == int(sizeof(Record)) {
+		p.take_record(&p.feed_rec)
+	}
+	if fd_err {
+		// The resolver stopped and closed its end: the pool keeps the addresses
+		// it has. A pipe without a writer is ready for good, so watching it
+		// again would spin the worker.
+		p.feed_fd = -1
+		return .done // the runtime closes the read end
 	}
 	el.watch_fd(ready_fd, .readable, on_feed, watch_payload)
 	return .suspend

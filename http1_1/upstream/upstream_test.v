@@ -4,6 +4,7 @@ module upstream
 // Unit tests without a server: request building and validation, the Host
 // header, origin validation, the resolver hand-off, and deadline expiry. The
 // exchange over real sockets is examples/https_upstream's e2e suite.
+import core
 import time
 import sync.stdatomic
 import tls
@@ -235,6 +236,100 @@ fn test_resolver_thread_hands_off() {
 		time.sleep(5 * time.millisecond)
 	}
 	assert (int(p.addrs[0].data[2]) << 8 | int(p.addrs[0].data[3])) == 2222
+}
+
+// record_watch is a test event loop's register: it only notes the fd.
+fn record_watch(mut el core.EventLoop, fd int, _ core.WatchInterest, _ core.WakeFn, _ voidptr) {
+	el.last_watched = fd
+}
+
+// A stopped resolver closes its end of the pool's pipe, which hangs up:
+// on_feed takes the update still in it, then stops watching. (Watched again,
+// a pipe without a writer is ready for good: the worker spun on it.)
+fn test_feed_stops_when_the_resolver_stops() {
+	mut port := &Port{
+		n: 1111
+	}
+	pp := port
+	mut p := plain_pool(Origin{
+		host:    'svc.test'
+		port:    80
+		resolve: fn [pp] (host string, port int) []transport.Addr {
+			a := transport.ip_addr('127.0.0.1', int(stdatomic.load_i64(&pp.n))) or { return [] }
+			return [a]
+		}
+	})
+	mut r := Resolver.new(60_000) or { panic(err) }
+	p.follow(mut r) or { panic(err) }
+	stdatomic.store_i64(&port.n, 2222)
+	r.start()
+	p.request_resolve()
+	assert C.upstream_wait(p.feed_fd, 2000) > 0 // the update is in the pipe
+	r.stop()
+	fd := p.feed_fd
+	mut el := core.EventLoop{
+		register: record_watch
+	}
+	mut out := []u8{}
+	// fd_err: the worker's epoll reports the hangup (EPOLLHUP).
+	assert on_feed(mut out, fd, true, voidptr(p), unsafe { nil }, mut el) == .done
+	C.close(fd) // the runtime's part of .done
+	assert el.last_watched == -1
+	assert p.feed_fd == -1
+	assert (int(p.addrs[0].data[2]) << 8 | int(p.addrs[0].data[3])) == 2222
+}
+
+#include <malloc.h>
+
+struct C.mallinfo2 {
+	uordblks usize
+	hblkhd   usize
+}
+
+fn C.mallinfo2() C.mallinfo2
+
+fn heap_bytes() i64 {
+	mi := C.mallinfo2()
+	return i64(mi.uordblks) + i64(mi.hblkhd)
+}
+
+// A resolver update allocates nothing on either side: under -gc none (nothing
+// is ever freed) 1000 updates written by write_update and taken by on_feed
+// leave the heap as it was.
+fn test_feed_allocates_nothing() {
+	$if gcboehm ? {
+		return
+	}
+	$if race ? {
+		return
+	}
+	mut p := plain_pool(Origin{
+		host: '127.0.0.1'
+		port: 80
+	})
+	mut r := Resolver.new(60_000) or { panic(err) } // never started: the test writes
+	p.follow(mut r) or { panic(err) }
+	r.found << p.addrs[0]
+	wfd := r.subs[0].fd
+	mut el := core.EventLoop{
+		register: record_watch
+	}
+	mut out := []u8{}
+	heap0 := heap_bytes()
+	if heap0 == 0 {
+		return
+	}
+	mut parked := 0
+	for _ in 0 .. 1000 {
+		r.seq++
+		r.write_update(wfd)
+		if on_feed(mut out, p.feed_fd, false, voidptr(p), unsafe { nil }, mut el) == .suspend {
+			parked++
+		}
+	}
+	growth := heap_bytes() - heap0
+	assert parked == 1000
+	assert growth < 1024, 'the heap grew ${growth} bytes over 1000 resolver updates'
 }
 
 // maintain() shuts down the socket of an exchange past its deadline (its
