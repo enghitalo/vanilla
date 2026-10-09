@@ -160,13 +160,8 @@ fn win_conn_for(mut st WinState, fd int) &WinConn {
 		fd:        fd
 		slot:      st.conns.len
 	}
-	// Same no-scan gating as the epoll ConnState (see conn_state_linux.c.v).
-	$if vanilla_noscan ? {
-		unsafe {
-			cs.read_buf.flags.set(.noscan_data)
-			cs.write_buf.flags.set(.noscan_data)
-		}
-	}
+	// Both buffers are no-scan already (pointer-free `[]u8`; see the note in
+	// backend_epoll/conn_state_linux.c.v).
 	// The op→conn back-pointers never change for the life of the allocation.
 	cs.read_op.kind = op_read
 	cs.read_op.conn = cs

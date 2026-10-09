@@ -415,24 +415,12 @@ fn state_create(mut st PlainState, fd int) &ConnState {
 			read_buf:  []u8{len: 0, cap: read_buf_cap}
 			write_buf: []u8{len: 0, cap: write_buf_cap}
 		}
-		// Keep both buffers in a no-scan GC block ACROSS growth. A large response
-		// grows write_buf past write_buf_cap; without this flag grow_cap reallocates
-		// as a *scanned* block, and thousands of big per-conn buffers at high
-		// keep-alive conn counts turn GC scanning + stop-the-world into the
-		// bottleneck (the "static cliff"). The flag survives resize.
-		//
-		// `.noscan_data` only exists on V after the 0.5.1 release, so it is gated
-		// behind `-d vanilla_noscan` to keep the library buildable on the 0.5.1
-		// release. (`$if flag ? {}` is comptime-eliminated when the flag is unset,
-		// so the enum value is never type-checked there.) Enable it once a V
-		// release ships `.noscan_data` without the unrelated codegen slowdown that
-		// currently makes post-0.5.1 master far slower (vlang/v#27468).
-		$if vanilla_noscan ? {
-			unsafe {
-				cs.read_buf.flags.set(.noscan_data)
-				cs.write_buf.flags.set(.noscan_data)
-			}
-		}
+		// Both buffers stay in no-scan GC blocks across growth, with no flag to
+		// set: they are pointer-free `[]u8`, so under the default GC V allocates
+		// them with the no-scan constructor, which sets `.noscan_data`, and
+		// grow_cap keeps it. Thousands of big scanned per-conn buffers at high
+		// keep-alive conn counts would make GC scanning the bottleneck (the
+		// "static cliff"); see the same note in io_uring_linux.c.v.
 		st.conns[fd] = cs
 	}
 	return st.conns[fd]
