@@ -167,6 +167,9 @@ fn test_tls_verify_full_blocking_and_pipelined_queries() {
 	}
 	assert f.fake.stat('tls_handshakes') == 2
 	assert f.fake.stat('authenticated') == 2
+	// SNI went out for localhost only: an IP literal is never a server_name
+	// (RFC 6066 §3), and is checked against the iPAddress SANs instead (#233).
+	assert f.fake.stat('sni') == 1
 }
 
 // A certificate for another name: verify_full refuses it; verify_ca (chain

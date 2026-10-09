@@ -110,6 +110,8 @@ typedef struct {
     int peer_closed; // the peer ended the session: EOF or close_notify (vtls_peer_closed)
     int close_notify; // ...with a close_notify alert, not a bare EOF (vtls_peer_close_notify)
     int last_err;    // the Mbed TLS error that failed the handshake (vtls_handshake_error)
+    unsigned char peer_ip[16]; // a client's IP-literal host, checked by verify_ip_san
+    size_t peer_ip_len;        // 4 or 16; 0 = the host is a name (Mbed TLS checks it)
     size_t ra_off, ra_len; // unread ciphertext is ra[ra_off..ra_len]
     unsigned char ra[VTLS_READAHEAD];
 } vtls_session;
@@ -686,6 +688,23 @@ static int verify_chain_only(void *p, mbedtls_x509_crt *crt, int depth, uint32_t
     return 0;
 }
 
+// verify_ip_san is a VERIFY_FULL session's certificate callback when its host
+// is an IP literal (no name was given to Mbed TLS, so it checks none): the
+// server's own certificate must carry that address as an iPAddress SAN
+// (RFC 9525 §6.2; never a dNSName, a wildcard or the CN). The chain is still
+// checked by Mbed TLS.
+static int verify_ip_san(void *p, mbedtls_x509_crt *crt, int depth, uint32_t *flags) {
+    const vtls_session *s = (const vtls_session *)p;
+    if (depth != 0) return 0;
+    for (const mbedtls_x509_sequence *san = &crt->subject_alt_names; san != NULL; san = san->next) {
+        if ((san->buf.tag & MBEDTLS_ASN1_TAG_VALUE_MASK) == MBEDTLS_X509_SAN_IP_ADDRESS &&
+            san->buf.len == s->peer_ip_len && memcmp(san->buf.p, s->peer_ip, s->peer_ip_len) == 0)
+            return 0;
+    }
+    *flags |= MBEDTLS_X509_BADCERT_CN_MISMATCH;
+    return 0;
+}
+
 static int client_setup(vtls_ctx *c, const char *ca_file, int verify) {
     int ret = mbedtls_ssl_config_defaults(&c->conf, MBEDTLS_SSL_IS_CLIENT,
                                           MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
@@ -738,15 +757,21 @@ static void client_rearm(vtls_session *s, int fd) {
 void *vtls_client_session_new(vtls_ctx *c, int fd, const char *host) {
     vtls_session *s = (vtls_session *)calloc(1, sizeof(vtls_session));
     if (!s) return NULL;
-    unsigned char ip[16];
-    int is_ip = inet_pton(AF_INET, host, ip) == 1 || inet_pton(AF_INET6, host, ip) == 1;
+    if (inet_pton(AF_INET, host, s->peer_ip) == 1) s->peer_ip_len = 4;
+    else if (inet_pton(AF_INET6, host, s->peer_ip) == 1) s->peer_ip_len = 16;
+    int is_ip = s->peer_ip_len != 0;
     mbedtls_ssl_init(&s->ssl);
     VTLS_LOCK();
     int ret = mbedtls_ssl_setup(&s->ssl, &c->conf);
-    // The host is the SNI and, under VERIFY_FULL, the name to check. An IP
-    // address is no SNI (RFC 6066), so it is set only when it must be checked;
-    // NULL still counts as "set" for Mbed TLS's verify-without-a-name guard.
-    if (ret == 0) ret = mbedtls_ssl_set_hostname(&s->ssl, (is_ip && c->verify != VTLS_VERIFY_FULL) ? NULL : host);
+    // A name is the SNI and, under VERIFY_FULL, the name Mbed TLS checks. An
+    // IP literal is never SNI (RFC 6066 §3), and Mbed TLS takes one name for
+    // both: set none (NULL still counts as "set" for its verify-without-a-name
+    // guard) and, under VERIFY_FULL, check the address against the
+    // certificate's iPAddress SANs ourselves. The callback survives
+    // mbedtls_ssl_session_reset, so a re-dial keeps the check.
+    if (ret == 0) ret = mbedtls_ssl_set_hostname(&s->ssl, is_ip ? NULL : host);
+    if (ret == 0 && is_ip && c->verify == VTLS_VERIFY_FULL)
+        mbedtls_ssl_set_verify(&s->ssl, verify_ip_san, s);
     if (ret != 0) mbedtls_ssl_free(&s->ssl);
     VTLS_UNLOCK();
     if (ret != 0) {

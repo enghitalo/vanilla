@@ -339,7 +339,11 @@ their request.
   rather than falling back to plaintext. The query path is unchanged: the same
   pool, the same `watch_fd_persistent` parking, zero allocations per query;
   the trusted CAs are parsed once per pool and each connection's TLS session
-  is allocated once and re-armed on every re-dial. TLS 1.3 only.
+  is allocated once and re-armed on every re-dial. TLS 1.3 only. To reach the
+  database by IP address, its certificate must carry that address as an `IP:`
+  SAN: `.verify_full` matches an IP host against iPAddress SANs only (never a
+  `DNS:` spelling, a wildcard or the CN) and sends it no SNI (RFC 9525,
+  RFC 6066; CPython's `ssl` behaves the same).
 
 **Don't**
 

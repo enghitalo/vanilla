@@ -465,6 +465,9 @@ def main():
         TLS_CTX.minimum_version = ssl.TLSVersion.TLSv1_3
         TLS_CTX.load_cert_chain(ARGS.cert, ARGS.key)
         TLS_CTX.num_tickets = 0  # what PostgreSQL does; --tickets-per-query sends them on demand
+        # Count the ClientHellos that carry a server_name (SNI): an IP literal
+        # must never be one (RFC 6066 §3, vanilla#233).
+        TLS_CTX.sni_callback = lambda sock, name, ctx: bump('sni') if name is not None else None
 
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

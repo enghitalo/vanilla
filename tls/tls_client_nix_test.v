@@ -66,6 +66,9 @@ fn test_client_sessions_against_the_server() {
 			ClientCase{.full, '127.0.0.1', ''},
 			ClientCase{.full, '::1', ''},
 			ClientCase{.full, 'db.example.com', 'does not match the host name'},
+			// An IP the certificate does not carry as an iPAddress SAN (#233).
+			ClientCase{.full, '10.0.0.5', 'does not match the host name'},
+			ClientCase{.full, '::2', 'does not match the host name'},
 			ClientCase{.chain, 'db.example.com', ''},
 			ClientCase{.off, 'db.example.com', ''},
 		]
@@ -126,6 +129,43 @@ fn test_client_sessions_against_the_server() {
 			}
 			cli.free()
 			cli_cfg.free()
+		}
+	}
+}
+
+// An IP host matches only an iPAddress SAN (RFC 9525 §6.2). A certificate that
+// spells the address as a dNSName, exact or wildcard, is refused under
+// Verify.full and still accepted under Verify.chain, which checks no name
+// (#233: Mbed TLS matched the IP as a DNS name).
+fn test_ip_host_matches_ip_sans_only() {
+	$if vanilla_tls ? {
+		for sans in [['DNS:127.0.0.1'], ['DNS:*.0.0.1']] {
+			srv_cfg := new_self_signed(sans: sans) or { panic(err) }
+			ca := os.join_path(os.temp_dir(), 'vanilla_tls_ipsan_ca_${os.getpid()}.pem')
+			os.write_file(ca, srv_cfg.cert_pem()) or { panic(err) }
+			for verify in [Verify.full, .chain] {
+				cli_cfg := new_client(ca, verify) or { panic(err) }
+				fds := nonblocking_pair()
+				srv := srv_cfg.new_session(fds[0]) or { panic('server session') }
+				cli := cli_cfg.new_client_session(fds[1], '127.0.0.1') or {
+					panic('client session')
+				}
+				cr, _ := handshake_both(cli, srv)
+				if verify == .full {
+					assert cr == closed, '${sans}: the handshake must fail'
+					assert cli.handshake_error().contains('does not match the host name'), cli.handshake_error()
+				} else {
+					assert cr == 0, '${sans} ${verify}: ${cli.handshake_error()}'
+				}
+				assert cli.reset(-1)
+				srv.free()
+				C.close(fds[0])
+				C.close(fds[1])
+				cli.free()
+				cli_cfg.free()
+			}
+			os.rm(ca) or {}
+			srv_cfg.free()
 		}
 	}
 }

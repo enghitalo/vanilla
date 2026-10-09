@@ -127,10 +127,11 @@ int vtls_peer_close_notify(void *sess);
 // certificate in it parsed.
 int vtls_client_setup(vtls_ctx *ctx, const char *ca_file, int verify);
 
-// A client session on a connected, NON-BLOCKING socket, for server `host`:
-// the SNI unless it is an IP address (RFC 6066 names hosts only), and under
-// VTLS_VERIFY_FULL the name the certificate must carry — then an IP address
-// is sent as SNI too, since Mbed TLS checks the name it sends. Non-blocking
+// A client session on a connected, NON-BLOCKING socket, for server `host`. A
+// DNS name is the SNI and, under VTLS_VERIFY_FULL, the name the certificate
+// must carry. An IP literal is never sent as SNI (RFC 6066 §3); under
+// VTLS_VERIFY_FULL it must equal one of the certificate's iPAddress SANs
+// (RFC 9525 §6.2: not a dNSName, a wildcard or the CN). Non-blocking
 // because Mbed TLS must never wait in a recv holding the crypto lock (see
 // VTLS_LOCK in vanilla_tls.c). NULL on error.
 void *vtls_client_session_new(vtls_ctx *ctx, int fd, const char *host);

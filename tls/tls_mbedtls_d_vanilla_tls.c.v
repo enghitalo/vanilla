@@ -374,8 +374,11 @@ pub fn new_client(ca_file string, verify Verify) !&Config {
 }
 
 // new_client_session starts a client session on `fd`, a connected
-// NON-BLOCKING socket, to server `host` (SNI, and the name verified under
-// Verify.full). Drive it with handshake() like a server session.
+// NON-BLOCKING socket, to server `host`. A DNS name is sent as SNI and, under
+// Verify.full, matched against the certificate's dNSName SANs (or its CN when
+// it has none). An IP literal (`10.0.0.5`, `::1`) is never sent as SNI
+// (RFC 6066 §3) and, under Verify.full, must match an iPAddress SAN exactly
+// (RFC 9525 §6.2). Drive it with handshake() like a server session.
 pub fn (c &Config) new_client_session(fd int, host string) ?Session {
 	s := C.vtls_client_session_new(c.ctx, fd, &char(host.str))
 	if s == unsafe { nil } {
