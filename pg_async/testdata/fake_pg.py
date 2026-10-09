@@ -45,6 +45,11 @@ server_closes, ssl_requests, tls_handshakes, tickets, cancel_requests) up to
 date, so a test can assert on what the server saw. Every connection is logged
 to stderr.
 
+It exits after --lifetime seconds, or within 0.2 s of its parent process
+exiting: a test that panics never runs its deferred stop(), and a fake left
+behind would keep the test binary's stdout/stderr open, so `v test` would wait
+for their EOF instead of reporting the failure.
+
 usage: fake_pg.py --port-file PATH [options]
 """
 
@@ -444,6 +449,7 @@ def handle(conn, cid):
 
 def main():
     global ARGS
+    parent = os.getppid()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--port-file', required=True, help='written with the listening port once ready')
     ap.add_argument('--stats-file', default='')
@@ -478,7 +484,8 @@ def main():
     os.replace(tmp, ARGS.port_file)  # atomic: the reader never sees a partial port
     deadline = time.time() + ARGS.lifetime
     cid = 0
-    while time.time() < deadline:
+    # getppid() changes once the parent is gone: this process is re-parented.
+    while time.time() < deadline and os.getppid() == parent:
         try:
             conn, _ = srv.accept()
         except socket.timeout:
