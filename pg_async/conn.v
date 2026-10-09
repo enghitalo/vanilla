@@ -174,13 +174,42 @@ pub enum SslMode {
 	verify_full // TLS; the certificate chains to a trusted CA and names `host` (SNI is sent): what managed databases need
 }
 
+// PasswordFn returns the password for one connection attempt (see
+// ConnConfig.password_fn).
+pub type PasswordFn = fn () !string
+
 pub struct ConnConfig {
 pub:
 	host     string = 'localhost'
 	port     int    = 5432
 	user     string
 	password string
-	database string
+	// password_fn, when set, is asked for the password on every connection
+	// attempt instead of reading `password`: once per connection a pool brings
+	// up, and once per re-dial of a lost connection.
+	// It is for short-lived credentials, such as an IAM auth token (Aurora DSQL,
+	// RDS), which the server checks only when a session starts. It runs on the
+	// worker thread, never per query but inline in a re-dial step: keep it
+	// fast and non-blocking (sign a token locally; fetch secrets elsewhere).
+	// Every worker's pool calls it from its own thread, so state it shares
+	// across workers needs a lock or atomics. An error fails the attempt, and
+	// a pool retries after its backoff.
+	password_fn PasswordFn = unsafe { nil }
+	database    string
+	// params are run-time parameters sent in the StartupMessage, the session's
+	// defaults: {'application_name': 'orders-api'} names the sessions in
+	// pg_stat_activity. A name or value holding a NUL, an empty name, and
+	// `user` / `database` (set those fields) fail the connect before dialing.
+	params map[string]string
+	// allowed_auth lists the authentication methods the client answers, like
+	// libpq's require_auth: .sasl (SCRAM-SHA-256) and .cleartext_password. A
+	// server asking for another one is refused before any credential is sent.
+	// A server that asks for none (AuthenticationOk at once: trust) is
+	// accepted, as it sends nothing. .cleartext_password sends the password
+	// itself and is answered only over TLS, whatever this list says: token
+	// authentication (Aurora DSQL, RDS IAM) is [.cleartext_password] with
+	// ssl_mode .verify_full. MD5 is not supported.
+	allowed_auth []AuthType = [.sasl]
 	// ssl_mode: see SslMode. TLS 1.3, negotiated with PostgreSQL's SSLRequest.
 	ssl_mode SslMode
 	// ssl_root_cert is the PEM file of trusted CA certificates for .verify_ca
@@ -210,6 +239,33 @@ pub:
 	// before the kernel drops the connection. 0 = the OS default (~15 min of
 	// retransmissions).
 	tcp_user_timeout_ms int = 30_000
+}
+
+// check_startup_params refuses run-time parameters the StartupMessage cannot
+// carry as given: a NUL would end a name or value early (and let the rest be
+// read as other parameters), an empty name ends the list, and user /
+// database would override the fields of the same name.
+fn check_startup_params(params map[string]string) ! {
+	for name, value in params {
+		if name == '' {
+			return error('pg: startup parameter with an empty name')
+		}
+		if name.index_u8(0) >= 0 || value.index_u8(0) >= 0 {
+			return error('pg: startup parameter `${name.replace('\0', '\\0')}` holds a NUL byte')
+		}
+		if name == 'user' || name == 'database' {
+			return error('pg: set ConnConfig.${name}, not the `${name}` startup parameter')
+		}
+	}
+}
+
+// attempt_password is the password for one connection attempt: what
+// password_fn answers when it is set, else the static password.
+fn attempt_password(cfg &ConnConfig) !string {
+	if cfg.password_fn != unsafe { nil } {
+		return cfg.password_fn() or { return error('pg: password_fn failed: ${err.msg()}') }
+	}
+	return cfg.password
 }
 
 // LinkState is a connection's health. A live connection is .ready. It turns
@@ -299,9 +355,11 @@ struct Msg {
 }
 
 // PgConn.connect opens a TCP connection — TLS over it unless ssl_mode is
-// .disable — and runs the startup + SCRAM-SHA-256 handshake, returning once
-// the server reports ReadyForQuery.
+// .disable — and runs the startup and authentication (SCRAM-SHA-256, or a
+// cleartext password over TLS: allowed_auth), returning once the server
+// reports ReadyForQuery.
 pub fn PgConn.connect(cfg ConnConfig) !PgConn {
+	check_startup_params(cfg.params)!
 	mut c := PgConn{
 		recv_buf: []u8{cap: 16 * 1024}
 	}
@@ -316,10 +374,12 @@ pub fn PgConn.connect(cfg ConnConfig) !PgConn {
 	return c
 }
 
-// bring_up dials and authenticates, blocking: the TCP connect, then over TLS
-// the SSLRequest and the TLS handshake (on a non-blocking socket, every wait
-// bounded by connect_timeout_ms), then the startup and authentication.
+// bring_up dials and authenticates, blocking: the attempt's password first
+// (start_auth: password_fn), then the TCP connect, over TLS the SSLRequest and
+// the TLS handshake (on a non-blocking socket, every wait bounded by
+// connect_timeout_ms), then the startup and authentication.
 fn (mut c PgConn) bring_up(cfg &ConnConfig) ! {
+	c.start_auth(cfg)!
 	c.fd = dial(cfg, false, 0)!
 	if c.tls_cfg != unsafe { nil } {
 		if cfg.connect_timeout_ms > 0 {
@@ -449,28 +509,28 @@ fn (mut c PgConn) read_msg() !Msg {
 	return error('pg: unreachable')
 }
 
+// handshake sends the StartupMessage and answers the authentication with
+// c.scram (start_auth), blocking until ReadyForQuery.
 fn (mut c PgConn) handshake(cfg ConnConfig) ! {
 	mut startup := []u8{}
-	write_startup(mut startup, cfg.user, cfg.database)
+	write_startup(mut startup, cfg.user, cfg.database, cfg.params)
 	c.send(startup)!
-
-	mut scram := ScramClient.new(cfg.user, cfg.password)!
-	scram.cache = c.scram_cache
 	for {
 		msg := c.read_msg()!
-		if c.on_startup_msg(msg.typ, msg.payload, mut scram)! {
+		if c.on_startup_msg(msg.typ, msg.payload, &cfg, mut c.scram)! {
 			return
 		}
 	}
 }
 
 // on_startup_msg handles one backend message of the startup / authentication
-// exchange, answering the SCRAM steps; true once ReadyForQuery arrives. Shared
-// by the blocking handshake and the non-blocking re-dial (redial.v).
-fn (mut c PgConn) on_startup_msg(typ u8, payload []u8, mut scram ScramClient) !bool {
+// exchange, answering the authentication requests cfg allows; true once
+// ReadyForQuery arrives. Shared by the blocking handshake and the
+// non-blocking re-dial (redial.v).
+fn (mut c PgConn) on_startup_msg(typ u8, payload []u8, cfg &ConnConfig, mut scram ScramClient) !bool {
 	match typ {
 		bt_authentication {
-			c.handle_auth(payload, mut scram)!
+			c.handle_auth(payload, cfg, mut scram)!
 		}
 		bt_error_response {
 			info := parse_error_response(payload)
@@ -486,15 +546,33 @@ fn (mut c PgConn) on_startup_msg(typ u8, payload []u8, mut scram ScramClient) !b
 	return false
 }
 
-fn (mut c PgConn) handle_auth(payload []u8, mut scram ScramClient) ! {
+// handle_auth answers one Authentication request. `scram` carries the
+// attempt's password, for SCRAM and for a cleartext request alike.
+fn (mut c PgConn) handle_auth(payload []u8, cfg &ConnConfig, mut scram ScramClient) ! {
 	sub := auth_subtype(payload)
 	data := if payload.len > 4 { payload[4..] } else { []u8{} }
 	match sub {
 		0 {
 			// AuthenticationOk — ReadyForQuery follows.
 		}
+		3 {
+			// AuthenticationCleartextPassword — the password itself, so only
+			// when allowed and only inside TLS: on a plaintext connection
+			// anyone on the path would read it, and a man in the middle could
+			// ask for it in place of the server's SCRAM.
+			if AuthType.cleartext_password !in cfg.allowed_auth {
+				return error('pg: the server asks for a cleartext password, which allowed_auth does not allow (token authentication: allowed_auth [.cleartext_password] with ssl_mode .verify_full)')
+			}
+			if !c.tls.active() {
+				return error('pg: refusing to send a cleartext password over an unencrypted connection (set ssl_mode, e.g. .verify_full)')
+			}
+			c.send_password(scram.password)!
+		}
 		10 {
 			// AuthenticationSASL — offer SCRAM-SHA-256, send the client-first message.
+			if AuthType.sasl !in cfg.allowed_auth {
+				return error('pg: the server asks for SASL (SCRAM-SHA-256) authentication, which allowed_auth does not allow')
+			}
 			mut m := []u8{}
 			write_sasl_initial(mut m, scram_sha_256, scram.client_first())
 			c.send(m)!
@@ -511,9 +589,24 @@ fn (mut c PgConn) handle_auth(payload []u8, mut scram ScramClient) ! {
 			scram.handle_server_final(data)!
 		}
 		else {
-			return error('pg: unsupported authentication method (code ${sub}); only SCRAM-SHA-256 is implemented')
+			return error('pg: unsupported authentication method (code ${sub}); pg_async implements SCRAM-SHA-256 and, over TLS, cleartext password')
 		}
 	}
+}
+
+// send_password answers AuthenticationCleartextPassword with a
+// PasswordMessage, then zeroes the buffer that held the password.
+fn (mut c PgConn) send_password(password string) ! {
+	if password.index_u8(0) >= 0 {
+		return error('pg: the password holds a NUL byte')
+	}
+	mut m := []u8{cap: password.len + 6}
+	write_password(mut m, password)
+	c.send(m) or {
+		wipe(mut m)
+		return err
+	}
+	wipe(mut m)
 }
 
 // query runs one extended-protocol query (Parse/Bind/Describe/Execute/Sync,

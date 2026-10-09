@@ -3,11 +3,11 @@
 
 Python 3, standard library only. It speaks protocol 3.0 the way pg_async uses
 it: StartupMessage, then SCRAM-SHA-256 (the server signature is computed for
-real, so pg_async's verification passes) or trust auth, ParameterStatus,
-BackendKeyData, ReadyForQuery; then the extended-query flow — every message up
-to a Sync is one group, answered with ParseComplete, BindComplete,
-RowDescription, DataRows, CommandComplete (or an ErrorResponse) and
-ReadyForQuery. Results are binary, as pg_async's Bind asks for.
+real, so pg_async's verification passes), a cleartext password or trust auth,
+ParameterStatus, BackendKeyData, ReadyForQuery; then the extended-query flow
+— every message up to a Sync is one group, answered with ParseComplete,
+BindComplete, RowDescription, DataRows, CommandComplete (or an ErrorResponse)
+and ReadyForQuery. Results are binary, as pg_async's Bind asks for.
 
 What a query returns is decided by its SQL text (see answer_statement):
   select 1/0 ...                     ERROR 22012 division_by_zero
@@ -15,6 +15,8 @@ What a query returns is decided by its SQL text (see answer_statement):
   select g from generate_series(1, N) g    N int4 rows: 1..N
   select $1::int4, $2::text, ...     one row echoing the parameters (int4,
                                      int8, bool or text, from each cast)
+  show NAME                          the StartupMessage's NAME parameter (text),
+                                     ERROR 42704 when it sent none
   begin / commit / rollback          the transaction status in ReadyForQuery
   anything else                      ERROR 0A000 naming the unsupported text
 
@@ -26,7 +28,9 @@ needs happen deterministically:
       FATAL 57P01 (administrator command) 50 ms later, then close
   --hang-after K                    the K-th and later queries of a connection
       are never answered (the connection stays open)
-  --auth scram|trust                (default scram; password --password)
+  --auth scram|cleartext|trust      (default scram; password --password).
+      cleartext is AuthenticationCleartextPassword (code 3), over plaintext
+      too: refusing that is the client's job; a wrong password is FATAL 28P01
 
 TLS, per run (--ssl; certificates from gen_test_ca.sh via --cert/--key):
   --ssl off                         answer SSLRequest with 'N' (the default)
@@ -41,9 +45,9 @@ TLS, per run (--ssl; certificates from gen_test_ca.sh via --cert/--key):
       SSL_new_session_ticket, through ctypes: the ssl module has no call for it)
 
 --stats-file PATH keeps `key=value` counters (accepted, authenticated, queries,
-server_closes, ssl_requests, tls_handshakes, tickets, cancel_requests) up to
-date, so a test can assert on what the server saw. Every connection is logged
-to stderr.
+server_closes, ssl_requests, tls_handshakes, tickets, cancel_requests,
+password_messages, terminates) up to date, so a test can assert on what the
+server saw. Every connection is logged to stderr.
 
 usage: fake_pg.py --port-file PATH [options]
 """
@@ -195,6 +199,20 @@ def scram_auth(conn):
     conn.sendall(msg(b'R', struct.pack('!I', 12) + b'v=' + base64.b64encode(sig)))
 
 
+def cleartext_auth(conn):
+    """AuthenticationCleartextPassword (code 3): PostgreSQL's `password`
+    method, what Aurora DSQL and RDS IAM authentication ask for."""
+    conn.sendall(msg(b'R', struct.pack('!I', 3)))
+    typ, body = read_typed(conn)  # PasswordMessage
+    if typ != b'p':
+        raise EOFError
+    bump('password_messages')
+    password, _ = cstr(body, 0)
+    if password != ARGS.password.encode():
+        conn.sendall(error_response('FATAL', '28P01', 'password authentication failed for user'))
+        raise EOFError
+
+
 def startup(conn, cid):
     """Reads the startup packet, answering an SSLRequest first (--ssl), and
     authenticates. Returns (connection, startup parameters): the connection is
@@ -243,6 +261,8 @@ def startup(conn, cid):
         raise EOFError
     if ARGS.auth == 'scram':
         scram_auth(conn)
+    elif ARGS.auth == 'cleartext':
+        cleartext_auth(conn)
     conn.sendall(msg(b'R', struct.pack('!I', 0)))
     status = b''
     for k, v in (('server_version', '16.0 (vanilla fake_pg)'), ('integer_datetimes', 'on'),
@@ -283,6 +303,7 @@ def new_session_tickets(conn, n):
 CAST = re.compile(r'\$(\d+)(?:::(\w+))?')
 LITERAL = re.compile(r'^\s*select\s+(-?\d+)(?:::int4)?\s*$', re.I)
 SERIES = re.compile(r'generate_series\(\s*1\s*,\s*(\d+)\s*\)', re.I)
+SHOW = re.compile(r'^\s*show\s+(\w+)\s*$', re.I)
 
 
 def encode_param(value, cast):
@@ -297,13 +318,21 @@ def encode_param(value, cast):
     return value, OID_TEXT, -1
 
 
-def answer_statement(sql, params, tx):
+def answer_statement(sql, params, tx, settings):
     """One statement's reply after its ParseComplete/BindComplete: returns
-    (bytes, transaction status after it, whether it failed)."""
+    (bytes, transaction status after it, whether it failed). settings are the
+    StartupMessage's parameters (show NAME)."""
     text = sql.strip().rstrip(';').strip()
     low = text.lower()
     if '1/0' in low.replace(' ', ''):
         return error_response('ERROR', '22012', 'division by zero'), tx, True
+    m = SHOW.match(text)
+    if m:
+        name = m.group(1).lower()
+        if name not in settings:
+            return error_response('ERROR', '42704', f'unrecognized configuration parameter "{name}"'), tx, True
+        return (row_description([(name, OID_TEXT, -1)]) + data_row([settings[name].encode()]) +
+                msg(b'C', b'SHOW\x00')), tx, False
     if low in ('begin', 'start transaction'):
         return msg(b'n') + msg(b'C', b'BEGIN\x00'), b'T', False
     if low in ('commit', 'end'):
@@ -357,7 +386,7 @@ def parse_bind_params(body):
     return params
 
 
-def serve(conn, cid):
+def serve(conn, cid, settings):
     tx = b'I'
     queries = 0
     stmts = []  # [sql, params] of the current group (up to Sync)
@@ -365,6 +394,7 @@ def serve(conn, cid):
     while True:
         typ, body = read_typed(conn)
         if typ == b'X':
+            bump('terminates')
             log(cid, 'Terminate')
             return
         if typ == b'Q':
@@ -389,7 +419,7 @@ def serve(conn, cid):
             reply = b''
             for stmt_sql, params in stmts:
                 reply += msg(b'1') + msg(b'2')
-                part, tx, failed = answer_statement(stmt_sql, params, tx)
+                part, tx, failed = answer_statement(stmt_sql, params, tx, settings)
                 reply += part
                 if failed:
                     # An explicit transaction is now aborted; an implicit one
@@ -431,7 +461,7 @@ def handle(conn, cid):
     try:
         conn, params = startup(conn, cid)
         if params is not None:
-            serve(conn, cid)
+            serve(conn, cid, params)
     except (EOFError, OSError, ValueError, IndexError, struct.error) as e:
         if isinstance(e, ssl.SSLError):
             log(cid, f'TLS: {e}')
@@ -447,7 +477,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--port-file', required=True, help='written with the listening port once ready')
     ap.add_argument('--stats-file', default='')
-    ap.add_argument('--auth', choices=('scram', 'trust'), default='scram')
+    ap.add_argument('--auth', choices=('scram', 'cleartext', 'trust'), default='scram')
     ap.add_argument('--password', default='secret')
     ap.add_argument('--close', choices=('none', 'delayed', 'immediate', 'fatal'), default='none')
     ap.add_argument('--close-after', type=int, default=1)

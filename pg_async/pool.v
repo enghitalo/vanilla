@@ -37,6 +37,7 @@ pub fn PgPool.connect(cfg ConnConfig, size int) !PgPool {
 	if size < 1 {
 		return error('pg pool: size must be >= 1')
 	}
+	check_startup_params(cfg.params) or { return error('pg pool: ${err}') }
 	mut tls_cfg := &tls.Config(unsafe { nil })
 	if cfg.ssl_mode != .disable {
 		tls_cfg = new_tls_config(&cfg) or { return error('pg pool: ${err}') }

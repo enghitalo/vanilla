@@ -170,10 +170,54 @@ fn test_framing_under_byte_by_byte_fragmentation() {
 
 fn test_startup_message_has_no_type_byte_and_self_lengths() {
 	mut buf := []u8{}
-	write_startup(mut buf, 'bench', 'bench')
+	write_startup(mut buf, 'bench', 'bench', map[string]string{})
 	// length field covers the whole message
 	len := int(u32(buf[0]) << 24 | u32(buf[1]) << 16 | u32(buf[2]) << 8 | u32(buf[3]))
 	assert len == buf.len
 	// protocol version 3.0
 	assert buf[4] == 0 && buf[5] == 3 && buf[6] == 0 && buf[7] == 0
+	assert buf[8..] == 'user\0bench\0database\0bench\0\0'.bytes()
+}
+
+// Run-time parameters follow user/database as name/value C strings, before
+// the list's terminating NUL.
+fn test_startup_message_carries_the_params() {
+	mut buf := []u8{}
+	write_startup(mut buf, 'app', '', {
+		'application_name': 'orders-api'
+		'search_path':      'app'
+	})
+	len := int(u32(buf[0]) << 24 | u32(buf[1]) << 16 | u32(buf[2]) << 8 | u32(buf[3]))
+	assert len == buf.len
+	assert buf[8..] == 'user\0app\0application_name\0orders-api\0search_path\0app\0\0'.bytes()
+}
+
+// What the StartupMessage cannot carry as given is refused before dialing.
+fn test_startup_params_are_checked() {
+	check_startup_params({
+		'application_name': 'ok'
+	})!
+	for params in [{
+		'': 'x'
+	}, {
+		'app\0lication_name': 'x'
+	}, {
+		'application_name': 'a\0b'
+	}, {
+		'user': 'admin'
+	}, {
+		'database': 'other'
+	}] {
+		if _ := check_startup_params(params) {
+			assert false, 'accepted ${params}'
+		}
+	}
+}
+
+// PasswordMessage: 'p', Int32 length (itself included), the password as a C
+// string.
+fn test_password_message() {
+	mut buf := []u8{}
+	write_password(mut buf, 'tok')
+	assert buf == [u8(`p`), 0, 0, 0, 8, `t`, `o`, `k`, 0]
 }

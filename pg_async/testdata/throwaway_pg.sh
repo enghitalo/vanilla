@@ -23,7 +23,9 @@
 #            with `password` (cleartext, over TLS only). Plaintext TCP is
 #            rejected. The exports then add PGSSLMODE=verify-full and
 #            PGSSLROOTCERT (the test CA), which pg_async's live tests and
-#            bench/pg_async/e2e_server read (build with -d vanilla_tls).
+#            bench/pg_async/e2e_server read (build with -d vanilla_tls), and
+#            PG_CLEARTEXT_USER / PG_CLEARTEXT_PASSWORD (pw_user, for
+#            tls_live_test.v's cleartext login).
 #   PG_CPUS  taskset CPU list for the server and its backends (benchmarks)
 #
 # The cluster: user bench / password benchpw, database bench, scram-sha-256,
@@ -118,6 +120,7 @@ start() {
 	if [ "${PG_TLS:-0}" = 1 ]; then
 		echo "export PGSSLMODE=verify-full PGSSLROOTCERT=$dir/certs/ca.crt"
 		echo "export PG_TEST_CA=$dir/certs/ca.crt PG_TEST_CERTS=$dir/certs"
+		echo "export PG_CLEARTEXT_USER=pw_user PG_CLEARTEXT_PASSWORD=pwpass"
 	fi
 	echo "# throwaway PostgreSQL ($("$PG_BIN/postgres" --version)) up in $dir" >&2
 }
