@@ -33,6 +33,7 @@ on:
       - 'static_assets/**'
       - 'tls/**'
       - 'examples/https_upstream/**'
+      - 'examples/websocket_chat/**'
       - '.github/workflows/race_detector.yml'
   pull_request:
     branches: [ main ]
@@ -48,6 +49,7 @@ on:
       - 'static_assets/**'
       - 'tls/**'
       - 'examples/https_upstream/**'
+      - 'examples/websocket_chat/**'
       - '.github/workflows/race_detector.yml'
 
 # A new push to a pull request cancels that PR's run still in progress, so
@@ -121,10 +123,11 @@ jobs:
           v -race -cc "$RACE_CC" -no-parallel -run-only 'test_epoll_*' test tests/park_deadline_test.v
       # The push mailbox is a lock-free MPSC ring: producer threads against
       # the worker that drains it (vanilla#230).
-      - name: 'conn_push_test.v (epoll: subscriptions, the push mailbox from producer threads)'
+      - name: 'conn_push_test.v and examples/websocket_chat (epoll: subscriptions, the push mailbox from producer threads)'
         shell: bash
         run: |
           v -race -cc "$RACE_CC" -no-parallel -run-only 'test_epoll_*' test tests/conn_push_test.v
+          v -race -cc "$RACE_CC" -no-parallel test examples/websocket_chat/src
       - name: uds_test.v (epoll) and vtest smoke
         shell: bash
         run: |

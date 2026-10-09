@@ -132,3 +132,20 @@ fn test_close_and_pong_writers() {
 	assert hp.opcode == op_pong
 	assert pong[hp.payload_off..hp.payload_off + hp.payload_len].bytestr() == 'ka'
 }
+
+fn test_ping_writer() {
+	mut ping := []u8{}
+	write_ping(mut ping, 'hb'.bytes())
+	h := frame_head(ping)
+	assert h.total == ping.len
+	assert h.opcode == op_ping && h.fin && !h.masked
+	assert ping[h.payload_off..h.payload_off + h.payload_len].bytestr() == 'hb'
+	mut empty := []u8{}
+	write_ping(mut empty, []u8{})
+	assert empty == [u8(0x89), 0x00]
+	// A control frame carries at most 125 bytes: still a valid frame.
+	mut long := []u8{}
+	write_ping(mut long, []u8{len: 200, init: `x`})
+	hl := frame_head(long)
+	assert hl.total == long.len && hl.payload_len == 125
+}
