@@ -73,12 +73,20 @@ fn fake_cc() string {
 	return 'gcc'
 }
 
+// start_fake starts a fake on 127.0.0.1, serving `cert` over TLS when `certs`
+// is set.
 fn start_fake(certs string, cert string) !Fake {
+	return start_fake_on('127.0.0.1', certs, cert)
+}
+
+// start_fake_on is start_fake listening on `ip`.
+fn start_fake_on(ip string, certs string, cert string) !Fake {
 	bin := fake_bin()!
 	dir := os.join_path(os.temp_dir(), 'vanilla_fake_upstream_${os.getpid()}_${time.sys_mono_now()}')
 	os.mkdir_all(dir)!
 	mut p := os.new_process(bin)
-	mut a := ['--port-file', os.join_path(dir, 'port'), '--stats-file', os.join_path(dir, 'stats')]
+	mut a := ['--bind', ip, '--port-file', os.join_path(dir, 'port'), '--stats-file',
+		os.join_path(dir, 'stats')]
 	if certs != '' {
 		a << ['--tls', certs, '--cert', cert]
 	}
@@ -417,6 +425,80 @@ fn test_tls_verify_failures() {
 	r2 := get(h.port(), '/ok')
 	assert status_of(r2) == 502 && failure_of(r2) == 'tls_verify', r2
 	assert f.stat('requests') == 0
+}
+
+// An HTTPS origin given by IP address, IPv4 and IPv6 (#233): the address must
+// be one of the certificate's iPAddress SANs (server.crt: IP:127.0.0.1,
+// IP:::1), and the Host header carries it (an IPv6 one in brackets). A
+// certificate without it (wronghost.crt: DNS:wrong.example) fails with
+// .tls_verify, the request unsent. Each case runs twice, the second time on a
+// re-dial, where the slot re-arms its TLS session. (That no SNI is sent for
+// an IP is checked by tls/ and pg_async's tests: this fake cannot see it.)
+fn test_https_to_an_ip_literal() {
+	if true !in variants() {
+		return
+	}
+	certs := testkit.test_certs() or { panic(err) }
+	defer {
+		os.rmdir_all(certs) or {}
+	}
+	cfg := tls.new_client(os.join_path(certs, 'ca.crt'), .full) or { panic(err) }
+	for ip in ['127.0.0.1', '::1'] {
+		if !can_listen(ip) {
+			eprintln('https_upstream: cannot listen on ${ip} here; skipping it')
+			continue
+		}
+		for cert in ['server', 'wronghost'] {
+			mut f := start_fake_on(ip, certs, cert) or { panic(err) }
+			defer {
+				f.stop()
+			}
+			origin := upstream.Origin{
+				host: ip
+				port: f.port
+			}
+			mut h := vtest.start(server.ServerConfig{
+				handler:         edge
+				workers:         1
+				on_worker_start: on_worker_start
+				make_state:      fn [origin, cfg] () voidptr {
+					return new_app(origin, cfg, unsafe { nil })
+				}
+			}) or { panic(err) }
+			defer {
+				h.stop()
+			}
+			p := h.port()
+			if cert == 'server' {
+				want := if ip.contains(':') { '[${ip}]:${f.port}' } else { '${ip}:${f.port}' }
+				r := get(p, '/host')
+				assert status_of(r) == 200 && body_of(r) == want, '${ip}: ${r}'
+				assert status_of(get(p, '/connclose')) == 200, ip
+				r2 := get(p, '/host')
+				assert status_of(r2) == 200 && body_of(r2) == want, '${ip}: ${r2}'
+				assert f.stat('handshakes') == 2, ip
+			} else {
+				for _ in 0 .. 2 {
+					r := get(p, '/host')
+					assert status_of(r) == 502 && failure_of(r) == 'tls_verify', '${ip}: ${r}'
+				}
+				assert f.stat('requests') == 0, ip
+			}
+		}
+	}
+}
+
+// can_listen reports whether a socket can bind to `ip` here (some hosts and
+// containers have no IPv6 loopback).
+fn can_listen(ip string) bool {
+	a := transport.ip_addr(ip, 0) or { return false }
+	fd := C.socket(a.family, C.SOCK_STREAM, 0)
+	if fd < 0 {
+		return false
+	}
+	ok := C.bind(fd, voidptr(&a.data[0]), a.len) == 0
+	C.close(fd)
+	return ok
 }
 
 // An upstream that answers 413 after the head of a 4 MiB POST and stops

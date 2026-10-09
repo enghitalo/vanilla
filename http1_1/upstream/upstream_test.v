@@ -86,6 +86,16 @@ fn test_host_header() {
 		}
 	}, tls_stub()) or { panic(err) }
 	assert p.host_hdr.bytestr() == 'Host: api.example.com\r\n'
+	// HTTPS to an IP literal (#233: no SNI, an iPAddress SAN must match): the
+	// address is dialed as is, and the Host header carries it.
+	for c in [['127.0.0.1', '443', 'Host: 127.0.0.1\r\n'], ['::1', '8443', 'Host: [::1]:8443\r\n']] {
+		q := Pool.new(Origin{
+			host: c[0]
+			port: c[1].int()
+		}, tls_stub()) or { panic(err) }
+		assert q.host_hdr.bytestr() == c[2], c.str()
+		assert q.addrs.len == 1, c.str()
+	}
 }
 
 // tls_stub is a non-nil stand-in for a client TLS config: Pool.new only
@@ -121,12 +131,6 @@ fn test_origin_validation() {
 		if _ := Pool.new(bad, unsafe { nil }) {
 			assert false, bad.host
 		}
-	}
-	// HTTPS to an IP literal would be sent as SNI: refused for now.
-	if _ := Pool.new(Origin{
-		host: '127.0.0.1'
-	}, tls_stub()) {
-		assert false
 	}
 	// A name the resolver does not know.
 	if _ := Pool.new(Origin{

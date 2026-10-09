@@ -327,7 +327,9 @@ their request.
   with `.done`. Its views (`body_view`, `header_value`) borrow the exchange's
   buffer until `release()`. Request heads are validated (a CR/LF/NUL in a
   target or a header fails the exchange instead of injecting a line); share one
-  `tls.new_client` config across workers. See
+  `tls.new_client` config across workers. An HTTPS origin may be an IP
+  address: its certificate must then carry it as an `IP:` SAN, as for a
+  database (below). See
   [examples/https_upstream](../examples/https_upstream/src/main.v).
 - Talk TLS to any database that is not on the same host: `ssl_mode:
   .verify_full` (with `ssl_root_cert` for a private CA; the system bundle
@@ -339,7 +341,15 @@ their request.
   rather than falling back to plaintext. The query path is unchanged: the same
   pool, the same `watch_fd_persistent` parking, zero allocations per query;
   the trusted CAs are parsed once per pool and each connection's TLS session
-  is allocated once and re-armed on every re-dial. TLS 1.3 only.
+  is allocated once and re-armed on every re-dial. TLS 1.3 only. To reach the
+  database by IP address, its certificate must carry that address as an `IP:`
+  SAN: `.verify_full` matches an IP host (`10.0.0.5`, or any spelling
+  getaddrinfo dials as an address, such as `fe80::1%eth0`) against iPAddress
+  SANs only (never a `DNS:` spelling, a wildcard or the CN) and sends it no
+  SNI (RFC 9525, RFC 6066; CPython's `ssl` does the same for `10.0.0.5`).
+  That is stricter than libpq, whose `verify-full` also takes a `DNS:` or CN
+  spelling of the IP: a certificate psql accepts by IP may need an `IP:` SAN
+  here.
 
 **Don't**
 
