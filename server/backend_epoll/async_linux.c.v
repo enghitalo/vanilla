@@ -322,7 +322,9 @@ fn register_watch(mut w core.EventLoop, ext_fd int, interest core.WatchInterest,
 	}
 	mut r := unsafe { &Reactor(w.reactor) }
 	r.armed = true // sticky: the event loop starts probing the watch table
-	if r.rearming_dead {
+	// A clientless watch armed DURING a tombstone run (watch_fd_background,
+	// e.g. a CancelRequest) is a watch of its own, never the tombstone's re-arm.
+	if r.rearming_dead && w.client_fd >= 0 {
 		// Tombstone re-arm (drain_pipelined dead branch): the queue slot stays
 		// exactly as it is — only the (already-armed, level-triggered) fd needs to
 		// remain in epoll. Do NOT touch the watch table: a dedup match would

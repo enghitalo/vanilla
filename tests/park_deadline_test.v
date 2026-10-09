@@ -148,6 +148,13 @@ fn pd_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 			200)
 		return .suspend
 	}
+	if pd_has_prefix(req, 'GET /pqbg200 ') {
+		// /pq200 whose readiness run (here: the tombstone's) also arms a
+		// background watch (pd_bg_flag).
+		event_loop.watch_fd_persistent_deadline(db, .readable, pd_pq_cont, voidptr(usize(200) | pd_bg_flag),
+			200)
+		return .suspend
+	}
 	if pd_has_prefix(req, 'GET /pq5000 ') {
 		event_loop.watch_fd_persistent_deadline(db, .readable, pd_pq_cont, voidptr(usize(5000)),
 			5000)
@@ -202,9 +209,14 @@ fn pd_never_cont(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload 
 	return .done
 }
 
+// pd_bg_flag in a /pq watch_payload: its readiness run arms a background
+// watch on a fresh pipe, as pg_async's cancel() does from a continuation.
+const pd_bg_flag = usize(1) << 20
+
 // pd_pq_cont is a pooled-DB continuation (pg_async's shape): one byte is one
-// result. watch_payload is the deadline to re-arm with. On timeout it answers
-// 504 and leaves the result still due alone: the tombstone run consumes it.
+// result. watch_payload is the deadline to re-arm with (and pd_bg_flag). On
+// timeout it answers 504 and leaves the result still due alone: the
+// tombstone run consumes it.
 fn pd_pq_cont(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut p := unsafe { pd }
 	if event_loop.timed_out() {
@@ -213,10 +225,18 @@ fn pd_pq_cont(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voi
 		return .done
 	}
 	stdatomic.add_i64(&p.runs, 1)
+	if usize(watch_payload) & pd_bg_flag != 0 {
+		mut fds := [2]i32{}
+		C.pipe(&fds[0])
+		stdatomic.store_i64(&p.bg_w, i64(fds[1]))
+		if !event_loop.watch_fd_background(int(fds[0]), .readable, pd_bg_cont, unsafe { nil }) {
+			C.close(int(fds[0]))
+		}
+	}
 	mut b := [1]u8{}
 	if C.read(ready_fd, &b[0], 1) != 1 {
 		event_loop.watch_fd_persistent_deadline(ready_fd, .readable, pd_pq_cont, watch_payload,
-			int(usize(watch_payload)))
+			int(usize(watch_payload) & (pd_bg_flag - 1)))
 		return .suspend
 	}
 	stdatomic.add_i64(&p.drained, 1)
@@ -478,6 +498,29 @@ fn test_epoll_persistent_late_reply_is_drained_in_order() ! {
 	assert got2.ends_with('\r\n\r\nY'), 'the next request got the stale reply: ${got2}'
 	assert pd_load(&p.drained) == 2
 	assert pd_load(&p.timeouts) == 1
+}
+
+// A background watch armed from a tombstone run (pg_async cancels from a
+// continuation; a tombstone run is one) is a watch of its own: it is not
+// taken for the tombstone's re-arm, and its continuation runs.
+fn test_epoll_background_watch_from_a_tombstone_run() ! {
+	pd_open()
+	mut h := vtest.start(pd_config(.epoll, server.Limits{}))!
+	defer {
+		h.stop()
+		pd_close()
+	}
+	fd := pd_send(h.port(), 'GET /pqbg200 HTTP/1.1\r\nHost: x\r\n\r\n')!
+	defer {
+		transport.close_fd(fd)
+	}
+	got := testkit.fd_read_until(fd, '\r\n\r\n', 3000)
+	assert got.starts_with('HTTP/1.1 504 '), 'no 504: ${got}'
+	p := unsafe { pd }
+	pd_write(&p.db1, 'X') // the late reply: the tombstone run arms the background watch
+	assert pd_until(&p.drained, 1) == 1, 'the late reply was not drained'
+	pd_write(&p.bg_w, 'b')
+	assert pd_until(&p.bg_runs, 1) == 1, 'the background watch armed by the tombstone run never ran'
 }
 
 // A pipelined queue on one persistent fd: A parks first (5 s), B behind it
