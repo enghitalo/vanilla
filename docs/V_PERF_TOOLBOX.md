@@ -41,9 +41,10 @@ only safe where the hot path is **literally allocation-free** (otherwise it leak
 - `v -showcc …` — the exact C compiler command.
 - `v -warn-about-allocs …` — a warning per allocation site (array/struct/string
   building, locals moved to the heap). It cannot tell startup code from the request
-  path, and it misses arrays the compiler synthesizes (the `method.attrs` array below),
-  so confirm a hot path with a counter: a `gc_heap_usage().total_bytes` delta over N
-  requests in a test (`test_routing_allocates_nothing` in examples/veb_like).
+  path, and it can miss what the compiler creates (a struct moved to the heap
+  inside veb_like's generic `handle` went unreported, see below), so confirm a hot
+  path with a counter: a `gc_heap_usage().total_bytes` delta over N requests in a
+  test (`test_routing_allocates_nothing` in examples/veb_like).
 
 This is how we found (a) the `epoll_data` union GC-codegen bug and (b) that
 `[]u8{cap:N}` is already noscan/uninit (so a big-cap regression was GC pressure,
@@ -125,30 +126,46 @@ Already used here for the per-worker epoll fd arrays
   precompute `const` keys, parse ints in place, and append into a reused buffer.
   Corollary: confirm perf changes on a high-core run, not just a laptop.
 
-## Comptime and struct traps (open upstream)
+## Comptime, escape and allocation checks (V `5516000`)
 
-Found while making the routers allocation-free; verified in the emitted C on V
-0.5.2 (`0137eb5`). Each has a workaround in the tree.
+Found while making the routers allocation-free, and re-checked in the emitted C
+on V 0.5.2 `5516000` (2026-10-09), after the upstream fixes they led to.
 
-- **`method.attrs` allocates on every pass of a `$for`.** `for attr in method.attrs`
-  inside `$for method in T.methods` emits `new_array_from_c_array(...)` — a heap
-  array per method, per execution. In a per-request dispatch that is one
-  allocation per route scanned (the old `examples/veb_like` paid 13 to reach its
-  last route and 26 for a 404). Read attributes once, at startup, into a table
-  ([`veb_like.new`](../http1_1/veb_like/router.v)). A `$for` that only
-  calls `app.$method(...)` reads no attributes and allocates nothing; GCC folds
-  its integer compares into a jump table and inlines the handlers.
-- **A struct holding a fixed array moves to the heap when referenced.** A local
-  `struct { vals [8]Slice }` (even `[2]Slice`) is `memdup`'d as soon as it is
-  passed by `mut` or `&` — `unsafe { &x }` included. The same data as plain
-  fields stays on the stack (`veb_like.Params` keeps `v0`…`v7` and indexes them
-  through the first one's address). A bare fixed-array local is fine — `[20]u8`
-  digits behind `(&a[0]).vbytes(n)`, a `[4]i64` itimerspec behind `&spec[0]`.
-- **A forwarded `mut` parameter in a comptime call.** `app.$method(req, mut out)`,
-  where `out` is itself a `mut` parameter, fails ("cannot use `&[]u8` as
-  `&&[]u8`"); write `app.$method(req, out)` — it is still the caller's buffer.
-- **`T.$method` is not a value** (the emitted C names an undeclared `T`);
-  `app.$method` is, as a closure bound to `app`.
+- **`method.attrs` inside `$for` is free** since vlang/v#29404. `for attr in
+  method.attrs` unrolls into one block per attribute; `method.attrs.len`,
+  `.contains('x')` and `[i]` fold to constants, in `$if` too. (Before, it built a
+  heap array per method on every pass: the old `examples/veb_like` paid 13
+  allocations to reach its last route.) A `$for` that calls `app.$method(...)`
+  behind an integer compare compiles to a jump table with the handlers inlined.
+- **Route attributes can be parsed at compile time** (vlang/v#29601, #29723):
+  `$for attr in method.attributes`, `attr.name.all_after(' ')`,
+  `$for seg in path.split('/')` and `$if seg.starts_with(':')` fold and unroll,
+  so a router can generate one matcher per route. Against veb_like's trie on
+  bench/router's routes (aligned builds), that was 3–5% faster for routes with
+  two or three params, but 6–25% slower for static routes, catch-alls and 404s,
+  and slower for 405 (no prebuilt `Allow`); it is linear in the number of routes
+  and picks the first declared route, not the most specific. veb_like keeps the
+  trie.
+- **A struct holding a fixed array stays on the stack one call deep**
+  (vlang/v#29546). Passed by `mut` or `&` to a callee that reads or writes its
+  fields itself, it stays local; if that callee passes it on, even to a method
+  (`p.get(name)`), the struct is still `memdup`'d per call. `veb_like.Params` is
+  handed to handlers that call `p.get`, so it keeps eight plain fields
+  (`v0`…`v7`, indexed through the first one's address). `-warn-about-allocs`
+  reports the move ("local moved to the heap: its fixed array storage may
+  escape"), but it did not for veb_like's generic `Router[T].handle`. A bare
+  fixed-array local passed as `&a[0]` was never moved.
+- **Forwarding a `mut` parameter in a comptime call works** since
+  vlang/v#29404: `app.$method(req, p, mut out)`.
+- **Methods are values** since vlang/v#29551: `App.one` and `T.$method` are
+  plain `fn (&App, …)` pointers, no closure (`app.one` still allocates one).
+  Dispatching through a table of them measured within a few percent of the
+  `$for` jump table, so veb_like keeps the `$for`.
+- **`@[noalloc]` exists** (vlang/v#29567, `doc/noalloc.md` in V) but, on
+  `5516000`, it rejects `&&` and `||`, struct literals whose type has field
+  defaults, and string views (`tos`, returning a `string`), so the routers can't
+  carry it without contortions. The runtime tests (`test_routing_allocates_nothing`)
+  remain the check.
 
 ## Appending a static response
 

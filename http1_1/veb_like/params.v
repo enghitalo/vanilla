@@ -6,9 +6,10 @@ import http1_1.request_parser { Slice }
 // the request buffer. It lives on the router's stack frame for one request.
 //
 // The eight value slots are plain fields, not a `[8]Slice`: V moves a local
-// struct that contains a fixed-size array to the heap (memdup) as soon as it
-// is passed by `mut` or `&`, which would cost one allocation per request. A
-// struct of plain fields stays on the stack; the slots are reached by index
+// struct that contains a fixed-size array to the heap (memdup) when a function
+// it is passed to passes it on (every handler calls p.get), which would cost
+// one allocation per request (V 0.5.2 5516000; one call deep it stays local).
+// A struct of plain fields stays on the stack; the slots are reached by index
 // through the first one's address (same type, adjacent, no padding between).
 pub struct Params {
 mut:
