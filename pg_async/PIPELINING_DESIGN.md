@@ -100,6 +100,70 @@ reduction (fewer syscalls/parses per query), and because Postgres replies in ord
 a handful of pipelined conns saturate the link — so the per-worker 2-conn pool is
 fixable by pipelining, not by more connections.
 
+## Transactions on a pipelined pool (vanilla#199)
+Every `async_submit` carries its own Sync, so each query is its own implicit
+transaction. A pipelined connection is shared, so a transaction that spans
+queries must not be: everything pipelined behind a BEGIN runs inside it, a
+ROLLBACK undoes it, and after a failed statement every one of them fails with
+25P02 until someone rolls back.
+- **Status byte.** The ReadyForQuery that completes a query carries the
+  session's transaction status: `I` idle, `T` in a block, `E` in a failed
+  block. `async_on_readable` stores it (one byte of a frame already in hand);
+  `tx_status()` / `in_transaction()` read it. It describes the session as of
+  the last completed query, not the queries still in flight.
+- **Who may share.** `acquire()` is the exclusive borrow: held until
+  `release()`, and `acquire_pipelined()` never shares it — that is the borrow
+  for BEGIN … COMMIT across park/resume. `acquire_pipelined()` also skips a
+  connection whose status is not `I`, and `acquire()` skips one nobody holds
+  (a BEGIN that went through `acquire_pipelined()`, which the docs forbid).
+- **Safe release.** `release()` of a connection not in `I` queues a ROLLBACK
+  and keeps the slot out of the idle set (`rollback_deadline` set). Nobody is
+  parked on the connection any more, so the pool reads the reply itself: the
+  next `acquire()` / `acquire_pipelined()` / `maintain()` that passes the slot
+  advances it one non-blocking step (`finish_rollback`), exactly as they
+  advance a re-dial; `maintain()` ticks at `maintenance_busy_ms` while one is
+  in flight. The slot is idle again only once the ROLLBACK's ReadyForQuery
+  reports `I`. A lost connection, an error, or no answer within
+  `rollback_timeout` (5 s) breaks the connection instead, and the re-dial
+  replaces the session. The reactor needs nothing new: the ROLLBACK's reply
+  arriving on a pooled fd with no watch is the leftover-fd case (detached,
+  not closed), and the next `watch_fd_persistent` re-adds the fd. A release
+  of an idle session stays one flag write.
+- **Batches.** `async_submit_batch` writes N × Parse/Bind/Describe/Execute and
+  ONE Sync: one implicit transaction (atomic, one round trip), and ONE entry
+  of the in-flight FIFO, so the reactor's `queue[k] ↔ inflight[k]` alignment
+  is unchanged — the request parks once and gets one Result.
+  `Result.statement(i)` splits it at each CommandComplete /
+  EmptyQueryResponse (views, no allocation); a failure is the PgError of the
+  failing statement with its index in `PgError.statement` (the batch's length
+  when the commit at the Sync failed). A batch that can never fit the fixed
+  send buffer (`send_buf_cap`), or an empty one, is an error on every
+  connection; a momentarily full connection returns false, a shed (#51). A
+  batch without BEGIN is as pipeline-safe as one query; one that opens an
+  explicit transaction leaves the session in `T` (or `E`) after its Sync and
+  belongs on `acquire()`.
+- **Retries.** A serialization failure (40001: SERIALIZABLE, and every OCC
+  conflict on Aurora DSQL, often at COMMIT) means running the whole
+  transaction again. `TxRetry` holds no state: `retry(attempt, err)` and
+  `backoff_ms(attempt)` (full jitter, from the monotonic clock).
+  `examples/pg_transactions` re-runs the batch at once on the connection the
+  request holds and re-arms the same fd, counting attempts in the worker
+  state, not in the watch payload (a disconnected client's re-arm keeps its
+  first payload).
+- **Reactor limitation found here.** A continuation parked on a pooled fd
+  cannot step to ANOTHER fd (a timerfd for a backoff wait, an upstream) in
+  two cases. (1) It is pipelined: `drain_pipelined`'s `.suspend` arm assumes
+  the head re-armed the same fd, so the slot stays at the head and the next
+  reply on the connection runs it again. That is a FIFO misalignment:
+  measured as requests hanging forever while every backend sat idle.
+  (2) Its client disconnected: the dead-slot arm (`rearming_dead`) re-arms
+  whatever fd it is given without a watch entry. The tombstone stays at the
+  head, and the new fd is never closed. The single-watch path
+  (`on_watch_ready`) already handles a step away. io_uring's
+  `drain_pipelined_iou` mirrors the same arms. Until the drains pop a slot
+  that stepped away (and tear down a dead slot's new watch), a backoff wait
+  after a DB reply is not safe.
+
 ## Local validation harness
 `bench/pg_async/` pipeline-tests pg_async locally against a seeded PG
 (`pg_async/testdata/throwaway_pg.sh`): `e2e.sh` (req/s, latency, server CPU per
