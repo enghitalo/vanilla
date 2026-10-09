@@ -153,6 +153,12 @@ mut:
 	// While parked with a deadline (park_conn): this connection's entry in
 	// PlainState.timers, -1 when none is armed. Kept in step by the heap.
 	park_timer int = -1
+	// Its subscription (vanilla#230, push_linux.c.v): the wake fn (nil = not
+	// subscribed) and its state, and the entry of its wake_after timer in
+	// PlainState.timers (-1 = none).
+	wake_fn    core.WakeFn = unsafe { nil }
+	sub_state  voidptr
+	wake_timer int = -1
 }
 
 // PlainState is the per-worker connection table. `parked` counts armed
@@ -213,6 +219,14 @@ mut:
 	// wait timeout, so it works with no other timeout set.
 	park_ns u64
 	timers  []ParkTimer
+	// Subscriptions (push_linux.c.v): the worker's mailbox (nil: posts off),
+	// the .closed notifications due at the end of this loop iteration (reused,
+	// never shrunk), the pending-write bound of a pushed connection, and
+	// whether .shutdown was delivered.
+	mbox           &Mailbox = unsafe { nil }
+	closed_q       []ClosedNote
+	push_watermark int
+	shutdown_seen  bool
 }
 
 // birth_queue_cap is the capacity of a worker's BirthQueue (a power of two).
@@ -797,6 +811,12 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 				detach_rejected_watch(mut st.reactor, epoll_fd, cs.awaiting_fd, fd)
 			}
 			unpark_conn(mut st, mut cs) // releases a parked request's in-flight count
+			if cs.wake_fn != unsafe { nil } {
+				// A subscription ends with the connection: its wake fn gets
+				// .closed once, at the end of this loop iteration
+				// (notify_closed), never inside a close path.
+				st.queue_closed(mut cs)
+			}
 			if cs.read_deadline != 0 {
 				st.parked--
 			}
@@ -826,7 +846,8 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			cs.file_remaining = 0
 			cs.body_drain = 0
 			cs.drain_off = 0
-			// awaiting_fd and park_timer are already -1 (unpark_conn above)
+			// awaiting_fd and park_timer are already -1 (unpark_conn above),
+			// wake_fn, sub_state and wake_timer reset (queue_closed)
 			cs.close_after_flush = false
 			cs.sent_100 = false
 			cs.takeover = unsafe { nil }

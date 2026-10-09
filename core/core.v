@@ -83,8 +83,11 @@ pub type WakeFn = fn (mut response []u8, ready_fd int, ready_fd_error bool, watc
 // event_loop.timed_out()). One notion for every backend wake-up, so later
 // reasons extend this enum instead of adding a second continuation type.
 pub enum WakeReason {
-	ready   // the watched fd is ready, or failed (ready_fd_error)
-	timeout // the watch's deadline passed before the fd was ready
+	ready    // the watched fd is ready, or failed (ready_fd_error)
+	timeout  // the watch's deadline passed before the fd was ready; or, for a wake fn, its wake_after timer
+	posted   // a wake fn: a post reached the connection's ConnHandle (post_tag, post_data)
+	closed   // a wake fn's last call: the connection is gone, `response` is scratch
+	shutdown // a wake fn: Server.shutdown() was called
 }
 
 // Handler is THE request handler contract — one signature for every use case:
@@ -136,10 +139,14 @@ pub type RegisterFn = fn (mut event_loop EventLoop, ext_fd int, interest WatchIn
 //   event_loop.watch_fd_persistent_deadline(fd, .readable, continuation, watch_payload, timeout_ms)
 //   event_loop.timed_out() // in a continuation: woken by the deadline, not the fd
 //   event_loop.watch_fd_background(fd, .readable, continuation, watch_payload)
+//   event_loop.subscribe(wake_fn, sub_state) // server push (conn_handle.v)
+//   event_loop.wake_after(ms)
+//   event_loop.reason() / post_tag() / post_data() // in a wake fn
 //
 // Everything else (client_fd — whose request parks, loop_fd, reactor,
-// last_watched, persistent, timeout_ms, reason, register) is plumbing filled
-// by the backend; handlers never touch the fields. It is the layering bridge:
+// last_watched, persistent, timeout_ms, reason, register, the hooks and the
+// post fields) is plumbing filled by the backend; handlers never touch the
+// fields. It is the layering bridge:
 // `core` owns the type and the handler contract, each backend owns the
 // registration logic (installed via the `register` fn pointer), so `core`
 // stays backend-free.
@@ -166,6 +173,13 @@ pub mut:
 	// reason: plumbing, why the backend is running the current continuation.
 	reason   WakeReason
 	register RegisterFn = unsafe { nil }
+	// Subscriptions (conn_handle.v): the backend's hooks (nil = none here),
+	// and the post a wake fn is delivering (.posted).
+	subscribe_hook  SubscribeFn = unsafe { nil }
+	wake_after_hook WakeAfterFn = unsafe { nil }
+	post_tag        u64
+	post_ptr        voidptr
+	post_len        int
 }
 
 // watch_fd parks the current request and asks the worker to run `continuation`
@@ -265,10 +279,12 @@ pub fn (event_loop &EventLoop) timed_out() bool {
 pub fn (mut event_loop EventLoop) watch_fd_background(fd int, interest WatchInterest, continuation WakeFn, watch_payload voidptr) bool {
 	mut bg := EventLoop{
 		...event_loop
-		client_fd:    -1
-		last_watched: -1
-		persistent:   false
-		timeout_ms:   0
+		client_fd:       -1
+		last_watched:    -1
+		persistent:      false
+		timeout_ms:      0
+		subscribe_hook:  unsafe { nil }
+		wake_after_hook: unsafe { nil }
 	}
 	bg.register(mut bg, fd, interest, continuation, watch_payload)
 	return bg.last_watched == fd

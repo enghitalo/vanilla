@@ -55,7 +55,7 @@ fn test_heap_keeps_order_and_back_indexes() {
 		assert pt_ok(&st)
 	}
 	assert st.timers.len == 64 - 22
-	// Pop in deadline order, as fire_park_deadlines does.
+	// Pop in deadline order, as fire_timers does.
 	mut last := u64(0)
 	for st.timers.len > 0 {
 		t := st.timers[0]

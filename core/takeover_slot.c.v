@@ -18,6 +18,7 @@ module core
 fn C.vanilla_to_enable()
 fn C.vanilla_to_queue(cont voidptr, state voidptr) bool
 fn C.vanilla_to_take(out_cont &voidptr, out_state &voidptr) bool
+fn C.vanilla_to_pending() bool
 
 // ConnHandler drives a taken-over connection: it runs on every readable burst,
 // consumes complete protocol frames from `buf` (a view of the connection's
@@ -75,6 +76,14 @@ pub fn enable_takeover() {
 @[inline]
 pub fn queue_takeover(cont ConnHandler, takeover_state voidptr) bool {
 	return C.vanilla_to_queue(voidptr(cont), takeover_state)
+}
+
+// takeover_pending reports whether the handler running on this thread has
+// queued a takeover that the worker has not installed yet: the connection is
+// being handed over (EventLoop.subscribe uses it from the upgrade handler).
+@[inline]
+pub fn takeover_pending() bool {
+	return C.vanilla_to_pending()
 }
 
 // take_queued_takeover returns the takeover a handler queued during the

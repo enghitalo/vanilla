@@ -119,6 +119,12 @@ jobs:
         shell: bash
         run: |
           v -race -cc "$RACE_CC" -no-parallel -run-only 'test_epoll_*' test tests/park_deadline_test.v
+      # The push mailbox is a lock-free MPSC ring: producer threads against
+      # the worker that drains it (vanilla#230).
+      - name: 'conn_push_test.v (epoll: subscriptions, the push mailbox from producer threads)'
+        shell: bash
+        run: |
+          v -race -cc "$RACE_CC" -no-parallel -run-only 'test_epoll_*' test tests/conn_push_test.v
       - name: uds_test.v (epoll) and vtest smoke
         shell: bash
         run: |
@@ -134,6 +140,7 @@ jobs:
         run: |
           v -race -cc "$RACE_CC" -no-parallel test server/backend_epoll/reactor_pipelining_test.v
           v -race -cc "$RACE_CC" -no-parallel test server/backend_epoll/park_timer_test.v
+          v -race -cc "$RACE_CC" -no-parallel test server/backend_epoll/mailbox_test.v
       - name: static_assets (follow_disk race test included) and core hand-off slot unit tests
         shell: bash
         run: |

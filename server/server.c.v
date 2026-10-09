@@ -57,6 +57,33 @@ pub mut:
 	// re-arming and the workers quit accepting. Unused by the epoll backend (which
 	// stops accepting when its single listener is closed).
 	draining &core.Counter = &core.Counter{}
+	// Server push (vanilla#230): one mailbox per epoll plain worker when
+	// ServerConfig.push_mailbox_slots > 0 (empty otherwise), opaque here and
+	// never freed (ConnHandles may outlive the server); and the pending-write
+	// bound of a pushed connection (0 = the default).
+	mailboxes      []voidptr
+	push_watermark int
+}
+
+// PushStats are the server's push counters, summed over its workers'
+// mailboxes (push_stats): posts enqueued, refused because a mailbox was full,
+// delivered to a wake fn, and dropped as stale (the connection was gone, or
+// no longer subscribed, when its worker took the post).
+pub struct PushStats {
+pub:
+	posted    u64
+	full      u64
+	delivered u64
+	stale     u64
+}
+
+// push_stats sums the push counters of every worker's mailbox (zero when the
+// mailbox is off).
+pub fn (s &Server) push_stats() PushStats {
+	$if linux {
+		return push_stats_linux(s.mailboxes)
+	}
+	return PushStats{}
 }
 
 // shutdown performs a graceful stop: it stops every listener so the kernel
@@ -96,6 +123,11 @@ pub fn (s Server) shutdown(grace_ms int) {
 	// Tell the io_uring accept handlers to stop re-arming BEFORE the listeners are
 	// shut, so the resulting accept-error completion already observes the flag.
 	stdatomic.store_i64(&s.draining.n, 1)
+	// Subscribed connections (vanilla#230) get .shutdown, to say goodbye; the
+	// drain below waits for those deliveries, not for the connections.
+	$if linux {
+		signal_push_shutdown(s.mailboxes, s.inflight)
+	}
 	// UDS + io_uring wake poke (issue #122 §5): shutdown(2) on an AF_UNIX
 	// listener produces NO CQE for armed multishot accepts (unlike TCP), so a
 	// parked worker would never observe `draining`. Wake each worker with a
@@ -188,9 +220,20 @@ pub:
 	// to log readiness, register in service discovery, write a PID/ready file,
 	// notify a supervisor, or signal a channel in tests. See core.AfterStartFn.
 	after_server_start core.AfterStartFn = unsafe { nil }
-	certificates       Certificates
-	limits             Limits
-	tls_config         &tls.Config = unsafe { nil } // set for HTTPS (e.g. tls.new_self_signed())
+	// push_mailbox_slots > 0 gives every epoll plain worker a mailbox of that
+	// many slots (rounded up to a power of two; ~280 B each: 4096 slots are
+	// ~1.1 MiB per worker), through which any thread can post to a subscribed
+	// connection (core.ConnHandle.post_wake / post_bytes, vanilla#230). 0 (the
+	// default) = off: posts report .unsupported; subscriptions, wake_after and
+	// .closed still work. The epoll plain worker only.
+	push_mailbox_slots int
+	// push_watermark_bytes bounds what a subscribed connection may have
+	// waiting to be sent after its wake fn ran: past it the connection is
+	// closed (a subscriber that stopped reading). 0 = 1 MiB; at most 8 MiB.
+	push_watermark_bytes int
+	certificates         Certificates
+	limits               Limits
+	tls_config           &tls.Config = unsafe { nil } // set for HTTPS (e.g. tls.new_self_signed())
 	// workers sets how many worker threads THIS server runs. 0 (default) =
 	// `VANILLA_WORKERS` env → `runtime.nr_cpus()` (the process-wide default). Set it
 	// PER server instance when co-hosting two servers in one process so their worker
@@ -336,6 +379,17 @@ pub fn new_server(config ServerConfig) !Server {
 		}
 	}
 
+	// Server push mailboxes (vanilla#230): one per epoll plain worker, built
+	// once the listeners are open, here so shutdown() can reach them; never
+	// freed.
+	mut mailboxes := []voidptr{}
+	$if linux {
+		if config.push_mailbox_slots > 0 && io_multiplexing == .epoll
+			&& config.tls_config == unsafe { nil } {
+			mailboxes = new_push_mailboxes(n_workers, config.push_mailbox_slots)
+		}
+	}
+
 	// sendfile(2) has no MSG_NOSIGNAL: a write to a peer that reset the
 	// connection raises SIGPIPE, whose default action kills the whole process.
 	// Ignore it, unless the application set its own disposition (see the doc
@@ -356,5 +410,7 @@ pub fn new_server(config ServerConfig) !Server {
 		threads:            []thread{len: n_workers, cap: n_workers}
 		inflight:           []&core.Counter{len: n_workers, init: &core.Counter{}}
 		listener_fds:       listener_fds
+		mailboxes:          mailboxes
+		push_watermark:     config.push_watermark_bytes
 	}
 }
