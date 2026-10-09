@@ -215,7 +215,8 @@ jobs:
       # examples/https_upstream's edge, against its fake upstream (a V
       # program the test builds, serving TLS with the test CA): response
       # shapes, keep-alive reuse, stale connections, retries, close_notify vs
-      # a bare FIN, certificate failures, early answers, 4 MiB bodies,
+      # a bare FIN, certificate failures, IPv4/IPv6 literal origins (iPAddress
+      # SANs), early answers, 4 MiB bodies,
       # deadlines, shedding, client disconnects, the resolver thread.
       # VANILLA_REQUIRE_FAKE_PG turns a missing openssl (the test CA) into a
       # failure instead of a skip.
