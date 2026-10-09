@@ -42,6 +42,16 @@ bench/middleware/middleware_bench
 bench/request_parser/request_parser_bench
 bench/static_assets/static_assets_bench
 
+# Compiled test binaries: `v tests/foo_test.v` drops `foo_test` beside the
+# source (#258). Extension-less files only: `foo_test.v` does not match, and
+# the negation keeps any `*_test/` directory visible.
+*_test
+!*_test/
+
+# Compiled example binaries (build from `src/`, see each README)
+examples/etag/simple
+examples/io_uring_demo/io_uring_demo
+
 # V build / profiling artifacts
 *.tmp.c
 perf.data
