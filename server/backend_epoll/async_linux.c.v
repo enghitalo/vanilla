@@ -96,10 +96,11 @@ mut:
 	// per event instead of an fd-indexed table load — the pure-sync fast path.
 	armed bool
 	// Set around a tombstoned slot's continuation (drain_pipelined dead branch):
-	// its re-arm must ONLY re-arm the fd in epoll — the tombstone queue slot stays
-	// exactly as it is (same continuation, same udata), and the watch table must
-	// not be touched (a dedup match would refresh the tombstone; a dedup that
-	// skips dead slots would append a duplicate).
+	// a re-arm of the tombstone's own fd re-arms it in epoll and updates only the
+	// head slot's continuation and udata (a multi-step chain), never dedups or
+	// appends (a dedup match could hand a live slot the dead continuation; a
+	// dedup that skips dead slots would append a duplicate). A watch on any other
+	// fd is a step away: see dead_fd.
 	rearming_dead bool
 	// dead_fd: the fd whose tombstone is running while rearming_dead is set. A
 	// watch on any OTHER fd is the continuation stepping away (a retry on a
@@ -1368,11 +1369,11 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 				reactor:   unsafe { voidptr(&reactor) }
 				register:  register_watch
 			}
-			// rearming_dead: a re-arm from this tombstone's continuation must leave
-			// the watch table alone (the tombstone slot stays exactly as it is) —
-			// see register_watch. Without the bypass, dedup matching the dead slot
-			// would refresh it, and a dedup that SKIPS dead slots would append a
-			// duplicate instead.
+			// rearming_dead: a re-arm from this tombstone's continuation updates
+			// only this head slot (continuation, udata) and re-arms ext_fd; a
+			// watch on another fd is a step away (dead_fd). See register_watch: a
+			// plain dedup could match a live slot on the dead client's reused
+			// number, and a dedup that SKIPS dead slots would append a duplicate.
 			reactor.rearming_dead = true
 			reactor.dead_fd = ext_fd
 			// No file from a continuation (on_watch_ready).

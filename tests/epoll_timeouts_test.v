@@ -44,7 +44,17 @@ import vtest
 $if linux {
 	#include <sys/timerfd.h>
 	#include <sys/socket.h>
+	#include <sys/resource.h>
 }
+
+struct C.rlimit {
+mut:
+	rlim_cur u64
+	rlim_max u64
+}
+
+fn C.getrlimit(resource int, rlim &C.rlimit) int
+fn C.setrlimit(resource int, rlim &C.rlimit) int
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
@@ -55,6 +65,34 @@ fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
 fn C.clock() i64 // this process's CPU time, in CLOCKS_PER_SEC (1e6 on POSIX) units
 fn C.send(__fd int, __buf voidptr, __n usize, __flags int) int
 fn C.recv(__fd int, __buf voidptr, __n usize, __flags int) int
+
+// et_fd_room makes fd number `n` usable: it raises the RLIMIT_NOFILE soft
+// limit past `n`, up to the hard limit. false when the hard limit is too low
+// (a check pinned to `n` is then skipped, not failed).
+fn et_fd_room(n int) bool {
+	mut rl := C.rlimit{}
+	if C.getrlimit(C.RLIMIT_NOFILE, &rl) != 0 {
+		return false
+	}
+	if rl.rlim_cur > u64(n) {
+		return true
+	}
+	if rl.rlim_max <= u64(n) {
+		return false
+	}
+	rl.rlim_cur = u64(n) + 1
+	return C.setrlimit(C.RLIMIT_NOFILE, &rl) == 0
+}
+
+// et_pinned_tombstone_step runs check_tombstone_steps_to_new_fd pinned to fd
+// 4000 (past the watch table) when the fd limit allows it.
+fn et_pinned_tombstone_step(backend server.IOBackend, limits server.Limits) ! {
+	if !et_fd_room(4000) {
+		eprintln('[test] RLIMIT_NOFILE hard limit <= 4000: skipping the fd-4000 variant')
+		return
+	}
+	check_tombstone_steps_to_new_fd(backend, limits, 4000)!
+}
 
 const et_req = 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 const et_ok = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
@@ -2061,8 +2099,15 @@ fn check_tombstone_multi_step_same_fd(limits server.Limits) ! {
 	assert stdatomic.load_i64(&c.tparked) == 1, '${label}: precondition: A did not park'
 	o := h.fire([et_one(et_torch_req)])! // A hangs up, then the upstream answers
 	assert o.conns[0].frames.len == 1, '${label}: /torch not answered'
-	seen := h.send(barrier.group, et_req, vtest.frames(2))!
-	assert seen.conns[0].frames.len == 2
+	mut seen := h.send(barrier.group, et_req, vtest.frames(2))!
+	// The second step runs one batch after the first, which may have shared a
+	// batch with that barrier: more round trips (a batch each) let it run.
+	mut n := 2
+	for n < 6 && stdatomic.load_i64(&c.step2) == 0 {
+		n++
+		seen = h.send(barrier.group, et_req, vtest.frames(n))!
+	}
+	assert seen.conns[0].frames.len == n
 	assert stdatomic.load_i64(&c.step2) == 1, "${label}: the tombstone's second step ran ${stdatomic.load_i64(&c.step2)} times with its own payload"
 }
 
@@ -2144,7 +2189,7 @@ fn test_epoll_stale_event_not_routed_to_new_watch() ! {
 fn test_epoll_tombstone_steps_to_new_fd() ! {
 	$if linux {
 		for limits in [server.Limits{}, et_births_on] {
-			check_tombstone_steps_to_new_fd(.epoll, limits, 4000)!
+			et_pinned_tombstone_step(.epoll, limits)!
 			check_tombstone_steps_to_new_fd(.epoll, limits, 0)!
 		}
 	}
@@ -2170,7 +2215,7 @@ fn test_iouring_tombstone_steps_to_new_fd() ! {
 			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
 			return
 		}
-		check_tombstone_steps_to_new_fd(.io_uring, server.Limits{}, 4000)!
+		et_pinned_tombstone_step(.io_uring, server.Limits{})!
 		check_tombstone_steps_to_new_fd(.io_uring, server.Limits{}, 0)!
 	}
 }
