@@ -28,7 +28,8 @@ import time
 // fresh credential for every attempt) and the TLS handshake's crypto steps do
 // run inline, once per attempt. The SCRAM key derivation (PBKDF2) does not:
 // the pool's ScramCache already holds it, unless the server changed the
-// salt. A failed attempt
+// salt. A connection recycled for max_lifetime_ms takes the same path, driven
+// by maintain() alone (maintenance.v). A failed attempt
 // (refused, closed, authentication error, or redial_timeout) closes its socket
 // and is retried after redial_backoff, starting at the next resolved address
 // (addr_cursor), so a dead one is not retried first forever. The first attempt starts on the first
@@ -169,6 +170,7 @@ fn (mut c PgConn) redial_step(cfg ConnConfig) !bool {
 		c.recv_pos += hdr.total
 		if c.on_startup_msg(typ, payload, &cfg, mut c.scram)! {
 			c.state = .ready
+			c.expires_at = c.lifetime_deadline(&cfg, time.sys_mono_now())
 			return true
 		}
 	}

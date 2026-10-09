@@ -1,6 +1,7 @@
 module pg_async
 
 import tls
+import time
 
 // PgPool is a per-worker pool of PostgreSQL connections. Each worker owns its
 // own pool — no cross-worker sharing, so no locks (the make_state model). The
@@ -14,6 +15,11 @@ import tls
 // requests parked on it have collected their errors (redial.v). So a dead
 // connection costs at most the queries that were already on it — the other
 // slots keep serving, and the slot comes back on its own.
+//
+// With max_lifetime_ms, maintain() also recycles connections that have been up
+// that long, before the server's own cap closes them under a query: one at a
+// time, out of the idle set, so no request ever waits on its re-dial
+// (maintenance.v).
 
 pub struct PgPool {
 mut:
@@ -29,6 +35,13 @@ mut:
 	// next tick to stop.
 	timer_fd int = -1
 	closed   bool
+	// clock is the monotonic time of the last maintain() tick: release()
+	// compares lifetime deadlines with it, so the query path reads no clock.
+	clock u64
+	// recycling is the connection being recycled for max_lifetime_ms (-1 if
+	// none): the pool holds it out of the idle set until maintain() has
+	// re-dialed it.
+	recycling int = -1
 }
 
 // PgPool.connect brings up `size` connections (size >= 1) and returns a ready
@@ -62,6 +75,7 @@ pub fn PgPool.connect(cfg ConnConfig, size int) !PgPool {
 			free_tls_config(tls_cfg)
 			return error('pg pool: set_nonblocking on connection ${i} failed: ${err}')
 		}
+		c.expires_at = c.lifetime_deadline(&cfg, time.sys_mono_now())
 		conns << c
 	}
 	return PgPool{
@@ -134,15 +148,54 @@ pub fn (mut p PgPool) acquire() ?int {
 // successfully or not). A connection released with a query still in flight —
 // the borrower gave up on it, e.g. after a failed or partial flush — is retired
 // instead of reused: its late reply would go to the next borrower. It is
-// re-dialed like a lost one.
+// re-dialed like a lost one. A connection past its max_lifetime_ms (as of the
+// last maintain() tick) is kept by the pool instead, and recycled by
+// maintain() before anyone takes it again.
 pub fn (mut p PgPool) release(idx int) {
 	if idx >= 0 && idx < p.idle.len {
 		if p.conns[idx].inflight.len > 0 {
 			p.conns[idx].lose('released with a query in flight')
 			p.conns[idx].inflight.clear()
 		}
+		if p.conns[idx].expires_at <= p.clock && p.recycling < 0 {
+			p.recycling = idx
+			return
+		}
 		p.idle[idx] = true
 	}
+}
+
+// lifetime_deadline is when a connection that came up at `now` is due for
+// recycling: max_u64 (never) unless cfg.max_lifetime_ms is set. A random share
+// of lifetime_jitter_ms comes off it, so connections opened together (every
+// worker's pool, at startup) spread over the jitter instead of coming due in
+// the same tick. The share hashes the clock with the connection's address
+// (splitmix64): per connection, no shared RNG, no lock, no allocation.
+fn (c &PgConn) lifetime_deadline(cfg &ConnConfig, now u64) u64 {
+	if cfg.max_lifetime_ms <= 0 {
+		return max_u64
+	}
+	life := u64(cfg.max_lifetime_ms) * u64(time.millisecond)
+	mut span := if cfg.lifetime_jitter_ms > 0 {
+		u64(cfg.lifetime_jitter_ms) * u64(time.millisecond)
+	} else {
+		u64(0)
+	}
+	if span >= life {
+		span = life - 1 // a connection always gets some lifetime
+	}
+	return now + life - splitmix64(now ^ u64(voidptr(c))) % (span + 1)
+}
+
+// splitmix64 is one round of the SplitMix64 generator's output mix (Steele,
+// Lea and Flood, 2014): nearby inputs (two clock readings, two addresses)
+// come out unrelated.
+@[inline]
+fn splitmix64(x u64) u64 {
+	mut z := x + 0x9e37_79b9_7f4a_7c15
+	z = (z ^ (z >> 30)) * 0xbf58_476d_1ce4_e5b9
+	z = (z ^ (z >> 27)) * 0x94d0_49bb_1331_11eb
+	return z ^ (z >> 31)
 }
 
 // acquire_pipelined returns the index of the connection with the FEWEST in-flight

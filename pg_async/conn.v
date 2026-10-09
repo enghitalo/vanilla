@@ -186,7 +186,7 @@ pub:
 	password string
 	// password_fn, when set, is asked for the password on every connection
 	// attempt instead of reading `password`: once per connection a pool brings
-	// up, and once per re-dial of a lost connection.
+	// up, and once per re-dial (a lost connection, a max_lifetime_ms recycle).
 	// It is for short-lived credentials, such as an IAM auth token (Aurora DSQL,
 	// RDS), which the server checks only when a session starts. It runs on the
 	// worker thread, never per query but inline in a re-dial step: keep it
@@ -239,6 +239,18 @@ pub:
 	// before the kernel drops the connection. 0 = the OS default (~15 min of
 	// retransmissions).
 	tcp_user_timeout_ms int = 30_000
+	// max_lifetime_ms (PgPool) recycles a pooled connection once it has been
+	// up this long: it is taken out of the pool, its pipelined queries drain,
+	// it says goodbye (Terminate) and is re-dialed in place without blocking
+	// (a fresh password_fn credential), one connection at a time. Set it below
+	// a server's own cap (Aurora DSQL closes every connection after 60 min), so
+	// a query never meets the server's close. Driven by maintain(): run
+	// start_maintenance (or call maintain() from your own timer). 0 = off.
+	max_lifetime_ms int
+	// lifetime_jitter_ms takes a random share of up to this much off each
+	// connection's lifetime, so the connections every worker opened at startup
+	// do not all come due in the same tick. max_lifetime_ms stays the bound.
+	lifetime_jitter_ms int
 }
 
 // check_startup_params refuses run-time parameters the StartupMessage cannot
@@ -347,6 +359,10 @@ mut:
 	// io_deadline bounds the waits of the blocking bring-up over TLS
 	// (monotonic ns; 0 = wait as long as it takes).
 	io_deadline u64
+	// expires_at is when a pooled connection is due for recycling
+	// (max_lifetime_ms, monotonic ns; max_u64 = never), set each time it
+	// comes up (lifetime_deadline).
+	expires_at u64 = max_u64
 }
 
 struct Msg {
@@ -405,11 +421,18 @@ fn (mut c PgConn) bring_up(cfg &ConnConfig) ! {
 // the socket.
 pub fn (mut c PgConn) close() {
 	if c.fd >= 0 && c.state == .ready {
-		mut out := []u8{}
-		write_terminate(mut out)
-		c.send_some(out.data, out.len) // one attempt: never wait on a peer to close
+		c.send_terminate()
 	}
 	c.teardown()
+}
+
+// terminate_msg is a Terminate ('X'): the whole message, Int32 length 4.
+const terminate_msg = [u8(`X`), 0, 0, 0, 4]!
+
+// send_terminate tells the server the session ends: one attempt, never waiting
+// on a peer to close, nothing allocated.
+fn (mut c PgConn) send_terminate() {
+	c.send_some(&terminate_msg[0], terminate_msg.len)
 }
 
 // teardown frees the TLS session (sending close_notify while the socket is
