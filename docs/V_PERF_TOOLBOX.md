@@ -40,11 +40,10 @@ only safe where the hot path is **literally allocation-free** (otherwise it leak
 - `v -show-c-output …` — full C-compiler output on error.
 - `v -showcc …` — the exact C compiler command.
 - `v -warn-about-allocs …` — a warning per allocation site (array/struct/string
-  building, locals moved to the heap). It cannot tell startup code from the request
-  path, and it can miss what the compiler creates (a struct moved to the heap
-  inside veb_like's generic `handle` went unreported, see below), so confirm a hot
-  path with a counter: a `gc_heap_usage().total_bytes` delta over N requests in a
-  test (`test_routing_allocates_nothing` in examples/veb_like).
+  building, locals the compiler moves to the heap). It cannot tell startup code
+  from the request path, so confirm a hot path with a counter: a
+  `gc_heap_usage().total_bytes` delta over N requests in a test
+  (`test_routing_allocates_nothing` in examples/veb_like).
 
 This is how we found (a) the `epoll_data` union GC-codegen bug and (b) that
 `[]u8{cap:N}` is already noscan/uninit (so a big-cap regression was GC pressure,
@@ -153,8 +152,13 @@ on V 0.5.2 `5516000` (2026-10-09), after the upstream fixes they led to.
   handed to handlers that call `p.get`, so it keeps eight plain fields
   (`v0`…`v7`, indexed through the first one's address). `-warn-about-allocs`
   reports the move ("local moved to the heap: its fixed array storage may
-  escape"), but it did not for veb_like's generic `Router[T].handle`. A bare
+  escape"); vlang/v#29801 asks for summaries that follow such calls. A bare
   fixed-array local passed as `&a[0]` was never moved.
+- **An address passed straight into a comptime call escapes.** `&p` given to
+  `app.$method(...)` inside the `$for` moves `p` to the heap ("its address
+  escapes"), whatever its type; the same call behind an ordinary method keeps it
+  on the stack. veb_like matches in one method and calls handlers from another
+  (`dispatch`), which is why its `Params` stays local (vlang/v#29801).
 - **Forwarding a `mut` parameter in a comptime call works** since
   vlang/v#29404: `app.$method(req, p, mut out)`.
 - **Methods are values** since vlang/v#29551: `App.one` and `T.$method` are
@@ -164,8 +168,8 @@ on V 0.5.2 `5516000` (2026-10-09), after the upstream fixes they led to.
 - **`@[noalloc]` exists** (vlang/v#29567, `doc/noalloc.md` in V) but, on
   `5516000`, it rejects `&&` and `||`, struct literals whose type has field
   defaults, and string views (`tos`, returning a `string`), so the routers can't
-  carry it without contortions. The runtime tests (`test_routing_allocates_nothing`)
-  remain the check.
+  carry it without contortions (vlang/v#29800). The runtime tests
+  (`test_routing_allocates_nothing`) remain the check.
 
 ## Appending a static response
 
