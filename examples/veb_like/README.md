@@ -60,8 +60,9 @@ request on an fd (`event_loop.watch_fd` + `.suspend`: an async DB query, a
 timer, an upstream), read its worker's state, or `.close`. `GET /delay/:ms` in
 [main.v](src/main.v) suspends on a timerfd ([delay_linux.c.v](src/delay_linux.c.v)).
 
-Every method of `App` that returns `core.Step` is a handler, routed or not, so
-it must have one of these shapes (a clear compile error says so otherwise).
+A method of `App` that returns `core.Step` and carries attributes is a handler,
+so it must have one of these shapes (a clear compile error says so otherwise).
+Without attributes it is an ordinary method, whatever its parameters.
 
 ### Routes in this example
 
