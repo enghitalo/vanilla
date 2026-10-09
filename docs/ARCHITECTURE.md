@@ -12,7 +12,7 @@ import and says nothing). Protocols are **siblings** over one engine:
 | module | role |
 |---|---|
 | `core/` | protocol-neutral contract: `Handler`, `Step`, `Counter`, `Limits`, hand-off slots, `ConnHandle` (server push, the post hook a backend installs). `Handler` is bytes-in/bytes-out — nothing HTTP about it. |
-| `socket/` | listen side: TCP listeners, Windows sockets; UDS listeners and `peer_cred` (kernel-verified pid/uid/gid, §6); fd passing lands here (§7). |
+| `socket/` | listen side: TCP listeners, Windows sockets; UDS listeners and `peer_cred` (kernel-verified pid/uid/gid, [LOCAL_IPC §6](LOCAL_IPC.md#6-conventions-security-tooling)); fd passing lands here ([LOCAL_IPC §7](LOCAL_IPC.md#7-beyond-tier-1-the-zero-hop-router)). |
 | `tls/` | mbedTLS split (`-d vanilla_tls` / stub) — the HTTPS server, and the client side `pg_async` uses for TLS to PostgreSQL. |
 | `epoll/` `io_uring/` `kqueue/` `iocp/` | thin per-mechanism syscall wrappers, one dir-module each (`poll/` joins them as the portability floor). |
 | `server/` | **the engine** (was `http_server`) — one engine, N protocols via conn modes: the takeover seam (issue #136) lets a handler hand a connection to a `core.ConnHandler` (`core.queue_takeover`, epoll-first), so upgrades change the framing authority without changing buffers or backpressure. OS facades (`server_linux.c.v`, …) select an `IOBackend`; `server/backend_*` are the reactors. |

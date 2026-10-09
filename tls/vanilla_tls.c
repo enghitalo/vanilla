@@ -31,6 +31,7 @@
 #include <netinet/tcp.h> /* TCP_ULP, SOL_TCP */
 #include <sys/socket.h>  /* setsockopt, SOL_TLS (via bits/socket.h) */
 #include <arpa/inet.h>   /* inet_pton for IP: SAN entries */
+#include <netdb.h>       /* getaddrinfo: is a client's host an IP address (ip_host) */
 #ifndef SOL_TLS
 #define SOL_TLS 282
 #endif
@@ -110,6 +111,8 @@ typedef struct {
     int peer_closed; // the peer ended the session: EOF or close_notify (vtls_peer_closed)
     int close_notify; // ...with a close_notify alert, not a bare EOF (vtls_peer_close_notify)
     int last_err;    // the Mbed TLS error that failed the handshake (vtls_handshake_error)
+    unsigned char peer_ip[16]; // a client's IP-address host (ip_host), checked by verify_ip_san
+    size_t peer_ip_len;        // 4 or 16; 0 = the host is a name (Mbed TLS checks it)
     size_t ra_off, ra_len; // unread ciphertext is ra[ra_off..ra_len]
     unsigned char ra[VTLS_READAHEAD];
 } vtls_session;
@@ -676,13 +679,31 @@ int vtls_write(void *sess, const unsigned char *buf, size_t len) {
 
 // ---- client (pg_async) ------------------------------------------------------
 
-// verify_chain_only is VTLS_VERIFY_CA's certificate callback. The session still
-// names the host, for SNI, so Mbed TLS checks the name as well: drop that one
-// finding on the server's own certificate, keep every chain error.
+// verify_chain_only is VTLS_VERIFY_CA's certificate callback. A session to a
+// DNS name still names the host, for SNI, so Mbed TLS checks the name as well:
+// drop that one finding on the server's own certificate, keep every chain
+// error.
 static int verify_chain_only(void *p, mbedtls_x509_crt *crt, int depth, uint32_t *flags) {
     (void)p;
     (void)crt;
     if (depth == 0) *flags &= ~(uint32_t)MBEDTLS_X509_BADCERT_CN_MISMATCH;
+    return 0;
+}
+
+// verify_ip_san is a VERIFY_FULL session's certificate callback when its host
+// is an IP literal (no name was given to Mbed TLS, so it checks none): the
+// server's own certificate must carry that address as an iPAddress SAN
+// (RFC 9525 §6.2; never a dNSName, a wildcard or the CN). The chain is still
+// checked by Mbed TLS.
+static int verify_ip_san(void *p, mbedtls_x509_crt *crt, int depth, uint32_t *flags) {
+    const vtls_session *s = (const vtls_session *)p;
+    if (depth != 0) return 0;
+    for (const mbedtls_x509_sequence *san = &crt->subject_alt_names; san != NULL; san = san->next) {
+        if ((san->buf.tag & MBEDTLS_ASN1_TAG_VALUE_MASK) == MBEDTLS_X509_SAN_IP_ADDRESS &&
+            san->buf.len == s->peer_ip_len && memcmp(san->buf.p, s->peer_ip, s->peer_ip_len) == 0)
+            return 0;
+    }
+    *flags |= MBEDTLS_X509_BADCERT_CN_MISMATCH;
     return 0;
 }
 
@@ -735,18 +756,58 @@ static void client_rearm(vtls_session *s, int fd) {
     s->ra_len = 0;
 }
 
+// ip_host reads a client's `host` as an IP address the way the system
+// resolver does (pg_async and http1_1/upstream dial it through getaddrinfo)
+// into its 4 or 16 bytes: 0 for a DNS name. Every spelling that dials an
+// address counts (127.1, 0x7f.0.0.1, 10.0.0.010 = 10.0.0.8, fe80::1%eth0), not
+// only the inet_pton forms.
+static size_t ip_host(const char *host, unsigned char ip[16]) {
+    // A zone is local to this host: a certificate names the address alone. It
+    // is cut here, not handed to getaddrinfo, which would look the interface
+    // up (a socket and an ioctl), and a failed lookup (EMFILE) would make the
+    // address a name for the session's whole life. IPv6 has one spelling,
+    // inet_pton's.
+    const char *zone = strchr(host, '%');
+    if (zone != NULL) {
+        char a[INET6_ADDRSTRLEN];
+        size_t n = (size_t)(zone - host);
+        if (n >= sizeof(a)) return 0;
+        memcpy(a, host, n);
+        a[n] = '\0';
+        return inet_pton(AF_INET6, a, ip) == 1 ? 16 : 0;
+    }
+    // AI_NUMERICHOST: getaddrinfo's own parse, no lookup.
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_NUMERICHOST;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0) return 0;
+    size_t n = 0;
+    if (res->ai_family == AF_INET) {
+        memcpy(ip, &((const struct sockaddr_in *)res->ai_addr)->sin_addr, 4);
+        n = 4;
+    } else if (res->ai_family == AF_INET6) {
+        memcpy(ip, &((const struct sockaddr_in6 *)res->ai_addr)->sin6_addr, 16);
+        n = 16;
+    }
+    freeaddrinfo(res);
+    return n;
+}
+
 void *vtls_client_session_new(vtls_ctx *c, int fd, const char *host) {
     vtls_session *s = (vtls_session *)calloc(1, sizeof(vtls_session));
     if (!s) return NULL;
-    unsigned char ip[16];
-    int is_ip = inet_pton(AF_INET, host, ip) == 1 || inet_pton(AF_INET6, host, ip) == 1;
+    s->peer_ip_len = ip_host(host, s->peer_ip);
     mbedtls_ssl_init(&s->ssl);
     VTLS_LOCK();
     int ret = mbedtls_ssl_setup(&s->ssl, &c->conf);
-    // The host is the SNI and, under VERIFY_FULL, the name to check. An IP
-    // address is no SNI (RFC 6066), so it is set only when it must be checked;
-    // NULL still counts as "set" for Mbed TLS's verify-without-a-name guard.
-    if (ret == 0) ret = mbedtls_ssl_set_hostname(&s->ssl, (is_ip && c->verify != VTLS_VERIFY_FULL) ? NULL : host);
+    // A name is the SNI and, under VERIFY_FULL, the name Mbed TLS checks. An
+    // IP address is never SNI (RFC 6066 §3), and Mbed TLS takes one name for
+    // both: set none (NULL still counts as "set" for its verify-without-a-name
+    // guard) and, under VERIFY_FULL, check the address against the
+    // certificate's iPAddress SANs ourselves (below).
+    if (ret == 0) ret = mbedtls_ssl_set_hostname(&s->ssl, s->peer_ip_len ? NULL : host);
     if (ret != 0) mbedtls_ssl_free(&s->ssl);
     VTLS_UNLOCK();
     if (ret != 0) {
@@ -755,13 +816,16 @@ void *vtls_client_session_new(vtls_ctx *c, int fd, const char *host) {
     }
     client_rearm(s, fd);
     mbedtls_ssl_set_bio(&s->ssl, &s->net, vtls_bio_send, vtls_bio_recv, NULL);
+    // Like the bio, the callback survives mbedtls_ssl_session_reset: a re-dial
+    // keeps the check.
+    if (s->peer_ip_len && c->verify == VTLS_VERIFY_FULL) mbedtls_ssl_set_verify(&s->ssl, verify_ip_san, s);
     return s;
 }
 
 int vtls_session_reset(void *sess, int fd) {
     vtls_session *s = (vtls_session *)sess;
     VTLS_LOCK(); // drops the old session's keys from PSA's store
-    int ret = mbedtls_ssl_session_reset(&s->ssl); // keeps the host name and the bio
+    int ret = mbedtls_ssl_session_reset(&s->ssl); // keeps the host name, the bio and the verify callback
     VTLS_UNLOCK();
     client_rearm(s, fd);
     return ret;
@@ -783,9 +847,18 @@ void vtls_handshake_error(void *sess, char *buf, size_t len) {
                 : (flags & MBEDTLS_X509_BADCERT_CN_MISMATCH)
                 ? "the server certificate does not match the host name"
                 : "the server certificate failed verification";
-            // Then Mbed TLS's findings, one per line: joined on one.
+            // Then the findings, one per line: joined on one. An IP host's name
+            // finding is verify_ip_san's, and Mbed TLS's text for that flag
+            // speaks of the CN, which is never consulted for an IP: say what
+            // is missing instead.
             char info[512];
-            int n = mbedtls_x509_crt_verify_info(info, sizeof(info), "", flags);
+            int n = 0;
+            if (s->peer_ip_len && (flags & MBEDTLS_X509_BADCERT_CN_MISMATCH)) {
+                n = snprintf(info, sizeof(info), "the address is in none of its iPAddress SANs (IP:)\n");
+                flags &= ~(uint32_t)MBEDTLS_X509_BADCERT_CN_MISMATCH;
+            }
+            int m = flags ? mbedtls_x509_crt_verify_info(info + n, sizeof(info) - n, "", flags) : 0;
+            if (m > 0) n += m;
             for (int i = 0; i < n; i++) {
                 if (info[i] == '\n') info[i] = (i + 1 < n) ? ';' : '\0';
             }
