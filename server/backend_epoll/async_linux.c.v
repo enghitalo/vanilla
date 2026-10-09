@@ -373,13 +373,21 @@ fn register_watch(mut w core.EventLoop, ext_fd int, interest core.WatchInterest,
 	events := if interest == .writable { u32(C.EPOLLOUT) } else { u32(C.EPOLLIN) }
 	if r.rearming_dead {
 		if ext_fd == r.dead_fd {
-			// Tombstone re-arm (drain_pipelined dead branch): the queue slot stays
-			// exactly as it is — only the (already-armed, level-triggered) fd needs to
-			// remain in epoll. Do NOT touch the watch table: a dedup match would
-			// refresh the tombstone, and a dedup that skips dead slots would append a
-			// duplicate live entry for a dead client.
-			if epoll.mod_fd_in_epoll(w.loop_fd, ext_fd, u32(C.EPOLLIN)) != 0 {
-				epoll.add_fd_to_epoll(w.loop_fd, ext_fd, u32(C.EPOLLIN))
+			// Tombstone re-arm (drain_pipelined dead branch): the running tombstone
+			// is the head of ext_fd's queue. It takes the new continuation and
+			// payload, as a live slot would (a multi-step chain: the next step's
+			// continuation, its state), and stays dead; the fd is re-armed for the
+			// interest asked for (an exchange that must finish sending waits on
+			// writability). Nothing else in the table changes: reactor_watch's
+			// dedup would match a live slot, maybe a new connection's on the dead
+			// client's reused number, and skipping dead slots would append a
+			// duplicate live entry for the dead client.
+			if r.watches[ext_fd].queue.len > 0 {
+				r.watches[ext_fd].queue[0].cont = cont
+				r.watches[ext_fd].queue[0].udata = udata
+			}
+			if epoll.mod_fd_in_epoll(w.loop_fd, ext_fd, events) != 0 {
+				epoll.add_fd_to_epoll(w.loop_fd, ext_fd, events)
 				r.watches[ext_fd].added = r.batch // a fresh registration: see below
 			}
 			w.last_watched = ext_fd
@@ -1388,17 +1396,18 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 				// is never closed here.
 				reactor.close_watch_fd(epoll_fd, stepped)
 			}
-			if dead_step == .suspend && stepped == ext_fd {
+			stepped_away := dead_step == .suspend && stepped >= 0 && stepped != ext_fd
+			if dead_step == .suspend && !stepped_away {
 				break // result not ready yet — the tombstone stays at the head
 			}
-			// Done with ext_fd: finished, or stepped to another fd (or to none).
-			// Pop it: left at the head with its old continuation, it would run
-			// against the next client's reply on ext_fd (#231).
+			// Done with ext_fd: finished, or stepped to another fd. Pop it: left
+			// at the head with its old continuation, it would run against the
+			// next client's reply on ext_fd (#231).
 			reactor.watches[ext_fd].queue.delete(0)
 			reactor.reactor_clear_if_drained(ext_fd)
-			if dead_step == .suspend && !reactor.watches[ext_fd].active {
-				// Stepped away and nothing else waits on ext_fd: detach it,
-				// never close it (the app owns it), as on_watch_ready does.
+			if stepped_away && !reactor.watches[ext_fd].active {
+				// Nothing else waits on ext_fd: detach it, never close it (the
+				// app owns it), as on_watch_ready does.
 				epoll.detach_fd_from_epoll(epoll_fd, ext_fd)
 			}
 			continue
@@ -1464,6 +1473,35 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 					cs, state)
 			}
 			.suspend {
+				stepped := event_loop.last_watched
+				if stepped >= 0 && stepped != ext_fd {
+					// The head stepped to another fd (a backoff timer after a
+					// serialization failure, a second upstream): it no longer waits
+					// on ext_fd. Pop it, or its old continuation would run against
+					// the next client's reply here (#231), and park the client on
+					// the fd it now waits on. The edge may carry the next replies
+					// too: go on with the new head.
+					reactor.watches[ext_fd].queue.delete(0)
+					reactor.reactor_clear_if_drained(ext_fd)
+					if !reactor.watches[ext_fd].active {
+						epoll.detach_fd_from_epoll(epoll_fd, ext_fd) // as on_watch_ready
+					}
+					if cs.write_buf.len > cs.write_off {
+						if !flush_batch(epoll_fd, client_fd, limits, active_conns, mut st, mut cs) {
+							// The client is gone (flush_batch closed it) and its new
+							// watch is not recorded on the connection: tear it down,
+							// as on_watch_ready does.
+							if stepped == client_fd {
+								reactor.reactor_clear(client_fd)
+							} else {
+								detach_rejected_watch(mut reactor, epoll_fd, stepped, client_fd)
+							}
+							continue
+						}
+					}
+					park_conn(mut st, mut cs, stepped)
+					continue
+				}
 				// Front query not ready yet. The continuation re-armed ext_fd in place
 				// (reactor_watch found it already queued — no duplicate). Send anything it
 				// streamed, keep it at the head, and stop: nothing behind it is ready.

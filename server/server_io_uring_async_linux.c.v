@@ -357,10 +357,15 @@ fn iou_register_watch(mut w core.EventLoop, ext_fd int, interest core.WatchInter
 	mask := (if interest == .writable { io_uring.pollout } else { io_uring.pollin }) | io_uring.pollerr | io_uring.pollhup
 	if env.rearming_dead {
 		if ext_fd == env.dead_fd {
-			// Tombstone re-arm (drain_pipelined_iou dead branch): the queue slot stays
-			// exactly as it is — only the consumed oneshot poll needs re-queueing. The
-			// watch table is NOT touched: a dedup/append here would revive or duplicate
-			// the tombstone.
+			// Tombstone re-arm (drain_pipelined_iou dead branch): the running
+			// tombstone, the head of ext_fd's queue, takes the new continuation and
+			// payload (a multi-step chain) and stays dead; the consumed oneshot poll
+			// is re-queued. Nothing else in the table changes: a dedup/append here
+			// would revive or duplicate the tombstone.
+			if env.watches[ext_fd].queue.len > 0 {
+				env.watches[ext_fd].queue[0].cont = cont
+				env.watches[ext_fd].queue[0].udata = udata
+			}
 			env.iou_queue_poll(ext_fd, mask)
 			w.last_watched = ext_fd
 			return
@@ -762,10 +767,10 @@ fn drain_pipelined_iou(mut env IouEnv, ext_fd int, ready_err bool, limits Limits
 				// its client is gone, so close it (iou_detach_rejected_watch's rule).
 				C.close(stepped)
 			}
-			if dead_step == .suspend && stepped == ext_fd {
+			if dead_step == .suspend && (stepped < 0 || stepped == ext_fd) {
 				break // result not ready yet — the tombstone stays at the head
 			}
-			// Done with ext_fd, or stepped away from it: pop the tombstone, which
+			// Done with ext_fd, or stepped to another fd: pop the tombstone, which
 			// would otherwise run against the next client's reply (#231).
 			env.watches[ext_fd].queue.delete(0)
 			env.iou_reactor_clear_if_drained(ext_fd)
@@ -810,6 +815,17 @@ fn drain_pipelined_iou(mut env IouEnv, ext_fd int, ready_err bool, limits Limits
 					conn.close_after_send = true
 					iou_finish_resume(mut env, mut *conn, limits, active_conns)
 					break
+				}
+				if event_loop.last_watched != ext_fd {
+					// The head stepped to another fd (a backoff timer, a second
+					// upstream): it no longer waits on ext_fd. Pop it, or its old
+					// continuation would run against the next client's reply here
+					// (#231), park the connection on the fd it now waits on, and go
+					// on with the new head: the edge may carry its reply too.
+					env.watches[ext_fd].queue.delete(0)
+					env.iou_reactor_clear_if_drained(ext_fd)
+					iou_park(env.worker, mut *conn, event_loop.last_watched)
+					continue
 				}
 				// Front query not ready yet. The continuation re-armed ext_fd in place
 				// (iou_reactor_watch found it already queued — no duplicate) and
