@@ -29,6 +29,11 @@
 //
 // The stats file holds key=value lines: accepted, handshakes, requests, and
 // path:<path>=<count>.
+//
+// It exits within 200 ms of its parent process (the test) exiting: a test that
+// panics never runs its deferred stop(), and a fake left behind would keep the
+// test binary's stdout/stderr open, so `v test` would wait for their EOF
+// instead of reporting the failure.
 module main
 
 import os
@@ -420,6 +425,14 @@ fn serve(mut a App, fd int) {
 }
 
 fn main() {
+	// Once the parent is gone this process is re-parented: getppid() changes.
+	parent := os.getppid()
+	spawn fn [parent] () {
+		for os.getppid() == parent {
+			time.sleep(200 * time.millisecond)
+		}
+		exit(0)
+	}()
 	mut port_file := ''
 	mut stats_file := ''
 	mut bind := '127.0.0.1'
