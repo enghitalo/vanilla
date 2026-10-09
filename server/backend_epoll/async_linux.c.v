@@ -101,6 +101,11 @@ mut:
 	// not be touched (a dedup match would refresh the tombstone; a dedup that
 	// skips dead slots would append a duplicate).
 	rearming_dead bool
+	// dead_fd: the fd whose tombstone is running while rearming_dead is set. A
+	// watch on any OTHER fd is the continuation stepping away (a retry on a
+	// fresh connection, a second upstream, a backoff timer), not a re-arm: see
+	// register_watch (#231).
+	dead_fd int = -1
 	// The worker's batch counter: one per epoll_wait (see WatchEntry.added).
 	batch u64
 	// The worker's connection table, for its stale stamps
@@ -146,15 +151,7 @@ fn (mut r Reactor) reactor_clear_if_drained(ext_fd int) {
 @[direct_array_access]
 fn (mut r Reactor) reactor_watch(ext_fd int, client_fd int, cont core.WakeFn, udata voidptr) {
 	if ext_fd >= r.watches.len {
-		mut new_len := if r.watches.len == 0 { conn_table_min } else { r.watches.len }
-		for new_len <= ext_fd {
-			new_len *= 2
-		}
-		mut grown := []WatchEntry{len: new_len}
-		for i in 0 .. r.watches.len {
-			grown[i] = r.watches[i]
-		}
-		r.watches = grown
+		r.grow_watches(ext_fd)
 	}
 	if !r.watches[ext_fd].active {
 		// Fresh watch — the single-watch fast path (timerfd / SSE / one query).
@@ -213,6 +210,59 @@ fn (mut r Reactor) reactor_watch(ext_fd int, client_fd int, cont core.WakeFn, ud
 		client_fd: client_fd
 		cont:      cont
 		udata:     udata
+	}
+}
+
+// grow_watches doubles the table until ext_fd fits. Out of line: the table
+// starts at conn_table_min and grows a handful of times per worker lifetime.
+@[direct_array_access]
+fn (mut r Reactor) grow_watches(ext_fd int) {
+	mut new_len := if r.watches.len == 0 { conn_table_min } else { r.watches.len }
+	for new_len <= ext_fd {
+		new_len *= 2
+	}
+	mut grown := []WatchEntry{len: new_len}
+	for i in 0 .. r.watches.len {
+		grown[i] = r.watches[i]
+	}
+	r.watches = grown
+}
+
+// reactor_tombstone records a DEAD slot for client_fd at the tail of ext_fd's
+// queue: the watch a tombstone's continuation armed on a persistent fd other
+// than the one it is draining (#231). Never a live watch, and never a dedup on
+// client_fd: the client is gone, and a new connection may already hold its
+// number, maybe parked on ext_fd itself (a dedup would hand that live slot the
+// dead continuation). A live single watch already on ext_fd is promoted to the
+// queue head first, as reactor_watch does. The slot then drains like any
+// tombstone: its continuation runs, against the scratch buffer, when ext_fd
+// is ready.
+@[direct_array_access]
+fn (mut r Reactor) reactor_tombstone(ext_fd int, client_fd int, cont core.WakeFn, udata voidptr) {
+	if ext_fd >= r.watches.len {
+		r.grow_watches(ext_fd)
+	}
+	if !r.watches[ext_fd].active {
+		r.watches[ext_fd].active = true
+		r.watches[ext_fd].client_fd = client_fd
+		r.watches[ext_fd].cont = cont
+		r.watches[ext_fd].udata = udata
+		unsafe {
+			r.watches[ext_fd].queue.len = 0
+		}
+	} else if r.watches[ext_fd].queue.len == 0 {
+		r.watches[ext_fd].queue << ParkSlot{
+			client_fd: r.watches[ext_fd].client_fd
+			cont:      r.watches[ext_fd].cont
+			udata:     r.watches[ext_fd].udata
+		}
+	}
+	r.watches[ext_fd].persistent = true
+	r.watches[ext_fd].queue << ParkSlot{
+		client_fd: client_fd
+		cont:      cont
+		udata:     udata
+		dead:      true
 	}
 }
 
@@ -320,17 +370,44 @@ fn register_watch(mut w core.EventLoop, ext_fd int, interest core.WatchInterest,
 	}
 	mut r := unsafe { &Reactor(w.reactor) }
 	r.armed = true // sticky: the event loop starts probing the watch table
+	events := if interest == .writable { u32(C.EPOLLOUT) } else { u32(C.EPOLLIN) }
 	if r.rearming_dead {
-		// Tombstone re-arm (drain_pipelined dead branch): the queue slot stays
-		// exactly as it is — only the (already-armed, level-triggered) fd needs to
-		// remain in epoll. Do NOT touch the watch table: a dedup match would
-		// refresh the tombstone, and a dedup that skips dead slots would append a
-		// duplicate live entry for a dead client.
-		if epoll.mod_fd_in_epoll(w.loop_fd, ext_fd, u32(C.EPOLLIN)) != 0 {
-			epoll.add_fd_to_epoll(w.loop_fd, ext_fd, u32(C.EPOLLIN))
+		if ext_fd == r.dead_fd {
+			// Tombstone re-arm (drain_pipelined dead branch): the queue slot stays
+			// exactly as it is — only the (already-armed, level-triggered) fd needs to
+			// remain in epoll. Do NOT touch the watch table: a dedup match would
+			// refresh the tombstone, and a dedup that skips dead slots would append a
+			// duplicate live entry for a dead client.
+			if epoll.mod_fd_in_epoll(w.loop_fd, ext_fd, u32(C.EPOLLIN)) != 0 {
+				epoll.add_fd_to_epoll(w.loop_fd, ext_fd, u32(C.EPOLLIN))
+				r.watches[ext_fd].added = r.batch // a fresh registration: see below
+			}
+			w.last_watched = ext_fd
+			return
+		}
+		// The tombstone's continuation steps to ANOTHER fd (#231). Its client is
+		// gone, so no live watch may record the step. A persistent fd gets a
+		// tombstone of its own: the continuation still runs, in dead mode, when
+		// it is ready. A request-owned fd is neither armed nor recorded:
+		// drain_pipelined DELs and closes it once the continuation returns, as
+		// close_client does for any request-owned fd of a client that is gone.
+		w.last_watched = ext_fd
+		if !w.persistent {
+			return
+		}
+		r.reactor_tombstone(ext_fd, w.client_fd, cont, udata)
+		if epoll.mod_fd_in_epoll(w.loop_fd, ext_fd, events) != 0 {
+			if epoll.add_fd_to_epoll(w.loop_fd, ext_fd, events) < 0 {
+				// Not armable: drop the tombstone just appended (the tail).
+				unsafe {
+					r.watches[ext_fd].queue.len--
+				}
+				r.reactor_clear_if_drained(ext_fd)
+				w.last_watched = -1
+				return
+			}
 			r.watches[ext_fd].added = r.batch // a fresh registration: see below
 		}
-		w.last_watched = ext_fd
 		return
 	}
 	r.reactor_watch(ext_fd, w.client_fd, cont, udata)
@@ -340,7 +417,6 @@ fn register_watch(mut w core.EventLoop, ext_fd int, interest core.WatchInterest,
 		// this re-stamps it every park; promotion to a queue preserves it.
 		r.watches[ext_fd].persistent = true
 	}
-	events := if interest == .writable { u32(C.EPOLLOUT) } else { u32(C.EPOLLIN) }
 	// Re-arm if the fd is already in this worker's epoll (a pool-owned connection
 	// re-watched across queries), otherwise add it (a fresh request-owned fd).
 	// Trying MOD first avoids an EEXIST perror on every pool-fd reuse and needs no
@@ -1290,20 +1366,41 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 			// would refresh it, and a dedup that SKIPS dead slots would append a
 			// duplicate instead.
 			reactor.rearming_dead = true
+			reactor.dead_fd = ext_fd
 			// No file from a continuation (on_watch_ready).
 			core.set_queue_file_allowed(false)
 			dead_step := slot.cont(mut reactor.scratch, ext_fd, ready_err, slot.udata, state,
 				mut dead_loop)
 			core.set_queue_file_allowed(true)
 			reactor.rearming_dead = false
+			reactor.dead_fd = -1
 			// A dead client cannot be taken over — drain the thread-local slot.
 			if _ := core.take_queued_takeover() {
 			}
-			if dead_step == .suspend {
+			stepped := dead_loop.last_watched
+			if stepped >= 0 && stepped != ext_fd && stepped != client_fd
+				&& !(stepped < reactor.watches.len && reactor.watches[stepped].active)
+				&& !(stepped < st.conns.len && unsafe { st.conns[stepped] != nil }) {
+				// It armed a request-owned fd, which register_watch left unarmed
+				// and unrecorded (#231): its client is gone, so tear it down, as
+				// close_client would have. A persistent step is a tombstone now
+				// (active); the dead client's own number, or a connection's,
+				// is never closed here.
+				reactor.close_watch_fd(epoll_fd, stepped)
+			}
+			if dead_step == .suspend && stepped == ext_fd {
 				break // result not ready yet — the tombstone stays at the head
 			}
+			// Done with ext_fd: finished, or stepped to another fd (or to none).
+			// Pop it: left at the head with its old continuation, it would run
+			// against the next client's reply on ext_fd (#231).
 			reactor.watches[ext_fd].queue.delete(0)
 			reactor.reactor_clear_if_drained(ext_fd)
+			if dead_step == .suspend && !reactor.watches[ext_fd].active {
+				// Stepped away and nothing else waits on ext_fd: detach it,
+				// never close it (the app owns it), as on_watch_ready does.
+				epoll.detach_fd_from_epoll(epoll_fd, ext_fd)
+			}
 			continue
 		}
 		mut cs := st.conns[client_fd]

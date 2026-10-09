@@ -20,7 +20,10 @@
 // client vanished mid-stream keeps its result from the next client; a
 // continuation that steps away from an fd leaves no spin and no zombie
 // behind; and a stale event for an fd closed earlier in the batch neither
-// releases a connection twice nor wakes the new watch on a reused number.
+// releases a connection twice nor wakes the new watch on a reused number. And
+// (#231) a disconnected client's tombstone whose continuation steps to a fresh
+// fd: no panic past the watch table, the step's continuation runs, and the
+// next client's reply on the pooled fd stays its own.
 // The checks that need no watch reactor or takeover also run on the poll
 // backend (`-d vanilla_poll`), which shares the 408 / fresh-deadline rules.
 //
@@ -131,6 +134,13 @@ mut:
 	up1      i64 = -1 // ...and the end its "DB" writes the results into, in order
 	pinned   i64 // 1 once /h6new's timer holds x's (freed) number
 	spurious i64 // continuations that ran with nothing ready
+	// #231: /tpark's continuation steps to a fresh fd (x, peer) while `step`
+	// is 1, pinned to number `pin` when > 0; `tparked` counts /tpark parks and
+	// `retried` the runs of the fresh fd's continuation.
+	step    i64
+	pin     i64
+	tparked i64
+	retried i64
 }
 
 const et_ch = &EtChoreo{}
@@ -140,8 +150,9 @@ fn et_ch_reset() {
 	for p in [&c.a, &c.b, &c.x, &c.peer, &c.up0, &c.up1] {
 		stdatomic.store_i64(p, -1)
 	}
-	stdatomic.store_i64(&c.pinned, 0)
-	stdatomic.store_i64(&c.spurious, 0)
+	for p in [&c.pinned, &c.spurious, &c.step, &c.pin, &c.tparked, &c.retried] {
+		stdatomic.store_i64(p, 0)
+	}
 }
 
 // et_ch_close closes and clears the fd kept in *p, if any. Each fd has one
@@ -250,6 +261,21 @@ const et_qorch_req = 'GET /qorch HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 const et_qorch_prefix = 'GET /qorch'.bytes()
 const et_qfeed_req = 'GET /qfeed HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 const et_qfeed_prefix = 'GET /qfeed'.bytes()
+
+// /tpark parks on the mock upstream (et_ch.up0, persistent) like /pq; its
+// continuation reads one reply byte, then "retries on a fresh connection" (a
+// new socketpair end, persistent) while et_ch.step is set, or answers. /torch
+// closes client A (parked there) and then makes the upstream readable, so the
+// retry runs from A's tombstone; /tfire makes the upstream readable; /tretry
+// makes the fresh end readable.
+const et_tpark_req = 'GET /tpark HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const et_tpark_prefix = 'GET /tpark'.bytes()
+const et_torch_req = 'GET /torch HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const et_torch_prefix = 'GET /torch'.bytes()
+const et_tfire_req = 'GET /tfire HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const et_tfire_prefix = 'GET /tfire'.bytes()
+const et_tretry_req = 'GET /tretry HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const et_tretry_prefix = 'GET /tretry'.bytes()
 
 // /stepw parks on a socketpair end (.writable), then steps to a 500 ms timer
 // keeping that end open. /stepr does the same on an end that is readable (a
@@ -505,6 +531,36 @@ fn et_choreo_handler(req []u8, mut out []u8, mut event_loop core.EventLoop) core
 		out << et_ok
 		return .done
 	}
+	if et_has_prefix(req, et_tpark_prefix) {
+		if stdatomic.load_i64(&c.up0) < 0 {
+			mut sv := [2]i32{}
+			if C.socketpair(C.AF_UNIX, C.SOCK_STREAM | C.SOCK_NONBLOCK, 0, &sv[0]) != 0 {
+				return .close
+			}
+			stdatomic.store_i64(&c.up1, i64(sv[1]))
+			stdatomic.store_i64(&c.up0, i64(sv[0]))
+		}
+		stdatomic.add_i64(&c.tparked, 1)
+		event_loop.watch_fd_persistent(int(stdatomic.load_i64(&c.up0)), .readable, et_tup_done,
+			unsafe { nil })
+		return .suspend
+	}
+	if et_has_prefix(req, et_torch_prefix) {
+		et_ch_close(&c.a)
+		et_ch_write(&c.up1, 'x'.bytes())
+		out << et_ok
+		return .done
+	}
+	if et_has_prefix(req, et_tfire_prefix) {
+		et_ch_write(&c.up1, 'y'.bytes())
+		out << et_ok
+		return .done
+	}
+	if et_has_prefix(req, et_tretry_prefix) {
+		et_ch_write(&c.peer, 'r'.bytes())
+		out << et_ok
+		return .done
+	}
 	if et_has_prefix(req, et_stepw_prefix) {
 		mut sv := [2]i32{}
 		if C.socketpair(C.AF_UNIX, C.SOCK_STREAM, 0, &sv[0]) != 0 {
@@ -596,6 +652,45 @@ fn et_pq_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voi
 		out << et_pq_head
 	}
 	out << b[0]
+	return .done
+}
+
+// et_tup_done takes the upstream's reply byte. While et_ch.step is set it then
+// retries on a fresh connection: a new socketpair end (pinned to et_ch.pin
+// when set), watched persistently. Otherwise it answers.
+fn et_tup_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	mut c := unsafe { et_ch }
+	mut b := [1]u8{}
+	if C.read(ready_fd, &b[0], 1) != 1 {
+		event_loop.watch_fd_persistent(ready_fd, .readable, et_tup_done, watch_payload)
+		return .suspend
+	}
+	if stdatomic.load_i64(&c.step) == 1 {
+		mut sv := [2]i32{}
+		if C.socketpair(C.AF_UNIX, C.SOCK_STREAM | C.SOCK_NONBLOCK, 0, &sv[0]) != 0 {
+			return .close
+		}
+		mut fd := int(sv[0])
+		pin := i32(stdatomic.load_i64(&c.pin))
+		if pin > 0 && C.dup2(sv[0], pin) == pin {
+			C.close(fd)
+			fd = int(pin)
+		}
+		stdatomic.store_i64(&c.peer, i64(sv[1]))
+		stdatomic.store_i64(&c.x, i64(fd))
+		event_loop.watch_fd_persistent(fd, .readable, et_tretry_done, unsafe { nil })
+		return .suspend
+	}
+	out << et_ok
+	return .done
+}
+
+// et_tretry_done takes the fresh connection's reply byte and answers.
+fn et_tretry_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	mut b := [1]u8{}
+	C.read(ready_fd, &b[0], 1)
+	stdatomic.add_i64(unsafe { &et_ch.retried }, 1)
+	out << et_ok
 	return .done
 }
 
@@ -1774,6 +1869,83 @@ fn check_stale_event_not_routed_to_new_watch(limits server.Limits) ! {
 	assert resp == et_ok, '${label}: /h6new answered ${resp.bytestr()}'
 }
 
+// check_tombstone_steps_to_new_fd (#231): client A parks on a pooled upstream
+// (watch_fd_persistent) and hangs up; when the upstream answers, A's tombstone
+// runs the continuation, which retries on a fresh persistent fd. Numbered past
+// the watch table (`pin` 4000 > conn_table_min), that fd panicked the server:
+// index out of range. Numbered inside it, its watch was never recorded (its
+// continuation never ran), and the tombstone stayed at the upstream's head with
+// its old continuation, so it ate the next live client's reply: that client
+// was never answered. `pin` 0 leaves the fresh end at its natural number. On
+// io_uring a parked client's hangup is only seen when its request resumes, so
+// A is not tombstoned there and the step runs on the live path: the check
+// holds on both backends, but only epoll exercises the dead-mode step (the
+// io_uring twin, drain_pipelined_iou, got the same fix).
+fn check_tombstone_steps_to_new_fd(backend server.IOBackend, limits server.Limits, pin int) ! {
+	path := et_uds('t231')
+	et_ch_reset()
+	mut c := unsafe { et_ch }
+	stdatomic.store_i64(&c.pin, pin)
+	stdatomic.store_i64(&c.step, 1)
+	mut h := vtest.start(server.ServerConfig{
+		...et_uds_server(path, limits)
+		io_multiplexing: backend
+	})!
+	defer {
+		h.stop()
+		et_ch_close(&c.up0)
+		et_ch_close(&c.up1)
+		et_ch_close(&c.x)
+		et_ch_close(&c.peer)
+	}
+	label := '${backend} ${et_births(limits)}, fresh fd ${if pin > 0 {
+		'pinned to ${pin}'
+	} else {
+		'unpinned'
+	}}'
+	stdatomic.store_i64(&c.a, i64(et_dial(path, et_tpark_req)!))
+	// Served after A's /tpark (one worker), and accepted before the orchestrated
+	// batch: each round trip below is also a barrier for the events before it.
+	barrier := h.fire([et_one(et_req)])!
+	assert stdatomic.load_i64(&c.tparked) == 1, '${label}: precondition: A did not park'
+	o := h.fire([et_one(et_torch_req)])! // A hangs up, then the upstream answers
+	assert o.conns[0].frames.len == 1, '${label}: /torch not answered'
+	mut seen := h.send(barrier.group, et_req, vtest.frames(2))!
+	fresh := stdatomic.load_i64(&c.x)
+	assert fresh >= 0, "${label}: A's tombstone did not run the continuation"
+	if pin > 0 {
+		assert fresh == pin, '${label}: precondition: the fresh end is ${fresh}, not ${pin} (ulimit -n?)'
+	}
+	// The fresh fd answers: its continuation must run, once, in dead mode.
+	seen = h.send(barrier.group, et_tretry_req, vtest.frames(3))!
+	seen = h.send(barrier.group, et_req, vtest.frames(4))!
+	assert stdatomic.load_i64(&c.retried) == 1, "${label}: the fresh fd's continuation ran ${stdatomic.load_i64(&c.retried)} times"
+	// A live client parks on the upstream, which answers it: the reply is its own.
+	stdatomic.store_i64(&c.step, 0)
+	live := h.fire([
+		vtest.Script{
+			rounds: [
+				vtest.Round{
+					send: et_tpark_req
+					want: 0 // answered once /tfire feeds the upstream
+				},
+			]
+		},
+	])!
+	seen = h.send(barrier.group, et_req, vtest.frames(5))!
+	assert stdatomic.load_i64(&c.tparked) == 2, '${label}: precondition: the live client did not park'
+	seen = h.send(barrier.group, et_tfire_req, vtest.frames(6))!
+	assert seen.conns[0].frames.len == 6, '${label}: /tfire not answered'
+	out := h.wait(live.group, vtest.frames(1))!
+	r := out.conns[0]
+	assert !r.unmet && r.frames.len == 1 && r.frames[0] == et_ok, "${label}: the live client was not answered (A's tombstone took its reply): ${r.raw.bytestr()}"
+	// The barrier, the orchestrator and the live client stay open; A is gone.
+	// (io_uring counts active connections only under max_connections.)
+	if backend == .epoll {
+		assert out.active_after == 3, '${label}: active_conns drifted to ${out.active_after}'
+	}
+}
+
 // check_pooled_fd_eof_births_off: check_pooled_fd_eof_no_spin with births off
 // (the default Limits), where no birth guard looks at an fd with no state.
 // The pooled end reading EOF was taken for a client hanging up: the worker
@@ -1846,6 +2018,26 @@ fn test_epoll_stale_event_not_routed_to_new_watch() ! {
 	$if linux {
 		check_stale_event_not_routed_to_new_watch(server.Limits{})!
 		check_stale_event_not_routed_to_new_watch(et_births_on)!
+	}
+}
+
+fn test_epoll_tombstone_steps_to_new_fd() ! {
+	$if linux {
+		for limits in [server.Limits{}, et_births_on] {
+			check_tombstone_steps_to_new_fd(.epoll, limits, 4000)!
+			check_tombstone_steps_to_new_fd(.epoll, limits, 0)!
+		}
+	}
+}
+
+fn test_iouring_tombstone_steps_to_new_fd() ! {
+	$if linux {
+		if !server.iou_backend_available() {
+			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
+			return
+		}
+		check_tombstone_steps_to_new_fd(.io_uring, server.Limits{}, 4000)!
+		check_tombstone_steps_to_new_fd(.io_uring, server.Limits{}, 0)!
 	}
 }
 

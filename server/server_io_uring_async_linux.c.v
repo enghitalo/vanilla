@@ -148,6 +148,10 @@ mut:
 	// watch table must not be touched (a dedup/append there would either revive
 	// the tombstone or duplicate it).
 	rearming_dead bool
+	// dead_fd: the fd whose tombstone is running while rearming_dead is set; a
+	// watch on any other fd is the continuation stepping away (#231, the epoll
+	// Reactor.dead_fd twin).
+	dead_fd int = -1
 	// The reused `response` of a tombstone's continuation, whose output is
 	// discarded (the epoll Reactor.scratch twin: a fresh array per tombstone
 	// grew per disconnect, a leak under -gc none).
@@ -168,15 +172,7 @@ struct PendingIouPoll {
 @[direct_array_access]
 fn (mut env IouEnv) iou_reactor_watch(ext_fd int, cont core.WakeFn, udata voidptr) {
 	if ext_fd >= env.watches.len {
-		mut new_len := if env.watches.len == 0 { iou_watch_table_min } else { env.watches.len }
-		for new_len <= ext_fd {
-			new_len *= 2
-		}
-		mut grown := []IouWatchEntry{len: new_len}
-		for i in 0 .. env.watches.len {
-			grown[i] = env.watches[i]
-		}
-		env.watches = grown
+		env.iou_grow_watches(ext_fd)
 	}
 	conn := env.cur_conn
 	if !env.watches[ext_fd].active {
@@ -233,6 +229,57 @@ fn (mut env IouEnv) iou_reactor_watch(ext_fd int, cont core.WakeFn, udata voidpt
 		client_fd: if unsafe { conn != nil } { conn.fd } else { -1 }
 		cont:      cont
 		udata:     udata
+	}
+}
+
+// iou_grow_watches doubles the table until ext_fd fits (out of line: it runs a
+// handful of times per worker lifetime).
+@[direct_array_access]
+fn (mut env IouEnv) iou_grow_watches(ext_fd int) {
+	mut new_len := if env.watches.len == 0 { iou_watch_table_min } else { env.watches.len }
+	for new_len <= ext_fd {
+		new_len *= 2
+	}
+	mut grown := []IouWatchEntry{len: new_len}
+	for i in 0 .. env.watches.len {
+		grown[i] = env.watches[i]
+	}
+	env.watches = grown
+}
+
+// iou_reactor_tombstone records a DEAD slot for client_fd at the tail of
+// ext_fd's queue: the watch a tombstone's continuation armed on a persistent fd
+// other than the one it is draining (#231; the epoll reactor_tombstone twin).
+// Never a live watch and never a dedup: the client is gone. A live single
+// watch already on ext_fd is promoted to the queue head first.
+@[direct_array_access]
+fn (mut env IouEnv) iou_reactor_tombstone(ext_fd int, client_fd int, cont core.WakeFn, udata voidptr) {
+	if ext_fd >= env.watches.len {
+		env.iou_grow_watches(ext_fd)
+	}
+	if !env.watches[ext_fd].active {
+		env.watches[ext_fd].active = true
+		env.watches[ext_fd].conn = unsafe { nil }
+		env.watches[ext_fd].client_fd = client_fd
+		env.watches[ext_fd].cont = cont
+		env.watches[ext_fd].udata = udata
+		unsafe {
+			env.watches[ext_fd].queue.len = 0
+		}
+	} else if env.watches[ext_fd].queue.len == 0 {
+		env.watches[ext_fd].queue << IouParkSlot{
+			conn:      env.watches[ext_fd].conn
+			client_fd: env.watches[ext_fd].client_fd
+			cont:      env.watches[ext_fd].cont
+			udata:     env.watches[ext_fd].udata
+		}
+	}
+	env.watches[ext_fd].persistent = true
+	env.watches[ext_fd].queue << IouParkSlot{
+		client_fd: client_fd
+		cont:      cont
+		udata:     udata
+		dead:      true
 	}
 }
 
@@ -309,12 +356,24 @@ fn iou_register_watch(mut w core.EventLoop, ext_fd int, interest core.WatchInter
 	mut env := unsafe { &IouEnv(w.reactor) }
 	mask := (if interest == .writable { io_uring.pollout } else { io_uring.pollin }) | io_uring.pollerr | io_uring.pollhup
 	if env.rearming_dead {
-		// Tombstone re-arm (drain_pipelined_iou dead branch): the queue slot stays
-		// exactly as it is — only the consumed oneshot poll needs re-queueing. The
-		// watch table is NOT touched: a dedup/append here would revive or duplicate
-		// the tombstone.
-		env.iou_queue_poll(ext_fd, mask)
+		if ext_fd == env.dead_fd {
+			// Tombstone re-arm (drain_pipelined_iou dead branch): the queue slot stays
+			// exactly as it is — only the consumed oneshot poll needs re-queueing. The
+			// watch table is NOT touched: a dedup/append here would revive or duplicate
+			// the tombstone.
+			env.iou_queue_poll(ext_fd, mask)
+			w.last_watched = ext_fd
+			return
+		}
+		// The tombstone's continuation steps to ANOTHER fd (#231): a persistent
+		// one gets a tombstone of its own (its continuation runs in dead mode
+		// when it is ready); a request-owned one is left unrecorded and is
+		// closed by drain_pipelined_iou once the continuation returns.
 		w.last_watched = ext_fd
+		if w.persistent {
+			env.iou_reactor_tombstone(ext_fd, w.client_fd, cont, udata)
+			env.iou_queue_poll(ext_fd, mask)
+		}
 		return
 	}
 	env.iou_reactor_watch(ext_fd, cont, udata)
@@ -691,12 +750,23 @@ fn drain_pipelined_iou(mut env IouEnv, ext_fd int, ready_err bool, limits Limits
 			// re-queue the oneshot poll — the queue slot stays as-is and the watch
 			// table is untouched (see iou_register_watch).
 			env.rearming_dead = true
+			env.dead_fd = ext_fd
 			dead_step := slot.cont(mut env.scratch, ext_fd, ready_err, slot.udata, env.state, mut
 				dead_loop)
 			env.rearming_dead = false
-			if dead_step == .suspend {
+			env.dead_fd = -1
+			stepped := dead_loop.last_watched
+			if stepped >= 0 && stepped != ext_fd && stepped != slot.client_fd
+				&& !(stepped < env.watches.len && env.watches[stepped].active) {
+				// A request-owned fd, left unrecorded by iou_register_watch (#231):
+				// its client is gone, so close it (iou_detach_rejected_watch's rule).
+				C.close(stepped)
+			}
+			if dead_step == .suspend && stepped == ext_fd {
 				break // result not ready yet — the tombstone stays at the head
 			}
+			// Done with ext_fd, or stepped away from it: pop the tombstone, which
+			// would otherwise run against the next client's reply (#231).
 			env.watches[ext_fd].queue.delete(0)
 			env.iou_reactor_clear_if_drained(ext_fd)
 			continue
