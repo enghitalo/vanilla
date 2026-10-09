@@ -1,8 +1,9 @@
 module main
 
-// Handler-state tests: assert the KEY property of the rewrite without a socket —
-// subscribing registers an fd in epoll-resident state and spawns NO per-client
-// thread. The real push fan-out is proven in server_end_to_end_test.v.
+// Handler-state tests without a socket: the routes, the broadcast endpoint and
+// malformed input. Subscribing (a registered connection, NO per-client thread)
+// is tested in registry_nix_test.v; the real push fan-out is proven in
+// server_end_to_end_test.v.
 import core
 
 // serve adapts the raw-handler contract (writes into a caller-owned buffer) to
@@ -14,15 +15,6 @@ fn serve(req string, mut clients Clients) (string, core.Step) {
 	mut out := []u8{}
 	step := handle(req.bytes(), -1, mut out, mut clients)
 	return out.bytestr(), step
-}
-
-fn test_subscribe_returns_event_stream_and_registers_fd() {
-	mut clients := Clients{}
-	out, step := serve('GET /events HTTP/1.1\r\nHost: x\r\n\r\n', mut clients)
-	assert step == .done
-	assert out.contains('Content-Type: text/event-stream')
-	assert !out.contains('Content-Length:') // a stream stays open, no fixed length
-	assert clients.snapshot().len == 1 // fd registered; cost is one map entry
 }
 
 fn test_broadcast_endpoint_accepts() {
