@@ -4,20 +4,23 @@
  * CQE for an armed io_uring multishot accept?
  *
  *   AF_INET listener:  yes — CQE res=-EINVAL, F_MORE=0, within milliseconds.
- *                      This is what Server.shutdown relies on today to stop
- *                      every worker ring's armed accept.
+ *                      On TCP, vanilla's accept handler sees this CQE with
+ *                      `draining` set and stops re-arming.
  *   AF_UNIX listener:  NO — shutdown() returns 0 and no CQE ever arrives; the
  *                      armed accept stays parked forever (epoll_wait on the
  *                      same shut-down listener DOES wake with EPOLLIN|EPOLLHUP,
  *                      so the gap is specific to io_uring's armed accept).
  *
- * Consequence: a UDS listener needs its own shutdown path — per-ring
+ * Consequence: code that must observe the accept's end (joining a worker,
+ * io_uring_queue_exit) needs a UDS-specific path — per-ring
  * io_uring_prep_cancel_fd(listener, IORING_ASYNC_CANCEL_FD|_ALL) issued from
- * each ring's own thread (SINGLE_ISSUER), or a dummy connect() per worker
- * after setting the draining flag. See docs/LOCAL_IPC.md §5 item 3.
+ * each ring's own thread (SINGLE_ISSUER). vanilla's Server.shutdown waits on
+ * in-flight requests only, so there the parked accept is harmless (new
+ * connects get ECONNREFUSED). See docs/LOCAL_IPC.md §5 item 3.
  *
- * Observed on Linux 6.8.0-124 (liburing 2.x); plain rings and
- * SINGLE_ISSUER|DEFER_TASKRUN rings behave the same.
+ * Runs each listener against a plain ring and a SINGLE_ISSUER|DEFER_TASKRUN
+ * ring (vanilla's flags; kernel 6.1+). Observed on Linux 6.8.0-124 and
+ * 7.1.13: both ring setups behave the same.
  *
  * Build: cc -O2 -o uds_uring_shutdown_repro uds_uring_shutdown_repro.c -luring
  * Run:   ./uds_uring_shutdown_repro [workdir]   (default workdir: /tmp)
@@ -37,9 +40,10 @@
 static int lfd;
 
 static void *ring_thread(void *arg) {
-	(void)arg;
+	unsigned flags = *(const unsigned *)arg;
 	struct io_uring ring;
-	if (io_uring_queue_init(64, &ring, 0) < 0) { perror("ring"); exit(1); }
+	int e = io_uring_queue_init(64, &ring, flags);
+	if (e < 0) { fprintf(stderr, "ring init: %s\n", strerror(-e)); exit(1); }
 	struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
 	io_uring_prep_multishot_accept(sqe, lfd, NULL, NULL, 0);
 	io_uring_submit(&ring);
@@ -61,8 +65,9 @@ static void *ring_thread(void *arg) {
 	return NULL;
 }
 
-static void run(const char *label, int family) {
-	printf("== %s listener ==\n", label);
+static void run(const char *label, int family, unsigned flags) {
+	printf("== %s listener, %s ring ==\n", label,
+	       flags ? "SINGLE_ISSUER|DEFER_TASKRUN" : "plain");
 	if (family == AF_UNIX) {
 		unlink("shut.sock");
 		lfd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -77,8 +82,8 @@ static void run(const char *label, int family) {
 		a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 		if (bind(lfd, (struct sockaddr *)&a, sizeof a) < 0) { perror("bind"); exit(1); }
 	}
-	listen(lfd, 64);
-	pthread_t t; pthread_create(&t, NULL, ring_thread, NULL);
+	if (lfd < 0 || listen(lfd, 64) < 0) { perror("listen"); exit(1); }
+	pthread_t t; pthread_create(&t, NULL, ring_thread, &flags);
 	usleep(300 * 1000); /* let the ring arm before shooting */
 	int r = shutdown(lfd, SHUT_RDWR);
 	printf("  shutdown(SHUT_RDWR) -> ret=%d%s%s\n", r, r ? " errno=" : "",
@@ -90,7 +95,10 @@ static void run(const char *label, int family) {
 
 int main(int argc, char **argv) {
 	if (chdir(argc > 1 ? argv[1] : "/tmp") < 0) { perror("chdir"); return 1; }
-	run("AF_INET (TCP loopback)", AF_INET);
-	run("AF_UNIX", AF_UNIX);
+	const unsigned setups[] = { 0, IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN };
+	for (int i = 0; i < 2; i++) {
+		run("AF_INET (TCP loopback)", AF_INET, setups[i]);
+		run("AF_UNIX", AF_UNIX, setups[i]);
+	}
 	return 0;
 }
