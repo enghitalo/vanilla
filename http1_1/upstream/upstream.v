@@ -86,7 +86,10 @@ pub:
 	// or IPv6 literal is dialed as is and sent as the Host header (an IPv6 one
 	// in brackets); over HTTPS it is never sent as SNI (RFC 6066 §3) and must
 	// equal one of the certificate's iPAddress SANs, never a dNSName or the CN
-	// (RFC 9525 §6.2).
+	// (RFC 9525 §6.2). An IPv6 literal with a zone (`fe80::1%eth0`) is
+	// resolved instead (getaddrinfo needs the zone's interface on this host),
+	// and the Host header and the SAN match take the address alone: the zone
+	// only means something here (RFC 6874 §4).
 	host  string
 	port  int  = 443
 	https bool = true // false: plain HTTP (an internal or link-local endpoint)
