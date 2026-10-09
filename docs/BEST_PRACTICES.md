@@ -340,6 +340,20 @@ their request.
   pool, the same `watch_fd_persistent` parking, zero allocations per query;
   the trusted CAs are parsed once per pool and each connection's TLS session
   is allocated once and re-armed on every re-dial. TLS 1.3 only.
+- For token authentication (Aurora DSQL, RDS / Aurora IAM), where the server
+  asks for a short-lived token as a cleartext password over TLS: set
+  `allowed_auth: [.cleartext_password]` with `ssl_mode: .verify_full`, and
+  `password_fn` to mint the token. It is called once per connection attempt
+  (each pooled connection's bring-up, every re-dial), on the worker thread:
+  sign locally, never fetch over the network there. pg_async refuses to send
+  a cleartext password over plaintext, or when `allowed_auth` does not list it
+  (the default is SCRAM only). Keep connections younger than the server's own
+  cap (DSQL closes them at 60 min) with `max_lifetime_ms` and
+  `lifetime_jitter_ms`, and run the maintenance timer: it recycles a due
+  connection, one at a time, after its pipelined queries drain, so no request
+  meets the server's close or waits on the re-dial. `params:
+  {'application_name': 'orders-api'}` names the sessions in
+  `pg_stat_activity`.
 
 **Don't**
 
