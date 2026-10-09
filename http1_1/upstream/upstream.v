@@ -82,8 +82,9 @@ pub struct Origin {
 pub:
 	// host is the name dialed, sent as the Host header, and — over HTTPS — the
 	// SNI and the name the certificate must carry (tls.Verify.full). An IPv4
-	// or IPv6 literal is dialed as is (plain HTTP only, for now: Mbed TLS
-	// would send it as SNI, which RFC 6066 forbids).
+	// or IPv6 literal is dialed as is (plain HTTP only, for now: tls sends no
+	// SNI for it and checks it against iPAddress SANs since #233, but this
+	// pool has no HTTPS-to-IP tests yet).
 	host  string
 	port  int  = 443
 	https bool = true // false: plain HTTP (an internal or link-local endpoint)
@@ -255,7 +256,7 @@ pub fn Pool.new(o Origin, tls_cfg &tls.Config) !&Pool {
 			return error('upstream: an HTTPS origin needs a client TLS config (tls.new_client)')
 		}
 		if literal != none {
-			return error('upstream: HTTPS to an IP literal (${o.host}) is not supported yet: it would be sent as SNI (RFC 6066)')
+			return error('upstream: HTTPS to an IP literal (${o.host}) is not supported yet: use a host name')
 		}
 	}
 	mut p := &Pool{
