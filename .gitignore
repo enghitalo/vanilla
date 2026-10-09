@@ -22,8 +22,8 @@ bin/
 # vweb and database
 *.db
 *.js
-# ...but DO track the static_assets example's SPA bundle (a real, committed .js asset)
-!examples/static_assets/dist/*.js
+# ...but DO track the spa_static_assets example's SPA bundle (a real, committed .js asset)
+!examples/spa_static_assets/dist/*.js
 
 server_cert.pem
 examples/tiny/src/src
@@ -40,7 +40,7 @@ sample.mp4
 bench/etag_hash/etag_hash
 bench/middleware/middleware_bench
 bench/request_parser/request_parser_bench
-bench/static_assets/static_assets_bench
+bench/static_assets_bench/static_assets_bench
 
 # Compiled test binaries: `v tests/foo_test.v` drops `foo_test` beside the
 # source (#258). Extension-less files only: `foo_test.v` does not match, and
