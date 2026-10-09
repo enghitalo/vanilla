@@ -58,9 +58,11 @@ return .done
   `transport.dial_addr` (non-blocking, close-on-exec, `TCP_NODELAY`, keepalive,
   `TCP_USER_TIMEOUT`); the one that answers is tried first next time.
 - **TLS:** TLS 1.3, verify-full + SNI with `tls.Verify.full`; each slot keeps
-  its own Mbed TLS session and re-arms it on a re-dial (no allocation). A body
-  delimited by the connection close is complete only after `close_notify`; a
-  bare FIN is `.truncated`.
+  its own Mbed TLS session and re-arms it on a re-dial (no allocation). An
+  origin given by IP address (`host: '10.0.0.5'`, `'::1'`) gets no SNI, and
+  its certificate must carry that address as an `IP:` SAN (a `DNS:` spelling
+  or the CN does not count). A body delimited by the connection close is
+  complete only after `close_notify`; a bare FIN is `.truncated`.
 - **Framing:** `client.Framer` frames as bytes arrive (each recv costs only
   the new bytes): Content-Length, chunked with trailers, `100 Continue` then
   the final response, HEAD, 204/304, close-delimited bodies. Chunked bodies

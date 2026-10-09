@@ -49,6 +49,7 @@ jobs:
           - examples/simple/src
           - examples/simple2/src
           - examples/sse/src
+          - examples/static_files/src
           - examples/veb_like/src
           - examples/websocket_echo/src
           - examples/websocket_chat/src # server push: subscriptions, the mailbox, wake_after (#230)
