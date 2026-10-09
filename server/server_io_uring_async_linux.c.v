@@ -41,11 +41,13 @@ module server
 // Parked-connection deadlines: read/write deadlines are cleared at park (no
 // client op is armed, so neither timeout applies — nor the idle one: a parked
 // request is never idle-reaped) and re-arm naturally at resume (a read deadline
-// for a buffered partial, else the idle deadline, via iou_arm_recv). A hung
-// query on a vanished client therefore pins the slot until the
-// query returns — the same known gap as the epoll runtime (async_linux.c.v:29);
-// bound it DB-side with e.g. statement_timeout. A parked-deadline sweep is a
-// follow-up shared with epoll.
+// for a buffered partial, else the idle deadline, via iou_arm_recv). Park
+// deadlines (Limits.park_timeout_ms, watch_fd_deadline, vanilla#200) are
+// enforced by the epoll plain worker only: here a deadline watch is a plain
+// watch and event_loop.timed_out() stays false, so a hung query pins its slot
+// until the query returns; bound it DB-side with e.g. statement_timeout. A
+// deadline here would also have to retire the oneshot poll still armed on the
+// fd (IORING_OP_POLL_REMOVE), not only the watch entry.
 import io_uring
 import core
 import http1_1.request_parser
@@ -300,9 +302,11 @@ fn (mut env IouEnv) iou_reactor_clear(ext_fd int) {
 // Runs on the ring's own worker thread (continuations execute inside the CQE
 // dispatch), so SINGLE_ISSUER holds and no synchronization is needed.
 fn iou_register_watch(mut w core.EventLoop, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
-	if ext_fd < 0 {
+	if ext_fd < 0 || w.client_fd < 0 {
 		// A consumer handed us a failed fd (e.g. timerfd_create returned -1); never
-		// index the flat table at a negative slot. Arm nothing.
+		// index the flat table at a negative slot. Arm nothing. Nor for a
+		// clientless watch (watch_fd_background): this runtime resumes
+		// connections only, and would pin it to whichever one is running.
 		w.last_watched = -1
 		return
 	}

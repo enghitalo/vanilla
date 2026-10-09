@@ -150,6 +150,9 @@ mut:
 	// starts in write_buf (start_body_drain). Everything before it answers
 	// earlier requests.
 	drain_off int
+	// While parked with a deadline (park_conn): this connection's entry in
+	// PlainState.timers, -1 when none is armed. Kept in step by the heap.
+	park_timer int = -1
 }
 
 // PlainState is the per-worker connection table. `parked` counts armed
@@ -204,6 +207,12 @@ mut:
 	// connections are handed over by the accept thread through births_q (see
 	// BirthQueue).
 	births_q &BirthQueue = unsafe { nil }
+	// Park deadlines (park_deadline_linux.c.v): Limits.park_timeout_ms in ns
+	// (0 = no default deadline), and the min-heap of the deadlines armed on
+	// parked connections. The heap has its own clock and its own term in the
+	// wait timeout, so it works with no other timeout set.
+	park_ns u64
+	timers  []ParkTimer
 }
 
 // birth_queue_cap is the capacity of a worker's BirthQueue (a power of two).
@@ -437,12 +446,20 @@ fn state_create(mut st PlainState, fd int) &ConnState {
 // the gap. One uncontended atomic per park and per resume (the counter is
 // this worker's, on its own cache line); a request that never parks pays
 // nothing.
+//
+// They also arm and cancel the park's deadline (vanilla#200): timeout_ms is
+// the one the watch_fd* call that armed the watch asked for (EventLoop.
+// timeout_ms; 0 = Limits.park_timeout_ms, < 0 = none). With neither set, as
+// by default, that is one compare per park and per resume.
 @[inline]
-fn park_conn(mut st PlainState, mut cs ConnState, ext_fd int) {
+fn park_conn(mut st PlainState, mut cs ConnState, fd int, ext_fd int, timeout_ms int) {
 	if cs.awaiting_fd < 0 {
 		stdatomic.add_i64(&st.inflight.n, 1)
 	}
 	cs.awaiting_fd = ext_fd
+	if timeout_ms != 0 || st.park_ns != 0 {
+		st.arm_park_timer(mut cs, fd, timeout_ms)
+	}
 }
 
 @[inline]
@@ -450,6 +467,9 @@ fn unpark_conn(mut st PlainState, mut cs ConnState) {
 	if cs.awaiting_fd >= 0 {
 		cs.awaiting_fd = -1
 		stdatomic.add_i64(&st.inflight.n, -1)
+		if cs.park_timer >= 0 {
+			st.cancel_park_timer(mut cs)
+		}
 	}
 }
 
@@ -806,7 +826,7 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			cs.file_remaining = 0
 			cs.body_drain = 0
 			cs.drain_off = 0
-			// awaiting_fd is already -1 (unpark_conn above)
+			// awaiting_fd and park_timer are already -1 (unpark_conn above)
 			cs.close_after_flush = false
 			cs.sent_100 = false
 			cs.takeover = unsafe { nil }

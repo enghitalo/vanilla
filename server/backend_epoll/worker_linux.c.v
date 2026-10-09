@@ -213,6 +213,11 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 		0
 	}
 	st.idle_ns = u64(limits.idle_ms()) * 1_000_000
+	st.park_ns = if limits.park_timeout_ms > 0 {
+		u64(limits.park_timeout_ms) * 1_000_000
+	} else {
+		0
+	}
 	st.listen_port = listen_port
 	st.listen_uds = listen_uds
 	st.births_q = births_q
@@ -243,7 +248,7 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 	mut announced := false // this wait was announced to the accept thread (birth_queue_pending)
 	for {
 		mut grace := false
-		wait_ms := if hot {
+		mut wait_ms := if hot {
 			0
 		} else if sweep_on && st.parked > 0 {
 			rested = false // a quiet stretch starts once nothing is armed
@@ -269,6 +274,17 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 		} else {
 			-1 // nothing armed: sleep until the next event
 		}
+		if st.timers.len > 0 && wait_ms != 0 {
+			// A park deadline is armed: block no longer than until the earliest
+			// is due (park_deadline_linux.c.v). Such a wait is not a finished
+			// grace wait; an announced sleep stays announced (at worst the
+			// accept thread writes the eventfd once more).
+			park_ms := st.park_wait_ms()
+			if wait_ms < 0 || park_ms < wait_ms {
+				wait_ms = park_ms
+				grace = false
+			}
+		}
 		mut num_events := C.epoll_wait(epoll_fd, &events[0], socket.max_connection_size,
 			wait_ms)
 		if num_events < 0 {
@@ -288,8 +304,13 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 			stdatomic.store_u64(&st.births_q.sleeping, 0)
 			announced = false
 		}
-		if sweep_on {
-			st.tick() // the batch clock: one read per iteration, reused by every deadline
+		// The batch clock: one read per iteration, reused by every deadline,
+		// while a Limits timeout or a park deadline is armed. A deadline armed
+		// in this batch reads the clock itself (arm_park_timer), so with none
+		// armed here none can be due after it.
+		parks_due := st.timers.len > 0
+		if sweep_on || parks_due {
+			st.tick()
 		}
 		st.batch_seq = st.close_seq // closes from here on are in this batch (closed_in_batch)
 		reactor.batch++ // watches ADDed from here on are in this batch (WatchEntry.added)
@@ -411,6 +432,12 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 				handle_readable(handler, mut reactor, epoll_fd, fd, cs, limits, counter, active_conns, mut
 					st, state)
 			}
+		}
+		// Parks whose deadline passed (as of the batch clock) get their
+		// continuation, with the timeout reason.
+		if parks_due && st.timers.len > 0 && st.timers[0].at <= st.now {
+			fire_park_deadlines(handler, mut reactor, epoll_fd, limits, counter, active_conns, mut
+				st, state)
 		}
 		// After handling this batch (or a timeout wake with num_events == 0),
 		// reap any connection whose read/write/idle deadline has passed — at most

@@ -21,7 +21,9 @@ module backend_epoll
 // async-runtime umbrella issue. Cross-request pipelining (a per-fd FIFO) and
 // pool-owned, non-closing watched fds (watch_persistent — a client disconnect
 // tombstones the parked request and leaves the fd open for reuse) have
-// landed. Parked-connection timeouts remain a follow-up.
+// landed, and so have park deadlines (Limits.park_timeout_ms,
+// watch_fd_deadline: park_deadline_linux.c.v), which resume a park whose fd
+// never became ready with the timeout reason.
 import core
 import epoll
 import http1_1.request_parser
@@ -749,7 +751,7 @@ fn drain_takeover(mut reactor Reactor, epoll_fd int, fd int, limits core.Limits,
 					}
 					return false
 				}
-				park_conn(mut st, mut cs, event_loop.last_watched)
+				park_conn(mut st, mut cs, fd, event_loop.last_watched, event_loop.timeout_ms)
 				update_read_deadline(limits, mut st, mut cs) // parked ⇒ clears any armed deadline
 				if cs.write_buf.len > cs.write_off {
 					flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs)
@@ -999,7 +1001,7 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 					}
 					return false
 				}
-				park_conn(mut st, mut cs, event_loop.last_watched) // leftover stays buffered for resume
+				park_conn(mut st, mut cs, fd, event_loop.last_watched, event_loop.timeout_ms) // leftover stays buffered for resume
 			}
 			.close {
 				compact_read_buf(mut cs, pos)
@@ -1152,6 +1154,16 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 	core.set_queue_file_allowed(false) // no file from a continuation (see above)
 	cont_step := cont(mut cs.write_buf, ext_fd, ready_err, entry_udata, state, mut event_loop)
 	core.set_queue_file_allowed(true)
+	resume_step(h, mut reactor, epoll_fd, ext_fd, client_fd, cont_step, mut event_loop, limits,
+		active_conns, mut st, mut cs, state)
+}
+
+// resume_step carries out what a resumed parked request's continuation
+// returned: on_watch_ready's, after its watched fd fired, and on_park_timeout's,
+// after its deadline passed. The connection is already unparked; `event_loop`
+// is the one the continuation ran with.
+@[direct_array_access; manualfree]
+fn resume_step(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int, client_fd int, cont_step core.Step, mut event_loop core.EventLoop, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) {
 	if cont_step != .suspend && event_loop.last_watched >= 0 {
 		// Continuation re-watched but did not park (.done/.close after watch_fd):
 		// tear the stray watch down before the connection moves on / is closed.
@@ -1248,7 +1260,7 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 					return
 				}
 			}
-			park_conn(mut st, mut cs, event_loop.last_watched) // re-armed (multi-step); stay parked
+			park_conn(mut st, mut cs, client_fd, event_loop.last_watched, event_loop.timeout_ms) // re-armed (multi-step); stay parked
 		}
 		.close {
 			close_conn(epoll_fd, client_fd, active_conns, mut st)
@@ -1382,7 +1394,7 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 						break
 					}
 				}
-				park_conn(mut st, mut cs, ext_fd)
+				park_conn(mut st, mut cs, client_fd, ext_fd, event_loop.timeout_ms)
 				break
 			}
 			.close {
