@@ -186,7 +186,8 @@ mut:
 	// maintenance (maintenance_*.c.v) and the resolver hand-off (resolver.v)
 	timer_fd  int = -1
 	timer_due u64 // monotonic ns the timer is armed for (0: not armed)
-	feed_fd   int       = -1 // the resolver pipe's read end (follow)
+	feed_fd   int = -1 // the resolver pipe's read end (follow)
+	feed_rec  Record // the record on_feed reads into, reused
 	resolver  &Resolver = unsafe { nil }
 	sub_id    int       = -1
 	closed    bool
