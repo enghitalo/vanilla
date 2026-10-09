@@ -12,6 +12,18 @@
 # Per build it reports the MINIMUM of N runs via bench/measure.sh (the minimum
 # rejects upward noise — see that script and BEST_PRACTICES.md section 10).
 #
+# Only the library may differ between the two sides, so both are built from
+# HEAD's copy of each bench program, with functions and loops aligned:
+#   * a bench program that gained a phase or changed its workload otherwise reads
+#     as a library delta (vanilla#220: request_parser_bench.v gained two chunked
+#     phases and the parser "regressed" +80%, every old phase unchanged);
+#   * an unrelated change otherwise moves a micro-benchmark through code layout
+#     alone (#220: get_header_value_slice read +15% in a commit that never touched
+#     it, and 0% once aligned).
+# When HEAD's program does not build or run against the baseline (an API it
+# uses changed, or a phase checks behaviour the baseline lacks), the row has no
+# like-for-like baseline and no delta.
+#
 #   bench/ci_bench.sh                  # HEAD vs HEAD~1, default bench set
 #   BASE_REF=main BENCH_RUNS=7 bench/ci_bench.sh
 #
@@ -62,6 +74,11 @@ export BENCH_ITERS="${BENCH_ITERS:-2000000}"
 # when the baseline ref predates it.
 MEASURE="$ROOT/bench/measure.sh"
 
+# Code alignment for both sides (see the header). BENCH_CFLAGS='' turns it off.
+ALIGN_CFLAGS="${BENCH_CFLAGS--falign-functions=64 -falign-loops=64}"
+cflags=()
+[ -n "$ALIGN_CFLAGS" ] && cflags=(-cflags "$ALIGN_CFLAGS")
+
 bins="$(mktemp -d)"
 wt="$(mktemp -d)"
 cleanup() {
@@ -89,14 +106,32 @@ build() {
 	local key="$1|$2|$3" bin
 	if [ -z "${built[$key]+set}" ]; then
 		bin="$bins/bin_${#built[@]}"
-		# shellcheck disable=SC2086 # flags is a word list
-		if ( cd "$1" && v -prod -gc none $3 -o "$bin" "$2" ) >/dev/null 2>&1; then
+		# shellcheck disable=SC2086 # flags is a word list. cflags: an empty array
+		# under set -u is an "unbound variable" before bash 4.4, hence the +.
+		if ( cd "$1" && v -prod -gc none ${cflags[@]+"${cflags[@]}"} $3 -o "$bin" "$2" ) >/dev/null 2>&1; then
 			built[$key]=$bin
 		else
 			built[$key]=
 		fi
 	fi
 	BIN=${built[$key]}
+}
+
+# build_base <bench-relpath> <flags>: build() for the baseline, from HEAD's copy
+# of the bench program. Sets BIN, and CHANGED to 1 when the baseline's own copy
+# of the program differs from HEAD's (0 when identical or absent).
+declare -A changed=()
+build_base() {
+	if [ -z "${changed[$1]+set}" ]; then
+		changed[$1]=0
+		if [ -f "$ROOT/$1" ] && ! cmp -s "$ROOT/$1" "$wt/$1"; then
+			[ -f "$wt/$1" ] && changed[$1]=1
+			mkdir -p "$(dirname "$wt/$1")"
+			cp -f "$ROOT/$1" "$wt/$1"
+		fi
+	fi
+	build "$wt" "$1" "$2"
+	CHANGED=${changed[$1]}
 }
 
 # measure <binary> <args> <iterations> -> min seconds, or "" when a run fails
@@ -115,6 +150,9 @@ emit() {
 	return 0   # never let the summary-append status leak (Actions runs steps with -e)
 }
 
+align_note=''
+[ -n "$ALIGN_CFLAGS" ] && align_note=" with \`${ALIGN_CFLAGS}\`"
+
 # Hidden marker so a future run could find-and-update this comment instead of
 # stacking a new one.
 emit '<!-- vanilla-bench-bot -->'
@@ -124,7 +162,7 @@ if [ "$worktree_ok" -ne 1 ]; then
 	emit "⚠️ Could not check out baseline \`${BASE_REF}\` (shallow clone? need \`fetch-depth: 2\`). No comparison."
 	exit 0
 fi
-emit "Same-runner A/B on \`${RUNNER_OS:-local}\`, toolchain \`$(v version 2>/dev/null || echo 'V unknown')\`. Hosted runners are noisy — treat **|Δ| < ${THRESHOLD}%** as noise. Each side is the **minimum of ${BENCH_RUNS} runs** of ${BENCH_ITERS} iterations (the \`pg_async\` phases: their own default work) (\`bench/measure.sh\`)."
+emit "Same-runner A/B on \`${RUNNER_OS:-local}\`, toolchain \`$(v version 2>/dev/null || echo 'V unknown')\`. Hosted runners are noisy — treat **|Δ| < ${THRESHOLD}%** as noise. Each side is the **minimum of ${BENCH_RUNS} runs** of ${BENCH_ITERS} iterations (the \`pg_async\` phases: their own default work) (\`bench/measure.sh\`), both built from this commit's bench programs${align_note}."
 emit ''
 emit '| bench | baseline | this commit | Δ | |'
 emit '|---|--:|--:|--:|:--|'
@@ -133,7 +171,7 @@ regressions=0         # > THRESHOLD       (flagged in the table)
 issue_regressions=0   # > ISSUE_THRESHOLD (confident enough to open an issue)
 for entry in "${BENCHES[@]}"; do
 	IFS='|' read -r name src flags args iters <<< "$entry"
-	build "$wt" "$src" "$flags"
+	build_base "$src" "$flags"
 	base_bin=$BIN
 	build "$ROOT" "$src" "$flags"
 	head_bin=$BIN
@@ -150,9 +188,13 @@ for entry in "${BENCHES[@]}"; do
 		emit "| \`$name\` | $base_cell | — | — | ❌ $why (HEAD) |"
 		continue
 	elif [ -z "$base_min" ]; then
-		# Absent at the baseline, or present but unable to run this entry's
-		# args (a phase added since): new either way.
-		emit "| \`$name\` | — | $(printf '%.3f' "$head_min")s | — | 🆕 new bench |"
+		if [ "$CHANGED" = 1 ]; then
+			# The program changed, and this commit's copy does not build or run
+			# against the baseline library: nothing to compare it with.
+			emit "| \`$name\` | — | $(printf '%.3f' "$head_min")s | — | ↔ bench program changed, no like-for-like baseline |"
+		else
+			emit "| \`$name\` | — | $(printf '%.3f' "$head_min")s | — | 🆕 new bench |"
+		fi
 		continue
 	fi
 

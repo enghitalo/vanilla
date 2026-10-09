@@ -215,7 +215,8 @@ jobs:
       # examples/https_upstream's edge, against its fake upstream (a V
       # program the test builds, serving TLS with the test CA): response
       # shapes, keep-alive reuse, stale connections, retries, close_notify vs
-      # a bare FIN, certificate failures, early answers, 4 MiB bodies,
+      # a bare FIN, certificate failures, IPv4/IPv6 literal origins (iPAddress
+      # SANs), early answers, 4 MiB bodies,
       # deadlines, shedding, client disconnects, the resolver thread.
       # VANILLA_REQUIRE_FAKE_PG turns a missing openssl (the test CA) into a
       # failure instead of a skip.
@@ -269,15 +270,18 @@ jobs:
           VANILLA_NO_IOURING: '1'
         run: |
           v -gc none -cc gcc -no-parallel -d vanilla_tls test tests/tls_static_test.v
-      # No allocation per upstream exchange over TLS: the heap after 200 warm-up
-      # calls and after 4000 more grows by under 4 KiB.
+      # No allocation per upstream exchange over TLS (the heap after 200
+      # warm-up calls and after 4000 more grows by under 4 KiB), nor per
+      # resolver update. The whole suite, not the check alone: a test that
+      # leaves a thread allocating fails the check that runs after it (the
+      # workers spun on a stopped Resolver's pipes, ~130 KB per exchange).
       - name: Pooled HTTPS client under -gc none
         shell: bash
         env:
           VANILLA_NO_IOURING: '1'
           VANILLA_REQUIRE_FAKE_PG: '1'
         run: |
-          v -gc none -cc gcc -no-parallel -d vanilla_tls -run-only test_no_allocation_per_exchange test examples/https_upstream/src
+          v -gc none -cc gcc -no-parallel -d vanilla_tls test http1_1/upstream examples/https_upstream/src
       # The TLS worker under ThreadSanitizer (race_detector.yml has no Mbed
       # TLS). See race_detector.yml for the two steps that prepare it.
       - name: Make ASLR compatible with ThreadSanitizer
