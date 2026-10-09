@@ -58,7 +58,6 @@ mut:
 	handle   core.ConnHandle
 	wait_ms  int
 	timeouts int
-	park_w   int = -1 // the write end of the pipe `park` waits on (never written)
 }
 
 // CpRegistry is the application's handle registry, shared by every worker
@@ -77,7 +76,7 @@ mut:
 	timeouts    i64
 	next_worker i64
 	park_runs   i64 // runs of the `park` continuation
-	park_w      i64 // the write end of the last `park`'s pipe
+	park_w      i64 = -1 // the write end of the last `park`'s pipe: the test's to write and close
 }
 
 const cp_reg = &CpRegistry{}
@@ -125,6 +124,18 @@ fn cp_reset() {
 	stdatomic.store_i64(&c.timeouts, 0)
 	stdatomic.store_i64(&c.next_worker, 0)
 	stdatomic.store_i64(&c.park_runs, 0)
+	stdatomic.store_i64(&c.park_w, -1)
+}
+
+// cp_close_park closes the last `park` pipe's write end (after the server
+// stopped: the runtime closed its read end with the connection).
+fn cp_close_park() {
+	mut c := unsafe { cp }
+	w := stdatomic.load_i64(&c.park_w)
+	if w >= 0 {
+		stdatomic.store_i64(&c.park_w, -1)
+		C.close(int(w))
+	}
 }
 
 fn cp_prefix(b []u8, p string) bool {
@@ -240,7 +251,6 @@ fn cp_line_conn(buf []u8, mut out []u8, client_fd int, takeover_state voidptr, w
 			// database): the connection is parked, not subscribed-and-reading.
 			mut fds := [2]i32{}
 			C.pipe(&fds[0])
-			sub.park_w = int(fds[1])
 			mut c := unsafe { cp }
 			stdatomic.store_i64(&c.park_w, i64(fds[1]))
 			event_loop.watch_fd(int(fds[0]), .readable, cp_park_cont, voidptr(sub))
@@ -297,12 +307,8 @@ fn cp_wake(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidpt
 		.closed {
 			stdatomic.add_i64(&c.closed, 1)
 			if watch_payload != unsafe { nil } {
-				mut sub := unsafe { &CpSub(watch_payload) }
+				sub := unsafe { &CpSub(watch_payload) }
 				cp_reg_remove(sub.idx)
-				if sub.park_w >= 0 {
-					C.close(sub.park_w)
-					sub.park_w = -1
-				}
 			}
 		}
 		else {}
@@ -871,6 +877,9 @@ fn test_epoll_parked_takeover_sees_fin_behind_a_frame() ! {
 		return
 	}
 	cp_reset()
+	defer {
+		cp_close_park()
+	}
 	mut h := vtest.start(cp_config(1, 0, 0))!
 	defer {
 		h.stop()
@@ -901,6 +910,9 @@ fn test_epoll_parked_takeover_buffers_frames_for_the_resume() ! {
 		return
 	}
 	cp_reset()
+	defer {
+		cp_close_park()
+	}
 	mut h := vtest.start(cp_config(1, 0, 0))!
 	defer {
 		h.stop()
