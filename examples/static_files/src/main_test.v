@@ -12,12 +12,22 @@ import core
 import os
 
 const fixture_body = '<h1>hello</h1>' // 14 bytes
+const secret_body = 'SECRET-OUTSIDE-WEB-ROOT'
 const test_root = os.join_path(os.temp_dir(), 'vanilla_static_files_test_${os.getpid()}')
 
+// The fixture: ./public (the web root) and, outside it, a sibling ./public2
+// that shares the root's name as a prefix (#228). Symlinks inside the root
+// point at the secret (out) and at the index (in).
 fn testsuite_begin() {
 	os.mkdir_all(os.join_path(test_root, 'public')) or { panic(err) }
+	os.mkdir_all(os.join_path(test_root, 'public2')) or { panic(err) }
 	os.write_file(os.join_path(test_root, 'public', 'index.html'), fixture_body) or { panic(err) }
+	os.write_file(os.join_path(test_root, 'public2', 'secret.txt'), secret_body) or { panic(err) }
 	os.chdir(test_root) or { panic(err) }
+	$if !windows {
+		os.symlink('../public2/secret.txt', os.join_path('public', 'escape.txt')) or { panic(err) }
+		os.symlink('index.html', os.join_path('public', 'alias.html')) or { panic(err) }
+	}
 }
 
 fn testsuite_end() {
@@ -93,6 +103,23 @@ fn test_path_traversal_refused() {
 	// a normal path resolves to something inside the root
 	p := safe_path('/index.html') or { '' }
 	assert p != ''
+}
+
+// A sibling directory whose name starts with the root's name is outside the
+// root: containment is checked on a path-segment boundary (#228).
+fn test_sibling_with_root_prefix_refused() {
+	assert safe_path('/../public2/secret.txt') == none
+	assert safe_path('/../public2') == none
+	assert safe_path('/../public') == none // the root itself is no file
+}
+
+fn test_symlink_out_of_root_refused() {
+	$if windows {
+		return
+	}
+	assert safe_path('/escape.txt') == none
+	p := safe_path('/alias.html') or { '' } // a link that stays inside is fine
+	assert p.ends_with('index.html')
 }
 
 // ---- raw-request E2E (serve adapter) -------------------------------------------
@@ -171,6 +198,24 @@ fn test_if_none_match_roundtrip_304() {
 fn test_path_traversal_gets_404() {
 	out := serve('GET /../../etc/passwd HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()).bytestr()
 	assert out.contains('404 Not Found')
+}
+
+fn test_sibling_with_root_prefix_gets_404() {
+	out := serve('GET /../public2/secret.txt HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()).bytestr()
+	assert out.contains('404 Not Found')
+	assert !out.contains(secret_body)
+}
+
+fn test_symlink_out_of_root_gets_404() {
+	$if windows {
+		return
+	}
+	out := serve('GET /escape.txt HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()).bytestr()
+	assert out.contains('404 Not Found')
+	assert !out.contains(secret_body)
+	inside := serve('GET /alias.html HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()).bytestr()
+	assert inside.contains('200 OK')
+	assert inside.ends_with(fixture_body)
 }
 
 fn test_malformed_request_errors() {
