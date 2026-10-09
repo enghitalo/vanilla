@@ -55,8 +55,8 @@ TLS, per run (--ssl; certificates from gen_test_ca.sh via --cert/--key):
 
 --stats-file PATH keeps `key=value` counters (accepted, authenticated, queries
 — one per Sync —, statements — one per Bind —, rollbacks, conflicts,
-server_closes, ssl_requests, tls_handshakes, tickets, cancel_requests) up to
-date, so a test can assert on what the server saw. Every connection is logged
+server_closes, ssl_requests, tls_handshakes, sni, tickets, cancel_requests) up
+to date, so a test can assert on what the server saw. Every connection is logged
 to stderr.
 
 usage: fake_pg.py --port-file PATH [options]
@@ -98,6 +98,15 @@ CONFLICT_LOCK = threading.Lock()
 
 def log(cid, text):
     print(f'fake-pg conn {cid}: {text}', file=sys.stderr, flush=True)
+
+
+def count_sni(sock, name, ctx):
+    """Counts the ClientHellos that carry a server_name (SNI): an IP address
+    must never be one (RFC 6066 §3, vanilla#233). Returns None: anything else
+    is an alert that aborts the handshake."""
+    if name is not None:
+        bump('sni')
+    return None
 
 
 def bump(key, n=1):
@@ -502,6 +511,7 @@ def main():
         TLS_CTX.minimum_version = ssl.TLSVersion.TLSv1_3
         TLS_CTX.load_cert_chain(ARGS.cert, ARGS.key)
         TLS_CTX.num_tickets = 0  # what PostgreSQL does; --tickets-per-query sends them on demand
+        TLS_CTX.sni_callback = count_sni
 
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
