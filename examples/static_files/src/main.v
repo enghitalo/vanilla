@@ -8,8 +8,10 @@ module main
 //
 // SECURITY FIRST
 //   The single most important line in a static server is the one that prevents
-//   `GET /../../etc/passwd`. We resolve the requested path against the root and
-//   verify the result is still inside the root. Never trust the URL path.
+//   `GET /../../etc/passwd`. We resolve the requested path against the root
+//   (symlinks included) and verify the result is still inside the root, on a
+//   path-segment boundary: `./public2` is not inside `./public`. Never trust
+//   the URL path.
 //
 // WORKS TODAY: everything here is plain file I/O + header building — read into a
 // []u8 and write it out, which is the clearest way to show the logic.
@@ -26,7 +28,7 @@ module main
 //     O(filesize) BY DESIGN — it is the conditional-GET pedagogy; for
 //     precomputed validators use `server.static_assets`.
 //   - The URL path reaches `safe_path` as a zero-copy `tos` VIEW; the os path
-//     APIs (norm_path/join_path/abs_path) are string-typed and make their own
+//     APIs (norm_path/join_path, realpath) are string-typed and make their own
 //     copies internally — the documented teaching trade-off (rule 3: don't
 //     contort a path that is disk-bound anyway).
 //
@@ -167,13 +169,43 @@ fn safe_path(url_path string) ?string {
 	// upstream layer, so it simply fails the file lookup; the literal `..` is
 	// what this guard refuses. The query string was already stripped by
 	// offsets in handle().
+	//
+	// Both sides are resolved (see resolve), so a symlink inside the root is
+	// followed only when its target is inside the root too (a missing file
+	// does not resolve and is refused: a 404 either way). This guards against
+	// requests, not local writers: the check and the open below are two walks
+	// of the path, and a writer inside the root can swap a directory for a
+	// symlink in between (closing that takes openat2's RESOLVE_BENEATH).
 	clean := os.norm_path(os.join_path(web_root, url_path.trim_left('/')))
-	root_abs := os.abs_path(web_root)
-	cand_abs := os.abs_path(clean)
-	if !cand_abs.starts_with(root_abs) {
+	root := resolve(web_root)?
+	cand := resolve(clean)?
+	// Containment on a path-segment boundary: the candidate must be the root
+	// followed by a separator. A bare prefix test lets a sibling that shares
+	// the root's name through (`/../public2/secret.txt` for `./public`, #228).
+	if !(cand.len > root.len && cand.starts_with(root) && cand[root.len] == os.path_separator[0]) {
 		return none // traversal attempt — refuse
 	}
-	return cand_abs
+	return cand
+}
+
+// resolve is os.real_path that fails closed. When realpath(3) fails,
+// os.real_path returns its input unchanged: a path that may still lead through
+// a symlink out of the root, and that passes the containment check whenever
+// the root is absolute. Here a path that does not resolve (missing, a symlink
+// loop, a target past PATH_MAX) is refused. Windows keeps os.real_path, whose
+// fallback (GetFullPathName) normalizes without following links.
+fn resolve(path string) ?string {
+	$if windows {
+		return os.real_path(path)
+	} $else {
+		p := C.realpath(&char(path.str), unsafe { nil })
+		if p == unsafe { nil } {
+			return none
+		}
+		s := unsafe { cstring_to_vstring(p) }
+		unsafe { C.free(p) }
+		return s
+	}
 }
 
 // ---- ETag --------------------------------------------------------------------
