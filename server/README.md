@@ -23,7 +23,7 @@ per-request allocation.
 
 | Platform | Backend | Accept model | Notes |
 |---|---|---|---|
-| Linux | `.epoll` *(default)* | one central acceptor → round-robins fds to per-worker epolls | `.suspend` watches, `make_state`, `on_worker_start`, TLS |
+| Linux | `.epoll` *(default)* | one central acceptor → round-robins fds to per-worker epolls | `.suspend` watches, park deadlines, server push (subscriptions, mailbox), `make_state`, `on_worker_start`, TLS |
 | Linux | `.io_uring` | per-worker `SO_REUSEPORT` listener + multishot accept (kernel 5.19+) | `.suspend` watches (oneshot `IORING_OP_POLL_ADD`), `make_state` |
 | macOS | kqueue | per-worker | `.suspend` watches, `make_state` |
 | Windows | IOCP | one central acceptor → round-robins fds to per-worker IOCP ports | `.done`/`.close` only (`.suspend` closes), `make_state`, limits + timeouts |
@@ -64,6 +64,24 @@ per-request allocation.
   `event_loop.watch_fd_background(...)` arms a clientless watch from a handler
   or continuation (fire-and-forget I/O on the worker, e.g. pg_async's
   CancelRequest; epoll plain worker only, false elsewhere).
+- **Server push** — a taken-over connection (WebSocket, SSE, h2c) can
+  `event_loop.subscribe(wake_fn, sub_state)`: it keeps reading its client,
+  and its wake fn (a `core.WakeFn`, called on its own worker between client
+  bursts) gets every other event, told apart by `event_loop.reason()`:
+  `.posted` (`ConnHandle.post_wake` / `post_bytes` from any thread; read
+  `post_tag()` / `post_data()`), `.timeout` (`event_loop.wake_after(ms)`, no
+  `Limits` needed), `.shutdown` (`Server.shutdown`), and last `.closed`,
+  exactly once whatever closed it — free the subscription's state there. The
+  `ConnHandle` subscribe returns is generation-checked on its worker: a post
+  for a connection that is gone is dropped (`Server.push_stats().stale`),
+  never delivered to the connection that reuses its fd number. Posts need
+  `ServerConfig.push_mailbox_slots > 0` (a bounded ring per worker, ~280 B a
+  slot; a post never blocks and reports `.full` / `.too_big` / `.ok`); past
+  `push_watermark_bytes` (default 1 MiB) pending, a subscriber is closed. A
+  subscription does not park the connection and does not hold
+  `shutdown(grace)`. Epoll plain worker only: elsewhere `subscribe` returns
+  a nil handle and posts report `.unsupported`. See
+  `examples/websocket_chat` and `core/conn_handle.v`.
 - **Per-worker state** — set `make_state`: it runs once per worker thread, and
   every handler call on that worker receives the value as the
   **`worker_state`** parameter (e.g. a per-thread DB connection — no shared
