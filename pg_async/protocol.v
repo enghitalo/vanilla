@@ -166,6 +166,59 @@ pub fn (res &Result) rows() RowIter {
 	}
 }
 
+const err_no_such_statement = error('pg: result: no statement at that index')
+
+// statement returns statement i's part of a batch result (async_submit_batch):
+// its frames, as a view (read its rows() and columns()), and its own
+// rows_affected. A batch's Result holds every statement's reply: its rows()
+// walks the rows of all of them, and its rows_affected is the last
+// statement's. statement(0) of a single query is the query. Each call walks
+// the frames from the start, allocating nothing.
+@[direct_array_access]
+pub fn (res &Result) statement(i int) !Result {
+	mut pos := 0
+	mut start := 0
+	mut n := 0
+	for {
+		hdr := next_message_at(res.frames, pos) or { break }
+		pos += hdr.total
+		if hdr.typ != bt_command_complete && hdr.typ != bt_empty_query_response {
+			continue
+		}
+		if n == i {
+			mut rows := u64(0)
+			if hdr.typ == bt_command_complete {
+				rows = parse_command_complete(unsafe { (&u8(res.frames.data) + pos - hdr.total + 5).vbytes(hdr.total - 5) })
+			}
+			return Result{
+				frames:        unsafe { (&u8(res.frames.data) + start).vbytes(pos - start) }
+				rows_affected: rows
+			}
+		}
+		n++
+		start = pos
+	}
+	return err_no_such_statement
+}
+
+// statements_done counts the statements a reply has completed so far: its
+// CommandComplete and EmptyQueryResponse messages. At an ErrorResponse that is
+// the failing statement's index in a batch (PgError.statement). Error path
+// only.
+@[direct_array_access]
+fn statements_done(frames []u8) int {
+	mut n := 0
+	mut pos := 0
+	for {
+		hdr := next_message_at(frames, pos) or { break }
+		if hdr.typ == bt_command_complete || hdr.typ == bt_empty_query_response {
+			n++
+		}
+		pos += hdr.total
+	}
+	return n
+}
+
 // RowIter yields the DataRow frames in a result, skipping everything else.
 pub struct RowIter {
 mut:
@@ -608,6 +661,11 @@ pub:
 	severity string // non-localized severity: ERROR, FATAL or PANIC
 	sqlstate string // the five-character SQLSTATE, e.g. 23505, 40001, 57P01
 	message  string // the primary human-readable message
+	// statement is how many statements of the query completed before the
+	// error: in a batch (async_submit_batch), the index of the statement that
+	// failed, or the batch's length when its commit at the Sync failed. 0 for
+	// a single query that failed (1 if its own commit did).
+	statement int
 }
 
 pub fn (e PgError) msg() string {

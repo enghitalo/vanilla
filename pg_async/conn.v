@@ -214,9 +214,10 @@ pub:
 
 // LinkState is a connection's health. A live connection is .ready. It turns
 // .broken the moment it is known lost: EOF, a socket error (a TLS error
-// included), a FATAL/PANIC ErrorResponse, or an exclusive borrower releasing
+// included), a FATAL/PANIC ErrorResponse, an exclusive borrower releasing
 // it with a query still in flight (its reply stream can no longer be matched
-// to queries). A broken connection takes no new query and fails what is still
+// to queries), or a ROLLBACK queued at release that failed or got no answer
+// (PgPool.finish_rollback). A broken connection takes no new query and fails what is still
 // in flight — after delivering every reply already buffered — and its pool
 // then re-dials it through .connecting (over TLS, .ssl_request and
 // .tls_handshake) and .starting back to .ready, without blocking (redial.v).
@@ -247,6 +248,15 @@ mut:
 	send_off int  // [0, send_off) already sent
 	send_len int  // [send_off, send_len) written, still to send
 	inflight []PendingQuery
+	// ready_status is the transaction status byte of the last ReadyForQuery
+	// that completed a query: tx_idle, tx_in_block or tx_failed (tx.v). A
+	// fresh session starts idle.
+	ready_status u8 = tx_idle
+	// rollback_deadline is set while the ROLLBACK release() queued for a
+	// connection left in a transaction is in flight (monotonic ns; 0 = none):
+	// the pool hands the connection out again only once that ROLLBACK's
+	// ReadyForQuery reports it idle (PgPool.finish_rollback).
+	rollback_deadline u64
 	// Per-connection reply-accumulator pool: max_inflight buffers (frame_buf_cap each)
 	// allocated ONCE and reused round-robin via frame_ring, so a pipelined query never
 	// allocates its accumulator per submit — essential under `-gc none`, where a
@@ -542,6 +552,9 @@ pub fn (mut c PgConn) query(query_text string, params []?[]u8) !Result {
 		}
 		match msg.typ {
 			bt_ready_for_query {
+				if msg.payload.len > 0 {
+					c.ready_status = msg.payload[0]
+				}
 				break
 			}
 			bt_command_complete {

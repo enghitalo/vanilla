@@ -3,7 +3,8 @@ module pg_async
 import time
 
 // Pool maintenance, off the request path: finding connections the server
-// closed while they sat idle, and re-dialing broken ones.
+// closed while they sat idle, re-dialing broken ones, and reading the reply
+// to the ROLLBACK release() queued on a connection left in a transaction.
 //
 // Without it, a connection the server closes while idle (a restart,
 // idle_session_timeout, a managed database's lifetime cap such as Aurora
@@ -74,13 +75,26 @@ fn (mut c PgConn) probe_idle() {
 // milliseconds, it wants to run again: maintenance_busy_ms while a re-dial is
 // in flight, the remaining backoff while one waits to retry, else
 // maintenance_idle_ms. A connection held by acquire() or carrying pipelined
-// queries is left alone: its reader finds out on its own. Never blocks on the
-// network.
+// queries is left alone: its reader finds out on its own. One whose
+// release-time ROLLBACK is in flight has nobody to read the reply but the pool:
+// maintain() reads what arrived (finish_rollback), at the busy tick until the
+// ROLLBACK is answered. Never blocks on the network.
 pub fn (mut p PgPool) maintain() int {
 	mut next := maintenance_idle_ms
 	now := time.sys_mono_now()
 	for i in 0 .. p.conns.len {
-		if !p.idle[i] || p.conns[i].inflight.len > 0 {
+		if !p.idle[i] {
+			if p.conns[i].rollback_deadline == 0 {
+				continue // held by acquire()
+			}
+			if !p.finish_rollback(i) {
+				if maintenance_busy_ms < next {
+					next = maintenance_busy_ms
+				}
+				continue
+			}
+		}
+		if p.conns[i].inflight.len > 0 {
 			continue
 		}
 		p.conns[i].probe_idle()
