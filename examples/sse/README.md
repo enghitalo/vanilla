@@ -31,18 +31,27 @@ connection, which never subscribed. One disconnect followed by one new
 connection is enough, with no timeout involved
 ([#232](https://github.com/enghitalo/vanilla/issues/232)).
 
-So `Clients.add` registers a `dup()` of the connection instead. The dup keeps
+So `Clients.add` registers a `dup()` of the connection instead, and
+`GET /events` returns `.close`: the core sends the SSE head and closes its own
+fd, and the registry's descriptor is the connection's only one. The dup keeps
 the socket open, so its number cannot be reused while it is in the registry,
-and only the registry closes it, under its lock. A subscriber is dropped when
-a send does not take the whole event: the client is gone (`EPIPE`, on the
-second send after it left), or it stopped reading (`EAGAIN` or a partial
-write). The registry then shuts the socket down, so the client sees a clean
-end of stream (an `EventSource` reconnects), never a truncated event.
+and only the registry closes it, under its lock. Since the core never reads
+the connection again, a client that pipelines more requests behind
+`GET /events` subscribes once, instead of taking a descriptor per request.
 
-The costs: each subscriber holds two fds, and a departed subscriber's socket
-lingers until that failed send, up to about 30 s with the heartbeat. On
-Windows a `SOCKET` has no `dup()`, so there the registry keys the core's
-handle, and a reused handle can still receive a departed subscriber's events.
+A subscriber is dropped when a send does not take the whole event: the client
+is gone (`EPIPE`, on the second send after it left), or it stopped reading
+(`EAGAIN` or a partial write). The registry then shuts the socket down, so the
+stream ends at once: an `EventSource` discards an event cut short, and
+reconnects.
+
+The costs: a departed subscriber's socket lingers until that failed send, up
+to about 30 s with the heartbeat. A subscriber is the registry's, not the
+core's, so it does not count toward `max_connections`, and `srv.shutdown()`
+does not end it. On Windows a `SOCKET` has no `dup()`, so there the core keeps
+the connection (`.done`) and the registry keys its handle. Any request on a
+handle drops it from the registry, but a reused handle that has not sent one
+yet can still receive a departed subscriber's events.
 
 Two things need core support
 ([#230](https://github.com/enghitalo/vanilla/issues/230)): a close
@@ -53,13 +62,13 @@ the head.
 
 ### Timeouts
 
-`GET /events` returns `.done` after the SSE headers, so to the core the
-subscriber looks like an **idle keep-alive connection**. This example sets no
-`Limits`, so nothing reaps it. If you add a `read_timeout_ms`, also set
-`idle_timeout_ms: -1`: the default (`0`) inherits the read timeout, so the core
-would close its fd for every subscriber that long after it subscribed. The
-stream itself keeps going through the registry's dup, but that subscriber no
-longer counts toward `max_connections`.
+On POSIX the core lets go of a subscriber right after the SSE head, so no
+`Limits` timeout applies to a stream. On Windows `GET /events` returns `.done`,
+so to the core the subscriber looks like an **idle keep-alive connection**.
+This example sets no `Limits`, so nothing reaps it. If you add a
+`read_timeout_ms`, also set `idle_timeout_ms: -1`: the default (`0`) inherits
+the read timeout, so the core would close every subscriber that long after it
+subscribed.
 
 ```v
 limits: server.Limits{

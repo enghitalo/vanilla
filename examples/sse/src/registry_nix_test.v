@@ -2,7 +2,8 @@ module main
 
 // The subscriber registry with real sockets (a socketpair stands in for an
 // accepted connection), POSIX-only (`_nix`): subscribing registers the
-// registry's own dup() of the connection, a connection it cannot dup is
+// registry's own dup() of the connection and hands the core's fd back
+// (.close), a connection it cannot dup is
 // refused, and a departed subscriber's events never reach the connection that
 // reuses its fd number (#232). On Windows the registry keys the core's handle
 // (no dup() for a SOCKET); its subscribe path runs in server_end_to_end_test.v.
@@ -49,7 +50,7 @@ fn test_subscribe_returns_event_stream_and_registers_a_dup() {
 	mut clients := Clients{}
 	srv, cli := conn_pair()
 	out, step := subscribe(srv, mut clients)
-	assert step == .done
+	assert step == .close // the core sends the head and lets go of its fd
 	assert out.contains('Content-Type: text/event-stream')
 	assert !out.contains('Content-Length:') // a stream stays open, no fixed length
 	subs := clients.snapshot()

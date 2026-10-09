@@ -10,13 +10,14 @@ module main
 //   non-blocking core this server is built on.
 //
 // THE PURE DESIGN
-//   A client is just an fd that already lives in the server's epoll set. We
-//   never spawn anything per client. On `GET /events` we return the SSE
-//   headers (the core sends them and, being keep-alive, LEAVES the fd in
-//   epoll). From then on a SINGLE broadcaster writes events to every
-//   subscriber, through the registry's own dup() of its connection (see
-//   Clients.add: never by the core's fd number, which the kernel reuses).
-//   Cost per client: one extra fd + one map entry. Nothing blocks.
+//   A client is just a connection. We never spawn anything per client. On
+//   `GET /events` the registry takes the connection over through its own
+//   dup() (see Clients.add: never the core's fd number, which the kernel
+//   reuses), and we return the SSE headers with .close: the core sends them
+//   and lets go of its own fd, the stream stays open through the dup. From
+//   then on a SINGLE broadcaster writes events to every subscriber. Cost per
+//   client: one fd + one map entry. No thread waits on a client: every send
+//   is non-blocking, and the lock only serializes broadcasts and subscribes.
 //
 // This is the shape SSE should always take on top of a non-blocking core.
 import server
@@ -50,19 +51,23 @@ mut:
 	fds map[int]bool
 }
 
-// add registers the subscriber on connection `fd` under a dup() of it. The
-// core owns `fd`: it closes it when the client goes away, without telling the
-// app, and the kernel gives the number to the next accepted connection. Keyed
-// by `fd`, that connection, which never subscribed, would get every later
-// event and heartbeat (#232). The dup keeps the socket open, so its number
-// cannot be reused while it is in the map, and only the registry closes it.
-// The core closes a connection with a plain close() (after EPOLL_CTL_DEL), so
-// the dup leaves no stale epoll registration behind. false: no descriptor to
-// spare (EMFILE).
+// add registers the subscriber on connection `fd` under a dup() of it, and
+// handle() then returns .close: the core flushes the SSE head and closes
+// `fd`, so the registry's descriptor is the connection's only one. Never key
+// by `fd`: the kernel gives a closed number to the next accepted connection,
+// which never subscribed, and it would get every later event and heartbeat
+// (#232). The dup keeps the socket open, so its number cannot be reused while
+// it is in the map, and only the registry closes it. The core closes `fd`
+// with a plain close() after EPOLL_CTL_DEL (kqueue: EV_DELETE), so the dup
+// leaves no stale registration behind. And the core never reads the
+// connection again: a client that pipelines more requests behind
+// `GET /events` subscribes once, not once per request. false: no descriptor
+// to spare (EMFILE).
 //
 // Windows has no dup() for a SOCKET: there the registry keys the core's
-// handle, and a handle the system reuses can still receive a departed
-// subscriber's events (README).
+// handle and the core keeps the connection (.done). Every request on a
+// handle drops it first (drop), but a handle the system reuses can still
+// receive a departed subscriber's events until it sends one (README).
 fn (mut c Clients) add(fd int) bool {
 	mut own := fd
 	$if !windows {
@@ -75,6 +80,14 @@ fn (mut c Clients) add(fd int) bool {
 	c.fds[own] = true
 	c.mu.unlock()
 	return true
+}
+
+// drop forgets the subscriber keyed by the core's handle `fd` (Windows, see
+// add): a request on a handle means it is not, or no longer, a stream.
+fn (mut c Clients) drop(fd int) {
+	c.mu.lock()
+	c.fds.delete(fd)
+	c.mu.unlock()
 }
 
 fn (mut c Clients) snapshot() []int {
@@ -93,8 +106,9 @@ fn (mut c Clients) snapshot() []int {
 // A send that does not take the whole event ends that stream: the peer is
 // gone (EPIPE: the second send after it left, since TCP accepts the first),
 // or its buffer is full (EAGAIN or a partial write; reliable buffering is
-// #23). shutdown() gives the client a clean EOF instead of a truncated event
-// (an EventSource reconnects), and the core then reads EOF and closes its fd.
+// #23). shutdown() ends it at once: the client reads EOF after whatever part
+// of the event got through, and an EventSource discards an event cut short
+// and reconnects.
 fn (mut c Clients) broadcast(event []u8) {
 	mut dead := []int{} // allocates only when a subscriber is dropped
 	c.mu.lock()
@@ -106,7 +120,7 @@ fn (mut c Clients) broadcast(event []u8) {
 	for fd in dead {
 		c.fds.delete(fd)
 		$if !windows {
-			C.shutdown(fd, 2) // SHUT_RDWR: ENOTCONN once the peer is gone, harmless
+			C.shutdown(fd, C.SHUT_RDWR) // ENOTCONN once the peer is gone, harmless
 			C.close(fd)
 		}
 	}
@@ -114,8 +128,9 @@ fn (mut c Clients) broadcast(event []u8) {
 }
 
 // SSE response: note the deliberate ABSENCE of Content-Length and the
-// text/event-stream content type. The core sends these bytes and keeps the
-// connection open. Single literals — no `+` concatenation, even at init.
+// text/event-stream content type. The core sends these bytes, and the
+// connection stays open (through the registry's dup, see Clients.add). Single
+// literals — no `+` concatenation, even at init.
 const sse_headers = 'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n'
 
 const ok_response = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
@@ -149,21 +164,28 @@ fn slice_eq(buf []u8, s request_parser.Slice, lit string) bool {
 }
 
 fn handle(req_buffer []u8, fd int, mut out []u8, mut clients Clients) core.Step {
+	$if windows {
+		clients.drop(fd) // a stream never sends a request: see Clients.add
+	}
 	req := request_parser.decode_http_request(req_buffer) or {
 		core.append_str(mut out, bad_request)
 		return .close
 	}
 
-	// GET /events  — subscribe. Register the connection; the core sends the
-	//                headers and leaves it open. The broadcaster writes to it
-	//                from now on, through the registry's own descriptor.
+	// GET /events  — subscribe. The registry takes the connection over; the
+	//                core sends the headers and lets go of its fd (.close).
+	//                The broadcaster writes to it from now on, through the
+	//                registry's own descriptor.
 	if slice_eq(req.buffer, req.method, 'GET') && slice_eq(req.buffer, req.path, '/events') {
 		if !clients.add(fd) {
 			core.append_str(mut out, unavailable)
 			return .close
 		}
 		core.append_str(mut out, sse_headers)
-		return .done
+		$if windows {
+			return .done // the registry keys the core's handle: the core keeps it
+		}
+		return .close
 	}
 
 	// POST /broadcast — fan a message out to every subscriber, right now.
