@@ -33,13 +33,13 @@ import time
 // the message. The fix is to run the WHOLE transaction again: TxRetry decides
 // whether to, and computes a randomized wait between attempts — never a
 // sleep on the worker. A request learns of the conflict in a continuation
-// parked on its pooled connection, and the server's runtime only supports
-// re-arming that same fd from there: a step to another fd (a timerfd for the
-// wait) is lost when the request is pipelined or its client disconnected
-// meanwhile (the connection's park queue keeps the stale slot at its head).
-// So, today, run the next attempt at once on the connection the request holds
-// (acquire()), counting attempts outside watch_payload, which a disconnected
-// client's re-arm keeps unchanged (examples/pg_transactions).
+// parked on its pooled connection. Until vanilla#247 lands, that continuation
+// cannot step to another fd (a timerfd for the wait) when the request is
+// pipelined or its client disconnected meanwhile, and a disconnected client's
+// re-arm keeps its first watch_payload: run the next attempt at once on the
+// connection the request holds (acquire()), counting attempts outside
+// watch_payload (examples/pg_transactions). Once #247 is in, backoff_ms can
+// arm a timerfd the request parks on between attempts.
 //
 // Aurora DSQL's transaction limits, which a batch or a retried transaction
 // must stay within (exceeding one is a clear error from the server, not
@@ -92,8 +92,9 @@ pub fn is_serialization_failure(err IError) bool {
 //   poll := conn.async_on_readable() or {
 //       if policy.retry(st.attempts[idx], err) {
 //           st.attempts[idx]++
-//           // submit the whole transaction again on conn, and re-arm the
-//           // same fd (see above for why not after backoff_ms on a timer)
+//           // submit the whole transaction again on conn and re-arm the
+//           // same fd (until vanilla#247: see above); afterwards, park on a
+//           // timerfd armed for policy.backoff_ms(attempt) first
 //       }
 //       ...
 //   }
@@ -117,8 +118,8 @@ pub fn (r TxRetry) retry(attempt int, err IError) bool {
 // max_backoff_ms. The randomness spreads apart transactions that conflicted
 // with each other, so they do not collide again; it comes from the monotonic
 // clock, so it needs no state and no lock. Never 0, so it can arm a timerfd
-// (where a 0 expiry disarms it) — from a request that is not parked on a
-// pooled connection (see the top of this file).
+// (where a 0 expiry disarms it) — from a continuation on a pooled connection
+// once vanilla#247 lands (see the top of this file).
 pub fn (r TxRetry) backoff_ms(attempt int) int {
 	return r.backoff_from(attempt, time.sys_mono_now())
 }

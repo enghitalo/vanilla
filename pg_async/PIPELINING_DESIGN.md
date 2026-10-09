@@ -149,23 +149,18 @@ ROLLBACK undoes it, and after a failed statement every one of them fails with
   conflict on Aurora DSQL, often at COMMIT) means running the whole
   transaction again. `TxRetry` holds no state: `retry(attempt, err)` and
   `backoff_ms(attempt)` (full jitter, from the monotonic clock).
-  `examples/pg_transactions` re-runs the batch at once on the connection the
-  request holds and re-arms the same fd, counting attempts in the worker
-  state, not in the watch payload (a disconnected client's re-arm keeps its
-  first payload).
-- **Reactor limitation found here.** A continuation parked on a pooled fd
-  cannot step to ANOTHER fd (a timerfd for a backoff wait, an upstream) in
-  two cases. (1) It is pipelined: `drain_pipelined`'s `.suspend` arm assumes
-  the head re-armed the same fd, so the slot stays at the head and the next
-  reply on the connection runs it again. That is a FIFO misalignment:
-  measured as requests hanging forever while every backend sat idle.
-  (2) Its client disconnected: the dead-slot arm (`rearming_dead`) re-arms
-  whatever fd it is given without a watch entry. The tombstone stays at the
-  head, and the new fd is never closed. The single-watch path
-  (`on_watch_ready`) already handles a step away. io_uring's
-  `drain_pipelined_iou` mirrors the same arms. Until the drains pop a slot
-  that stepped away (and tear down a dead slot's new watch), a backoff wait
-  after a DB reply is not safe.
+- **Until vanilla#247 lands, no backoff wait after a DB reply.** Before
+  #247, a continuation parked on a pooled fd cannot step to ANOTHER fd (a
+  timerfd for the wait) when it is pipelined (`drain_pipelined` keeps the
+  slot at the head, and the next reply on the connection runs it again — a
+  FIFO misalignment, seen here as requests hanging forever while every
+  backend sat idle) or when its client disconnected (a tombstone's re-arm
+  of another fd, or of its own fd with a new continuation or payload, is not
+  taken). So `examples/pg_transactions` runs the next attempt at once on the
+  connection the request holds and re-arms the same fd, counting attempts
+  in the worker state rather than in the watch payload. Once #247 is in, the
+  continuation can arm a timerfd for `backoff_ms(attempt)` and park on it in
+  both cases, and a tombstone's re-arm takes the new payload.
 
 ## Local validation harness
 `bench/pg_async/` pipeline-tests pg_async locally against a seeded PG

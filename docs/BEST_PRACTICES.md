@@ -328,11 +328,13 @@ their request.
   connection would run inside it. `release()` it on every path — a connection
   left in a transaction gets a ROLLBACK before anyone else can take it. On a
   serialization failure (40001: SERIALIZABLE, every conflict on Aurora DSQL)
-  run the whole transaction again, as `pg_async.TxRetry` decides: today at
-  once, on the connection the request holds (acquire()), re-arming that same
-  fd — a continuation parked on a pooled connection cannot yet step to a
-  timerfd for a backoff wait (`pg_async/tx.v` says why), and it never sleeps
-  on the worker ([examples/pg_transactions](../examples/pg_transactions/src/main.v)).
+  run the whole transaction again, as `pg_async.TxRetry` decides — never by
+  sleeping on the worker. Until
+  [vanilla#247](https://github.com/enghitalo/vanilla/pull/247) lands, run the
+  next attempt at once on the connection the request holds (`acquire()`),
+  re-arming that same fd; afterwards `backoff_ms` can arm a timerfd the
+  request parks on between attempts
+  ([examples/pg_transactions](../examples/pg_transactions/src/main.v)).
   Aurora DSQL also caps a transaction at 3,000 modified rows, 10 MiB written
   and 5 minutes, and keeps DDL and DML apart (`pg_async/tx.v`).
 - Call third-party HTTP APIs through `http1_1.upstream`, the same shape for

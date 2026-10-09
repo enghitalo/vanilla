@@ -16,18 +16,19 @@ module main
 // a shed, not an error. Any other failure: 500.
 //
 // The next attempt runs at once, on the connection the request holds
-// (acquire()), not after TxRetry.backoff_ms on a timerfd: the request learns of
-// the conflict in a continuation parked on that pooled connection, and today's
-// runtime only supports re-arming that same fd from there. A step to another
-// fd is lost when the parked request is pipelined (acquire_pipelined) or its
-// client disconnected meanwhile: the connection's park queue keeps the stale
-// slot at its head, and the next reply on that connection runs the wrong
+// (acquire()), not after TxRetry.backoff_ms on a timerfd: until vanilla#247
+// lands, a continuation parked on a pooled connection cannot step to another
+// fd when the request is pipelined (acquire_pipelined) or its client
+// disconnected meanwhile — the connection's park queue keeps the stale slot
+// at its head, and the next reply on that connection runs the wrong
 // continuation. Re-running on the held connection is right in every case: the
-// failed batch left the session idle, and only this request uses it. (The batch
-// itself would be safe pipelined: it has no BEGIN, so its Sync ends its
-// transaction.) A transaction that needs a statement's result before the next
-// one is BEGIN … COMMIT across park/resume instead, on acquire() too:
-// release() rolls back a connection left in a transaction (pg_async/tx.v).
+// failed batch left the session idle, and only this request uses it. Once
+// #247 is in, the continuation can release the connection, park on a timerfd
+// armed for backoff_ms, and acquire again when it fires. (The batch itself is
+// safe pipelined: it has no BEGIN, so its Sync ends its transaction.) A
+// transaction that needs a statement's result before the next one is BEGIN …
+// COMMIT across park/resume instead, on acquire() too: release() rolls back a
+// connection left in a transaction (pg_async/tx.v).
 //
 // Setup, then run with PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE set:
 //   create table accounts (id int4 primary key, balance int4 not null check (balance >= 0));
@@ -55,7 +56,7 @@ const transfer = [
 ]
 
 // policy: up to 5 runs of a transfer in all (its backoff fields are unused
-// here: see above).
+// here until vanilla#247: see above).
 const policy = pg_async.TxRetry{
 	max_attempts: 5
 }
@@ -83,7 +84,8 @@ fn env_or(name string, dflt string) string {
 // of the transfer holding each connection. The count lives here, per held
 // connection, not in watch_payload: when the client of a parked request
 // disconnects, the runtime still runs its continuation to drain the reply,
-// and a re-arm from there keeps the payload of the first park.
+// and until vanilla#247 a re-arm from there keeps the payload of the first
+// park.
 struct TxState {
 mut:
 	pool     &pg_async.PgPool
@@ -156,7 +158,8 @@ fn on_reply(mut out []u8, ready_fd int, _ bool, watch_payload voidptr, worker_st
 	poll := conn.async_on_readable() or {
 		if policy.retry(st.attempts[idx], err) {
 			// A conflict: the batch did nothing. Run it again, whole, on the
-			// same connection (see the top of the file for why not after a wait).
+			// same connection (see the top of the file for why not after a wait,
+			// until vanilla#247).
 			st.attempts[idx]++
 			return run_attempt(mut st, idx, mut out, mut event_loop)
 		}
