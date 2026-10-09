@@ -147,9 +147,14 @@ fn test_tls_verify_full_blocking_and_pipelined_queries() {
 	defer {
 		f.stop()
 	}
-	for host in ['localhost', '127.0.0.1'] {
+	// 127.1 is 127.0.0.1 too (getaddrinfo dials it): an IP host as well.
+	for host in ['localhost', '127.0.0.1', '127.1'] {
 		mut c := PgConn.connect(f.cfg(.verify_full, host))!
 		assert c.tls.active()
+		// SNI went out for localhost only: an IP address, however spelled, is
+		// never a server_name (RFC 6066 §3), and is checked against the
+		// iPAddress SANs instead (#233).
+		assert f.fake.stat('sni') == 1, host
 		res := c.query(r'select $1::int4, $2::text', [?[]u8('42'.bytes()), ?[]u8('hi'.bytes())])!
 		mut it := res.rows()
 		row := it.next() or { panic('expected a row') }
@@ -165,11 +170,8 @@ fn test_tls_verify_full_blocking_and_pipelined_queries() {
 		assert !c.is_busy()
 		c.close()
 	}
-	assert f.fake.stat('tls_handshakes') == 2
-	assert f.fake.stat('authenticated') == 2
-	// SNI went out for localhost only: an IP literal is never a server_name
-	// (RFC 6066 §3), and is checked against the iPAddress SANs instead (#233).
-	assert f.fake.stat('sni') == 1
+	assert f.fake.stat('tls_handshakes') == 3
+	assert f.fake.stat('authenticated') == 3
 }
 
 // A certificate for another name: verify_full refuses it; verify_ca (chain

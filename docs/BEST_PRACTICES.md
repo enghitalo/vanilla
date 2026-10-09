@@ -343,9 +343,13 @@ their request.
   the trusted CAs are parsed once per pool and each connection's TLS session
   is allocated once and re-armed on every re-dial. TLS 1.3 only. To reach the
   database by IP address, its certificate must carry that address as an `IP:`
-  SAN: `.verify_full` matches an IP host against iPAddress SANs only (never a
-  `DNS:` spelling, a wildcard or the CN) and sends it no SNI (RFC 9525,
-  RFC 6066; CPython's `ssl` behaves the same).
+  SAN: `.verify_full` matches an IP host (`10.0.0.5`, or any spelling
+  getaddrinfo dials as an address, such as `fe80::1%eth0`) against iPAddress
+  SANs only (never a `DNS:` spelling, a wildcard or the CN) and sends it no
+  SNI (RFC 9525, RFC 6066; CPython's `ssl` does the same for `10.0.0.5`).
+  That is stricter than libpq, whose `verify-full` also takes a `DNS:` or CN
+  spelling of the IP: a certificate psql accepts by IP may need an `IP:` SAN
+  here.
 
 **Don't**
 
