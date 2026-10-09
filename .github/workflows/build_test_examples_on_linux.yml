@@ -43,6 +43,7 @@ jobs:
           - examples/json_api/src
           - examples/mesh/src
           - examples/per_server_workers/src
+          - examples/pg_transactions/src # its e2e test runs against fake_pg.py (python3)
           - examples/rate_limit/src
           - examples/request_limits/src
           - examples/router/src
