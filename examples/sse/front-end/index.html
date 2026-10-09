@@ -6,7 +6,7 @@
   </head>
   <body>
     <script>
-      const eventSource = new EventSource("http://localhost:3001/sse");
+      const eventSource = new EventSource("http://localhost:3000/events");
       eventSource.onmessage = function (event) {
         console.log("Notification:", event.data);
         document.body.innerHTML += `<p>${event.data}</p>`;
