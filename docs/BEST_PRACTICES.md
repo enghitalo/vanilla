@@ -291,6 +291,35 @@ and once every slot has leaked the worker sheds every query with 503
 `watch_fd` for per-request fds (a timerfd, a pipe), which must be closed with
 their request.
 
+**Bound every park.** A parked request has no read, write or idle deadline:
+it waits as long as its fd does, so a database or upstream that stops
+answering holds the request, its client and its pool slot for good. Set
+`Limits.park_timeout_ms` as the server-wide bound, and give a call its own
+budget with `event_loop.watch_fd_deadline(...)` /
+`watch_fd_persistent_deadline(...)` (`timeout_ms` < 0 exempts a long poll;
+each watch arms a fresh deadline, so pass the time left to bound a multi-step
+request). When the deadline passes first, the continuation runs once with
+`event_loop.timed_out()` true: answer 504 and return `.done`. On a pooled fd
+the reply is still due, and the park's tombstone consumes it in order (the
+continuation runs again, against a discarded buffer, when it arrives), so in
+the timeout branch don't read the fd and don't release the connection:
+
+```v
+if event_loop.timed_out() {
+    // pg_async: the server abandons the query, its 57014 comes back at once,
+    // and the tombstone run consumes it (and releases the slot).
+    st.pool.conn(idx).cancel(mut event_loop) or {}
+    core.append_str(mut out, resp_504)
+    return .done
+}
+```
+
+`PgConn.cancel` sends PostgreSQL's CancelRequest on a second connection to the
+same server (over TLS when the session is), without blocking the worker: it
+runs as a background watch on the worker's loop. Park deadlines and
+background watches are enforced by the epoll plain worker; on io_uring and
+kqueue a deadline watch is a plain watch, and `cancel` fails.
+
 **Do**
 
 - Use the **pool**, not a connection per request; build params/queries into
@@ -345,6 +374,9 @@ their request.
 
 - Open/close a socket or connection inside every handler invocation.
 - Block the worker on a DB/upstream call — `watch` + `.suspend` instead.
+- Park on a database or an upstream with no deadline: one that stops
+  answering then holds every request parked on it, for good
+  (`Limits.park_timeout_ms`, `watch_fd_deadline`, above).
 - Return `200` with empty data for a *write* that was shed (it's a lie about a
   mutation) — `503` is the honest answer. (The backpressure policy is tracked in
   [vanilla#51](https://github.com/enghitalo/vanilla/issues/51).)

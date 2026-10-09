@@ -51,6 +51,19 @@ per-request allocation.
   honor it yet). Linux epoll + io_uring and macOS/kqueue;
   on TLS and Windows/IOCP a `.suspend` closes the connection (no watch reactor
   there yet).
+- **Bounding a wait** — a park lasts as long as its fd takes, unless it has a
+  deadline: `Limits.park_timeout_ms` for every park, or one per watch with
+  `event_loop.watch_fd_deadline(..., timeout_ms)` /
+  `watch_fd_persistent_deadline(...)` (< 0 exempts one). When it passes
+  first, the continuation runs once with `event_loop.timed_out()` true (the
+  fd is not ready): answer 504 and return `.done`, or re-arm to keep waiting.
+  The watch it stops waiting on is retired — a request-owned fd leaves the
+  event loop; a persistent fd keeps a tombstone that consumes the reply still
+  due, in order (see `core.EventLoop.timed_out`). The epoll plain worker
+  enforces it; on io_uring and kqueue a deadline watch is a plain watch.
+  `event_loop.watch_fd_background(...)` arms a clientless watch from a handler
+  or continuation (fire-and-forget I/O on the worker, e.g. pg_async's
+  CancelRequest; epoll plain worker only, false elsewhere).
 - **Per-worker state** — set `make_state`: it runs once per worker thread, and
   every handler call on that worker receives the value as the
   **`worker_state`** parameter (e.g. a per-thread DB connection — no shared
@@ -107,10 +120,15 @@ alone also reaps idle keep-alive connections. With both at 0 nothing is armed.
 | `read_timeout_ms` | a request (head + body) must arrive complete within this long, else close. The **first** request's clock starts at **accept**, so it also bounds a connection that never sends a byte and the TLS handshake; a later request's clock starts at its first byte. Not refreshed on progress (the slowloris bound) — size it for your largest upload. **408** only if part of the request arrived and no earlier response is still being sent (plaintext epoll / poll / iocp); otherwise — and always on TLS / io_uring — the connection is closed silently |
 | `write_timeout_ms` | close a connection whose parked response can't drain in time |
 | `idle_timeout_ms` | keep-alive: once a response is fully sent, how long to wait for the first byte of the next request before closing **silently** (no 408). `0` ⇒ `read_timeout_ms`; `-1` (any negative) ⇒ never. With no read timeout it also bounds a new connection's wait for its first byte (over TLS, its first decrypted byte, so the handshake too). Never applies to a request parked on a watch, a parked write, or a taken-over connection (WebSocket, h2c) |
+| `park_timeout_ms` | the default deadline of a request parked on a watch (`.suspend`): past it, the continuation runs once with `event_loop.timed_out()` true and answers (504). Per park — a re-arm gets a fresh one — and overridden per watch by `watch_fd_deadline` (< 0 exempts a watch). The only bound on a parked request: none of the above applies to one. Epoll plain worker only |
 
 Deadlines are enforced by each worker's sweep, which runs every
 `Limits.sweep_interval_ms()` (a quarter of the shortest timeout, clamped to
 25–250 ms): a connection is closed at most one interval after its deadline.
+Park deadlines are not swept: each worker keeps them in a min-heap and wakes
+for the earliest, so one fires within about a millisecond of its time, with
+or without any other timeout set. A request parked with a deadline holds
+`shutdown(grace)` only until that deadline answers it.
 
 Use `idle_timeout_ms: -1` when a handler hands its fd to another thread to
 stream (the fd-handoff pattern in `examples/sse` and `examples/video_stream`):
@@ -120,8 +138,9 @@ longer than the balancer's own idle timeout, or it will reuse a connection the
 server is closing and answer 502.
 
 **kqueue (macOS) enforces none of `max_connections`, `read_timeout_ms`,
-`write_timeout_ms` or `idle_timeout_ms` yet** — only the header/body size
-limits. Do not rely on it to reap connections.
+`write_timeout_ms`, `idle_timeout_ms` or `park_timeout_ms` yet** — only the
+header/body size limits. Do not rely on it to reap connections. io_uring
+enforces every timeout but the park deadlines.
 
 ## TLS
 
