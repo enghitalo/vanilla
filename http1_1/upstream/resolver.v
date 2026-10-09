@@ -111,8 +111,9 @@ pub fn (mut r Resolver) start() {
 	r.th = spawn r.run()
 }
 
-// stop ends the resolver thread and waits for it. Pools keep the addresses
-// they have, and their workers stop watching the pipes it closes.
+// stop ends the resolver thread for good and waits for it: a stopped
+// Resolver does not start again. Pools keep the addresses they have, and
+// their workers stop watching the pipes it closes.
 pub fn (mut r Resolver) stop() {
 	if !r.started {
 		return
