@@ -171,7 +171,7 @@ pub enum SslMode {
 	disable     // plaintext (the default)
 	require     // TLS; the certificate is not checked, unless ssl_root_cert is set: then as .verify_ca (libpq's rule)
 	verify_ca   // TLS; the certificate chains to a trusted CA
-	verify_full // TLS; the certificate chains to a trusted CA and names `host` (SNI is sent): what managed databases need
+	verify_full // TLS; the certificate chains to a trusted CA and names `host` (SNI is sent for a DNS name; an IP must be an iPAddress SAN, stricter than libpq): what managed databases need
 }
 
 // PasswordFn returns the password for one connection attempt (see

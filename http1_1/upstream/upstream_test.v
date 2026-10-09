@@ -121,7 +121,7 @@ fn test_origin_validation() {
 			assert false, bad.host
 		}
 	}
-	// HTTPS to an IP literal would be sent as SNI: refused for now.
+	// HTTPS to an IP literal: refused for now.
 	if _ := Pool.new(Origin{
 		host: '127.0.0.1'
 	}, tls_stub()) {

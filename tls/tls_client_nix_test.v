@@ -66,6 +66,16 @@ fn test_client_sessions_against_the_server() {
 			ClientCase{.full, '127.0.0.1', ''},
 			ClientCase{.full, '::1', ''},
 			ClientCase{.full, 'db.example.com', 'does not match the host name'},
+			// An IP the certificate does not carry as an iPAddress SAN (#233).
+			ClientCase{.full, '10.0.0.5', ip_mismatch},
+			ClientCase{.full, '::2', ip_mismatch},
+			// Any spelling getaddrinfo dials as an address is an IP host too:
+			// 127.0.0.1, ::1 (the zone is not part of it), 127.0.0.2.
+			ClientCase{.full, '127.1', ''},
+			ClientCase{.full, '0x7f.0.0.1', ''},
+			ClientCase{.full, '::1%1', ''},
+			ClientCase{.full, '127.2', ip_mismatch},
+			ClientCase{.full, 'fe80::1%lo', ip_mismatch},
 			ClientCase{.chain, 'db.example.com', ''},
 			ClientCase{.off, 'db.example.com', ''},
 		]
@@ -130,7 +140,50 @@ fn test_client_sessions_against_the_server() {
 	}
 }
 
+// An IP host matches only an iPAddress SAN (RFC 9525 §6.2). A certificate that
+// spells the address as a dNSName, exact or wildcard, is refused under
+// Verify.full and still accepted under Verify.chain, which checks no name
+// (#233: Mbed TLS matched the IP as a DNS name). The same for a host that only
+// getaddrinfo reads as an address (127.1 dials 127.0.0.1).
+fn test_ip_host_matches_ip_sans_only() {
+	$if vanilla_tls ? {
+		for c in [['DNS:127.0.0.1', '127.0.0.1'], ['DNS:*.0.0.1', '127.0.0.1'], ['DNS:127.1', '127.1'],
+			['DNS:*.1', '127.1']] {
+			san, host := c[0], c[1]
+			srv_cfg := new_self_signed(sans: [san]) or { panic(err) }
+			ca := os.join_path(os.temp_dir(), 'vanilla_tls_ipsan_ca_${os.getpid()}.pem')
+			os.write_file(ca, srv_cfg.cert_pem()) or { panic(err) }
+			for verify in [Verify.full, .chain] {
+				cli_cfg := new_client(ca, verify) or { panic(err) }
+				fds := nonblocking_pair()
+				srv := srv_cfg.new_session(fds[0]) or { panic('server session') }
+				cli := cli_cfg.new_client_session(fds[1], host) or { panic('client session') }
+				cr, _ := handshake_both(cli, srv)
+				if verify == .full {
+					assert cr == closed, '${san} ${host}: the handshake must fail'
+					assert cli.handshake_error().contains(ip_mismatch), cli.handshake_error()
+					assert cli.verify_failed()
+				} else {
+					assert cr == 0, '${san} ${host} ${verify}: ${cli.handshake_error()}'
+				}
+				assert cli.reset(-1)
+				srv.free()
+				C.close(fds[0])
+				C.close(fds[1])
+				cli.free()
+				cli_cfg.free()
+			}
+			os.rm(ca) or {}
+			srv_cfg.free()
+		}
+	}
+}
+
 fn C.shutdown(fd int, how int) int
+
+// ip_mismatch is handshake_error() for an IP host whose address the
+// certificate does not carry: not Mbed TLS's text, which speaks of the CN.
+const ip_mismatch = 'does not match the host name: the address is in none of its iPAddress SANs (IP:)'
 
 struct ClientCase {
 	verify   Verify
