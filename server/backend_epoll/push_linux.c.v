@@ -110,11 +110,11 @@ fn wake_after_conn(mut el core.EventLoop, ms int) bool {
 //   else    — over the push watermark the connection is closed (a subscriber
 //             that does not read); otherwise what was appended is flushed,
 //             unless a flush is already parked on EPOLLOUT, which sends it.
-// Skipped for a connection that is closing (close_after_flush) or not taken
-// over (a subscription whose takeover never happened).
-fn deliver_wake(mut reactor Reactor, epoll_fd int, fd int, reason core.WakeReason, tag u64, data voidptr, data_len int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) {
+// Skipped (false) for a connection that is closing (close_after_flush) or not
+// taken over (a subscription whose takeover never happened).
+fn deliver_wake(mut reactor Reactor, epoll_fd int, fd int, reason core.WakeReason, tag u64, data voidptr, data_len int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) bool {
 	if cs.wake_fn == unsafe { nil } || cs.takeover == unsafe { nil } || cs.close_after_flush {
-		return
+		return false
 	}
 	stdatomic.add_i64(&counter.n, 1) // running app code counts as in flight
 	defer {
@@ -138,30 +138,31 @@ fn deliver_wake(mut reactor Reactor, epoll_fd int, fd int, reason core.WakeReaso
 	if step == .close {
 		if cs.write_off < cs.write_buf.len {
 			if !flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-				return // closed by the failed send
+				return true // closed by the failed send
 			}
 			if cs.write_off < cs.write_buf.len {
 				cs.close_after_flush = true // parked on EPOLLOUT: closes once sent
-				return
+				return true
 			}
 		}
 		close_conn(epoll_fd, fd, active_conns, mut st)
-		return
+		return true
 	}
 	if cs.write_buf.len - cs.write_off > st.push_watermark {
 		close_conn(epoll_fd, fd, active_conns, mut st) // not reading: no point flushing
-		return
+		return true
 	}
 	if !parked_flush && cs.write_off < cs.write_buf.len {
 		flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs)
 	}
+	return true
 }
 
 // drain_mailbox delivers up to mailbox_drain_max posts, in order. A post goes
 // to its connection only if that is still the connection the handle was taken
-// for (same close stamp) and still subscribed; otherwise it is dropped and
-// counted. Each slot is freed after its delivery: the wake fn's post_data()
-// is a view into it.
+// for (same close stamp), still subscribed and not closing; otherwise it is
+// dropped and counted as stale. Each slot is freed after its delivery: the
+// wake fn's post_data() is a view into it.
 @[direct_array_access]
 fn drain_mailbox(mut reactor Reactor, epoll_fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, state voidptr) {
 	mut m := st.mbox
@@ -172,10 +173,9 @@ fn drain_mailbox(mut reactor Reactor, epoll_fd int, limits core.Limits, counter 
 		mut delivered := false
 		if fd >= 0 && fd < st.conns.len && st.stamp_of(fd) == slot.epoch {
 			mut cs := st.conns[fd]
-			if unsafe { cs != nil } && cs.wake_fn != unsafe { nil } {
-				deliver_wake(mut reactor, epoll_fd, fd, .posted, slot.tag, unsafe { &slot.data[0] },
+			if unsafe { cs != nil } {
+				delivered = deliver_wake(mut reactor, epoll_fd, fd, .posted, slot.tag, unsafe { &slot.data[0] },
 					slot.len, limits, counter, active_conns, mut st, mut cs, state)
-				delivered = true
 			}
 		}
 		stdatomic.add_u64(if delivered { &m.delivered } else { &m.stale }, 1)
