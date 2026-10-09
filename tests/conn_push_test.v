@@ -31,6 +31,9 @@ import vtest
 
 fn C.recv(fd int, buf voidptr, len usize, flags int) int
 fn C.setsockopt(fd int, level int, optname int, optval voidptr, optlen u32) int
+fn C.pipe(fds &i32) int
+fn C.close(fd int) int
+fn C.shutdown(fd int, how int) int
 
 struct C.mallinfo2 {
 	uordblks usize
@@ -55,6 +58,7 @@ mut:
 	handle   core.ConnHandle
 	wait_ms  int
 	timeouts int
+	park_w   int = -1 // the write end of the pipe `park` waits on (never written)
 }
 
 // CpRegistry is the application's handle registry, shared by every worker
@@ -72,6 +76,8 @@ mut:
 	closed      i64
 	timeouts    i64
 	next_worker i64
+	park_runs   i64 // runs of the `park` continuation
+	park_w      i64 // the write end of the last `park`'s pipe
 }
 
 const cp_reg = &CpRegistry{}
@@ -118,6 +124,7 @@ fn cp_reset() {
 	stdatomic.store_i64(&c.closed, 0)
 	stdatomic.store_i64(&c.timeouts, 0)
 	stdatomic.store_i64(&c.next_worker, 0)
+	stdatomic.store_i64(&c.park_runs, 0)
 }
 
 fn cp_prefix(b []u8, p string) bool {
@@ -228,6 +235,16 @@ fn cp_line_conn(buf []u8, mut out []u8, client_fd int, takeover_state voidptr, w
 			core.append_str(mut out, 'pong\n')
 		} else if line.len == 5 && cp_prefix(line, 'close') {
 			return consumed, core.Step.close
+		} else if line.len == 4 && cp_prefix(line, 'park') {
+			// Wait mid-protocol on something that never comes (a hung
+			// database): the connection is parked, not subscribed-and-reading.
+			mut fds := [2]i32{}
+			C.pipe(&fds[0])
+			sub.park_w = int(fds[1])
+			mut c := unsafe { cp }
+			stdatomic.store_i64(&c.park_w, i64(fds[1]))
+			event_loop.watch_fd(int(fds[0]), .readable, cp_park_cont, voidptr(sub))
+			return consumed, core.Step.suspend
 		} else if cp_prefix(line, 'wait ') {
 			mut ms := 0
 			for c in line[5..] {
@@ -280,12 +297,25 @@ fn cp_wake(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidpt
 		.closed {
 			stdatomic.add_i64(&c.closed, 1)
 			if watch_payload != unsafe { nil } {
-				sub := unsafe { &CpSub(watch_payload) }
+				mut sub := unsafe { &CpSub(watch_payload) }
 				cp_reg_remove(sub.idx)
+				if sub.park_w >= 0 {
+					C.close(sub.park_w)
+					sub.park_w = -1
+				}
 			}
 		}
 		else {}
 	}
+	return .done
+}
+
+// cp_park_cont is `park`'s continuation: its fd is never written, so it must
+// never run.
+fn cp_park_cont(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	mut c := unsafe { cp }
+	stdatomic.add_i64(&c.park_runs, 1)
+	core.append_str(mut out, 'resumed\n')
 	return .done
 }
 
@@ -828,6 +858,66 @@ fn test_epoll_push_shutdown_says_goodbye() ! {
 	assert b.until('shutdown\n', 2000) && b.eof(2000)
 	c := unsafe { cp }
 	assert cp_until(&c.closed, 2, 2000) == 2
+}
+
+// Repro C inverted: a taken-over connection parked on a watch that never
+// fires, whose client sends a frame and then its FIN. The connection closes at
+// once (it no longer waits for the watch), the continuation never runs, the
+// frame before the FIN is dropped (the frame-before-FIN policy:
+// read_while_parked), and its subscription gets .closed. Before, only a
+// 1-byte peek looked at a parked connection: it saw the frame, never the FIN.
+fn test_epoll_parked_takeover_sees_fin_behind_a_frame() ! {
+	$if tinyc {
+		return
+	}
+	cp_reset()
+	mut h := vtest.start(cp_config(1, 0, 0))!
+	defer {
+		h.stop()
+	}
+	mut a, _, _ := cp_sub(h.port(), '/sub')!
+	defer {
+		a.close()
+	}
+	a.send('park\n')!
+	time.sleep(50 * time.millisecond) // parked
+	a.send('late\n')!
+	time.sleep(50 * time.millisecond) // the frame is in, unprocessed
+	C.shutdown(a.fd, C.SHUT_WR) // FIN behind it
+	sw := time.new_stopwatch()
+	assert a.eof(3000), 'a parked connection whose peer left was not closed'
+	assert sw.elapsed().milliseconds() < 1000
+	assert !a.acc.bytestr().contains('echo:late'), 'a frame reached the ConnHandler while parked'
+	assert !a.acc.bytestr().contains('resumed')
+	c := unsafe { cp }
+	assert cp_until(&c.closed, 1, 2000) == 1
+	assert stdatomic.load_i64(&c.park_runs) == 0, 'the continuation of a closed park ran'
+}
+
+// While parked the connection keeps taking its client's bytes into its
+// buffer, and its ConnHandler gets them, in order, once the park ends.
+fn test_epoll_parked_takeover_buffers_frames_for_the_resume() ! {
+	$if tinyc {
+		return
+	}
+	cp_reset()
+	mut h := vtest.start(cp_config(1, 0, 0))!
+	defer {
+		h.stop()
+	}
+	mut a, _, _ := cp_sub(h.port(), '/sub')!
+	defer {
+		a.close()
+	}
+	a.send('park\n')!
+	time.sleep(50 * time.millisecond)
+	a.send('one\ntwo\n')!
+	assert !a.until('echo:', 200), 'the ConnHandler ran while parked: ${a.acc.bytestr()}'
+	// End the park: its fd becomes readable.
+	c := unsafe { cp }
+	one := u8(1)
+	C.write(int(stdatomic.load_i64(&c.park_w)), &one, 1)
+	assert a.until('resumed\necho:one\necho:two\n', 2000), a.acc.bytestr()
 }
 
 // The unsupported paths: a plain EventLoop (unit tests) and an HTTP/1.1
