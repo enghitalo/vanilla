@@ -106,8 +106,9 @@ build() {
 	local key="$1|$2|$3" bin
 	if [ -z "${built[$key]+set}" ]; then
 		bin="$bins/bin_${#built[@]}"
-		# shellcheck disable=SC2086 # flags is a word list
-		if ( cd "$1" && v -prod -gc none "${cflags[@]}" $3 -o "$bin" "$2" ) >/dev/null 2>&1; then
+		# shellcheck disable=SC2086 # flags is a word list. cflags: an empty array
+		# under set -u is an "unbound variable" before bash 4.4, hence the +.
+		if ( cd "$1" && v -prod -gc none ${cflags[@]+"${cflags[@]}"} $3 -o "$bin" "$2" ) >/dev/null 2>&1; then
 			built[$key]=$bin
 		else
 			built[$key]=
