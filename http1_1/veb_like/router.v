@@ -88,13 +88,15 @@ pub fn new[T](app &T) !&Router[T] {
 	mut handler := 0
 	$for method in T.methods {
 		$if method.return_type is core.Step {
-			$if method.args.len != 3 && method.args.len != 6 {
-				$compile_error('veb_like: every method returning core.Step is a route handler and must take (req HttpRequest, p &veb_like.Params, mut out []u8), optionally followed by (client_fd int, worker_state voidptr, mut event_loop core.EventLoop)')
+			$if method.attrs.len > 0 {
+				$if method.args.len != 3 && method.args.len != 6 {
+					$compile_error('veb_like: a method returning core.Step with attributes is a route handler and must take (req HttpRequest, p &veb_like.Params, mut out []u8), optionally followed by (client_fd int, worker_state voidptr, mut event_loop core.EventLoop)')
+				}
+				for attr in method.attrs {
+					t.add(attr, handler, method.name)!
+				}
+				handler++
 			}
-			for attr in method.attrs {
-				t.add(attr, handler, method.name)!
-			}
-			handler++
 		}
 	}
 	t.finish()
@@ -147,24 +149,24 @@ pub fn (r &Router[T]) handle(req_buffer []u8, mut out []u8, client_fd int, worke
 }
 
 // dispatch calls T's handler number `h`. The `$for` unrolls into one direct
-// call per handler behind an integer compare; it never reads method.attrs,
-// which V would materialize as a fresh heap array on every pass.
+// call per handler behind an integer compare, which GCC turns into a jump
+// table with the handlers inlined; the `$if`s are decided at compile time.
 fn (r &Router[T]) dispatch(h int, req HttpRequest, p &Params, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	app := r.app
 	mut i := 0
 	$for method in T.methods {
 		$if method.return_type is core.Step {
-			if i == h {
-				// A forwarded `mut` parameter is passed without `mut` in a
-				// comptime call (V rejects `mut out` here); it is still the
-				// caller's buffer.
-				$if method.args.len == 3 {
-					return app.$method(req, p, out)
-				} $else {
-					return app.$method(req, p, out, client_fd, worker_state, event_loop)
+			$if method.attrs.len > 0 {
+				if i == h {
+					$if method.args.len == 3 {
+						return app.$method(req, p, mut out)
+					} $else {
+						return app.$method(req, p, mut out, client_fd, worker_state, mut
+							event_loop)
+					}
 				}
+				i++
 			}
-			i++
 		}
 	}
 	return .close // unreachable: route ids only name handlers

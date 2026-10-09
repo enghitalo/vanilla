@@ -35,11 +35,12 @@ mut:
 
 // ScramCache keeps the PBKDF2 result for one (salt, iteration count). A role's
 // SCRAM verifier on the server does not change between connections, so a pool
-// derives Hi(password, salt, i) (4096 iterations of HMAC-SHA-256 by default,
-// ~10 ms of CPU and several MB of allocations with V's crypto.pbkdf2) once,
-// and every other connection and every re-dial reuses it: a reconnect then
-// costs the worker no key derivation and, under -gc none, leaks nothing for
-// it. A new salt or count (the role's password was changed) derives again.
+// derives Hi(password, salt, i) (4096 iterations of HMAC-SHA-256 by default:
+// ~2.3 ms of CPU and 20 allocations with V's crypto.pbkdf2 on V 0.5.2 5516000,
+// down from several MB before vlang/v#29324) once, and every other connection
+// and every re-dial reuses it: a reconnect then costs the worker no key
+// derivation and, under -gc none, leaks nothing for it. A new salt or count
+// (the role's password was changed) derives again.
 // It holds password-equivalent material, like the ConnConfig it comes from:
 // per pool (one worker thread, no lock), never logged.
 @[heap]

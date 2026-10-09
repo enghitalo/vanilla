@@ -60,8 +60,9 @@ request on an fd (`event_loop.watch_fd` + `.suspend`: an async DB query, a
 timer, an upstream), read its worker's state, or `.close`. `GET /delay/:ms` in
 [main.v](src/main.v) suspends on a timerfd ([delay_linux.c.v](src/delay_linux.c.v)).
 
-Every method of `App` that returns `core.Step` is a handler, routed or not, so
-it must have one of these shapes (a clear compile error says so otherwise).
+A method of `App` that returns `core.Step` and carries attributes is a handler,
+so it must have one of these shapes (a clear compile error says so otherwise).
+Without attributes it is an ordinary method, whatever its parameters.
 
 ### Routes in this example
 
@@ -96,13 +97,12 @@ table and inlines the handlers.
 
 **Nothing is allocated per request** — not for a hit, a 404, a 405, a 501 or a
 400 (`test_routing_allocates_nothing`). Under `-gc none`, vanilla's production
-build, any per-request allocation would be a permanent leak. Three V traps had
-to be avoided to get there (see [docs/V_PERF_TOOLBOX.md](../../docs/V_PERF_TOOLBOX.md)):
+build, any per-request allocation would be a permanent leak. Two choices keep it
+there (see [docs/V_PERF_TOOLBOX.md](../../docs/V_PERF_TOOLBOX.md)):
 
-- `for attr in method.attrs` inside `$for` builds a new heap array on every
-  pass, so attributes are only read in `new`, never per request;
-- a struct holding a fixed array (`[8]Slice`) is copied to the heap when passed
-  by `&`/`mut`, so `Params` stores its eight slots as plain fields;
+- `Params` stores its eight slots as plain fields, not a `[8]Slice`: V still
+  copies a struct holding a fixed array to the heap when the function it is
+  passed to passes it on, as every handler does with `p.get(name)`;
 - params live in that stack struct, not a `map[string]Slice` (a map plus a
   clone of every key, per request).
 

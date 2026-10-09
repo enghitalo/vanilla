@@ -133,6 +133,13 @@ fn (a &ShapesApp) helper() int {
 	return 1
 }
 
+// not a handler either: it returns core.Step but has no attribute, so it can
+// take any parameters (a shared response helper, here)
+fn (a &ShapesApp) teapot(mut out []u8) core.Step {
+	out << "HTTP/1.1 418 I'm a teapot\r\nContent-Length: 0\r\n\r\n".bytes()
+	return .done
+}
+
 fn test_both_shapes_and_extra_attributes() {
 	r := new[ShapesApp](&ShapesApp{})!
 	assert body(run(r, get('/short'))) == 'short'
@@ -142,6 +149,8 @@ fn test_both_shapes_and_extra_attributes() {
 	step := r.handle(raw, mut out, 99, unsafe { nil }, mut el)
 	assert step == .close // client_fd reached the long handler
 	assert ShapesApp{}.helper() == 1
+	mut tea := []u8{}
+	assert ShapesApp{}.teapot(mut tea) == .done
 }
 
 fn test_custom_not_found() {
