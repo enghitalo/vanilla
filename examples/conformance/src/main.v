@@ -10,9 +10,9 @@
 // Probe: uvx --from git+https://github.com/dropseed/h1spec h1spec --strict localhost:3000
 module main
 
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
+import server
+import core
+import http1_1.request_parser
 
 // handle_request appends the complete raw HTTP response to `out` and returns a
 // Step: `.done` keeps the connection alive, `.close` flushes then closes it. It
@@ -24,7 +24,7 @@ fn handle_request(req_buffer []u8, mut out []u8, _client_fd int, _worker_state v
 	req := request_parser.decode_http_request(req_buffer) or {
 		// Malformed head: emit a self-delimiting 400 and close (RFC 9112 §9.6 —
 		// the byte stream can no longer be trusted).
-		out << resp_400_bad_request
+		core.append_str(mut out, resp_400_bad_request)
 		return .close
 	}
 
@@ -33,15 +33,15 @@ fn handle_request(req_buffer []u8, mut out []u8, _client_fd int, _worker_state v
 	match classify(req) {
 		.ok {}
 		.bad_request {
-			out << resp_400_bad_request
+			core.append_str(mut out, resp_400_bad_request)
 			return .close
 		}
 		.not_supported {
-			out << resp_505_version_not_supported
+			core.append_str(mut out, resp_505_version_not_supported)
 			return .close
 		}
 		.not_impl {
-			out << resp_501_not_implemented
+			core.append_str(mut out, resp_501_not_implemented)
 			return .close
 		}
 	}
@@ -56,19 +56,19 @@ fn handle_request(req_buffer []u8, mut out []u8, _client_fd int, _worker_state v
 		}
 		'HEAD' {
 			// HEAD is GET without a body: same status/headers, zero body bytes.
-			out << resp_200_head
+			core.append_str(mut out, resp_200_head)
 			step_for(req)
 		}
 		'POST' {
 			// A conformant POST target: accept the body the framer already
 			// validated and acknowledge it.
-			out << resp_200_ok
+			core.append_str(mut out, resp_200_ok)
 			step_for(req)
 		}
 		else {
 			// Recognized-but-unimplemented methods (OPTIONS/PUT/DELETE/…) and any
 			// other syntactically valid method: 405 with an Allow header.
-			out << resp_405_method_not_allowed
+			core.append_str(mut out, resp_405_method_not_allowed)
 			step_for(req)
 		}
 	}
@@ -81,14 +81,14 @@ fn serve_get(req request_parser.HttpRequest, mut out []u8) core.Step {
 	path := unsafe { tos(&req.buffer[req.path.start], req.path.len) }
 	is_root := path == '/' || path.starts_with('/?') || path.starts_with('http')
 	if !is_root {
-		out << resp_404_not_found
+		core.append_str(mut out, resp_404_not_found)
 		return step_for(req)
 	}
 	if wants_close(req) {
-		out << resp_200_ok_close
+		core.append_str(mut out, resp_200_ok_close)
 		return .close
 	}
-	out << resp_200_ok
+	core.append_str(mut out, resp_200_ok)
 	return .done
 }
 
@@ -128,17 +128,17 @@ fn token_list_has(val string, want string) bool {
 
 fn main() {
 	// Per-OS backend selection (parity with the other examples).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		handler:         handle_request
 		io_multiplexing: backend
 	})!
-	server.run()
+	srv.run()
 }

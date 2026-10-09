@@ -6,6 +6,14 @@
 - Always try to keep abstraction to a minimum
 - Don't complicate it
 
+## Module imports
+
+Use **fully-qualified imports** from the repo root (`import server.backend_epoll`,
+`import http1_1.response`) — never sibling-relative paths — so any future directory
+move stays a pure import-line change. The one-direction dependency rule between
+modules is documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
+enforced by CI.
+
 ## Sending Raw HTTP Requests for Testing
 
 You can test your server by sending raw HTTP requests directly using tools like `nc` (netcat), `telnet`, or `socat`. This is useful for debugging, learning, or end-to-end testing.
@@ -56,10 +64,17 @@ v -prod -gc none -o /tmp/bench bench/request_parser/request_parser_bench.v
 bench/measure.sh /tmp/bench
 ```
 
-### Valgrind
+### Race detector
 
 ```sh
-# Race condition check
-v -prod -gc none .
-valgrind --tool=helgrind ./vanilla
+# Data race check: ThreadSanitizer, with V file:line stacks in each report
+v -race -o vanilla .
+./vanilla                      # drive it with real traffic; exit status 66 = a race was found
+v -race test tests/            # or run the e2e suites instrumented
 ```
+
+`-race` builds without a GC (like `-gc none`) and prefers clang: gcc's TSan
+misses races on struct values. `VRACE` takes TSan options, e.g.
+`VRACE="log_path=/tmp/race"`. Prefer it to `valgrind --tool=helgrind`, which
+does not model C11 atomics: it reports the BirthQueue ring's atomically
+published slots as races (#164).

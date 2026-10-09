@@ -19,22 +19,58 @@ on:
     branches: [ main ]
     paths:
       - 'examples/conformance/**'
-      - 'http_server/**'
+      - 'server/**'
+      - 'core/**'
+      - 'http1_1/**'
+      - 'http2/**'
+      - 'socket/**'
+      - 'epoll/**'
+      - 'io_uring/**'
+      - 'kqueue/**'
+      - 'iocp/**'
+      - 'tls/**'
+      - 'static_assets/**'
+      - 'testkit/**'
+      - 'vtest/**'
+      - 'tests/**'
       - '.github/workflows/conformance_h1spec.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'examples/conformance/**'
-      - 'http_server/**'
+      - 'server/**'
+      - 'core/**'
+      - 'http1_1/**'
+      - 'http2/**'
+      - 'socket/**'
+      - 'epoll/**'
+      - 'io_uring/**'
+      - 'kqueue/**'
+      - 'iocp/**'
+      - 'tls/**'
+      - 'static_assets/**'
+      - 'testkit/**'
+      - 'vtest/**'
+      - 'tests/**'
       - '.github/workflows/conformance_h1spec.yml'
 
 permissions:
   contents: write        # to refresh the auto-managed README status block on merge
   pull-requests: write   # to post the conformance scorecard on the PR
 
+# A new push to a pull request cancels that PR's run still in progress, so
+# superseded commits don't queue for the account's runners; on main every
+# commit is its own group and runs to the end.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   conformance:
     runs-on: ubuntu-latest
+    # Runs tests/ and the example tests on vtest, which has no client-side
+    # timeouts: a liveness regression hangs instead of failing — the backstop.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: Set up V
@@ -47,7 +83,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y liburing-dev linux-libc-dev
+          sudo apt-get install -y linux-libc-dev
 
       # --- Hard gate: deterministic handler-level conformance assertions --------
       # `-cc gcc -no-parallel`: the default build hits two V-toolchain flakes —
@@ -56,8 +92,8 @@ jobs:
       #     unmangled (`array_free` vs `builtin__array_free`) → intermittent
       #     `undefined reference` at link. It is a codegen bug, so it is NOT
       #     C-compiler-dependent; only -no-parallel eliminates it.
-      #   * -cc gcc avoids the separate tcc<->gcc fallback race on liburing's
-      #     <stdatomic.h> (which every http_server build pulls in).
+      #   * -cc gcc: every lane builds with gcc (it also avoided a tcc<->gcc
+      #     fallback race on liburing's <stdatomic.h> until #189 dropped liburing).
       # Matches the example matrix workflows. -prod is not immune to #27749, so
       # keep -no-parallel here even though these are debug builds.
       - name: Build examples/conformance
@@ -66,10 +102,10 @@ jobs:
       - name: Unit tests (hard gate)
         shell: bash
         run: v -cc gcc -no-parallel test examples/conformance/src
-      - name: http_server package tests (hard gate)
+      - name: module package tests (hard gate)
         shell: bash
-        # Runs the WHOLE http_server package test tree (recursive) — the example
-        # matrices don't cover http_server/ tests, so they run here on Linux:
+        # Runs EVERY library module test tree (recursive) — the example
+        # matrices do not cover module tests, so they run here on Linux:
         #   • http1_1/request_parser/ — split-point framing incl. CL+TE (#104),
         #     missing-chunk-terminator (#109) and chunk-size / Content-Length
         #     overflow regressions (guards against a hostile request re-crashing a
@@ -88,7 +124,7 @@ jobs:
         #     pass trivially.
         env:
           VANILLA_NO_IOURING: 1
-        run: v -cc gcc -no-parallel test http_server/ tests/
+        run: v -cc gcc -no-parallel test server/ core/ http1_1/ http2/ socket/ epoll/ io_uring/ kqueue/ iocp/ tls/ static_assets/ testkit/ tests/
 
       # --- Report: live-server probe with h1spec --------------------------------
       - name: Install h1spec (uv)

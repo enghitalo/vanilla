@@ -1,7 +1,12 @@
 module pg_async
 
-// PgConn is a single PostgreSQL connection: the TCP socket plus the v3 startup /
-// SCRAM-SHA-256 handshake and extended-query execution.
+import tls
+import time
+import transport
+
+// PgConn is a single PostgreSQL connection: the TCP socket (optionally TLS over
+// it, see SslMode) plus the v3 startup / SCRAM-SHA-256 handshake and
+// extended-query execution.
 //
 // This is the BLOCKING form. It is used for pool bring-up (connecting + auth
 // happen once, before the worker starts serving) and to validate the protocol
@@ -12,9 +17,9 @@ module pg_async
 // pg_async deliberately does NOT import V's `net`: `net` declares `C.socket`
 // with TYPED enum params on some V versions, and V merges C declarations
 // globally — so importing `net` clashes with the plain-`int` `C.socket` that
-// http_server's socket module declares and breaks the build (e.g. on the V 0.5.1
+// the socket module declares and breaks the build (e.g. on the V 0.5.1
 // tag). The connection is opened with libc directly, using the same signatures
-// http_server.socket uses. C.recv/C.send/C.fcntl live in conn_async.v.
+// server.socket uses. C.recv/C.send/C.fcntl live in conn_async.v.
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
@@ -34,35 +39,139 @@ mut:
 	ai_next      voidptr
 }
 
+#include <poll.h>
+#include "@VMODROOT/pg_async/pg_async_shim.h"
+
 fn C.socket(domain int, typ int, protocol int) int
 fn C.connect(sockfd int, addr voidptr, addrlen u32) int
 fn C.close(fd int) int
 fn C.getaddrinfo(node &char, service &char, hints &C.addrinfo, res &&C.addrinfo) int
 fn C.freeaddrinfo(res &C.addrinfo)
+fn C.pg_async_wait(fd int, events int, timeout_ms int) int
+fn C.pg_async_gai_strerror(rc int) &char
+fn C.pg_async_getsockopt_int(fd int, level int, name int) int
 
-// dial resolves host:port (getaddrinfo) and opens a blocking TCP connection.
-fn dial(host string, port int) !int {
+// resolve returns every address getaddrinfo gives for host:port, in its order
+// (IPv6 and IPv4 alike); dial tries them in turn. Blocking: DNS.
+fn resolve(host string, port int) ![]transport.Addr {
 	mut hints := C.addrinfo{}
 	unsafe { vmemset(&hints, 0, int(sizeof(hints))) }
 	hints.ai_family = C.AF_UNSPEC
 	hints.ai_socktype = C.SOCK_STREAM
 	port_str := port.str()
 	mut res := &C.addrinfo(unsafe { nil })
-	if C.getaddrinfo(&char(host.str), &char(port_str.str), &hints, &res) != 0 {
-		return error('pg: getaddrinfo failed for ${host}:${port}')
+	rc := C.getaddrinfo(&char(host.str), &char(port_str.str), &hints, &res)
+	if rc != 0 {
+		reason := unsafe { cstring_to_vstring(C.pg_async_gai_strerror(rc)) }
+		return error('pg: cannot resolve ${host}:${port}: ${reason}')
 	}
 	defer {
 		C.freeaddrinfo(res)
 	}
-	fd := C.socket(res.ai_family, res.ai_socktype, res.ai_protocol)
-	if fd < 0 {
-		return error('pg: socket() failed')
+	mut out := []transport.Addr{}
+	mut ai := res
+	for ai != unsafe { nil } {
+		if ai.ai_addrlen > 0 && ai.ai_addrlen <= 128 {
+			mut a := transport.Addr{
+				family: ai.ai_family
+				len:    u32(ai.ai_addrlen)
+			}
+			unsafe { vmemcpy(&a.data[0], ai.ai_addr, ai.ai_addrlen) }
+			out << a
+		}
+		ai = unsafe { &C.addrinfo(ai.ai_next) }
 	}
-	if C.connect(fd, res.ai_addr, u32(res.ai_addrlen)) != 0 {
+	if out.len == 0 {
+		return error('pg: no usable address for ${host}:${port}')
+	}
+	return out
+}
+
+// connect_addr opens a TCP socket to `a` with transport.dial_addr (the connect
+// always starts non-blocking, on a close-on-exec socket tuned per cfg). With
+// `nonblocking` the socket is returned as is (the connect may still be in
+// flight: the re-dial path, redial.v, finishes it without waiting on the
+// network). Otherwise this waits up to cfg.connect_timeout_ms (0 = no bound)
+// for the connect to complete, then returns a blocking socket. On error the
+// socket is closed and the errno is the error code.
+fn connect_addr(a &transport.Addr, cfg &ConnConfig, nonblocking bool) !int {
+	fd := transport.dial_addr(a, tcp_opts(cfg))
+	if fd < 0 {
+		return error_with_code('connect failed (errno ${-fd})', -fd)
+	}
+	if nonblocking {
+		return fd
+	}
+	timeout_ms := cfg.connect_timeout_ms
+	r := C.pg_async_wait(fd, C.POLLOUT, if timeout_ms > 0 { timeout_ms } else { -1 })
+	if r == 0 {
 		C.close(fd)
-		return error('pg: connect to ${host}:${port} failed')
+		return error_with_code('connect timed out after ${timeout_ms} ms', C.ETIMEDOUT)
+	}
+	so_error := transport.socket_error(fd)
+	if r < 0 || so_error != 0 {
+		C.close(fd)
+		code := if so_error > 0 { so_error } else { C.errno }
+		return error_with_code('connect failed (errno ${code})', code)
+	}
+	flags := C.fcntl(fd, C.F_GETFL, 0)
+	if flags < 0 || C.fcntl(fd, C.F_SETFL, flags & ~int(C.O_NONBLOCK)) < 0 {
+		e := C.errno
+		C.close(fd)
+		return error_with_code('fcntl(restore blocking) failed', e)
 	}
 	return fd
+}
+
+// tcp_opts is the socket tuning cfg asks for: TCP_NODELAY, so a small
+// pipelined query is not held back by Nagle waiting on the server's delayed
+// ACK; keepalive and TCP_USER_TIMEOUT, so a peer that vanished without a FIN
+// or RST is noticed.
+fn tcp_opts(cfg &ConnConfig) transport.TcpOpts {
+	return transport.TcpOpts{
+		nodelay:           cfg.tcp_nodelay
+		keepalive_idle_s:  cfg.tcp_keepalive_idle_s
+		keepalive_intvl_s: cfg.tcp_keepalive_interval_s
+		keepalive_cnt:     cfg.tcp_keepalive_count
+		user_timeout_ms:   cfg.tcp_user_timeout_ms
+	}
+}
+
+// dial resolves cfg.host:cfg.port and connects to the first address that
+// accepts, starting at address `start` (mod the count) and trying each in
+// turn. Every socket it returns is tuned (tcp_opts). Blocking (each connect
+// bounded by connect_timeout_ms), unless `nonblocking`: then the first address
+// whose connect() starts is returned with the connect possibly still in
+// flight.
+fn dial(cfg &ConnConfig, nonblocking bool, start int) !int {
+	addrs := resolve(cfg.host, cfg.port)!
+	return dial_addrs(addrs, cfg, nonblocking, start)
+}
+
+// dial_addrs is dial over an already resolved address list.
+fn dial_addrs(addrs []transport.Addr, cfg &ConnConfig, nonblocking bool, start int) !int {
+	mut last := ''
+	for i in 0 .. addrs.len {
+		a := &addrs[(start + i) % addrs.len]
+		fd := connect_addr(a, cfg, nonblocking) or {
+			last = err.msg()
+			continue
+		}
+		return fd
+	}
+	return error('pg: connect to ${cfg.host}:${cfg.port} failed on all ${addrs.len} address(es): ${last}')
+}
+
+// SslMode is whether, and how strictly, a connection uses TLS — libpq's
+// sslmode values, minus `allow` and `prefer`: a mode that asks for TLS gets it
+// or fails, it never falls back to plaintext. TLS needs the `-d vanilla_tls`
+// build (Mbed TLS 4, the same library the HTTPS server links); without it
+// every mode but .disable fails to connect.
+pub enum SslMode {
+	disable     // plaintext (the default)
+	require     // TLS; the certificate is not checked, unless ssl_root_cert is set: then as .verify_ca (libpq's rule)
+	verify_ca   // TLS; the certificate chains to a trusted CA
+	verify_full // TLS; the certificate chains to a trusted CA and names `host` (SNI is sent): what managed databases need
 }
 
 pub struct ConnConfig {
@@ -72,11 +181,60 @@ pub:
 	user     string
 	password string
 	database string
+	// ssl_mode: see SslMode. TLS 1.3, negotiated with PostgreSQL's SSLRequest.
+	ssl_mode SslMode
+	// ssl_root_cert is the PEM file of trusted CA certificates for .verify_ca
+	// and .verify_full; '' = the system's bundle (tls.system_ca_file:
+	// $SSL_CERT_FILE, else /etc/ssl/certs/ca-certificates.crt and the like).
+	ssl_root_cert string
+	// connect_timeout_ms bounds the TCP connect to each resolved address on
+	// the blocking bring-up path (over TLS, also the TLS handshake and the
+	// authentication after it), and one whole re-dial attempt (connect +
+	// handshake) on the non-blocking path. 0 = no bound on bring-up.
+	connect_timeout_ms int = 5000
+	// tcp_nodelay disables Nagle on the connection (what libpq does). Without
+	// it a pipelined query written while an earlier one is unacknowledged can
+	// wait for the server's delayed ACK (~40 ms on Linux). The cost is one TCP
+	// segment per query flush instead of coalesced ones: a few µs of server CPU
+	// per request under deep pipelining on loopback.
+	tcp_nodelay bool = true
+	// TCP keepalive: after tcp_keepalive_idle_s seconds without traffic, probe
+	// every tcp_keepalive_interval_s; tcp_keepalive_count unanswered probes
+	// drop the connection, so an idle pooled connection whose server vanished
+	// (no FIN/RST: a host down, a NAT or firewall that forgot it) is found
+	// broken instead of swallowing the next query. idle 0 = keepalive off.
+	tcp_keepalive_idle_s     int = 30
+	tcp_keepalive_interval_s int = 10
+	tcp_keepalive_count      int = 3
+	// tcp_user_timeout_ms (Linux): how long sent data may stay unacknowledged
+	// before the kernel drops the connection. 0 = the OS default (~15 min of
+	// retransmissions).
+	tcp_user_timeout_ms int = 30_000
+}
+
+// LinkState is a connection's health. A live connection is .ready. It turns
+// .broken the moment it is known lost: EOF, a socket error (a TLS error
+// included), a FATAL/PANIC ErrorResponse, or an exclusive borrower releasing
+// it with a query still in flight (its reply stream can no longer be matched
+// to queries). A broken connection takes no new query and fails what is still
+// in flight — after delivering every reply already buffered — and its pool
+// then re-dials it through .connecting (over TLS, .ssl_request and
+// .tls_handshake) and .starting back to .ready, without blocking (redial.v).
+enum LinkState {
+	ready
+	broken
+	connecting    // re-dial: non-blocking connect() in flight
+	ssl_request   // re-dial over TLS: SSLRequest sent, waiting for the server's one-byte answer
+	tls_handshake // re-dial over TLS: the TLS handshake under way
+	starting      // re-dial: StartupMessage sent, authenticating until ReadyForQuery
 }
 
 pub struct PgConn {
 mut:
 	fd       int = -1 // the raw socket fd
+	state    LinkState
+	fatal    PgError // the FATAL/PANIC that ended the session (sqlstate '' if none)
+	loss     string  // why the connection was lost, as seen from this side
 	recv_buf []u8
 	recv_pos int // async read cursor: [recv_pos, recv_buf.len) is received-but-unframed
 	// In-flight non-blocking query state. The connection pipelines up to
@@ -101,6 +259,38 @@ mut:
 	// Allocated once (lazy), reset to len 0 each submit, grows to a high-water mark —
 	// so a submit never allocates a throwaway frame (which would leak under -gc none).
 	submit_scratch []u8
+	// Re-dial bookkeeping (redial.v), touched only while the connection is not
+	// .ready: the SCRAM exchange in progress, the earliest next attempt after a
+	// failed one, and the deadline of the attempt in flight (monotonic ns).
+	scram         ScramClient
+	retry_at      u64
+	dial_deadline u64
+	// addr_cursor is the resolved address the next re-dial starts at: a failed
+	// attempt moves it on, so a dead address (an IPv6 one on an IPv4-only path,
+	// a failed-over primary) is not retried first forever.
+	addr_cursor int
+	// scram_cache is the pool's PBKDF2 cache (ScramCache), shared by its
+	// connections so a bring-up derives once and a re-dial not at all; nil
+	// for a standalone connection.
+	scram_cache &ScramCache = unsafe { nil }
+	// tls is the TLS session over fd (ssl_mode != .disable), else the zero
+	// Session: the one field every send and recv branches on (transport.v).
+	// It and the rest of the TLS state sit after the plaintext path's fields,
+	// so adding them moved none of those.
+	tls tls.Session
+	// TLS bookkeeping (transport.v): the client config the session comes from
+	// (the pool's, or this connection's own when owns_tls), the readiness a
+	// blocked TLS call waits for (POLLIN / POLLOUT), the length a write Mbed
+	// TLS could not finish must be retried with, and whether a read is
+	// blocked until the socket takes a write (async_wants_write).
+	tls_cfg          &tls.Config = unsafe { nil }
+	owns_tls         bool
+	tls_wait         int
+	tls_wlen         int
+	tls_read_blocked bool
+	// io_deadline bounds the waits of the blocking bring-up over TLS
+	// (monotonic ns; 0 = wait as long as it takes).
+	io_deadline u64
 }
 
 struct Msg {
@@ -108,34 +298,124 @@ struct Msg {
 	payload []u8
 }
 
-// PgConn.connect opens a TCP connection and runs the startup + SCRAM-SHA-256
-// handshake, returning once the server reports ReadyForQuery.
+// PgConn.connect opens a TCP connection — TLS over it unless ssl_mode is
+// .disable — and runs the startup + SCRAM-SHA-256 handshake, returning once
+// the server reports ReadyForQuery.
 pub fn PgConn.connect(cfg ConnConfig) !PgConn {
-	fd := dial(cfg.host, cfg.port)!
 	mut c := PgConn{
-		fd:       fd
 		recv_buf: []u8{cap: 16 * 1024}
 	}
-	c.handshake(cfg)!
+	if cfg.ssl_mode != .disable {
+		c.tls_cfg = new_tls_config(&cfg)!
+		c.owns_tls = true
+	}
+	c.bring_up(&cfg) or {
+		c.teardown()
+		return err
+	}
 	return c
 }
 
-// close sends a best-effort Terminate and closes the socket.
-pub fn (mut c PgConn) close() {
-	mut out := []u8{}
-	write_terminate(mut out)
-	c.send(out) or {}
-	C.close(c.fd)
+// bring_up dials and authenticates, blocking: the TCP connect, then over TLS
+// the SSLRequest and the TLS handshake (on a non-blocking socket, every wait
+// bounded by connect_timeout_ms), then the startup and authentication.
+fn (mut c PgConn) bring_up(cfg &ConnConfig) ! {
+	c.fd = dial(cfg, false, 0)!
+	if c.tls_cfg != unsafe { nil } {
+		if cfg.connect_timeout_ms > 0 {
+			c.io_deadline = time.sys_mono_now() + u64(cfg.connect_timeout_ms) * u64(time.millisecond)
+		}
+		c.set_nonblocking()!
+		for !c.send_ssl_request()! {
+			c.wait_io(C.POLLOUT)!
+		}
+		for !c.ssl_answer()! {
+			c.wait_io(C.POLLIN)!
+		}
+		c.tls_attach(cfg)!
+		for !c.tls_step(cfg)! {
+			c.wait_io(c.tls_wait)!
+		}
+	}
+	c.handshake(cfg)!
+	c.io_deadline = 0
 }
 
+// close sends a best-effort Terminate (and, over TLS, close_notify) and closes
+// the socket.
+pub fn (mut c PgConn) close() {
+	if c.fd >= 0 && c.state == .ready {
+		mut out := []u8{}
+		write_terminate(mut out)
+		c.send_some(out.data, out.len) // one attempt: never wait on a peer to close
+	}
+	c.teardown()
+}
+
+// teardown frees the TLS session (sending close_notify while the socket is
+// still open) and the connection's own TLS config, then closes the socket.
+// The connection is left broken; over TLS it also has no config left, so a
+// later re-dial fails before it dials (redial_start) instead of reaching
+// freed memory.
+fn (mut c PgConn) teardown() {
+	if c.tls.active() {
+		c.tls.free()
+		c.tls = tls.Session{}
+	}
+	if c.owns_tls && c.tls_cfg != unsafe { nil } {
+		c.tls_cfg.free()
+	}
+	c.tls_cfg = unsafe { nil }
+	if c.fd >= 0 {
+		C.close(c.fd)
+		c.fd = -1
+	}
+	c.state = .broken
+}
+
+// is_broken reports whether the connection is unusable: lost (EOF, socket
+// error, a FATAL/PANIC from the server) or still being re-dialed by its pool.
+// After a query error it tells a lost connection — retry on another one; the
+// pool re-dials this one — from a statement error on a healthy connection
+// (see PgError for the SQLSTATE).
+pub fn (c &PgConn) is_broken() bool {
+	return c.state != .ready
+}
+
+// lose marks a live connection broken, recording why. The first cause wins:
+// a later symptom (the EOF after a FATAL) does not overwrite it.
+fn (mut c PgConn) lose(reason string) {
+	if c.state == .ready {
+		c.state = .broken
+		c.loss = reason
+	}
+}
+
+// loss_error is the error a lost connection reports for a query that cannot
+// complete: the FATAL the server ended the session with, when it sent one.
+fn (c &PgConn) loss_error() IError {
+	if c.fatal.sqlstate != '' {
+		return c.fatal
+	}
+	return error('pg: ${c.loss}')
+}
+
+// send writes all of data, waiting while the socket is full — except during a
+// re-dial, which must never block the worker (its messages are small, on an
+// empty socket: a full one fails the attempt instead).
 fn (mut c PgConn) send(data []u8) ! {
 	mut sent := 0
 	for sent < data.len {
-		n := C.send(c.fd, unsafe { &u8(data.data) + sent }, usize(data.len - sent), C.MSG_NOSIGNAL)
-		if n <= 0 {
-			return error('pg: send failed')
+		n := c.send_some(unsafe { &u8(data.data) + sent }, data.len - sent)
+		if n > 0 {
+			sent += n
+			continue
 		}
-		sent += n
+		if n == io_again && c.state == .ready {
+			c.wait_io(c.io_wait(C.POLLOUT))!
+			continue
+		}
+		return error('pg: send failed')
 	}
 }
 
@@ -153,7 +433,14 @@ fn (mut c PgConn) read_msg() !Msg {
 			}
 		}
 		mut tmp := []u8{len: 16 * 1024}
-		n := C.recv(c.fd, tmp.data, usize(tmp.len), 0)
+		if c.tls.active() {
+			c.tls.mark_readable()
+		}
+		n := c.recv_some(tmp.data, tmp.len)
+		if n == io_again {
+			c.wait_io(c.io_wait(C.POLLIN))!
+			continue
+		}
 		if n <= 0 {
 			return error('pg: connection closed by server')
 		}
@@ -168,24 +455,35 @@ fn (mut c PgConn) handshake(cfg ConnConfig) ! {
 	c.send(startup)!
 
 	mut scram := ScramClient.new(cfg.user, cfg.password)!
+	scram.cache = c.scram_cache
 	for {
 		msg := c.read_msg()!
-		match msg.typ {
-			bt_authentication {
-				c.handle_auth(msg.payload, mut scram)!
-			}
-			bt_error_response {
-				info := parse_error_response(msg.payload)
-				return error('pg: startup failed: ${info.message.bytestr()} (SQLSTATE ${info.code.bytestr()})')
-			}
-			bt_ready_for_query {
-				return
-			}
-			else {
-				// ParameterStatus / BackendKeyData / NoticeResponse — ignored.
-			}
+		if c.on_startup_msg(msg.typ, msg.payload, mut scram)! {
+			return
 		}
 	}
+}
+
+// on_startup_msg handles one backend message of the startup / authentication
+// exchange, answering the SCRAM steps; true once ReadyForQuery arrives. Shared
+// by the blocking handshake and the non-blocking re-dial (redial.v).
+fn (mut c PgConn) on_startup_msg(typ u8, payload []u8, mut scram ScramClient) !bool {
+	match typ {
+		bt_authentication {
+			c.handle_auth(payload, mut scram)!
+		}
+		bt_error_response {
+			info := parse_error_response(payload)
+			return error('pg: startup failed: ${info.message.bytestr()} (SQLSTATE ${info.code.bytestr()})')
+		}
+		bt_ready_for_query {
+			return true
+		}
+		else {
+			// ParameterStatus / BackendKeyData / NoticeResponse — ignored.
+		}
+	}
+	return false
 }
 
 fn (mut c PgConn) handle_auth(payload []u8, mut scram ScramClient) ! {
@@ -232,10 +530,16 @@ pub fn (mut c PgConn) query(query_text string, params []?[]u8) !Result {
 
 	mut frames := []u8{}
 	mut rows_affected := u64(0)
-	mut server_error := ''
-	mut sqlstate := ''
+	mut server_error := PgError{}
+	mut failed := false
 	for {
-		msg := c.read_msg()!
+		msg := c.read_msg() or {
+			c.lose('connection closed by server')
+			if failed {
+				return server_error // the statement's own error came before the close
+			}
+			return err
+		}
 		match msg.typ {
 			bt_ready_for_query {
 				break
@@ -245,8 +549,17 @@ pub fn (mut c PgConn) query(query_text string, params []?[]u8) !Result {
 			}
 			bt_error_response {
 				info := parse_error_response(msg.payload)
-				server_error = info.message.bytestr()
-				sqlstate = info.code.bytestr()
+				server_error = PgError{
+					severity: info.severity.bytestr()
+					sqlstate: info.code.bytestr()
+					message:  info.message.bytestr()
+				}
+				failed = true
+				if ends_session(info.severity) {
+					c.fatal = server_error
+					c.lose('connection closed by server')
+					return server_error // no ReadyForQuery follows a FATAL/PANIC
+				}
 			}
 			else {}
 		}
@@ -258,8 +571,8 @@ pub fn (mut c PgConn) query(query_text string, params []?[]u8) !Result {
 		framed << msg.payload
 		frames << framed
 	}
-	if server_error != '' {
-		return error('pg: query failed: ${server_error} (SQLSTATE ${sqlstate})')
+	if failed {
+		return server_error
 	}
 	return Result{
 		frames:        frames

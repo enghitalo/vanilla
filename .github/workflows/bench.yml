@@ -21,7 +21,21 @@ on:
   push:
     branches: [ main ]
     paths:
-      - 'http_server/**'
+      - 'server/**'
+      - 'core/**'
+      - 'http1_1/**'
+      - 'http2/**'
+      - 'socket/**'
+      - 'epoll/**'
+      - 'io_uring/**'
+      - 'kqueue/**'
+      - 'iocp/**'
+      - 'tls/**'
+      - 'pg_async/**'
+      - 'static_assets/**'
+      - 'testkit/**'
+      - 'vtest/**'
+      - 'tests/**'
       - 'bench/**'
       - '.github/workflows/bench.yml'
   workflow_dispatch:
@@ -65,7 +79,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsqlite3-dev liburing-dev linux-libc-dev
+          sudo apt-get install -y libsqlite3-dev linux-libc-dev
       - name: Same-runner A/B benchmark
         id: bench
         shell: bash

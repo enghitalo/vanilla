@@ -16,10 +16,18 @@ env:
   HOMEBREW_NO_INSTALL_CLEANUP: 1
   HOMEBREW_NO_ANALYTICS: 1
 
+# A new push to a pull request cancels that PR's run still in progress, so
+# superseded commits don't queue for the account's runners; on main every
+# commit is its own group and runs to the end.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   examples-building-and-testing:
     runs-on: macos-latest
     name: ${{ matrix.folder }}
+    timeout-minutes: 20 # backstop for a hung vtest e2e test (no client timeouts)
     strategy:
       fail-fast: false # Continue other jobs if one fails
       matrix:
@@ -32,9 +40,11 @@ jobs:
           - examples/etag/src
           - examples/hexagonal/src
           - examples/io_uring_demo/src
+          - examples/router/src
           # - examples/simple/src
           - examples/simple2/src
           - examples/sse/src
+          - examples/veb_like/src
     steps:
       - uses: actions/checkout@v4
       # Cache the V toolchain so setup-v restores a prebuilt compiler instead of

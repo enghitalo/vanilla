@@ -20,18 +20,18 @@ module main
 //   - Routing compares method/path bytes IN PLACE by offsets (slice_eq) — no
 //     `.to_string()` on the hot path.
 //   - Static responses are consts appended with `out <<`; dynamic responses
-//     are framed straight into `out` with ws/wi — no `${}`, no `+`.
+//     are framed straight into `out` with core.append_str/wi — no `${}`, no `+`.
 //   - Multipart parts are VIEWS into the request buffer (tos/vbytes): parsing
 //     allocates nothing per part, and CRLF is matched as numeric bytes (13/10).
 //     The views must not outlive `req.buffer` — safe here because the response
 //     is built synchronously in the same call.
 //   - ONE deliberate copy remains: `json.decode` is cJSON-backed and reads its
 //     input through strlen — see create_user_json.
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
-import http_server.http1_1.response
-import json
+import server
+import core
+import http1_1.request_parser
+import http1_1.response
+import json2
 import strconv
 import strings
 
@@ -79,12 +79,6 @@ const lf = u8(10)
 
 // ----- zero-alloc append helpers (BEST_PRACTICES §3b) -------------------------
 
-// ws appends a string's bytes straight into `out` — no allocation.
-@[inline]
-fn ws(mut out []u8, s string) {
-	unsafe { out.push_many(s.str, s.len) }
-}
-
 // wi appends n's decimal digits into `out` — itoa into a stack scratch, then
 // append. No allocation, no `.str()`.
 fn wi(mut out []u8, n i64) {
@@ -104,7 +98,7 @@ fn create_user_json(req request_parser.HttpRequest, mut out []u8) {
 	// measures its input with strlen). A `tos` view into the request buffer is
 	// not NUL-terminated at the body's end and would over-read past it.
 	body := req.body.to_string(req.buffer)
-	input := json.decode(CreateUser, body) or {
+	input := json2.decode[CreateUser](body) or {
 		out << resp_400_invalid_json
 		return
 	}
@@ -118,13 +112,13 @@ fn create_user_json(req request_parser.HttpRequest, mut out []u8) {
 		email: input.email
 	}
 	// json.encode escapes the user-controlled strings (§8 — never reflect raw
-	// input); ws/wi frame it straight into `out` — no intermediate response
+	// input); core.append_str/wi frame it straight into `out` — no intermediate response
 	// buffer, no `${}`.
-	payload := json.encode(created)
-	ws(mut out, 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: ')
+	payload := json2.encode(created, escape_unicode: true)
+	core.append_str(mut out, 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: ')
 	wi(mut out, payload.len)
-	ws(mut out, '\r\nConnection: keep-alive\r\n\r\n')
-	ws(mut out, payload)
+	core.append_str(mut out, '\r\nConnection: keep-alive\r\n\r\n')
+	core.append_str(mut out, payload)
 }
 
 // ----- multipart endpoint: POST /upload ---------------------------------------
@@ -377,17 +371,17 @@ fn upload(req request_parser.HttpRequest, mut out []u8) {
 		}
 		first = false
 		summary.write_string('{"field":')
-		summary.write_string(json.encode(p.name))
+		summary.write_string(json2.encode(p.name, escape_unicode: true))
 		summary.write_string(',"filename":')
-		summary.write_string(json.encode(p.filename))
+		summary.write_string(json2.encode(p.filename, escape_unicode: true))
 		summary.write_string(',"size":')
 		summary.write_decimal(p.content.len)
 		summary.write_u8(`}`)
 	}
 	summary.write_string(']}')
-	ws(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ')
+	core.append_str(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ')
 	wi(mut out, summary.len)
-	ws(mut out, '\r\nConnection: keep-alive\r\n\r\n')
+	core.append_str(mut out, '\r\nConnection: keep-alive\r\n\r\n')
 	out << summary // Builder IS []u8 — appended directly, never re-stringified
 }
 
@@ -434,18 +428,18 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 
 fn main() {
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         handle
 	})!
 	println('JSON API on http://localhost:3000/  (POST /users, POST /upload)')
-	server.run()
+	srv.run()
 }

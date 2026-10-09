@@ -14,8 +14,8 @@ module main
 // epoll only watches pollable fds (pipes/sockets), NOT regular files — a file
 // reads as "always ready", so streaming one needs no async at all. The pipe here
 // is the realistic case: the bytes genuinely arrive over time.
-import http_server
-import http_server.core
+import server
+import core
 
 #include <stdio.h>
 #include <fcntl.h>
@@ -28,24 +28,24 @@ fn C.fileno(stream voidptr) int
 fn C.fcntl(fd int, cmd int, arg int) int
 fn C.read(fd int, buf voidptr, count usize) int
 
-const chunk_headers = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const chunk_headers = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n'
 
-const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if !req.bytestr().contains('/stream') {
-		out << not_found
+		core.append_str(mut out, not_found)
 		return .done
 	}
 	// A producer whose output is spread over time — the whole point of streaming.
 	fp := C.popen(c'for i in 1 2 3 4 5; do echo "line $i"; sleep 0.2; done', c'r')
 	if fp == unsafe { nil } {
-		out << not_found
+		core.append_str(mut out, not_found)
 		return .done
 	}
 	fd := C.fileno(fp)
 	C.fcntl(fd, C.F_SETFL, C.O_NONBLOCK) // so read() returns EAGAIN instead of blocking
-	out << chunk_headers // flushed after the initial .suspend
+	core.append_str(mut out, chunk_headers) // flushed after the initial .suspend
 	event_loop.watch_fd(fd, .readable, on_chunk, fp) // carry FILE* so we can pclose at EOF
 	return .suspend
 }
@@ -79,10 +79,10 @@ fn on_chunk(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidp
 }
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            8093
 		io_multiplexing: .epoll
 		handler:         handle
 	})!
-	server.run()
+	srv.run()
 }

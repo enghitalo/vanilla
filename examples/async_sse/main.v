@@ -15,8 +15,8 @@ module main
 //
 // The same append-flush-suspend loop is how a chat feed, a progress stream, or a
 // log tail would push to many clients from one thread. See core.Handler.
-import http_server
-import http_server.core
+import server
+import core
 
 #include <sys/timerfd.h>
 #include <unistd.h>
@@ -34,9 +34,9 @@ mut:
 	max  int // stop (and close) after this many
 }
 
-const sse_headers = 'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const sse_headers = 'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n'
 
-const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 // arm_periodic programs a timerfd to fire every `ms` (it_value = it_interval).
 fn arm_periodic(tfd int, ms int) {
@@ -46,12 +46,12 @@ fn arm_periodic(tfd int, ms int) {
 	spec[1] = i64(ms % 1000) * 1_000_000
 	spec[2] = spec[0]
 	spec[3] = spec[1]
-	C.timerfd_settime(tfd, 0, voidptr(&spec[0]), unsafe { nil })
+	C.timerfd_settime(tfd, 0, unsafe { voidptr(&spec[0]) }, unsafe { nil })
 }
 
 fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if !req.bytestr().contains('/events') {
-		out << not_found
+		core.append_str(mut out, not_found)
 		return .done
 	}
 	tfd := C.timerfd_create(C.CLOCK_MONOTONIC, 0)
@@ -63,7 +63,7 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
 	}
 	// Headers go out NOW: async_serve flushes the write buffer after the initial
 	// .suspend, so the client sees `200 text/event-stream` before any tick.
-	out << sse_headers
+	core.append_str(mut out, sse_headers)
 	event_loop.watch_fd(tfd, .readable, sse_tick, voidptr(st))
 	return .suspend
 }
@@ -87,10 +87,10 @@ fn sse_tick(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidp
 }
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            8092
 		io_multiplexing: .epoll
 		handler:         handle
 	})!
-	server.run()
+	srv.run()
 }

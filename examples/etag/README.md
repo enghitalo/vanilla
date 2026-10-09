@@ -3,7 +3,7 @@
 To run the example server in production mode, use the following command:
 
 ```sh
-v -prod run examples/etag
+v -prod run examples/etag/src
 ```
 
 ### Serving the Front-End

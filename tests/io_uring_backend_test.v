@@ -1,6 +1,6 @@
 // vtest build: linux
 // End-to-end smoke tests for the io_uring backend, migrated from
-// http_server/io_uring_backend_test.v onto vtest (docs/VTEST.md). They guard
+// server/io_uring_backend_test.v onto vtest (docs/VTEST.md). They guard
 // the rewrite that turned the backend from "single request per recv,
 // pipelining broken" into the framed, pipelined, batched-send path — and in
 // particular the bug where the ring was set up on the main thread but driven
@@ -8,14 +8,14 @@
 //
 // io_uring is Linux-only AND requires the io_uring_setup syscall to be
 // permitted by the sandbox. GitHub's hosted runners deny it under seccomp, so
-// both tests SELF-SKIP via http_server.iou_backend_available() instead of
+// both tests SELF-SKIP via server.iou_backend_available() instead of
 // aborting. The backend runs one live ring per process: drive() fully stops
 // each server (shutdown drain included) before returning, so the sequential
 // tests in this binary never overlap rings. The pure multishot-accept
 // kernel-gate test (release-string parsing, no sockets) stays in
-// http_server/io_uring_backend_test.v — it needs module-internal access.
-import http_server
-import http_server.core
+// server/io_uring_backend_test.v — it needs module-internal access.
+import server
+import core
 import vtest
 
 const get_root = 'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
@@ -52,11 +52,11 @@ fn test_io_uring_end_to_end() ! {
 		return
 	}
 	$if linux {
-		if !http_server.iou_backend_available() {
+		if !server.iou_backend_available() {
 			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
 			return
 		}
-		out := vtest.drive(http_server.ServerConfig{
+		out := vtest.drive(server.ServerConfig{
 			io_multiplexing: .io_uring
 			handler:         iou_handler
 		}, [
@@ -89,11 +89,11 @@ fn test_io_uring_pipelined() ! {
 		return
 	}
 	$if linux {
-		if !http_server.iou_backend_available() {
+		if !server.iou_backend_available() {
 			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
 			return
 		}
-		out := vtest.drive(http_server.ServerConfig{
+		out := vtest.drive(server.ServerConfig{
 			io_multiplexing: .io_uring
 			handler:         iou_handler
 		}, [

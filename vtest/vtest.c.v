@@ -3,13 +3,16 @@ module vtest
 // vtest — event-driven end-to-end test client for vanilla servers.
 // Design + contract: docs/VTEST.md. The short version:
 //
-//   - drive()/start() own the whole lifecycle: bind (always port 0/ephemeral),
-//     spawn run(), and the client work begins the instant after_server_start
-//     fires. The test author never sees readiness.
+//   - drive()/start() own the whole lifecycle: bind (always port 0/ephemeral —
+//     or the config's `unix_socket_path`), spawn run(), and the client work
+//     begins the instant after_server_start fires. The test author never sees
+//     readiness.
 //   - There is NO timeout anywhere in this module. The reactor blocks in
 //     poll(-1); progress comes from the server (bytes or close), so the only
 //     clocks in a test are the server's own configs (Limits). A server that
 //     loses liveness hangs the test — deliberately (CI step timeout backstops).
+//     (The one bounded wait: drive() gives the server up to its shutdown grace
+//     to finish closing bookkeeping before it samples the leak counters.)
 //   - A run terminates exactly when every connection reached a terminal state:
 //     its script's expectations met, or EOF from the server.
 //   - Scripts are data. The engine is this one file; read it once and every
@@ -20,13 +23,29 @@ module vtest
 // kernel socket buffers hold anything that arrives in between), which is what
 // makes multi-step choreography (SSE subscribe → publish → expect) work with
 // completion-based ordering instead of sleeps.
-import net
+//
+// Connections dial through transport/ (raw non-blocking fds — no vlib
+// TcpConn): TCP to 127.0.0.1:port normally, or the unix socket when the
+// config set `unix_socket_path` — a UDS e2e IS a TCP e2e plus that one
+// config line (issue #122 step 2). A TCP connect may still be in flight
+// when fire() returns the fd (EINPROGRESS); the reactor resolves it — the
+// first round's unsent bytes arm POLLOUT, and a refused connect surfaces as
+// POLLERR/POLLHUP ⇒ eof with the script unmet.
 import sync.stdatomic
-import http_server
-import http_server.socket
+import time
+import server
+import socket
+import transport
 
 fn C.send(__fd int, __buf voidptr, __n usize, __flags int) int
 fn C.recv(__fd int, __buf voidptr, __n usize, __flags int) int
+
+// A send to a peer the server already closed (refused-connect probes, races
+// around shutdown) must report an error, not kill the test binary: Linux
+// suppresses SIGPIPE per send with MSG_NOSIGNAL, darwin per socket with
+// SO_NOSIGPIPE (socket.set_nosigpipe at dial), Windows has no SIGPIPE.
+// (vlib net used to SIG_IGN this process-wide; raw transport fds do not.)
+const msg_nosignal = $if linux { C.MSG_NOSIGNAL } $else { 0 }
 
 // Round is one send-then-expect step of a connection's life. Round k+1's bytes
 // go out only after round k's expectation held.
@@ -72,15 +91,14 @@ pub:
 	// Server internals, sampled when this Outcome was built (after shutdown for
 	// drive(); live for fire()/wait()). inflight_after == 0 proves the drain;
 	// active_after can lag EOF bookkeeping by a beat on a live server — assert
-	// it == 0 in drive() outcomes.
+	// it == 0 in drive() outcomes, which wait for that bookkeeping to settle.
 	inflight_after i64
 	active_after   i64
 }
 
 struct HConn {
 mut:
-	tcp         &net.TcpConn = unsafe { nil }
-	fd          int          = -1
+	fd          int = -1
 	rounds      []Round
 	then_eof    bool
 	shut_wr     bool
@@ -98,7 +116,7 @@ mut:
 @[heap]
 pub struct Harness {
 mut:
-	server  http_server.Server
+	server  server.Server
 	conns   []HConn
 	stopped bool
 pub mut:
@@ -109,10 +127,12 @@ pub mut:
 // the listeners synchronously, and the returned Harness only exists after
 // after_server_start fired on the run() thread. Always binds port 0 — the
 // resolved port is h.port() / h.server.port; tests never coordinate ports.
-pub fn start(config http_server.ServerConfig) !&Harness {
+// A config with `unix_socket_path` set listens there instead (the forced
+// port 0 is ignored on the UDS path) and fire() dials the socket file.
+pub fn start(config server.ServerConfig) !&Harness {
 	ready := chan bool{cap: 1}
 	user_hook := config.after_server_start
-	cfg := http_server.ServerConfig{
+	cfg := server.ServerConfig{
 		...config
 		port:               0
 		after_server_start: fn [ready, user_hook] () {
@@ -123,7 +143,7 @@ pub fn start(config http_server.ServerConfig) !&Harness {
 		}
 	}
 	mut h := &Harness{
-		server: http_server.new_server(cfg)!
+		server: server.new_server(cfg)!
 	}
 	mut srv := h.server // the run thread's copy shares the &Counter fields
 	spawn fn [mut srv] () {
@@ -140,7 +160,7 @@ pub fn (h &Harness) port() int {
 
 // server exposes the underlying Server for hand-rolled steps a Script cannot
 // express (e.g. calling shutdown() mid-flight in a graceful-drain test).
-pub fn (mut h Harness) server_ref() &http_server.Server {
+pub fn (mut h Harness) server_ref() &server.Server {
 	return &h.server
 }
 
@@ -157,7 +177,7 @@ pub fn (mut h Harness) fire(scripts []Script) !Outcome {
 			shut_wr:  s.shut_wr
 			acc:      []u8{cap: 8192}
 		}
-		mut tcp := net.dial_tcp('127.0.0.1:${h.server.port}') or {
+		hc.fd = h.dial() or {
 			hc.connect_err = err.msg()
 			hc.eof = true
 			hc.done = true
@@ -165,11 +185,7 @@ pub fn (mut h Harness) fire(scripts []Script) !Outcome {
 			group << h.conns.len - 1
 			continue
 		}
-		hc.tcp = tcp
-		// TcpConn carries two handle fields; dial_tcp only fills sock.handle
-		// (the outer .handle stays 0 — vlib itself reads sock.handle everywhere).
-		hc.fd = tcp.sock.handle
-		socket.set_blocking(hc.fd, false)
+		socket.set_nosigpipe(hc.fd) // no-op outside darwin
 		hc.arm_round()
 		h.conns << hc
 		group << h.conns.len - 1
@@ -178,16 +194,34 @@ pub fn (mut h Harness) fire(scripts []Script) !Outcome {
 	return h.results(group)
 }
 
+// dial connects to whatever the harness's server listens on: the unix socket
+// when the config set one, 127.0.0.1:port otherwise. transport hands back a
+// non-blocking fd; the connect may still be in flight (module header).
+fn (h &Harness) dial() !int {
+	if h.server.unix_socket_path != '' {
+		return transport.dial_unix(h.server.unix_socket_path)
+	}
+	return transport.dial_tcp('127.0.0.1', h.server.port)
+}
+
 // wait blocks until `until` holds on every connection of the group (or the
 // server closed it), then returns fresh results. This is the choreography
 // primitive: fire(subscribers) → fire(publisher) → wait(subscribers, count(...)).
 pub fn (mut h Harness) wait(group Group, until fn (acc []u8) bool) !Outcome {
+	return h.send(group, []u8{}, until)
+}
+
+// send writes `bytes` on every still-open connection of the group, then waits
+// like wait(). It continues a conversation on connections a previous fire()
+// left open — e.g. a second request after the server-side clock has moved on,
+// to prove the connection was NOT reaped in between.
+pub fn (mut h Harness) send(group Group, bytes []u8, until fn (acc []u8) bool) !Outcome {
 	for gi in group {
 		if h.conns[gi].eof {
 			continue
 		}
 		h.conns[gi].rounds << Round{
-			send:  []u8{}
+			send:  bytes
 			until: until
 		}
 		h.conns[gi].done = false
@@ -205,7 +239,7 @@ pub fn (mut h Harness) stop() {
 	h.stopped = true
 	for mut c in h.conns {
 		if c.fd >= 0 {
-			c.tcp.close() or {}
+			transport.close_fd(c.fd)
 			c.fd = -1
 		}
 	}
@@ -214,15 +248,31 @@ pub fn (mut h Harness) stop() {
 
 // drive is the one-shot form: start → fire → stop, with the Outcome's server
 // counters sampled AFTER the shutdown drain.
-pub fn drive(config http_server.ServerConfig, scripts []Script) !Outcome {
+pub fn drive(config server.ServerConfig, scripts []Script) !Outcome {
 	mut h := start(config)!
 	o := h.fire(scripts)!
 	h.stop()
+	h.settle()
 	return Outcome{
 		group:          o.group
 		conns:          o.conns
 		inflight_after: h.inflight_sum()
 		active_after:   stdatomic.load_i64(&h.server.active_conns.n)
+	}
+}
+
+// settle waits, for at most grace_ms, until the server has finished the
+// bookkeeping for the connections stop() just closed. Server.shutdown returns
+// as soon as nothing is in flight, which can be before a worker has even woken
+// for the clients' FINs — sampling then would read a connection that is about
+// to be released as leaked. A real leak never settles, and the counters are
+// then sampled as they are, so the asserts still catch it.
+fn (h &Harness) settle() {
+	for _ in 0 .. h.grace_ms {
+		if h.inflight_sum() == 0 && stdatomic.load_i64(&h.server.active_conns.n) == 0 {
+			return
+		}
+		time.sleep(time.millisecond)
 	}
 }
 
@@ -293,7 +343,7 @@ fn (mut c HConn) write_some() {
 	if c.sent >= r.send.len {
 		return
 	}
-	n := C.send(c.fd, unsafe { &r.send[c.sent] }, usize(r.send.len - c.sent), 0)
+	n := C.send(c.fd, unsafe { &r.send[c.sent] }, usize(r.send.len - c.sent), msg_nosignal)
 	if n > 0 {
 		c.sent += n
 	}

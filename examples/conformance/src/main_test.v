@@ -1,6 +1,6 @@
 module main
 
-import http_server.core
+import core
 
 // Handler-level conformance tests: feed raw request bytes to handle_request and
 // assert the status line, mirroring the checks an external probe (h1spec) makes.
@@ -96,6 +96,12 @@ fn test_chunked_not_final_rejected() {
 
 fn test_valid_chunked_accepted() {
 	assert status_of('POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n') == 200
+}
+
+fn test_valid_chunked_with_trailer_accepted() {
+	// A trailer section (RFC 9112 §7.1.2) is framed by the core (#185) and sits in
+	// the body, after the last chunk: it is not a header field to validate here.
+	assert status_of('POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n') == 200
 }
 
 fn test_chunked_http10_rejected() {

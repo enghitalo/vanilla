@@ -22,7 +22,7 @@ module main
 //
 // BYTE DISCIPLINE (docs/BEST_PRACTICES.md §2/§3, docs/V_PERF_TOOLBOX.md):
 //   - NEVER concatenate or interpolate — not even on the slow path. Response
-//     bytes are appended straight into `out` (`ws`/`wi`, §3b); the JWT is
+//     bytes are appended straight into `out` (`core.append_str`/`wi`, §3b); the JWT is
 //     assembled in ONE strings.Builder, no `+`, no `${}`.
 //   - VIEWS, NOT COPIES: password, API key and bearer token are zero-copy
 //     views into the request buffer (`vbytes`); jwt_verify scans view
@@ -45,19 +45,37 @@ module main
 // CONSTANT-TIME COMPARISON is the cross-cutting rule: any secret comparison
 // must not short-circuit, or timing leaks the secret. `hmac.equal()` for
 // every token/hash check; argon2's verifier uses it internally.
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
-import http_server.http1_1.response
+import server
+import core
+import http1_1.request_parser
+import http1_1.response
 import crypto.argon2
 import crypto.hmac
+import crypto.rand
 import crypto.sha256
 import encoding.base64
+import os
 import strconv
 import strings
 import time
 
-const jwt_secret = 'change-me-in-production'.bytes()
+// ---- JWT signing key ---------------------------------------------------------
+// The HMAC key comes from the environment, never from source: a key in a repo
+// is a key anyone can mint tokens with. main() refuses to start without
+// JWT_SECRET (>= 32 bytes), e.g. `JWT_SECRET=$(openssl rand -base64 32)`.
+const jwt_secret_min_len = 32
+const jwt_secret = load_jwt_secret()
+
+// load_jwt_secret reads JWT_SECRET once at init. Unset or too short, it falls
+// back to a random per-process key, so a token is never signed with a known
+// value even where main()'s check is skipped (the tests call handle() directly).
+fn load_jwt_secret() []u8 {
+	s := os.getenv('JWT_SECRET')
+	if s.len >= jwt_secret_min_len {
+		return s.bytes()
+	}
+	return rand.bytes(jwt_secret_min_len) or { panic(err) }
+}
 
 // ---- password hashing (argon2id, RFC 9106) ---------------------------------
 // The demo user's PHC hash is computed ONCE at init (~200 ms at the RFC
@@ -154,7 +172,15 @@ fn jwt_verify(token []u8) bool {
 	signing := unsafe { (&token[0]).vbytes(last) } // view: "header.payload"
 	expected := hmac.new(jwt_secret, signing, sha256.sum, sha256.block_size)
 	sig_b64 := unsafe { tos(&token[last + 1], token.len - last - 1) } // view string
-	if !hmac.equal(expected, base64.url_decode(sig_b64)) {
+	// Compare in the ENCODED domain (constant-time): re-encode the expected
+	// MAC and match the presented base64url bytes exactly. Comparing DECODED
+	// bytes silently accepts non-canonical encodings — a 32-byte MAC leaves 2
+	// free padding bits in the 43rd base64url char, so every token would have
+	// 4 accepted spellings (RFC 8725 token-malleability; it also made the
+	// tamper test flake whenever the flipped bit landed in the padding).
+	expected_b64 := base64.url_encode(expected)
+	if !hmac.equal(unsafe { expected_b64.str.vbytes(expected_b64.len) },
+		unsafe { sig_b64.str.vbytes(sig_b64.len) }) {
 		return false
 	}
 	payload_b64 := unsafe { tos(&token[first + 1], last - first - 1) } // view string
@@ -171,12 +197,12 @@ fn check_api_key(key []u8) bool {
 }
 
 // ---- static responses (consts — the fast path appends, never builds) -------
-const resp_ok_empty = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const resp_401_bearer = 'HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const resp_401 = 'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const resp_404 = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const resp_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: POST\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const resp_503 = 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const resp_ok_empty = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const resp_401_bearer = 'HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const resp_401 = 'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const resp_404 = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const resp_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: POST\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const resp_503 = 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 // write_token_200 mints a fresh JWT and appends the 200 response. Shared by the
 // synchronous /token path (fallback) and the async resume (token_done) so both
@@ -189,20 +215,14 @@ fn write_token_200(mut out []u8) {
 	payload.write_decimal(time.unix_now() + 3600)
 	payload.write_u8(`}`)
 	token := jwt_sign(payload)
-	ws(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ')
+	core.append_str(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ')
 	wi(mut out, token.len + 12) // len of {"token":""} wrapper = 12
-	ws(mut out, '\r\nConnection: keep-alive\r\n\r\n{"token":"')
+	core.append_str(mut out, '\r\nConnection: keep-alive\r\n\r\n{"token":"')
 	out << token
-	ws(mut out, '"}')
+	core.append_str(mut out, '"}')
 }
 
 // ---- zero-alloc append helpers (BEST_PRACTICES §3b) -------------------------
-// ws appends a string's bytes straight into `out` — no allocation.
-@[inline]
-fn ws(mut out []u8, s string) {
-	unsafe { out.push_many(s.str, s.len) }
-}
-
 // wi appends n's decimal digits into `out` — itoa into a stack scratch, then
 // append. No allocation, no `.str()`.
 fn wi(mut out []u8, n i64) {
@@ -268,11 +288,11 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, m
 		// handle() with worker_state == nil and reads the response on return, so
 		// that path stays synchronous. See offload_nix.c.v.
 		if !slice_eq(req.buffer, req.method, 'POST') {
-			out << resp_405
+			core.append_str(mut out, resp_405)
 			return .done
 		}
 		if req.body.len <= 0 {
-			out << resp_401 // empty password: reject before paying for argon2
+			core.append_str(mut out, resp_401) // empty password: reject before paying for argon2
 			return .done
 		}
 		password := unsafe { (&req.buffer[req.body.start]).vbytes(req.body.len) } // view
@@ -284,62 +304,69 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, m
 				if try_offload(worker_state, password, mut event_loop) {
 					return .suspend
 				}
-				out << resp_503 // pool saturated: shed load rather than block the worker
+				core.append_str(mut out, resp_503) // pool saturated: shed load rather than block the worker
 				return .done
 			}
 		}
 		// Fallback — synchronous verify on this worker. Taken by the unit test
 		// (nil worker_state) and by any backend with no watch reactor (IOCP).
 		if !verify_password(password, demo_password_phc) {
-			out << resp_401
+			core.append_str(mut out, resp_401)
 			return .done
 		}
 		write_token_200(mut out)
 	} else if slice_eq(req.buffer, req.path, '/protected') {
 		// FAST PATH — per-request JWT check over a view, const responses.
 		if !jwt_verify(bearer_token(req)) {
-			out << resp_401_bearer
+			core.append_str(mut out, resp_401_bearer)
 			return .done
 		}
-		out << resp_ok_empty
+		core.append_str(mut out, resp_ok_empty)
 	} else if slice_eq(req.buffer, req.path, '/service') {
 		// FAST PATH — API-key check over a view of the header bytes.
 		s := req.get_header_value_slice('X-API-Key') or {
-			out << resp_401
+			core.append_str(mut out, resp_401)
 			return .done
 		}
 		if s.len <= 0 {
-			out << resp_401
+			core.append_str(mut out, resp_401)
 			return .done
 		}
 		key := unsafe { (&req.buffer[s.start]).vbytes(s.len) } // view
 		if !check_api_key(key) {
-			out << resp_401
+			core.append_str(mut out, resp_401)
 			return .done
 		}
-		out << resp_ok_empty
+		core.append_str(mut out, resp_ok_empty)
 	} else {
-		out << resp_404
+		core.append_str(mut out, resp_404)
 	}
 	return .done
 }
 
 fn main() {
+	// A per-process random key would make every token die with the process and
+	// differ between replicas: require the real one instead of starting with it.
+	if os.getenv('JWT_SECRET').len < jwt_secret_min_len {
+		eprintln('JWT_SECRET must be set to at least ${jwt_secret_min_len} random bytes, e.g.')
+		eprintln('  JWT_SECRET=$(openssl rand -base64 32) v run examples/auth/src')
+		exit(1)
+	}
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         handle
 		// Per-worker argon2 offload pool (real on epoll/kqueue; a nil-returning
 		// stub on Windows, where handle falls back to a synchronous verify).
-		make_state: make_auth_state
+		make_state:      make_auth_state
 	})!
 	println('Auth demo on http://localhost:3000/')
 	println('  POST /token      (body = password)           -> JWT')
@@ -347,5 +374,5 @@ fn main() {
 	println('  GET  /service    (X-API-Key: ..)             -> 200/401')
 	print('  demo password: ')
 	println(demo_password)
-	server.run()
+	srv.run()
 }

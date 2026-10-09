@@ -21,7 +21,20 @@ on:
     branches: [ main ]
     paths:
       - 'examples/conformance/**'
-      - 'http_server/**'
+      - 'server/**'
+      - 'core/**'
+      - 'http1_1/**'
+      - 'http2/**'
+      - 'socket/**'
+      - 'epoll/**'
+      - 'io_uring/**'
+      - 'kqueue/**'
+      - 'iocp/**'
+      - 'tls/**'
+      - 'static_assets/**'
+      - 'testkit/**'
+      - 'vtest/**'
+      - 'tests/**'
       - '.github/workflows/conformance_http11probe.yml'
   workflow_dispatch:
     inputs:
@@ -54,12 +67,12 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y liburing-dev linux-libc-dev
+          sudo apt-get install -y linux-libc-dev
       - name: Build examples/conformance
         shell: bash
         # `-cc gcc -no-parallel`: -no-parallel fixes the codegen data race
         # vlang/v#27749 (unmangled `array_free` -> undefined reference at link),
-        # -cc gcc avoids the tcc<->gcc fallback race on liburing's <stdatomic.h>.
+        # -cc gcc: every lane builds with gcc.
         # Matches the example matrix and the h1spec conformance workflow.
         run: v -cc gcc -no-parallel examples/conformance/src
       - name: Start the conformance server

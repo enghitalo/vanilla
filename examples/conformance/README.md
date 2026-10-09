@@ -34,9 +34,14 @@ checks in [`src/validate.v`](src/validate.v):
 
 Malformed requests reach the handler already framed by
 `frame_request_length_lim`, which rejects the grossest framing errors (missing
-CRLF, over-limit head → 431, over-limit body → 413, bad chunk-size, non-digit
-`Content-Length`) *before* the handler runs. The handler covers everything that
-needs the parsed header view.
+CRLF, over-limit head → 431, over-limit body → 413, bad chunk-size line or
+chunk extension, malformed or over-limit trailer section → 400 / 431, non-digit
+`Content-Length`, and ambiguous framing → 400: differing repeated
+`Content-Length`, a `Transfer-Encoding` whose final coding is not `chunked`,
+`Transfer-Encoding` on HTTP/1.0, whitespace before the colon of either field —
+[#184](https://github.com/enghitalo/vanilla/issues/184)) *before* the handler
+runs. A valid trailer section is framed and its fields discarded (RFC 9112
+§7.1.2). The handler covers everything that needs the parsed header view.
 
 ## Run it
 
@@ -61,28 +66,40 @@ Both run in CI on every push/PR — see
 and
 [`.github/workflows/conformance_http11probe.yml`](../../.github/workflows/conformance_http11probe.yml).
 
-## Known limitations (tracked as core-vanilla issues)
+## Former limitations, now fixed in the core
 
 A handler can only decide a request the framer has already accepted as a complete
-message, so a few conformance gaps live in `http_server` core, not this example.
-They are tracked as issues:
+message, so these conformance gaps lived in the core framer
+(`http1_1.request_parser`, which every backend uses), not in this example. All of
+them are fixed:
 
-- **`Content-Length` + `Transfer-Encoding` sent together**
-  ([#104](https://github.com/enghitalo/vanilla/issues/104)) is rejected only when
-  the bytes happen to form a complete chunked frame. When they don't, the framer
-  waits for more input instead of rejecting the ambiguous message up front. The
-  fix is to reject CL+TE at the framing layer (`frame_request_length_lim_idx`).
+- **Ambiguous framing resolved instead of rejected**
+  ([#184](https://github.com/enghitalo/vanilla/issues/184)): differing repeated
+  `Content-Length`, a `Transfer-Encoding` whose final coding is not `chunked`,
+  `Transfer-Encoding` on HTTP/1.0 and whitespace before the colon of either field
+  now get `400` and a close.
+- **Chunked framer**
+  ([#185](https://github.com/enghitalo/vanilla/issues/185)): a trailer section is
+  framed (its fields discarded), and a malformed chunk-size line (empty or
+  extension-only size, bare LF, junk after CR) gets `400`.
+- **Field-value whitespace**
+  ([#186](https://github.com/enghitalo/vanilla/issues/186)): OWS around a field
+  value is excluded (`Content-Length: 5 ` is valid), a value ends at its own
+  line, and a bare LF gets `400`.
+- **`Content-Length` + `Transfer-Encoding` together**
+  ([#104](https://github.com/enghitalo/vanilla/issues/104)): the framer rejects
+  the message as soon as the header section ends, instead of waiting for more
+  input.
 - **Chunked body with a missing CRLF terminator**
-  ([#109](https://github.com/enghitalo/vanilla/issues/109)) is accepted on the
-  epoll backend (served `200` instead of `400`): `frame_chunked_total` assumes
-  the post-data CRLF is present without checking it.
+  ([#109](https://github.com/enghitalo/vanilla/issues/109)): `frame_chunked_total`
+  checks the CRLF after each chunk's data and rejects the request with `400`.
+- **Half-closed client**
+  ([#103](https://github.com/enghitalo/vanilla/issues/103)): a client that
+  `shutdown(SHUT_WR)`s after a complete request now receives its full reply on
+  both epoll and kqueue.
 
-The **half-closed-client** bug that used to drop the response
-([#103](https://github.com/enghitalo/vanilla/issues/103)) is **fixed** — a client
-that `shutdown(SHUT_WR)`s after a complete request now receives its full reply on
-both epoll and kqueue. The handler is still covered by `src/main_test.v` (the
-same decisions asserted without a socket), so the deterministic gate stays
-independent of backend I/O.
+The handler is still covered by `src/main_test.v` (the same decisions asserted
+without a socket), so the deterministic gate stays independent of backend I/O.
 
 The unit tests in [`src/main_test.v`](src/main_test.v) assert every row of the
 table above and always pass regardless of backend I/O behavior.

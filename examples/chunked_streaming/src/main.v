@@ -9,8 +9,9 @@ module main
 //
 // WHAT THE CORE DOES TODAY (this section used to say "ASPIRATIONAL" — it isn't):
 //   - FRAMES chunked requests: the handler is dispatched only after the
-//     terminating zero-chunk arrived (request_parser.frame_chunked_total);
-//     malformed chunk sizes are a 400 and an over-limit body a 413 BEFORE the
+//     terminating zero-chunk and its trailer section arrived
+//     (request_parser.frame_chunked_total); malformed chunk-size lines,
+//     extensions or trailer lines are a 400 and an over-limit body a 413 BEFORE the
 //     handler ever runs, so `req.body` always holds complete, well-formed
 //     chunk frames.
 //   - Ships the smuggling guard: `req.validate_http1()` rejects Content-Length
@@ -29,10 +30,10 @@ module main
 // delivery backed by the fd (backpressure via the event loop) see the async
 // examples (examples/async_sse). The frames below are still byte-exact wire
 // format; curl decodes them like any chunked response.
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
-import http_server.http1_1.response
+import server
+import core
+import http1_1.request_parser
+import http1_1.response
 
 // Escaped rune literals are broken in this toolchain (docs/V_PERF_TOOLBOX.md
 // gotcha) — CR/LF as explicit byte values, same as the core parser.
@@ -56,11 +57,14 @@ fn hex_digit(c u8) !int {
 // next_chunk parses ONE chunk frame at `pos` in buf[..limit] and returns
 // (data_start, data_len, next_pos):
 //   data_len > 0  -> chunk data is the window buf[data_start .. data_start+data_len]
-//   data_len == 0 -> terminating zero-chunk (next_pos is just past its CRLF)
-// Chunk extensions (`;name=val`) are skipped, trailers are not modeled.
+//   data_len == 0 -> terminating zero-chunk (next_pos is just past the empty
+//                    line that closes its trailer section)
+// Chunk extensions (`;name=val`) and trailer fields are skipped (RFC 9112
+// §7.1.1 / §7.1.2 let a recipient ignore both).
 // Zero allocations, zero copies — callers consume the data as a view.
 // In production malformed framing never reaches the handler (the core 400s it
-// first); the error paths exist for direct-call tests and defense in depth.
+// first, checking extension and trailer syntax too); the error paths exist for
+// direct-call tests and defense in depth.
 @[direct_array_access]
 fn next_chunk(buf []u8, pos int, limit int) !(int, int, int) {
 	mut size := 0
@@ -79,6 +83,9 @@ fn next_chunk(buf []u8, pos int, limit int) !(int, int, int) {
 		return error('missing chunk size')
 	}
 	for i < limit && buf[i] != cr { // skip chunk extensions
+		if buf[i] == lf {
+			return error('chunk-size line not CRLF-terminated')
+		}
 		i++
 	}
 	if i + 1 >= limit || buf[i + 1] != lf {
@@ -86,11 +93,24 @@ fn next_chunk(buf []u8, pos int, limit int) !(int, int, int) {
 	}
 	data_start := i + 2
 	if size == 0 {
-		// Terminating chunk: require the closing CRLF.
-		if data_start + 1 >= limit || buf[data_start] != cr || buf[data_start + 1] != lf {
-			return error('truncated terminating chunk')
+		// Terminating chunk: skip the trailer section (field lines, each
+		// CRLF-terminated) up to the empty line that ends the body.
+		mut p := data_start
+		for {
+			if p + 1 >= limit {
+				return error('truncated terminating chunk')
+			}
+			if buf[p] == cr && buf[p + 1] == lf {
+				return data_start, 0, p + 2
+			}
+			for p < limit && buf[p] != lf {
+				p++
+			}
+			if p >= limit || buf[p - 1] != cr {
+				return error('trailer line not CRLF-terminated')
+			}
+			p++
 		}
-		return data_start, 0, data_start + 2
 	}
 	end := data_start + size
 	if end + 2 > limit {
@@ -120,12 +140,6 @@ fn decode_chunked_into(buf []u8, start int, len int, mut dst []u8) ! {
 
 // ---- response side: frame views as chunks, no allocation --------------------
 
-// ws appends a string's bytes straight into `out` (BEST_PRACTICES §3b).
-@[inline]
-fn ws(mut out []u8, s string) {
-	unsafe { out.push_many(s.str, s.len) }
-}
-
 // wx appends n's lowercase hex digits into `out` — the chunk-size line —
 // via a stack scratch. No allocation, no `${n:x}`.
 fn wx(mut out []u8, n int) {
@@ -149,17 +163,16 @@ fn wx(mut out []u8, n int) {
 // view is appended directly — never copied through an intermediate.
 fn write_chunk(mut out []u8, data []u8) {
 	wx(mut out, data.len)
-	ws(mut out, '\r\n')
+	core.append_str(mut out, '\r\n')
 	out << data
-	ws(mut out, '\r\n')
+	core.append_str(mut out, '\r\n')
 }
 
-const resp_head_chunked = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const last_chunk = '0\r\n\r\n'.bytes()
+const resp_head_chunked = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n'
+const last_chunk = '0\r\n\r\n'
 
 // The no-body demo pieces — three separate frames on the wire.
-const demo_pieces = ['first piece\n'.bytes(), 'second piece\n'.bytes(),
-	'third piece\n'.bytes()]
+const demo_pieces = ['first piece\n'.bytes(), 'second piece\n'.bytes(), 'third piece\n'.bytes()]
 
 // is_chunked reports whether Transfer-Encoding is `chunked` — compared in
 // place over the header bytes (case-insensitive), no to_string/to_lower.
@@ -189,7 +202,7 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 		out << response.tiny_bad_request_response
 		return .close
 	}
-	out << resp_head_chunked
+	core.append_str(mut out, resp_head_chunked)
 	if req.body.len > 0 && is_chunked(req) {
 		// ECHO: walk the request's chunk frames and re-frame each data window
 		// into the response — request payload bytes are appended exactly once.
@@ -212,20 +225,20 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 			write_chunk(mut out, piece)
 		}
 	}
-	out << last_chunk
+	core.append_str(mut out, last_chunk)
 	return .done
 }
 
 fn main() {
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         handle
@@ -233,5 +246,5 @@ fn main() {
 	println('Chunked streaming demo on http://localhost:3000/')
 	println('  GET  /  -> three chunked pieces')
 	println("  POST /  with Transfer-Encoding: chunked -> echoes your chunks back (try: curl -sS -H 'Transfer-Encoding: chunked' --data-binary 'hello' localhost:3000)")
-	server.run()
+	srv.run()
 }

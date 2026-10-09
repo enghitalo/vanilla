@@ -186,7 +186,7 @@ Vanilla epoll backend today (`backend_epoll/worker_linux.c.v`,
 | Pipelining | **dropped** — `buf.trim(total)` discards trailing pipelined bytes | parse all, one batched send |
 | Recv buffer | fresh `[]u8{cap: 256}` allocated *per EPOLLIN event*, grown by doubling | persistent 8–16 KiB per-conn buffer, reused |
 | State lookup | `map[int]&ConnState` | flat fd-indexed array |
-| Wait strategy | `epoll_wait(-1)` (or 250 ms sweep) | adaptive timeout 0/-1 busy-poll hybrid |
+| Wait strategy | `epoll_wait(-1)` (or the `sweep_interval_ms()` tick, 25–250 ms, while a deadline is armed) | adaptive timeout 0/-1 busy-poll hybrid |
 | Response | handler allocates `[]u8`, one `send` per request, freed after | static prefix + itoa into reused write buffer |
 | Pinning | none | `sched_setaffinity` per worker |
 
@@ -233,7 +233,7 @@ req/conn, at 1024 / 4096 / 6800 connections). rps / peak RSS:
    A ~22,000× difference for the same work. A map lookup only hashes the key
    bytes and never retains the key, so a non-owning view (`tos`) is safe as a
    lookup key. The vanilla **library is already the reference for this**:
-   [`http_server/static_assets/static_assets.v:273-281`](../http_server/static_assets/static_assets.v)
+   [`static_assets/static_assets.v:388-396`](../static_assets/static_assets.v)
    builds the key as `key := tos(&buf[rs], rel_len)` — a zero-copy view into the
    request buffer, documented as "never retained, so routing costs no
    allocation." Never imply the lib leaks; the fix belongs in the arena handler.
@@ -246,7 +246,7 @@ req/conn, at 1024 / 4096 / 6800 connections). rps / peak RSS:
 
 4. **Secondary: the 24K/conn baseline floor (a deliberate tradeoff, not the
    balloon).** vanilla's per-conn buffers are read_buf 8K + write_buf 16K = 24K
-   ([`http_server/backend_epoll/conn_state_linux.c.v:54-55`](../http_server/backend_epoll/conn_state_linux.c.v)),
+   ([`server/backend_epoll/conn_state_linux.c.v:54-55`](../server/backend_epoll/conn_state_linux.c.v)),
    pooled in `free_conns` (bounded to peak concurrent conns). On the sendfile
    static path the 16K write_buf carries only a ~200 B header (the body goes
    through the kernel), so it is ~163 MiB of mostly-idle buffer at 6800 conns vs
@@ -267,7 +267,7 @@ req/conn, at 1024 / 4096 / 6800 connections). rps / peak RSS:
 
 ## Why they beat vanilla on io_uring
 
-Vanilla io_uring backend today (`http_server_io_uring_linux.c.v`,
+Vanilla io_uring backend today (`server_io_uring_linux.c.v`,
 `io_uring/io_uring_linux.c.v`):
 
 | Aspect | vanilla | fast servers / liburing guidance |
@@ -390,8 +390,9 @@ for {
 ```
 
 One line of state, measurable latency/throughput win under load, zero cost
-idle. (Compose with the existing 250 ms sweep: use `0` when hot, `250`/`-1`
-as today when idle.)
+idle. (Compose with the deadline sweep: use `0` when hot, and when idle the
+time left to the next `sweep_interval_ms()` tick, or `-1` if no deadline is
+armed.)
 
 ### 8. Pin workers to cores
 
@@ -494,6 +495,6 @@ GC makes the gap larger, in vanilla's favor of the raw contract.
 > under GC at scale.
 
 Benchmark each step in isolation with `-prod` (wrk/rewrk/gcannon, plain +
-pipelined profiles) and verify with helgrind, per CONTRIBUTING.md. Note: a couple
+pipelined profiles) and verify with `v -race`, per CONTRIBUTING.md. Note: a couple
 of small allocs per request look like noise at 4–16 cores but can be a multiple-x
 swing at 64 — confirm perf changes on a high-core run, not just a laptop.

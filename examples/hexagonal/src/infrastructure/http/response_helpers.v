@@ -22,6 +22,7 @@ const http_created = 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n
 
 const http_not_modified = 'HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 const http_bad_request = 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
+const http_unauthorized = 'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 const http_not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 const http_server_error = 'HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 
@@ -42,7 +43,7 @@ pub fn build_basic_response(status int, body_buffer []u8, content_type_buffer []
 	}
 
 	// ETag = 64-bit wyhash hex-encoded on the stack — a cheap, strong opaque
-	// validator (same as http_server.static_assets); a crypto digest here is
+	// validator (same as server.static_assets); a crypto digest here is
 	// pure cost, and md5 is broken anyway.
 	etag := hex16(wyhash.wyhash_c(body_buffer.data, u64(body_buffer.len), 0))
 

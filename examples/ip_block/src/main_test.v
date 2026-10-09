@@ -1,6 +1,6 @@
 module main
 
-import http_server.core
+import core
 
 // SOLUTION: in-memory state test (denylist) + handler gate.
 // The blocklist set is pure/in-memory, so block/unblock/is_blocked and the 403

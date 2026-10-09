@@ -1,0 +1,67 @@
+# Architecture — module tree and dependency rule
+
+Plan of record: GitHub issue #122 (module tree restructure for multi-protocol +
+multi-platform growth). This document records the shape the tree must keep.
+
+## The tree
+
+Flat top-level modules — no `protocol/` or `platform/` umbrella layers (each
+directory segment is an import segment in V; an umbrella segment inflates every
+import and says nothing). Protocols are **siblings** over one engine:
+
+| module | role |
+|---|---|
+| `core/` | protocol-neutral contract: `Handler`, `Step`, `Counter`, `Limits`, hand-off slots. `Handler` is bytes-in/bytes-out — nothing HTTP about it. |
+| `socket/` | listen side: TCP listeners, Windows sockets; UDS listeners and `peer_cred` (kernel-verified pid/uid/gid, §6); fd passing lands here (§7). |
+| `tls/` | mbedTLS split (`-d vanilla_tls` / stub) — the HTTPS server, and the client side `pg_async` uses for TLS to PostgreSQL. |
+| `epoll/` `io_uring/` `kqueue/` `iocp/` | thin per-mechanism syscall wrappers, one dir-module each (`poll/` joins them as the portability floor). |
+| `server/` | **the engine** (was `http_server`) — one engine, N protocols via conn modes: the takeover seam (issue #136) lets a handler hand a connection to a `core.ConnHandler` (`core.queue_takeover`, epoll-first), so upgrades change the framing authority without changing buffers or backpressure. OS facades (`server_linux.c.v`, …) select an `IOBackend`; `server/backend_*` are the reactors. |
+| `http1_1/` | HTTP/1.1 codecs: `request_parser/`, `response/`; `client/` is the client codec (request serializer + response parser, `Framer` for responses read over many recvs). `upstream/` is the one stateful module here: the pooled outbound client for handlers (#229), which composes `client/` with `transport/`, `tls/` and the watch API — it owns sockets and parks on the worker's reactor, like `pg_async/` does for PostgreSQL, but sits next to its codec. `router/` and `veb_like/` route requests for handlers: `router` reads the method and a zero-copy segment cursor straight from the raw request line, for handlers written as `match` over the path (no vanilla imports, no responses; `examples/router`); `veb_like` compiles `@['GET /path']` methods into a trie at startup (`examples/veb_like`). Both are HTTP/1 only: an h2 request reaches them as rebuilt HTTP/1 bytes (`examples/http2_cleartext`). |
+| `http2/` | frame/hpack/types grow in place: stream mux, flow control, settings. |
+| `websocket/` | RFC 6455 codec (accept-key, frame head parse, unmask, server frame writers) — pure bytes, zero vanilla imports; an app's `ConnHandler` composes it over the takeover seam (`examples/websocket_echo`). |
+| `grpc/` | reserved sibling (length-prefixed messages over http2). Future protocols land as siblings here. |
+| `static_assets/` `testkit/` `vtest/` `pg_async/` | reusable handler-side and test-side modules. |
+| `transport/` | client-side dialing (`dial_addr` for IPv4/IPv6 `Addr`s — close-on-exec, TCP-tuned, `-errno` on failure, no allocation; `dial_tcp`, `dial_unix`) — bytes + non-blocking fds ONLY, no name resolution; protocol clients compose it (handler → `dial_*` → `event_loop.watch_fd` → `.suspend`), they don't live in it. |
+
+## Dependency rule (grep-enforceable, one direction)
+
+```
+core  <-  { socket, transport, tls, epoll, io_uring, kqueue, iocp, poll,
+            http1_1, http2, websocket, grpc, static_assets }  <-  server
+```
+
+- Protocol modules import protocol modules **downward only**
+  (websocket→http1_1, grpc→http2).
+- Protocol modules may import `transport/`, `socket/`, `tls/` (downward) —
+  that is what lets a protocol ship its **client** codec without a second
+  framework growing under `transport/`.
+- Wrappers, `socket/`, `transport/`, `tls/` **never** import a protocol.
+- `server/backend_*` is the **single sanctioned meeting point** of platform +
+  transport + protocol — by design, because that is the measured fast path
+  (reactors keep their *direct* imports of the http1_1 codec; no interface
+  dispatch is introduced anywhere).
+
+CI enforces this with `scripts/check_dependency_direction.sh` (grep over
+import lines — run it locally from the repo root).
+
+## Platform rule of thumb (the tree's existing idiom, made explicit)
+
+- Different **event-delivery model** → new `server/backend_*` dir-module
+  (poll vs epoll vs ionotify are different loops, not different lines).
+- Same contract, **per-OS implementation** → OS-suffix file inside the
+  existing module (`socket_windows.c.v` today; `wake_qnx.c.v` tomorrow).
+- **Single-line divergence** → `$if` block.
+
+Arch targets (ARM, RISC-V) are cross-compilation concerns (`-arch` + cross
+`-cc`) and have zero tree impact.
+
+## Imports
+
+Use fully-qualified imports from the repo root (`import server.backend_epoll`,
+`import http1_1.response`) — never sibling-relative paths — so any future
+directory move stays a pure import-line change (CONTRIBUTING.md).
+
+External consumers use the `vanilla.` prefix (`import vanilla.server`,
+`import vanilla.core`, `import vanilla.http1_1.response`); CI compiles a
+synthetic external consumer to keep that convention honest. Migrating a
+pre-restructure consumer: `scripts/migrate_imports.sh`.

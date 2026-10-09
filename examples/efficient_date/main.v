@@ -17,8 +17,8 @@ module main
 // A background timerfd could refresh the cache proactively instead of lazily,
 // but that needs a worker-start hook for a watch not tied to any request — a
 // noted async-runtime follow-up. Lazy refresh is simpler and just as cheap.
-import http_server
-import http_server.core
+import server
+import core
 import time
 
 // DateCache is one worker's cached Date line + the unix second it is valid for.
@@ -59,25 +59,25 @@ fn (mut dc DateCache) refresh() {
 
 const body = 'ok'.bytes()
 
-const head = 'HTTP/1.1 200 OK\r\n'.bytes()
+const head = 'HTTP/1.1 200 OK\r\n'
 
-const tail = 'Content-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
+const tail = 'Content-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'
 
 fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut dc := unsafe { &DateCache(worker_state) }
 	dc.refresh()
-	out << head
+	core.append_str(mut out, head)
 	out << dc.line // cached: no per-request formatting in the common case
-	out << tail
+	core.append_str(mut out, tail)
 	return .done
 }
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            8096
 		io_multiplexing: .epoll
 		handler:         handle
 		make_state:      make_state
 	})!
-	server.run()
+	srv.run()
 }

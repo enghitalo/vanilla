@@ -5,7 +5,8 @@ module main
 // are pure given the registry, so they're directly assertable — and the raw
 // requests go through the FULL observed() wrapper (the example's core lesson)
 // via the serve() adapter, no listening socket required (BEST_PRACTICES §9).
-import http_server.core
+import core
+import http1_1.response
 
 fn test_status_of() {
 	assert status_of('HTTP/1.1 200 OK\r\n\r\n'.bytes(), 0) == 200
@@ -88,26 +89,54 @@ fn test_unknown_path_gets_empty_200() ! {
 	assert resp.ends_with('Content-Length: 0\r\n\r\n')
 }
 
-fn test_malformed_request_errors_and_counts_5xx() {
-	// Malformed input must close the connection (canned 400), never a normal
-	// response — and the wrapper must record it as a 500.
+fn test_malformed_request_is_400_and_counts_4xx() {
+	// Malformed input is the client's error: the canned 400, the connection
+	// closes, and the metrics count the same 400 the client received.
 	mut m := &Metrics{}
-	if _ := serve('garbage'.bytes(), mut m) {
-		assert false, 'garbage request must not produce a response'
-	}
+	handler := observed(fn [mut m] (req_buffer []u8, mut out []u8) !core.Step {
+		return app(req_buffer, mut m, mut out)!
+	}, mut m)
+	mut out := []u8{}
+	mut event_loop := core.EventLoop{}
+	assert handler('garbage'.bytes(), mut out, -1, unsafe { nil }, mut event_loop) == .close
+	assert out == response.tiny_bad_request_response
 	mut body := []u8{cap: 160}
 	m.prometheus_body(mut body)
-	out := body.bytestr()
-	assert out.contains('http_requests_total 1')
-	assert out.contains('class="5xx"} 1')
+	exposition := body.bytestr()
+	assert exposition.contains('http_requests_total 1')
+	assert exposition.contains('class="4xx"} 1')
+	assert exposition.contains('class="5xx"} 0')
+}
+
+fn test_internal_error_answers_500_and_counts_5xx() {
+	// The wrapped handler fails after appending part of a response: the
+	// partial bytes are dropped, the client gets the canned 500 (and the
+	// connection closes), and the metrics count the same 500.
+	mut m := &Metrics{}
+	handler := observed(fn (_req_buffer []u8, mut out []u8) !core.Step {
+		out << 'HTTP/1.1 200 OK\r\nContent-Le'.bytes()
+		return error('database unavailable')
+	}, mut m)
+	earlier := 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'
+	mut out := earlier.bytes() // a pipelined response already in the buffer
+	mut event_loop := core.EventLoop{}
+	assert handler('GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), mut out, -1, unsafe { nil }, mut
+		event_loop) == .close
+	assert out.bytestr() == earlier + resp_internal_error_500
+	mut body := []u8{cap: 160}
+	m.prometheus_body(mut body)
+	exposition := body.bytestr()
+	assert exposition.contains('http_requests_total 1')
+	assert exposition.contains('class="4xx"} 0')
+	assert exposition.contains('class="5xx"} 1')
 }
 
 // serve routes a raw request through the FULL observed() wrapper — access log
 // + metrics + app — and adapts the append-into-out contract to the
 // return-a-buffer shape the assertions expect (BEST_PRACTICES §9).
 fn serve(req []u8, mut m Metrics) ![]u8 {
-	handler := observed(fn [mut m] (req_buffer []u8, mut out []u8) ! {
-		app(req_buffer, mut m, mut out)!
+	handler := observed(fn [mut m] (req_buffer []u8, mut out []u8) !core.Step {
+		return app(req_buffer, mut m, mut out)!
 	}, mut m)
 	mut out := []u8{}
 	mut event_loop := core.EventLoop{}

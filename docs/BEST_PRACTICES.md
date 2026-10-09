@@ -76,7 +76,7 @@ Reach for the bytes you already have before allocating new ones.
 - Defer `.clone()` / `.to_string()` until the byte data must outlive the buffer.
 - Build a map lookup key as a non-owning view — `unsafe { tos(ptr, len) }` —
   when the map never retains it (it only hashes the key bytes). The
-  [static_assets module](../http_server/static_assets/static_assets.v#L273-L281)
+  [static_assets module](../static_assets/static_assets.v#L388-L396)
   is the canonical example: `key := tos(&buf[rs], rel_len)`, a view straight into
   the request buffer, so routing costs no allocation.
 - **Whenever a view suffices, use a view.** `unsafe { (&buf[start]).vbytes(len) }`
@@ -112,46 +112,49 @@ allocation — to format them. On a per-request response builder that overhead i
 real and adds GC pressure. The core proves the pattern: it never interpolates to
 build responses.
 
-### 3a. Static responses → precompute as `const ... .bytes()`
+### 3a. Static responses → a `const` string, appended with `core.append_str`
 
-If a response never changes, build it **once at compile time** and send the
-bytes directly. This is exactly what the core does
-([response.c.v](../http_server/http1_1/response/response.c.v)):
+If a response never changes, write it **once, as a `const` string**, and append
+it with [`core.append_str`](../core/append_str.v):
 
 ```v
-const status_413_response = 'HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
+const resp_404 = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+
+core.append_str(mut out, resp_404)
 ```
 
-No allocation, no formatting — ever.
+No allocation, no formatting — ever. A `const` string is static data, and the
+inlined append compiles to a few fixed-size moves: 2.5 ns for a 102-byte
+response against 4.7 ns for `out << resp` with a `const ... .bytes()`, whose
+bytes are also copied to the heap at startup
+([V_PERF_TOOLBOX.md](V_PERF_TOOLBOX.md#appending-a-static-response)). Keep
+`.bytes()` for a const used as a `[]u8` value — returned, compared, compressed,
+or passed to `C.send` — and for the library's public `[]u8` consts
+(`out << response.status_413_response`).
 
 ### 3b. Dynamic responses → append parts straight into `out`
 
 For responses with dynamic values, append the literal segments and the integers
 **directly into `out`** — no intermediate `strings.Builder`, no return-then-copy.
-Two tiny no-alloc helpers are all you need: one that pushes a string's bytes, and
-one that writes an integer's decimal digits (itoa into a stack scratch).
+`core.append_str` pushes a string's bytes; for integers, `strconv.write_dec` (or a
+small local `wi`, itoa into a stack scratch) writes the decimal digits.
 
 ```v
-@[inline]
-fn ws(mut out []u8, s string) {
-    unsafe { out.push_many(s.str, s.len) } // append bytes, no allocation
-}
-
 fn wi(mut out []u8, n i64) { /* itoa into a stack buffer, append digits */ }
 
 fn write_json(mut out []u8, body string) {
-    ws(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ')
+    core.append_str(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ')
     wi(mut out, i64(body.len)) // no .str(), no alloc
-    ws(mut out, '\r\nConnection: keep-alive\r\n\r\n')
-    ws(mut out, body)
+    core.append_str(mut out, '\r\nConnection: keep-alive\r\n\r\n')
+    core.append_str(mut out, body)
 }
 ```
 
 A `strings.new_builder` (seeded with `header_overhead + body.len`, written via
 `write_string`/`write_decimal`) is still fine where you genuinely need a `string`
 result — but on the response hot path, appending into `out` avoids the builder
-allocation *and* the builder→`out` copy. **Fully static** responses should be a
-precomputed `const ... .bytes()` appended with `out << the_const`.
+allocation *and* the builder→`out` copy. **Fully static** responses are a `const`
+string appended with `core.append_str` (§3a).
 
 Two things that make the builder go further when a dynamic string is
 unavoidable:
@@ -162,7 +165,7 @@ unavoidable:
   the builder directly, then appends the signature: one buffer, zero
   intermediate strings — and `return sb` satisfies a `[]u8` return type.
 - **"Slow route" is not an excuse to concatenate.** A login route that pays
-  ~200 ms of argon2id still frames its response with `ws`/`wi` and builds its
+  ~200 ms of argon2id still frames its response with `core.append_str`/`wi` and builds its
   JWT in one builder. Rules stay simple by having no carve-outs; the only
   place `${}` belongs is off-path diagnostics (below).
 
@@ -200,7 +203,7 @@ sb.write_string('Content-Length: ${body.len}\r\n')
 
 **Worked example — the `Date` header.** `examples/date_header`, `examples/efficient_date`
 and `examples/async_date_timerfd` cache the 1-second-resolution `Date` line and just
-append it. `date_header` now builds the response from two `const ... .bytes()` halves +
+append it. `date_header` now builds the response from two `const` string halves +
 the cached line appended straight into `out` — no per-request `strings.Builder` (which
 also leaked under `-gc none`, §4). `efficient_date` checks the current second with a
 cheap `C.time()` instead of constructing a full calendar `time.utc()` on every request.
@@ -221,7 +224,7 @@ valuable for latency/headroom — **not** raw req/s. Correct, cheap, paid once p
 > **Worked example — auth.** [examples/auth](../examples/auth/src/main.v) applies the
 > same byte discipline where responses *can't* all be consts: argon2id login
 > (slow by design), JWT signed in a single builder, verification over
-> `vbytes`/`tos` views of the token, `ws`/`wi` framing the one dynamic response.
+> `vbytes`/`tos` views of the token, `core.append_str`/`wi` framing the one dynamic response.
 
 ---
 
@@ -247,7 +250,7 @@ The recurring zero-allocation patterns:
 - **Borrow, don't copy** — return `tos`/slice views into the read buffer; defer
   `.clone()`/`.bytes()` until bytes must outlive the buffer (they rarely do —
   responses are built synchronously before the buffer is recycled).
-- **Append bytes directly** — `unsafe { out.push_many(s.str, s.len) }`; never
+- **Append bytes directly** — `core.append_str(mut out, s)`; never
   build an intermediate `string`/`[]u8` just to append it.
 - **Pool structs on a free-list** — reuse a heap object across requests, resetting
   its fields on release (the per-worker `ConnState` and per-request `Stash` pools
@@ -276,20 +279,67 @@ consumers of this one primitive — see the
 
 For Postgres specifically, `pg_async` is a native (no-libpq) wire client with a
 per-worker pool and **cross-request pipelining** (`max_inflight` queries per
-connection). Pool connections are **persistent** (`watch_persistent`): a client
+connection). Pool connections are **persistent**: park on a pooled fd with
+`event_loop.watch_fd_persistent(...)`, never `watch_fd`. Then a client
 disconnecting mid-query tombstones the parked request rather than closing the
-connection, so the pooled conn (and its SCRAM handshake) survives client churn.
+connection. The continuation still runs when the reply arrives (its response is
+discarded), so it drains the reply and releases the slot, and the pooled conn
+(and its SCRAM handshake) survives client churn. With a plain `watch_fd` the
+runtime closes the pooled fd and the continuation never runs: the slot leaks,
+and once every slot has leaked the worker sheds every query with 503
+([vanilla#190](https://github.com/enghitalo/vanilla/issues/190)). Keep
+`watch_fd` for per-request fds (a timerfd, a pipe), which must be closed with
+their request.
 
 **Do**
 
 - Use the **pool**, not a connection per request; build params/queries into
   reused per-worker buffers (the DB path is allocation-free under `-gc none`).
+- Read results with the typed `Row` accessors (`int4`, `text`, `uuid_into`,
+  `time`, `numeric_i64_scaled`, `array_iter`, …): they decode the binary
+  values in place and allocate nothing, errors included, and the `_into`
+  variants append into a buffer you reuse. When you walk an `array_iter`
+  yourself, append each element with `push_many`: `out << v.bytes` inside that
+  loop makes V move the iterator to the heap, an allocation per call. The
+  bytes the accessors return borrow the connection's buffer: copy what must
+  outlive the continuation. A typed accessor rejects SQL NULL; read a nullable
+  column with `row.col(i)` and test `is_null`. To address columns by name,
+  resolve each index once per result (`cols := res.columns()!`, then
+  `cols.index('name')`), not once per row. The accessors check a value's
+  width, not its column's type: when the query doesn't fix the types, compare
+  `cols.type_oid(i)` with `oid_*` once per result.
 - Under saturation, **shed with the honest status**: `503 Service Unavailable`
   when the pool is momentarily full, not `400`/`404`. A backpressure shed is not
   a client error — misreporting it as `4xx` showed up as spurious failures in the
   benchmark (see the wiki's *Gotchas* page). Genuine `400` (bad body) / `404`
   (missing row) stay as they are.
 - Keep the pool sized to the worker/thread model.
+- Expect pooled connections to die (restart, failover, `pg_terminate_backend`,
+  idle or lifetime caps): the pool skips a broken connection and re-dials it
+  without blocking, so `release` it on every path, error or not. Decide retries
+  on the typed error — `err is pg_async.PgError && err.sqlstate == '40001'` —
+  and on `conn.is_broken()` for a lost connection, never on the message text.
+- Call third-party HTTP APIs through `http1_1.upstream`, the same shape for
+  HTTP: a per-worker `Pool` per origin (built in `make_state`, maintenance
+  started in `on_worker_start`), `acquire()` / `send()` + `.suspend` in the
+  handler, `advance()` in the continuation, `release()` on every path. Shed
+  with 503 when `acquire()` has nothing, answer 502 / 504 from `failure()`
+  with `.done`. Its views (`body_view`, `header_value`) borrow the exchange's
+  buffer until `release()`. Request heads are validated (a CR/LF/NUL in a
+  target or a header fails the exchange instead of injecting a line); share one
+  `tls.new_client` config across workers. See
+  [examples/https_upstream](../examples/https_upstream/src/main.v).
+- Talk TLS to any database that is not on the same host: `ssl_mode:
+  .verify_full` (with `ssl_root_cert` for a private CA; the system bundle
+  otherwise) is what managed PostgreSQL needs (Aurora DSQL, RDS with
+  `rds.force_ssl`, Cloud SQL, Azure, Supabase, Neon) and the only mode that
+  authenticates the server — `.require` encrypts against a passive eavesdropper
+  but accepts any certificate. Build with `-d vanilla_tls` (Mbed TLS 4, the
+  library the HTTPS server uses); without it every TLS mode fails to connect
+  rather than falling back to plaintext. The query path is unchanged: the same
+  pool, the same `watch_fd_persistent` parking, zero allocations per query;
+  the trusted CAs are parsed once per pool and each connection's TLS session
+  is allocated once and re-armed on every re-dial. TLS 1.3 only.
 
 **Don't**
 
@@ -313,12 +363,19 @@ is a first-class guarantee — keep it that way.
 - Prefer per-connection / per-request state over global state.
 - If you must share, protect it (atomics, channels, or a lock) and measure the
   cost.
-- Verify with the race checker before merging:
+- Verify with the race detector before merging — ThreadSanitizer, with the V
+  file:line stacks of both accesses in each report:
 
   ```sh
-  v -prod -gc none .
-  valgrind --tool=helgrind ./vanilla
+  v -race -o vanilla .
+  ./vanilla          # drive it with real traffic; exit status 66 = a race was found
+  v -race test tests/
   ```
+
+  CI runs the epoll e2e suites under `-race`
+  ([race_detector.yml](../.github/workflows/race_detector.yml)). Prefer it to
+  `valgrind --tool=helgrind`, which does not model C11 atomics and reports
+  atomically published data (the BirthQueue ring, #164) as races.
 
 **Don't**
 
@@ -360,6 +417,11 @@ vanilla targets [RFC 9112](https://datatracker.ietf.org/doc/rfc9112/) and the
   for JSON, escape for HTML).
 - Don't leak internal errors to clients — log detail server-side, return a
   generic message.
+- Never `panic` on request input; answer a `4xx`/`5xx` instead. A V `panic`
+  exits the whole process (all workers, every open connection), not just the
+  worker that hit it, and vanilla installs no recovery around handler calls.
+  Run the server under a supervisor that restarts it (systemd `Restart=always`,
+  a container restart policy).
 
 ---
 
@@ -380,7 +442,10 @@ Handlers are pure, so you can feed them raw requests directly via
     | nc localhost 3000
   ```
 
-See [examples/TESTING.md](../examples/TESTING.md) for the full guide.
+See the README's [End-to-End Testing](../README.md#end-to-end-testing) section
+for both layers (in-process and over a real socket), and
+[VTEST.md](VTEST.md) for the `vtest` scripted client that drives a running
+server.
 
 ---
 
@@ -431,12 +496,15 @@ Performance claims must be measured, not assumed.
 
 ---
 
-## Checklist before opening a PR
+## Checklist before every commit / PR
 
+- [ ] **`v fmt -w .` run from the repo root, changes included.** CI gates on
+      `v fmt -verify .` with the latest V — an unformatted file (even a
+      pre-existing one a newer formatter rule now rewrites) fails the whole PR.
 - [ ] Handler stays a pure `(request) -> response` function.
 - [ ] No new hidden I/O or shared mutable state on the hot path.
 - [ ] Responses carry correct framing and standard headers.
 - [ ] Inputs are bounded and validated.
 - [ ] Tests added/updated (raw-request E2E where it fits).
-- [ ] `helgrind` clean; benchmark shows no regression.
+- [ ] `v -race` clean; benchmark shows no regression.
 - [ ] No new abstraction layer that wasn't strictly necessary.

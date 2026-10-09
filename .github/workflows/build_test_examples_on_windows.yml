@@ -6,14 +6,28 @@ on:
   pull_request:
     branches: [ main ]
 
+# A new push to a pull request cancels that PR's run still in progress, so
+# superseded commits don't queue for the account's runners; on main every
+# commit is its own group and runs to the end.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  # The http_server module tests include the backend-agnostic behaviour suite
-  # (pipelining, split-request framing, max_connections, read timeout,
-  # graceful shutdown, large-upload streaming drain), which runs against the
-  # IOCP backend on Windows.
+  # The library module tests, then the backend-agnostic behaviour suite in
+  # tests/backend_behaviors_test.v (pipelining, split-request framing,
+  # max_connections, read timeout, connection reaping — silent connect, idle
+  # keep-alive, the idle opt-out, slots freed by reaping — graceful shutdown,
+  # large-upload streaming drain) against the IOCP backend: its test_iocp_*
+  # functions are the only Windows coverage of the IOCP connection state
+  # machine. (The module list below does not include tests/, so the suite
+  # needs its own step.)
   module-tests:
     runs-on: windows-latest
-    name: http_server module tests
+    name: server module tests
+    # vtest has no client-side timeouts: a liveness regression hangs instead of
+    # failing, and this is the backstop.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Set up V
@@ -22,14 +36,19 @@ jobs:
         shell: bash
         run: |
           rm -rfv vlang || true
-      - name: Test http_server
+      - name: Test server modules
         shell: bash
         run: |
-          v test http_server
+          v test server core http1_1 http2 websocket socket epoll io_uring kqueue iocp tls static_assets testkit
+      - name: Behaviour suite on IOCP
+        shell: bash
+        run: |
+          v test tests/backend_behaviors_test.v
 
   examples-building-and-testing:
     runs-on: windows-latest
     name: ${{ matrix.folder }}
+    timeout-minutes: 20 # backstop for a hung vtest e2e test (no client timeouts)
     strategy:
       fail-fast: false # Continue other jobs if one fails
       matrix:
@@ -44,9 +63,17 @@ jobs:
           - examples/io_uring_demo/src
           - examples/json_api/src
           - examples/middleware/src
+          - examples/router/src
           - examples/simple/src
           - examples/simple2/src
           - examples/sse/src
+          - examples/veb_like/src
+          # websocket_echo: the takeover seam is epoll-only, but the example must
+          # degrade cleanly elsewhere — the 501-fallback + codec tests run here.
+          - examples/websocket_echo/src
+          # http2_cleartext: same story — the 501-fallback + the pure-bytes
+          # bridge tests run here; the socket e2e is Linux-guarded.
+          - examples/http2_cleartext/src
     steps:
       - uses: actions/checkout@v4
       - name: Set up V

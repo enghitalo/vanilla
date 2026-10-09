@@ -14,10 +14,14 @@ iterations; 64-conn slowloris storm: all reaped by the server's own
    cannot exercise SO_REUSEPORT sharding or cross-worker behavior; vtest can.
 2. **No test-side clocks.** There is no timeout anywhere in a vtest test. The only
    clock in the program is the server's own config (`Limits.read_timeout_ms`,
-   `write_timeout_ms`, shutdown grace). A stalled-client test *completes* because
+   `write_timeout_ms`, `idle_timeout_ms`, shutdown grace). A stalled-client test *completes* because
    the server's reaper closes the connection — the test exercises the timeout
    machinery instead of duplicating it. If the server loses liveness entirely, the
    test hangs: that is the correct signal (CI step timeout is the backstop).
+   The one bounded wait: `drive()` gives the server up to its shutdown grace to
+   finish closing bookkeeping before it samples the leak counters
+   (`inflight_after`, `active_after`). It never decides a test's outcome — a
+   real leak never settles and the counters are then sampled as they are.
 3. **Starts when the server is ready, ends when everything answered.** The test
    author never sees readiness: `drive()`/`start()` own the lifecycle and fire the
    client reactor from `after_server_start`. A run terminates exactly when every
@@ -58,6 +62,7 @@ pub mut:
 
 pub struct Outcome {
 pub:
+	group          Group        // this call's connections, for a later wait()/send()
 	conns          []ConnResult // SAME order as the scripts passed in: position = identity
 	inflight_after i64          // server counters sampled after shutdown drain —
 	active_after   i64          // assert == 0 to prove nothing leaked
@@ -65,12 +70,13 @@ pub:
 
 // One-shot: new_server(port:0) → spawn run() → reactor at readiness → all scripts
 // terminal → shutdown(grace) → Outcome.
-pub fn drive(config http_server.ServerConfig, scripts []Script) !Outcome
+pub fn drive(config server.ServerConfig, scripts []Script) !Outcome
 
 // Session form, for cross-connection choreography (SSE, shutdown-while-in-flight):
-pub fn start(config http_server.ServerConfig) !&Harness
+pub fn start(config server.ServerConfig) !&Harness
 pub fn (mut h Harness) fire(scripts []Script) !Outcome   // returns when THESE scripts' last round completed; conns stay open in the reactor
-pub fn (mut h Harness) wait(group GroupId, until fn (acc []u8) bool) !Outcome // block until predicate holds on every conn of the group (or EOF)
+pub fn (mut h Harness) wait(group Group, until fn (acc []u8) bool) !Outcome // block until predicate holds on every conn of the group (or EOF)
+pub fn (mut h Harness) send(group Group, bytes []u8, until fn (acc []u8) bool) !Outcome // write bytes on every still-open conn of the group, then wait like wait()
 pub fn (mut h Harness) stop()                             // close client fds, shutdown server, join reactor
 
 // Predicates (pure fns over accumulated bytes — the client-side mirror of the
@@ -94,6 +100,11 @@ pub fn repeat(n int, s Script) []Script
 - **Rounds** sequence *within* a connection with no barrier across connections.
   `fire()` sequences *groups* of connections: an ordering step for choreography
   (subscribe-all → publish → expect events) with completion, never sleeps.
+- **Continuing a conversation:** `send(out.group, bytes, until)` writes more
+  bytes on connections a previous `fire()` left open — e.g. a second request
+  after the server's clock has moved on (a later `fire()` whose connections the
+  server had to reap), proving the first connection was NOT reaped in between.
+  `wait(group, until)` is `send` with no bytes.
 - **No client timeouts, ever.** The reactor blocks in `poll(fds, -1)`. Progress
   comes from the server (bytes or close). See goal 2 for the hang contract.
 
@@ -103,9 +114,18 @@ pub fn repeat(n int, s Script) []Script
   the first connect happens at the readiness instant (listeners are bound+listening
   even earlier — `new_server` is synchronous — so the backlog would absorb earlier
   connects anyway; the hook is the honest signal).
-- Per connection: blocking `connect()` on loopback (instant), then `O_NONBLOCK`
-  for all I/O. State: bytes sent (partial-send loop), accumulated `acc []u8`
-  (noscan, sized 8 KiB, grows), current round index, terminal flag.
+- Per connection: `transport.dial_tcp` / `dial_unix` (raw non-blocking fd — no
+  vlib TcpConn). A TCP connect may still be in flight when the fd enters the
+  reactor (EINPROGRESS); the first round's unsent bytes arm `POLLOUT`, which
+  resolves it, and a refused connect surfaces as `POLLERR`/`POLLHUP` ⇒ `eof`
+  with the script unmet (the refusal asserts accept both shapes). When the
+  server config sets `unix_socket_path`, `fire()` dials the socket file — a
+  UDS e2e is a TCP e2e plus that one config line. State: bytes sent
+  (partial-send loop), accumulated `acc []u8` (noscan, sized 8 KiB, grows),
+  current round index, terminal flag.
+- Sends use `MSG_NOSIGNAL` on Linux and `SO_NOSIGPIPE` (per socket, at dial)
+  on darwin: a peer the server already closed must report an error, not raise
+  SIGPIPE (vlib `net` used to SIG_IGN that process-wide; raw fds do not).
 - Loop: build pollfd set of live conns (`POLLIN`, plus `POLLOUT` while the current
   round's send is unfinished) + the self-pipe (`fire`/`wait`/`stop` wake the loop
   the same way the server's own reactor is woken from outside) → `poll(-1)` →
@@ -116,14 +136,19 @@ pub fn repeat(n int, s Script) []Script
   recorded, never fatal to the run.
 - Frame counting = the Content-Length predicate `testkit` uses today, generalized
   to N and kept as a pure `fn (acc []u8) bool`.
-- Windows: `WSAPoll` behind `$if windows` (same struct; POLLERR-on-connect quirk
-  fixed in Win10 2004+, current runners fine). Winsock init comes free via the
-  socket module.
+- Windows: `WSAPoll` behind `$if windows` (same struct). The WSAPoll
+  POLLERR-on-connect quirk never applies: `transport`'s Windows side connects
+  synchronously (then switches the fd non-blocking), so refusal surfaces as a
+  dial error. Winsock init happens inside `transport.dial_tcp` (WSAStartup is
+  refcounted).
 
 ## The enabler: `port: 0` = kernel-assigned ephemeral port
 
 `drive()` defaults to `port: 0` so parallel test binaries never coordinate ports
-(the old hand-maintained registry 8121–8162/18181–18184 dies).
+(the old hand-maintained registry 8121–8162/18181–18184 dies). A config with
+`unix_socket_path` set sidesteps ports entirely: the server listens on the
+socket file and the harness dials it (`tests/uds_test.v`,
+`test_uds_vtest_scripts`).
 
 Server-side change in `new_server` (cold path only):
 
@@ -143,14 +168,15 @@ Server-side change in `new_server` (cold path only):
 
 ## Where things live (module cycles decide this)
 
-- `vtest/` is a **top-level module** (`import vtest`). It imports `http_server`,
+- `vtest/` is a **top-level module** (`import vtest`). It imports `server`
+  (plus `transport` for dialing and `socket` for `shutdown_write`/nosigpipe),
   so it can never be imported from files compiled *as part of* module
-  `http_server` — including that module's own `_test.v` files.
+  `server` — including that module's own `_test.v` files.
 - Therefore socket e2e tests for the server live in **`tests/`** (repo root),
-  standalone `_test.v` files importing `http_server` + `vtest`. They only ever
+  standalone `_test.v` files importing `server` + `vtest`. They only ever
   used public API; they never needed module-internal access.
 - Example tests are `module main` and import `vtest` directly, in place.
-- `http_server/testkit` (deadline-bounded readers) stays for the hand-rolled
+- `testkit` (deadline-bounded readers) stays for the hand-rolled
   escape-hatch tests; vtest does not import it.
 
 ## What stays hand-rolled (deliberately)
@@ -170,6 +196,17 @@ Server-side change in `new_server` (cold path only):
 3. io_uring allows one live ring per process: within one test binary, a test must
    fully `stop()`/shutdown its io_uring server before the next starts (the
    sequential-tests-per-file pattern already guarantees this).
+4. Connections held open across `fire()` groups are subject to the server's
+   idle deadline: with `read_timeout_ms` set, `idle_timeout_ms` inherits it, so a
+   keep-alive connection that sits between groups gets EOF after `idle_ms()`.
+   A test that parks connections (SSE subscribers, a later `send()`) needs
+   `idle_timeout_ms: -1` or no read timeout. `-1` only exempts a connection
+   that sits *between* requests: one whose first request is not complete yet
+   (silent, or a partial head continued later with `send()`) stays under
+   `read_timeout_ms` from accept, so such a test needs no read timeout at all
+   (nor a positive `idle_timeout_ms`, which is then armed at accept instead).
+   A "backstop" `read_timeout_ms` stays safe when the script sends all its
+   bytes at once and never idles.
 
 ## Migration plan (each step = one commit, `v test .` green)
 
@@ -178,7 +215,7 @@ Server-side change in `new_server` (cold path only):
    with a test.
 3. `vtest/` module: reactor + predicates + `drive`/`start`/`fire`/`wait`/`stop` +
    its own smoke tests in `tests/`.
-4. Prova de fogo: migrate `http_server/backend_behaviors_test.v` →
+4. Prova de fogo: migrate `tests/backend_behaviors_test.v` →
    `tests/backend_behaviors_test.v` on vtest (all 19 checks, same coverage,
    storms where they add value).
 5. Migrate `server_test.v` (keep hook-contract test hand-rolled),
@@ -196,4 +233,5 @@ Server-side change in `new_server` (cold path only):
   for anything they cannot express is "write the sockets by hand with testkit",
   which remains supported.
 - Tests that would hang on a liveness bug hang instead of failing fast — accepted
-  and intended (goal 2); CI step timeouts bound the damage.
+  and intended (goal 2); the `timeout-minutes` on every CI job that runs `tests/`
+  or example tests bound the damage (and run them under `timeout` locally).

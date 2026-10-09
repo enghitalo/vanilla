@@ -454,8 +454,8 @@ if begin_example url_form examples/url_form/src; then
 	end_example
 fi
 
-# --- veb_like (lives at examples/veb_like, no src/) ---
-if begin_example veb_like examples/veb_like; then
+# --- veb_like ---
+if begin_example veb_like examples/veb_like/src; then
 	check veb_like "GET /users" 200 "$BASE/users"
 	check veb_like "POST /users" 201 -X POST "$BASE/users"
 	check veb_like "GET /users/7" 200 "$BASE/users/7"

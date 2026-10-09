@@ -18,8 +18,8 @@ module main
 // Run:   v run examples/async_date_timerfd/
 // Try:   curl -i http://localhost:8097/        # note Date; re-run after a few
 //        sleep 3; curl -i http://localhost:8097/   # Date advanced with no load
-import http_server
-import http_server.core
+import server
+import core
 import time
 
 #include <sys/timerfd.h>
@@ -85,7 +85,7 @@ fn arm_periodic(tfd int, ms int) {
 	spec[1] = i64(ms % 1000) * 1_000_000
 	spec[2] = spec[0]
 	spec[3] = spec[1]
-	C.timerfd_settime(tfd, 0, voidptr(&spec[0]), unsafe { nil })
+	C.timerfd_settime(tfd, 0, unsafe { voidptr(&spec[0]) }, unsafe { nil })
 }
 
 // on_start runs once per worker (client_fd = -1): build the cache now so the very
@@ -110,26 +110,26 @@ fn date_tick(mut _out []u8, ready_fd int, _ready_fd_error bool, _watch_payload v
 	return .suspend
 }
 
-const head = 'HTTP/1.1 200 OK\r\n'.bytes()
+const head = 'HTTP/1.1 200 OK\r\n'
 
-const tail = 'Content-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
+const tail = 'Content-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'
 
 // handle is a plain sync handler: zero time work — just append the cached Date.
 fn handle(_req []u8, mut out []u8, _client_fd int, worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
 	dc := unsafe { &DateCache(worker_state) }
-	out << head
+	core.append_str(mut out, head)
 	unsafe { out.push_many(&dc.line[0], date_line_len) }
-	out << tail
+	core.append_str(mut out, tail)
 	return .done
 }
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            8097
 		io_multiplexing: .epoll
 		handler:         handle
 		make_state:      make_state
 		on_worker_start: on_start
 	})!
-	server.run()
+	srv.run()
 }

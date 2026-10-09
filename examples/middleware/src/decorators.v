@@ -3,16 +3,18 @@ module main
 // Global response decorators — `fn (next) fn` wrappers applied to every response.
 // (Access logging lives in access_log.v — it has enough machinery to warrant its
 // own file.)
-import http_server.core
+import core
 
 const security_headers = ('X-Content-Type-Options: nosniff\r\n' + 'X-Frame-Options: DENY\r\n' +
 	"Content-Security-Policy: default-src 'self'\r\n").bytes()
 
 // with_security_headers injects the hardening headers into every response, once.
+// Every input reaches `next` unchanged: the wrapped handler may key on its
+// connection (client_fd) or dereference its make_state value (worker_state).
 fn with_security_headers(next Handler) Handler {
 	return fn [next] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 		start := out.len
-		step := next(req_buffer, mut out, -1, unsafe { nil }, mut event_loop)
+		step := next(req_buffer, mut out, client_fd, worker_state, mut event_loop)
 		if step != .done {
 			return step
 		}

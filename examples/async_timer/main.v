@@ -14,8 +14,8 @@ module main
 // The same `event_loop.watch_fd(...)` primitive drives an async DB query (watch the DB
 // socket), a reverse proxy (watch the upstream socket), or SSE/WebSocket
 // backpressure (watch the client for EPOLLOUT). See core.Handler.
-import http_server
-import http_server.core
+import server
+import core
 
 #include <sys/timerfd.h>
 #include <time.h>
@@ -25,7 +25,7 @@ fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
 fn C.read(fd int, buf voidptr, count usize) int
 
-const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
+const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'
 
 // handle is the request handler. For /delay it arms a one-shot timerfd and
 // parks the request on it (returns .suspend); the worker resumes `timer_done`
@@ -38,11 +38,11 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
 		mut spec := [4]i64{}
 		spec[2] = i64(ms / 1000)
 		spec[3] = i64(ms % 1000) * 1_000_000
-		C.timerfd_settime(tfd, 0, voidptr(&spec[0]), unsafe { nil })
+		C.timerfd_settime(tfd, 0, unsafe { voidptr(&spec[0]) }, unsafe { nil })
 		event_loop.watch_fd(tfd, .readable, timer_done, unsafe { nil })
 		return .suspend
 	}
-	out << resp_ok
+	core.append_str(mut out, resp_ok)
 	return .done
 }
 
@@ -58,10 +58,10 @@ fn timer_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voi
 }
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            8091
 		io_multiplexing: .epoll
 		handler:         handle
 	})!
-	server.run()
+	srv.run()
 }

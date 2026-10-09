@@ -4,7 +4,7 @@ module main
 // Percent-decoding is the kind of byte transformation that benefits most from
 // table-driven tests, including the SECURITY case: decode exactly once.
 // (`${}` and `.bytes()` here are test scaffolding — fine outside the handler.)
-import http_server.core
+import core
 
 fn test_percent_decode() {
 	assert percent_decode('hello%20world'.bytes()) == 'hello world'

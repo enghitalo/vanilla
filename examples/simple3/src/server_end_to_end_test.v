@@ -1,8 +1,8 @@
 module main
 
-import http_server
-import http_server.core
-import http_server.http1_1.response
+import server
+import core
+import http1_1.response
 import vtest
 
 // End-to-end cases against the example's real handler, on vtest (docs/VTEST.md):
@@ -40,9 +40,9 @@ fn test_server_end_to_end() ! {
 			}]
 		}
 	}
-	got := vtest.drive(http_server.ServerConfig{
+	got := vtest.drive(server.ServerConfig{
 		handler: fn [app] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
-			return app.handle_request(req_buffer, mut out, -1, unsafe { nil }, mut event_loop)
+			return app.handle_request(req_buffer, mut out, client_fd, worker_state, mut event_loop)
 		}
 	}, scripts)!
 

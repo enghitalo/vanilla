@@ -17,10 +17,16 @@ module main
 //   by spec for good reason. With credentials you must echo a SPECIFIC,
 //   allowlisted origin — never `*`, never blind reflection.
 //
+// CACHING: the response depends on `Origin`, so EVERY variant carries
+//   `Vary: Origin` — including the plain one sent without (or with a refused)
+//   Origin. Otherwise a shared cache (CDN, reverse proxy) can store the plain
+//   variant under no Vary key and serve it to an allowed origin, whose browser
+//   then blocks the read: intermittent, cache-dependent CORS failures.
+//
 // BYTE DISCIPLINE (docs/BEST_PRACTICES.md §2/§3, docs/V_PERF_TOOLBOX.md):
 //   - NEVER concatenate or interpolate — not even on the slow path. Every
 //     response is split into compile-time consts around the one dynamic part
-//     (the echoed origin), appended with `out <<` / `push_many`.
+//     (the echoed origin), appended with `core.append_str` / `out <<`.
 //   - VIEWS, NOT COPIES: the Origin value stays in the request buffer. The
 //     allowlist check wraps it in a read-only `tos` view (`in` on an array
 //     only compares, never retains — same blessing as the §2 map-key views);
@@ -30,10 +36,10 @@ module main
 //   After the parse, the handler allocates NOTHING per request.
 //
 // WORKS TODAY: pure header logic.
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
-import http_server.http1_1.response
+import server
+import core
+import http1_1.request_parser
+import http1_1.response
 
 const allowed_origins = ['https://app.example.com', 'http://localhost:5173']
 
@@ -45,12 +51,12 @@ fn origin_allowed(origin string) bool {
 // The echoed origin is the ONLY dynamic byte range; everything around it is a
 // compile-time const, so the `{"ok":true}` body's Content-Length is the known
 // constant 11 (keep the two in sync if you ever change the body).
-const resp_403 = 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'.bytes()
-const preflight_head = 'HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: '.bytes()
+const resp_403 = 'HTTP/1.1 403 Forbidden\r\nVary: Origin\r\nContent-Length: 0\r\n\r\n'.bytes()
+const preflight_head = 'HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: '
 const preflight_tail = '\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-CSRF-Token\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Max-Age: 86400\r\nVary: Origin\r\nContent-Length: 0\r\n\r\n'.bytes()
-const ok_cors_head = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: '.bytes()
+const ok_cors_head = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: '
 const ok_cors_tail = '\r\nAccess-Control-Allow-Credentials: true\r\nVary: Origin\r\nContent-Length: 11\r\n\r\n{"ok":true}'.bytes()
-const resp_ok_plain = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{"ok":true}'.bytes()
+const resp_ok_plain = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nVary: Origin\r\nContent-Length: 11\r\n\r\n{"ok":true}'.bytes()
 
 // slice_eq compares a request Slice against a literal IN PLACE by offsets —
 // no `.to_string()`, no `buf[a..b]` (V array slicing marks the source buffer
@@ -98,7 +104,7 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 			out << resp_403
 			return .done
 		}
-		out << preflight_head
+		core.append_str(mut out, preflight_head)
 		unsafe { out.push_many(&req.buffer[o_start], o_len) } // echo the allowlisted origin
 		out << preflight_tail
 		return .done
@@ -108,7 +114,7 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 	// origins; other requests still get the resource, just without the CORS
 	// grant (the browser blocks the cross-origin read, not the server).
 	if allowed {
-		out << ok_cors_head
+		core.append_str(mut out, ok_cors_head)
 		unsafe { out.push_many(&req.buffer[o_start], o_len) } // echo the allowlisted origin
 		out << ok_cors_tail
 		return .done
@@ -119,18 +125,18 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 
 fn main() {
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         handle
 	})!
 	println('CORS demo on http://localhost:3000/  (handles OPTIONS preflight + allowlist)')
-	server.run()
+	srv.run()
 }

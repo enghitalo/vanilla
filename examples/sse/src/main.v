@@ -17,9 +17,9 @@ module main
 //   Cost per client: one fd + one map entry. Nothing blocks.
 //
 // This is the shape SSE should always take on top of a non-blocking core.
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
+import server
+import core
+import http1_1.request_parser
 import sync
 import time
 
@@ -77,11 +77,11 @@ fn (mut c Clients) broadcast(event []u8) {
 // SSE response: note the deliberate ABSENCE of Content-Length and the
 // text/event-stream content type. The core sends these bytes and keeps the
 // connection open. Single literals — no `+` concatenation, even at init.
-const sse_headers = 'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n'.bytes()
+const sse_headers = 'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n'
 
-const ok_response = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const ok_response = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
-const bad_request = 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
+const bad_request = 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
 
 // Static SSE frame pieces: allocated once, reused for every event.
 const keepalive_event = ': keepalive\n\n'.bytes()
@@ -116,7 +116,7 @@ fn handle(req_buffer []u8, fd int, mut out []u8, mut clients Clients) core.Step 
 	clients.drop(fd)
 
 	req := request_parser.decode_http_request(req_buffer) or {
-		out << bad_request
+		core.append_str(mut out, bad_request)
 		return .close
 	}
 
@@ -124,7 +124,7 @@ fn handle(req_buffer []u8, fd int, mut out []u8, mut clients Clients) core.Step 
 	//                and leaves the connection open. The broadcaster owns it now.
 	if slice_eq(req.buffer, req.method, 'GET') && slice_eq(req.buffer, req.path, '/events') {
 		clients.add(fd)
-		out << sse_headers
+		core.append_str(mut out, sse_headers)
 		return .done
 	}
 
@@ -145,11 +145,11 @@ fn handle(req_buffer []u8, fd int, mut out []u8, mut clients Clients) core.Step 
 		}
 		event << event_end // an empty body still yields the valid event `data: \n\n`
 		clients.broadcast(event)
-		out << ok_response
+		core.append_str(mut out, ok_response)
 		return .done
 	}
 
-	out << bad_request
+	core.append_str(mut out, bad_request)
 	return .done
 }
 
@@ -166,14 +166,14 @@ fn main() {
 	}()
 
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         fn [mut clients] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
@@ -181,5 +181,5 @@ fn main() {
 		}
 	})!
 	println('SSE server on http://localhost:3000/  (GET /events, POST /broadcast)')
-	server.run()
+	srv.run()
 }

@@ -15,25 +15,25 @@ module main
 // (no CPU spin) and serves normally:
 //   v run examples/async_watch_hangup/
 //   curl http://localhost:8098/        # -> ok
-import http_server
-import http_server.core
+import server
+import core
 
 #include <unistd.h>
 
-fn C.pipe(fds &int) int
+fn C.pipe(fds &i32) int
 fn C.close(fd int) int
 
-const resp = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
+const resp = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'
 
 // on_start arms a clientless watch on a pipe read-end, then closes the write-end
 // so the read-end immediately reports a hangup (the "producer" is gone). Composes
 // with a plain stateless handler — no make_state.
 fn on_start(worker_state voidptr, mut event_loop core.EventLoop) {
-	mut fds := [2]int{}
+	mut fds := [2]i32{} // C ints: V int is 64-bit
 	if C.pipe(&fds[0]) != 0 {
 		return
 	}
-	read_fd, write_fd := fds[0], fds[1]
+	read_fd, write_fd := int(fds[0]), int(fds[1])
 	C.close(write_fd) // producer gone -> read_fd reports EPOLLHUP on the next poll
 	event_loop.watch_fd(read_fd, .readable, on_source_event, unsafe { nil })
 }
@@ -52,16 +52,16 @@ fn on_source_event(mut out []u8, ready_fd int, ready_fd_error bool, watch_payloa
 }
 
 fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
-	out << resp
+	core.append_str(mut out, resp)
 	return .done
 }
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            8098
 		io_multiplexing: .epoll
 		handler:         handle
 		on_worker_start: on_start
 	})!
-	server.run()
+	srv.run()
 }

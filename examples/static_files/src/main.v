@@ -18,13 +18,13 @@ module main
 //   - Method routing, the query strip and the If-None-Match check compare
 //     bytes IN PLACE by offsets — no `.to_string()`, no `buf[a..b]`
 //     slice-marking, no `${}` interpolation per request.
-//   - Responses append straight into `out`: consts for 404/405; `ws`/`wi`
+//   - Responses append straight into `out`: consts for 404/405; `core.append_str`/`wi`
 //     framing for 200/206/304; the file bytes and the range window are
 //     appended as direct pointer copies, never via `content[a..b]`.
 //   - The ETag is a 64-bit wyhash hex-encoded into a STACK scratch (`hex16`) —
 //     no `.hex()` string per request. Hashing the whole file per request is
 //     O(filesize) BY DESIGN — it is the conditional-GET pedagogy; for
-//     precomputed validators use `http_server.static_assets`.
+//     precomputed validators use `server.static_assets`.
 //   - The URL path reaches `safe_path` as a zero-copy `tos` VIEW; the os path
 //     APIs (norm_path/join_path/abs_path) are string-typed and make their own
 //     copies internally — the documented teaching trade-off (rule 3: don't
@@ -34,13 +34,13 @@ module main
 // userspace []u8. The epoll core can stream a file straight to the socket with
 // `sendfile(2)` (EPOLLOUT-driven, so a 4 GB file never sits in RAM) — a handler
 // hands the file off via `core.queue_file(fd, off, len)`. The reusable
-// `http_server.static_assets` module does exactly this for files past a size
-// threshold; see `examples/static_assets`. This example keeps the explicit
+// `server.static_assets` module does exactly this for files past a size
+// threshold; see `examples/spa_static_assets`. This example keeps the explicit
 // read-into-RAM path for teaching.
-import http_server
-import http_server.core
-import http_server.http1_1.request_parser
-import http_server.http1_1.response
+import server
+import core
+import http1_1.request_parser
+import http1_1.response
 import os
 import strconv
 import hash as wyhash
@@ -48,16 +48,10 @@ import hash as wyhash
 const web_root = './public'
 
 // ---- static responses (consts — the error paths append, never build) --------
-const resp_404 = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const resp_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\n\r\n'.bytes()
+const resp_404 = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const resp_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\n\r\n'
 
 // ---- zero-alloc append helpers (BEST_PRACTICES §3b) --------------------------
-// ws appends a string's bytes straight into `out` — no allocation.
-@[inline]
-fn ws(mut out []u8, s string) {
-	unsafe { out.push_many(s.str, s.len) }
-}
-
 // wi appends n's decimal digits into `out` — itoa into a stack scratch, then
 // append. No allocation, no `.str()`.
 fn wi(mut out []u8, n i64) {
@@ -283,7 +277,7 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 	// Method routing IN PLACE over the request buffer — no `.to_string()`.
 	is_get := slice_eq(req.buffer, req.method, 'GET')
 	if !is_get && !slice_eq(req.buffer, req.method, 'HEAD') {
-		out << resp_405
+		core.append_str(mut out, resp_405)
 		return .done
 	}
 
@@ -301,29 +295,29 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 	}
 
 	fs_path := safe_path(url_path) or {
-		out << resp_404
+		core.append_str(mut out, resp_404)
 		return .done
 	}
 	if !os.is_file(fs_path) {
-		out << resp_404
+		core.append_str(mut out, resp_404)
 		return .done
 	}
 	content := os.read_bytes(fs_path) or {
-		out << resp_404
+		core.append_str(mut out, resp_404)
 		return .done
 	}
 	ctype := mime_type(fs_path)
 	// ETag = 64-bit wyhash of the content, hex-encoded into a stack scratch —
-	// a cheap, strong opaque validator (same as http_server.static_assets);
+	// a cheap, strong opaque validator (same as server.static_assets);
 	// a crypto digest here is pure cost, and md5 is broken anyway.
 	etag := hex16(wyhash.wyhash_c(content.data, u64(content.len), 0))
 
 	// Conditional GET: if the client's cached ETag matches, save the bytes.
 	if inm := req.get_header_value_slice('If-None-Match') {
 		if etag_matches(req.buffer, inm, etag) {
-			ws(mut out, 'HTTP/1.1 304 Not Modified\r\nETag: "')
+			core.append_str(mut out, 'HTTP/1.1 304 Not Modified\r\nETag: "')
 			unsafe { out.push_many(&etag[0], 16) }
-			ws(mut out, '"\r\n\r\n')
+			core.append_str(mut out, '"\r\n\r\n')
 			return .done
 		}
 	}
@@ -333,19 +327,19 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 		if rng.len > 0 {
 			rview := unsafe { (&req.buffer[rng.start]).vbytes(rng.len) } // view
 			if start, end := parse_range(rview, content.len) {
-				ws(mut out, 'HTTP/1.1 206 Partial Content\r\nContent-Type: ')
-				ws(mut out, ctype)
-				ws(mut out, '\r\nContent-Range: bytes ')
+				core.append_str(mut out, 'HTTP/1.1 206 Partial Content\r\nContent-Type: ')
+				core.append_str(mut out, ctype)
+				core.append_str(mut out, '\r\nContent-Range: bytes ')
 				wi(mut out, start)
 				out << u8(`-`)
 				wi(mut out, end)
 				out << u8(`/`)
 				wi(mut out, content.len)
-				ws(mut out, '\r\nAccept-Ranges: bytes\r\nContent-Length: ')
+				core.append_str(mut out, '\r\nAccept-Ranges: bytes\r\nContent-Length: ')
 				wi(mut out, end + 1 - start)
-				ws(mut out, '\r\nETag: "')
+				core.append_str(mut out, '\r\nETag: "')
 				unsafe { out.push_many(&etag[0], 16) }
-				ws(mut out, '"\r\n\r\n')
+				core.append_str(mut out, '"\r\n\r\n')
 				if is_get {
 					// The range window is appended as a direct pointer copy —
 					// no content[start..end+1] slice-marking. In-bounds and
@@ -357,13 +351,13 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 		}
 	}
 
-	ws(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: ')
-	ws(mut out, ctype)
-	ws(mut out, '\r\nContent-Length: ')
+	core.append_str(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: ')
+	core.append_str(mut out, ctype)
+	core.append_str(mut out, '\r\nContent-Length: ')
 	wi(mut out, content.len)
-	ws(mut out, '\r\nAccept-Ranges: bytes\r\nETag: "') // advertise range support
+	core.append_str(mut out, '\r\nAccept-Ranges: bytes\r\nETag: "') // advertise range support
 	unsafe { out.push_many(&etag[0], 16) }
-	ws(mut out, '"\r\nCache-Control: public, max-age=3600\r\nConnection: keep-alive\r\n\r\n')
+	core.append_str(mut out, '"\r\nCache-Control: public, max-age=3600\r\nConnection: keep-alive\r\n\r\n')
 	if is_get {
 		out << content // HEAD gets the headers only
 	}
@@ -372,20 +366,20 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 
 fn main() {
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         handle
 	})!
 	// One-time init prints — `${}` is fine here, nothing below runs per request.
 	println('Static server on http://localhost:3000/  (root: ${web_root})')
-	println('For zero-copy large-file serving (sendfile(2)), use http_server.static_assets — see examples/static_assets.')
-	server.run()
+	println('For zero-copy large-file serving (sendfile(2)), use the static_assets module — see examples/spa_static_assets.')
+	srv.run()
 }

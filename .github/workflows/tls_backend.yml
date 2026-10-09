@@ -1,0 +1,312 @@
+name: TLS Backend (HTTPS on epoll)
+
+# The only lane that builds with `-d vanilla_tls`. Every other job compiles the
+# TLS stub (tls/tls_stub_notd_vanilla_tls.c.v), so without this one the HTTPS
+# path — mbedTLS handshake, deadlines armed at accept, the TLS sweep — is never
+# built or run in CI. Ubuntu's apt ships Mbed TLS 2.28; vanilla needs 4.x (PSA
+# crypto), so it is built from a pinned release tag and cached.
+#
+# Two legs, one per way Mbed TLS can be built (issue #157):
+#   threading off — the upstream default config (and distro packages such as
+#     Arch's): PSA Crypto's process-wide state is unlocked, so the shim
+#     serializes every call into Mbed TLS with its own lock;
+#   threading on  — MBEDTLS_THREADING_C + MBEDTLS_THREADING_PTHREAD: Mbed TLS
+#     locks that state itself, the shim's lock compiles out, and the TLS
+#     workers run their crypto in parallel.
+# The same tests run on both; tls/ checks the leg linked what it claims.
+#
+# The last steps load the `tls` kernel module (when the runner's kernel has
+# it; a GitHub warning when it does not), so tls_static_test.v exercises
+# sendfile(2) over kTLS as well as the userspace path it runs with
+# set_ktls(false), then run it under -gc none (the leak check) and -race. The
+# earlier steps run before the module is loaded and keep exercising userspace
+# Mbed TLS.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'tls/**'
+      - 'server/**'
+      - 'core/**'
+      - 'epoll/**'
+      - 'socket/**'
+      - 'http1_1/**'
+      - 'vtest/**'
+      - 'transport/**'
+      - 'static_assets/**'
+      - 'tests/tls_timeouts_test.v'
+      - 'tests/tls_pipelining_test.v'
+      - 'tests/tls_workers_test.v'
+      - 'tests/tls_static_test.v'
+      - 'examples/https_upstream/**'
+      - '.github/workflows/tls_backend.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'tls/**'
+      - 'server/**'
+      - 'core/**'
+      - 'epoll/**'
+      - 'socket/**'
+      - 'http1_1/**'
+      - 'vtest/**'
+      - 'transport/**'
+      - 'static_assets/**'
+      - 'tests/tls_timeouts_test.v'
+      - 'tests/tls_pipelining_test.v'
+      - 'tests/tls_workers_test.v'
+      - 'tests/tls_static_test.v'
+      - 'examples/https_upstream/**'
+      - '.github/workflows/tls_backend.yml'
+
+env:
+  # Bump to move to a newer Mbed TLS 4 release; the cache key follows it.
+  MBEDTLS_TAG: v4.2.0
+
+# A new push to a pull request cancels that PR's run still in progress, so
+# superseded commits don't queue for the account's runners; on main every
+# commit is its own group and runs to the end.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  tls-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - threading: 'off'
+            expect: vanilla_expect_serialized_crypto
+          - threading: 'on'
+            expect: vanilla_expect_parallel_crypto
+    # The default leg keeps the job's original name, which a required status
+    # check may refer to.
+    name: ${{ matrix.threading == 'on' && 'tls/ + TLS e2e, Mbed TLS with threading' || 'tls/ + TLS timeouts under -d vanilla_tls' }}
+    # vtest has no client-side timeouts by design: a liveness regression hangs
+    # the test instead of failing it. This bounds the damage (it also covers a
+    # cold Mbed TLS build).
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up V
+        uses: vlang/setup-v@v1.7
+      - name: Remove Vlang folder to avoid conflicts
+        shell: bash
+        run: |
+          rm -rf -v ./vlang || true
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-libc-dev clang
+
+      # Mbed TLS 4, installed where tls/tls_mbedtls_d_vanilla_tls.c.v looks
+      # (-I/usr/local/include -L/usr/local/lib -lmbedtls -lmbedx509
+      # -lmbedcrypto). Built once per tag and leg: the install is staged with
+      # DESTDIR into a runner-owned directory so actions/cache can save and
+      # restore it, then copied into /usr/local on every run. (The default
+      # leg's key is unchanged from before the legs existed.)
+      - name: Cache Mbed TLS ${{ env.MBEDTLS_TAG }} (threading ${{ matrix.threading }})
+        id: mbedtls-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/mbedtls-stage
+          key: mbedtls-${{ env.MBEDTLS_TAG }}-shared${{ matrix.threading == 'on' && '-threading' || '' }}-${{ runner.os }}-${{ runner.arch }}
+      - name: Build Mbed TLS ${{ env.MBEDTLS_TAG }} from source (threading ${{ matrix.threading }})
+        if: steps.mbedtls-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          # A tag checkout (unlike the release tarball) lacks the generated
+          # sources; the generators need jinja2 + jsonschema.
+          sudo apt-get install -y python3-jinja2 python3-jsonschema
+          git clone --depth 1 --recursive -b "$MBEDTLS_TAG" \
+            https://github.com/Mbed-TLS/mbedtls /tmp/mbedtls
+          if [ "${{ matrix.threading }}" = on ]; then
+            # The options live in TF-PSA-Crypto's crypto_config.h, which
+            # scripts/config.py edits. That header is installed, so vanilla is
+            # compiled against the config the library was built with (the
+            # options change struct layouts). Fail here if they did not apply.
+            (cd /tmp/mbedtls && python3 scripts/config.py set MBEDTLS_THREADING_C \
+              && python3 scripts/config.py set MBEDTLS_THREADING_PTHREAD)
+            test "$(grep -cE '^#define MBEDTLS_THREADING_(C|PTHREAD)( |$)' \
+              /tmp/mbedtls/tf-psa-crypto/include/psa/crypto_config.h)" = 2
+          fi
+          # Shared libraries (the default is static-only). CMAKE_INSTALL_LIBDIR
+          # pinned to lib so the files land in /usr/local/lib exactly.
+          cmake -S /tmp/mbedtls -B /tmp/mbedtls/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_TESTING=OFF -DENABLE_PROGRAMS=OFF \
+            -DUSE_SHARED_MBEDTLS_LIBRARY=ON -DUSE_STATIC_MBEDTLS_LIBRARY=OFF \
+            -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_INSTALL_LIBDIR=lib
+          cmake --build /tmp/mbedtls/build -j"$(nproc)"
+          DESTDIR="$HOME/mbedtls-stage" cmake --install /tmp/mbedtls/build
+      - name: Install Mbed TLS into /usr/local
+        shell: bash
+        run: |
+          sudo cp -a "$HOME/mbedtls-stage/usr/local/." /usr/local/
+          sudo ldconfig
+          grep -m1 'define MBEDTLS_VERSION_STRING ' /usr/local/include/mbedtls/build_info.h
+          ls -l /usr/local/lib/libmbedtls.so /usr/local/lib/libmbedx509.so /usr/local/lib/libmbedcrypto.so
+          echo "threading options in the installed crypto_config.h:"
+          grep -E '^#define MBEDTLS_THREADING_' /usr/local/include/psa/crypto_config.h || echo '(none)'
+
+      # `-cc gcc -no-parallel`: the same V-toolchain flake avoidance as every
+      # other lane (the vlang/v#27749 parallel-codegen link race).
+      #
+      # No extra link flags: this lane builds exactly what a user's
+      # `v -d vanilla_tls` build does. Ubuntu's gcc links with --as-needed by
+      # default, so tls/tls_mbedtls_d_vanilla_tls.c.v must list
+      # `#flag @VMODROOT/tls/vanilla_tls.c` BEFORE
+      # `-lmbedtls -lmbedx509 -lmbedcrypto`; with the libraries first they are
+      # dropped before the only object that uses them and the link fails with
+      # undefined mbedtls_* / psa_* references (V then retries with its
+      # established compiler, which cannot build every program). Do not paper
+      # over such a failure with -ldflags here: Ubuntu/Debian user builds would
+      # still be broken.
+      #
+      # VANILLA_NO_IOURING: the repo's kill-switch for hosted runners whose
+      # per-worker io_uring rings fail to init (see poll_backend.yml); the TLS
+      # path runs on epoll.
+      # `-d ${{ matrix.expect }}`: tls/ checks the shim was compiled against
+      # the build this leg claims (test_parallel_crypto_matches_the_linked_build).
+      - name: tls/ module tests
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+        run: |
+          v -cc gcc -no-parallel -d vanilla_tls -d ${{ matrix.expect }} test tls/
+      # HTTPS connection reaping end to end (read deadline armed at accept,
+      # bounding silent connects and the handshake; idle keep-alive; slots
+      # freed for max_connections). This exercises userspace mbedTLS: kTLS
+      # needs the `tls` kernel module, which the job loads only for the
+      # kTLS steps further down.
+      - name: TLS timeouts e2e
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+        run: |
+          v -cc gcc -no-parallel -d vanilla_tls test tests/tls_timeouts_test.v
+      # HTTP/1.1 pipelining over HTTPS (issue #152): every request of a burst
+      # answered in order, requests behind a response parked on WANT_WRITE
+      # answered after it (byte-exact), a pipelined partial on its own read
+      # deadline, and a client reset mid-response not killing the server.
+      - name: TLS pipelining e2e
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+        run: |
+          v -cc gcc -no-parallel -d vanilla_tls test tests/tls_pipelining_test.v
+      # Several TLS workers in one process (issue #157): many concurrent
+      # handshakes and keep-alive requests over four workers, every connection
+      # completing. The threading-off leg runs the shim's crypto lock (before
+      # it the workers raced on PSA's process-wide state: failed connections,
+      # heap corruption); the threading-on leg runs without it, on Mbed TLS's
+      # own locking.
+      - name: TLS multi-worker e2e
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+        run: |
+          v -cc gcc -no-parallel -d vanilla_tls test tests/tls_workers_test.v
+      # The pooled HTTPS client (http1_1/upstream, #229) through
+      # examples/https_upstream's edge, against its fake upstream (a V
+      # program the test builds, serving TLS with the test CA): response
+      # shapes, keep-alive reuse, stale connections, retries, close_notify vs
+      # a bare FIN, certificate failures, early answers, 4 MiB bodies,
+      # deadlines, shedding, client disconnects, the resolver thread.
+      # VANILLA_REQUIRE_FAKE_PG turns a missing openssl (the test CA) into a
+      # failure instead of a skip.
+      - name: Pooled HTTPS client (http1_1/upstream) e2e
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+          VANILLA_REQUIRE_FAKE_PG: '1'
+        run: |
+          v -cc gcc -no-parallel -d vanilla_tls test http1_1/upstream examples/https_upstream/src
+      # Static files over HTTPS (static_assets on the TLS worker): bodies at
+      # or above sendfile_min_bytes leave a kTLS connection with sendfile(2)
+      # behind a MSG_MORE header send, and a userspace-TLS one as bytes; every
+      # case runs both ways (kTLS only when the module loaded). Byte-exact
+      # large and pipelined bodies, a slow reader parked mid-file, follow_disk,
+      # a file shorter than its Content-Length or failing in the sendfile phase
+      # (the answers ahead of it still arrive), the sendfile slot drained on
+      # .close/.suspend, clients that reset mid-file, mixed routes.
+      # A runner whose kernel lacks the module only warns: the kTLS runs then
+      # fall back to userspace TLS, and the job still checks that path.
+      - name: Load the tls kernel module (kTLS)
+        shell: bash
+        run: |
+          if sudo modprobe tls && [ -e /proc/net/tls_stat ]; then
+            echo 'kTLS available'
+          else
+            echo '::warning title=kTLS not tested::sudo modprobe tls failed: the kTLS runs of tls_pipelining_test.v and tls_static_test.v fall back to userspace TLS, so kTLS RX, TLS_RX_EXPECT_NO_PAD and sendfile(2) over kTLS go untested'
+          fi
+      # The pipelining suite again, now that kTLS engages: pipelined records on
+      # kTLS RX, and test_tls_ktls_rx_no_pad_is_opt_in, which reads
+      # TLS_RX_EXPECT_NO_PAD off the server socket (off by default, on with
+      # set_ktls_rx_no_pad). In the userspace run above that test has no kTLS
+      # socket to read and checks nothing.
+      - name: TLS pipelining e2e over kTLS
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+        run: |
+          v -cc gcc -no-parallel -d vanilla_tls test tests/tls_pipelining_test.v
+      - name: TLS static files e2e
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+        run: |
+          v -cc gcc -no-parallel -d vanilla_tls test tests/tls_static_test.v
+      # -gc none frees nothing, so a per-request allocation on either path
+      # shows as heap growth (the leak case only measures in this build).
+      - name: TLS static files e2e under -gc none
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+        run: |
+          v -gc none -cc gcc -no-parallel -d vanilla_tls test tests/tls_static_test.v
+      # No allocation per upstream exchange over TLS: the heap after 200 warm-up
+      # calls and after 4000 more grows by under 4 KiB.
+      - name: Pooled HTTPS client under -gc none
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+          VANILLA_REQUIRE_FAKE_PG: '1'
+        run: |
+          v -gc none -cc gcc -no-parallel -d vanilla_tls -run-only test_no_allocation_per_exchange test examples/https_upstream/src
+      # The TLS worker under ThreadSanitizer (race_detector.yml has no Mbed
+      # TLS). See race_detector.yml for the two steps that prepare it.
+      - name: Make ASLR compatible with ThreadSanitizer
+        shell: bash
+        run: |
+          sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Pick the ThreadSanitizer compiler
+        shell: bash
+        run: |
+          printf 'int main(void) { return 0; }\n' > /tmp/tsan_probe.c
+          if clang -fsanitize=thread /tmp/tsan_probe.c -o /tmp/tsan_probe && /tmp/tsan_probe; then
+            echo 'RACE_CC=clang' >> "$GITHUB_ENV"
+          else
+            echo 'RACE_CC=gcc' >> "$GITHUB_ENV"
+          fi
+      - name: TLS static files e2e under -race
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+          VRACE: 'halt_on_error=0'
+        run: |
+          v -race -cc "$RACE_CC" -no-parallel -d vanilla_tls test tests/tls_static_test.v
+      # Four workers' pools and the resolver thread (refreshing every 10 ms)
+      # under concurrent HTTPS calls.
+      - name: Pooled HTTPS client under -race
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+          VANILLA_REQUIRE_FAKE_PG: '1'
+          VRACE: 'halt_on_error=0'
+        run: |
+          v -race -cc "$RACE_CC" -no-parallel -d vanilla_tls test http1_1/upstream examples/https_upstream/src

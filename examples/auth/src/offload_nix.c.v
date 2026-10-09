@@ -25,11 +25,11 @@ module main
 // The pool is PER WORKER (built in make_state): shared-nothing, so verifier
 // threads never contend across workers, and the resume always lands on the
 // worker that parked the request (the pipe is registered in that worker's epoll).
-import http_server.core
+import core
 
 #include <unistd.h>
 
-fn C.pipe(fds &int) int
+fn C.pipe(fds &i32) int
 fn C.write(fd int, buf voidptr, n usize) int
 fn C.read(fd int, buf voidptr, n usize) int
 fn C.close(fd int) int
@@ -91,7 +91,7 @@ fn hash_worker(jobs chan HashJob) {
 // caller then sheds the request with 503 instead of blocking the worker.
 fn try_offload(worker_state voidptr, password []u8, mut event_loop core.EventLoop) bool {
 	mut st := unsafe { &AuthState(worker_state) }
-	mut fds := [2]int{}
+	mut fds := [2]i32{} // C ints: V int is 64-bit
 	if C.pipe(unsafe { &fds[0] }) != 0 {
 		return false
 	}
@@ -99,24 +99,25 @@ fn try_offload(worker_state voidptr, password []u8, mut event_loop core.EventLoo
 	// .suspend. This is the slow path, so the copy is free relative to argon2.
 	job := HashJob{
 		password: password.clone()
-		pipe_w:   fds[1]
+		pipe_w:   int(fds[1])
 	}
 	mut queued := false
 	select {
 		st.jobs <- job {
 			queued = true
 		}
-		else {}
+		else {
+		}
 	}
 	if !queued {
-		C.close(fds[0])
-		C.close(fds[1])
+		C.close(int(fds[0]))
+		C.close(int(fds[1]))
 		return false
 	}
 	// Watch the read-end; token_done fires on the worker thread when the pool
 	// signals. Non-persistent: the runtime closes this fd if the client
 	// disconnects while parked.
-	event_loop.watch_fd(fds[0], .readable, token_done, unsafe { nil })
+	event_loop.watch_fd(int(fds[0]), .readable, token_done, unsafe { nil })
 	return true
 }
 
@@ -130,7 +131,7 @@ fn token_done(mut out []u8, ready_fd int, _ready_fd_error bool, _watch_payload v
 	nread := C.read(ready_fd, &verdict, 1)
 	C.close(ready_fd) // the request owns the read-end
 	if nread != 1 || verdict != 1 {
-		out << resp_401
+		core.append_str(mut out, resp_401)
 		return .done
 	}
 	write_token_200(mut out)

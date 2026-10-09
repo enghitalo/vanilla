@@ -27,7 +27,7 @@ bin/
 
 server_cert.pem
 examples/tiny/src/src
-examples/veb_like/veb_like
+examples/veb_like/src/src
 
 # generated at runtime by examples/video_stream
 sample.mp4
@@ -48,3 +48,7 @@ perf.data
 perf.data.old
 callgrind.out.*
 massif.out.*
+
+# Python bytecode (pg_async/testdata/fake_pg.py, bench/pg_async/*.py)
+__pycache__/
+*.pyc

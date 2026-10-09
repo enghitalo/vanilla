@@ -6,13 +6,18 @@ module pg_async
 import os
 
 // Live-Postgres integration tests. Skipped unless PGHOST is set, so CI without a
-// database stays green. Run against a local container, e.g.:
+// database stays green (pg_async.yml runs them against PostgreSQL 16 and 18).
+// Run against a local container, e.g.:
 //
 //   docker run -d --name pgtest -p 55432:5432 \
 //     -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=benchpw -e POSTGRES_DB=bench \
 //     -e POSTGRES_HOST_AUTH_METHOD=scram-sha-256 postgres:18.3-alpine
 //   PGHOST=127.0.0.1 PGPORT=55432 PGUSER=bench PGPASSWORD=benchpw PGDATABASE=bench \
 //     v test pg_async/
+//
+// or, without Docker, a throwaway cluster from the local server binaries:
+//
+//   eval "$(pg_async/testdata/throwaway_pg.sh start)" && v test pg_async/
 
 fn pg_test_cfg() ?ConnConfig {
 	host := os.getenv('PGHOST')
@@ -22,11 +27,14 @@ fn pg_test_cfg() ?ConnConfig {
 	}
 	port_env := os.getenv('PGPORT')
 	return ConnConfig{
-		host:     host
-		port:     if port_env != '' { port_env.int() } else { 5432 }
-		user:     os.getenv('PGUSER')
-		password: os.getenv('PGPASSWORD')
-		database: os.getenv('PGDATABASE')
+		host:          host
+		port:          if port_env != '' { port_env.int() } else { 5432 }
+		user:          os.getenv('PGUSER')
+		password:      os.getenv('PGPASSWORD')
+		database:      os.getenv('PGDATABASE')
+		// PGSSLMODE=verify-full + PGSSLROOTCERT: the TLS lane of pg_async.yml
+		ssl_mode:      SslMode.from_string(os.getenv('PGSSLMODE').replace('-', '_')) or { SslMode.disable }
+		ssl_root_cert: os.getenv('PGSSLROOTCERT')
 	}
 }
 
@@ -90,8 +98,8 @@ fn test_async_db_workload() {
 	// The real async-db query shape: price range + limit, all nine columns.
 	res := c.query(r'select id, name, category, price, quantity, active, tags, rating_score, rating_count
 		from pg_async_test_items where price between $1 and $2 limit $3', [
-		?[]u8('10'.bytes()),
-		?[]u8('60'.bytes()),
+		?[]u8('10'.bytes())
+		?[]u8('60'.bytes())
 		?[]u8('50'.bytes()),
 	])!
 	mut it := res.rows()
@@ -129,7 +137,7 @@ fn test_async_db_workload() {
 
 	// Empty range (the async-db anti-cheat): zero matching rows, clean iteration.
 	empty := c.query(r'select id from pg_async_test_items where price between $1 and $2', [
-		?[]u8('900000'.bytes()),
+		?[]u8('900000'.bytes())
 		?[]u8('999999'.bytes()),
 	])!
 	mut eit := empty.rows()

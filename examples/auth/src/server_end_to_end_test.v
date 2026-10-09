@@ -17,8 +17,8 @@
 // (machine-independent) plus a floor/ceiling.
 module main
 
-import http_server
-import http_server.core
+import server
+import core
 import vtest
 import strings
 import time
@@ -32,13 +32,13 @@ const hol_login_req = 'POST /token HTTP/1.1\r\nHost: x\r\nContent-Length: 28\r\n
 fn hol_sync_handler(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
 	if req_buffer.bytestr().contains('/token') {
 		if !verify_password('correct horse battery staple'.bytes(), demo_password_phc) {
-			out << resp_401
+			core.append_str(mut out, resp_401)
 			return .done
 		}
 		write_token_200(mut out)
 		return .done
 	}
-	out << resp_ok_empty
+	core.append_str(mut out, resp_ok_empty)
 	return .done
 }
 
@@ -59,7 +59,7 @@ fn hol_protected_req() []u8 {
 // measure_protected_tail: with a login in flight, measure how long /protected
 // takes to complete. Returns the elapsed milliseconds. Asserts /protected was
 // actually served 200 (never dropped).
-fn measure_protected_tail(cfg http_server.ServerConfig, protected_req []u8) !i64 {
+fn measure_protected_tail(cfg server.ServerConfig, protected_req []u8) !i64 {
 	mut h := vtest.start(cfg)!
 	defer {
 		h.stop()
@@ -90,7 +90,7 @@ fn test_offload_prevents_head_of_line_blocking() ! {
 
 	// Naive synchronous verify: the single worker is stuck in argon2, so
 	// /protected waits the whole login.
-	sync_ms := measure_protected_tail(http_server.ServerConfig{
+	sync_ms := measure_protected_tail(server.ServerConfig{
 		io_multiplexing: .epoll
 		workers:         1
 		handler:         hol_sync_handler
@@ -98,7 +98,7 @@ fn test_offload_prevents_head_of_line_blocking() ! {
 
 	// The shipped handler + offload pool: the worker parks the login and serves
 	// /protected immediately.
-	offload_ms := measure_protected_tail(http_server.ServerConfig{
+	offload_ms := measure_protected_tail(server.ServerConfig{
 		io_multiplexing: .epoll
 		workers:         1
 		handler:         handle

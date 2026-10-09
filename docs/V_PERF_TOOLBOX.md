@@ -39,6 +39,11 @@ only safe where the hot path is **literally allocation-free** (otherwise it leak
 - `v -prod -o out.c ./examples/<name>` — write the C without compiling; `grep` it.
 - `v -show-c-output …` — full C-compiler output on error.
 - `v -showcc …` — the exact C compiler command.
+- `v -warn-about-allocs …` — a warning per allocation site (array/struct/string
+  building, locals the compiler moves to the heap). It cannot tell startup code
+  from the request path, so confirm a hot path with a counter: a
+  `gc_heap_usage().total_bytes` delta over N requests in a test
+  (`test_routing_allocates_nothing` in examples/veb_like).
 
 This is how we found (a) the `epoll_data` union GC-codegen bug and (b) that
 `[]u8{cap:N}` is already noscan/uninit (so a big-cap regression was GC pressure,
@@ -93,7 +98,7 @@ Already used here for the per-worker epoll fd arrays
   `route[8..]` → **+625 MiB** (monotonic, never plateaus) vs `tos(route.str+8,
   route.len-8)` → **+28 KiB** flat — a ~22,000x gap for the same work. The vanilla
   LIBRARY is already the reference (the substr leak lived in an HttpArena benchmark
-  handler, not here): [`http_server/static_assets/static_assets.v:273-281`](../http_server/static_assets/static_assets.v)
+  handler, not here): [`static_assets/static_assets.v:388-396`](../static_assets/static_assets.v)
   builds the key as `key := tos(&buf[rs], rel_len)`, a view straight into the
   request buffer, "never retained, so routing costs no allocation."
 - **Zero-copy views, the pair to reach for:** `unsafe { (&buf[start]).vbytes(len) }`
@@ -120,12 +125,96 @@ Already used here for the per-worker epoll fd arrays
   precompute `const` keys, parse ints in place, and append into a reused buffer.
   Corollary: confirm perf changes on a high-core run, not just a laptop.
 
+## Comptime, escape and allocation checks (V `5516000`)
+
+Found while making the routers allocation-free, and re-checked in the emitted C
+on V 0.5.2 `5516000` (2026-10-09), after the upstream fixes they led to.
+
+- **`method.attrs` inside `$for` is free** since vlang/v#29404. `for attr in
+  method.attrs` unrolls into one block per attribute; `method.attrs.len`,
+  `.contains('x')` and `[i]` fold to constants, in `$if` too. (Before, it built a
+  heap array per method on every pass: the old `examples/veb_like` paid 13
+  allocations to reach its last route.) A `$for` that calls `app.$method(...)`
+  behind an integer compare compiles to a jump table with the handlers inlined.
+- **Route attributes can be parsed at compile time** (vlang/v#29601, #29723):
+  `$for attr in method.attributes`, `attr.name.all_after(' ')`,
+  `$for seg in path.split('/')` and `$if seg.starts_with(':')` fold and unroll,
+  so a router can generate one matcher per route. Against veb_like's trie on
+  bench/router's routes (aligned builds), that was 3–5% faster for routes with
+  two or three params, but 6–25% slower for static routes, catch-alls and 404s,
+  and slower for 405 (no prebuilt `Allow`); it is linear in the number of routes
+  and picks the first declared route, not the most specific. veb_like keeps the
+  trie.
+- **A struct holding a fixed array stays on the stack one call deep**
+  (vlang/v#29546). Passed by `mut` or `&` to a callee that reads or writes its
+  fields itself, it stays local; if that callee passes it on, even to a method
+  (`p.get(name)`), the struct is still `memdup`'d per call. `veb_like.Params` is
+  handed to handlers that call `p.get`, so it keeps eight plain fields
+  (`v0`…`v7`, indexed through the first one's address). `-warn-about-allocs`
+  reports the move ("local moved to the heap: its fixed array storage may
+  escape"); vlang/v#29801 asks for summaries that follow such calls. A bare
+  fixed-array local passed as `&a[0]` was never moved.
+- **An address passed straight into a comptime call escapes.** `&p` given to
+  `app.$method(...)` inside the `$for` moves `p` to the heap ("its address
+  escapes"), whatever its type; the same call behind an ordinary method keeps it
+  on the stack. veb_like matches in one method and calls handlers from another
+  (`dispatch`), which is why its `Params` stays local (vlang/v#29801).
+- **Forwarding a `mut` parameter in a comptime call works** since
+  vlang/v#29404: `app.$method(req, p, mut out)`.
+- **Methods are values** since vlang/v#29551: `App.one` and `T.$method` are
+  plain `fn (&App, …)` pointers, no closure (`app.one` still allocates one).
+  Dispatching through a table of them measured within a few percent of the
+  `$for` jump table, so veb_like keeps the `$for`.
+- **`@[noalloc]` exists** (vlang/v#29567, `doc/noalloc.md` in V) but, on
+  `5516000`, it rejects `&&` and `||`, struct literals whose type has field
+  defaults, and string views (`tos`, returning a `string`), so the routers can't
+  carry it without contortions (vlang/v#29800). The runtime tests
+  (`test_routing_allocates_nothing`) remain the check.
+
+## Appending a static response
+
+Measured on a 102-byte `200 OK … Hello, World!` response appended to a reused
+`out` (`-prod -gc none`, Ryzen 7 5800H, best of 7 × 100M appends, V 0.5.2 0137eb5):
+
+| const and append | ns/append |
+|---|---|
+| `r = '…'.bytes()`, `out << r` | 5.1 |
+| `r = '…'`, `unsafe { out.push_many(r.str, r.len) }` | 5.1–5.2 |
+| `r = [u8(…), …]!`, `unsafe { out.push_many(&r[0], r.len) }` | 5.2–5.4 |
+| `r = '…'`, `core.append_str(mut out, r)` (below) | 2.4–2.8 |
+
+- **The call matters, not the storage.** `<<` and `push_many` go through the generic
+  `array__push_many` / `array_push_many_ptr` (`ensure_cap`, a size multiply,
+  `memcpy@plt`), which is never inlined. So a `.bytes()` const, a string const and a
+  fixed `[N]u8` cost the same, and a fixed array's compile-time length buys nothing.
+- **gcc already knows a `const` string's bytes and length.** Inlined, the append is
+  `add $0x66` plus six 16-byte `movups`, the same code as for a fixed `[N]u8`. A
+  `.bytes()` const can't get there: its data is a heap copy made at startup, so even
+  an inlined append calls `memcpy` (4.7–4.9 ns).
+- **Don't slice a fixed array to append it.** `out << fixed[..]` builds a new heap
+  array on every call (`new_array_from_c_array` + `array_slice`), `-prod` included;
+  under `-gc none` that is a per-request leak.
+
+The helper is [`core.append_str`](../core/append_str.v): the inlined fast path
+is a capacity check plus `vmemcpy`, and growing `out` or appending to a slice
+view goes to a `noinline` `push_many`, so it behaves exactly like `push_many`.
+Keeping that fallback out of line is what keeps the fast path at 2.4–2.7 ns
+(4.6–4.8 ns for `out << r` in the same run); inlined, the check alone cost
+~0.7 ns.
+
+Scale: ~2.3 ns per response, against 50–150 ns of in-process work per request
+([#239](https://github.com/enghitalo/vanilla/issues/239)) and microseconds once
+syscalls count. It is still the default for static responses (see
+[BEST_PRACTICES §3a](BEST_PRACTICES.md#3a-static-responses--a-const-string-appended-with-coreappend_str)):
+free, and it drops the startup heap copy of every `.bytes()` const. A string →
+`[N]u8` literal (a `$fixed_bytes()`) would add nothing.
+
 ## Pure C escape hatch
 
 Allowed when it doesn't introduce a security problem. Good for: precise
 allocation (`C.malloc` = unzeroed, unmanaged, manual free), tight byte/bit ops,
 syscall wrappers, and sidestepping V codegen quirks. Example in the tree:
-[`http_server/epoll/epoll_shim.h`](../http_server/epoll/epoll_shim.h) keeps the
+[`epoll/epoll_shim.h`](../epoll/epoll_shim.h) keeps the
 `union epoll_data` access in C so V's GC never mislabels the union.
 
 ## Beyond `[]u8`
@@ -144,9 +233,13 @@ recipes are reproducible.)
 *which function allocates and how many times per request*. The recipe that makes
 it usable:
 
-- **Build with `-cc gcc`, not the default tcc** — callgrind can't resolve V app
-  symbols from tcc's debug info (everything shows as a hex address); gcc emits
-  DWARF, so `main__*` / `pg_async__*` are named.
+- **Build with `-cc gcc`, not the default tcc** — callgrind names a tcc build's
+  functions but gives them no file:line (`???`); gcc emits DWARF, so
+  `pg_async__*` (and the unprefixed `main` module functions) come with lines.
+- **`-g` lines are `.v` lines** on V ≥ 56509a4
+  ([vlang/v#29220](https://github.com/vlang/v/pull/29220)); older V3 builds
+  print `src.c:N` from a deleted file — keep the C with a `-cc` wrapper
+  ([#168](https://github.com/enghitalo/vanilla/pull/168)).
 - **`--instr-atstart=no`, then `callgrind_control -i on` *after* a hard warmup** —
   so pool bring-up + SCRAM + buffers reaching high-water run uninstrumented and
   only steady-state per-request work is counted.
@@ -168,6 +261,14 @@ it usable:
 each under load for a fixed window sampling `VmRSS`, report bytes/request + the
 trajectory (linear climb = real leak; jump-then-flat = one-time setup). Subtract
 the Boehm floor. A **hard RSS cap** kills a runaway so it's safe unattended.
+
+**In a test, assert on heap bytes, not RSS.** RSS moves in pages, and where
+transparent huge pages are `always` (GitHub's ubuntu-24.04 runners) in 2 MiB steps
+with no allocation at all: khugepaged collapsing a range, or a huge page faulted in.
+glibc's `mallinfo2()` (`uordblks + hblkhd`: bytes in use over every arena) is exact
+under `-gc none`, where every V allocation is a `malloc`; see
+[tests/tls_static_test.v](../tests/tls_static_test.v). Under `-race`
+ThreadSanitizer's allocator replaces malloc, and `mallinfo2` does not see it.
 
 **heaptrack caveat:** it sees `-gc none` allocations, but attributes from process
 start, so one-time bring-up (SCRAM/PBKDF2, lazy init) blurs the per-request

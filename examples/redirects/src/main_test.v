@@ -5,7 +5,7 @@ module main
 // direct assertion. This is the cheapest, most deterministic layer.
 // (.bytestr()/string helpers are fine HERE — tests are scaffolding, not the
 // hot path.)
-import http_server.core
+import core
 
 fn test_safe_next_rejects_offsite() {
 	assert safe_next('/dashboard'.bytes()) == '/dashboard'.bytes() // same-origin relative: ok

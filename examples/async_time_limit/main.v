@@ -14,8 +14,8 @@ module main
 // slow upstream, a long query loop): one monotonic check per resume, no extra
 // watch. (A single hard wall-clock deadline can also be a second timerfd — but
 // v1 allows one in-flight watch per conn, so here we check the clock per step.)
-import http_server
-import http_server.core
+import server
+import core
 import time
 
 #include <sys/timerfd.h>
@@ -27,7 +27,7 @@ fn C.read(fd int, buf voidptr, count usize) int
 
 const budget_ms = i64(300)
 
-const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 // Job is the per-request state carried across ticks via watch_payload.
 struct Job {
@@ -43,7 +43,7 @@ fn arm_periodic(tfd int, ms int) {
 	spec[1] = i64(ms % 1000) * 1_000_000
 	spec[2] = spec[0]
 	spec[3] = spec[1]
-	C.timerfd_settime(tfd, 0, voidptr(&spec[0]), unsafe { nil })
+	C.timerfd_settime(tfd, 0, unsafe { voidptr(&spec[0]) }, unsafe { nil })
 }
 
 // parse_steps pulls N out of `/job?steps=N`, defaulting to 10.
@@ -61,7 +61,7 @@ fn parse_steps(req []u8) int {
 
 fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if !req.bytestr().contains('/job') {
-		out << not_found
+		core.append_str(mut out, not_found)
 		return .done
 	}
 	tfd := C.timerfd_create(C.CLOCK_MONOTONIC, 0)
@@ -100,10 +100,10 @@ fn tick(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, 
 }
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            8095
 		io_multiplexing: .epoll
 		handler:         handle
 	})!
-	server.run()
+	srv.run()
 }

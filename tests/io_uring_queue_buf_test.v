@@ -7,10 +7,10 @@
 // server per process, so this must not share a binary with another io_uring
 // server test. Migrated from http_server/io_uring_queue_buf_test.v onto vtest
 // (docs/VTEST.md). Compile-time `$if linux` (the .io_uring enum value is
-// Linux-only) + runtime http_server.iou_backend_available() self-skip on
+// Linux-only) + runtime server.iou_backend_available() self-skip on
 // sandboxed runners.
-import http_server
-import http_server.core
+import server
+import core
 import vtest
 
 // Preloaded, process-lifetime response: header + 70 000-byte body (> write_buf_cap,
@@ -55,11 +55,11 @@ fn test_io_uring_queue_buf_borrowed_send() ! {
 		return
 	}
 	$if linux {
-		if !http_server.iou_backend_available() {
+		if !server.iou_backend_available() {
 			eprintln('[test] io_uring_setup blocked (sandboxed runner); skipping')
 			return
 		}
-		out := vtest.drive(http_server.ServerConfig{
+		out := vtest.drive(server.ServerConfig{
 			io_multiplexing: .io_uring
 			handler:         iou_qb_handler
 		}, [

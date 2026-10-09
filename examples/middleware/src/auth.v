@@ -4,7 +4,7 @@ module main
 // controller. Public routes call nothing; private routes call require_auth();
 // role-gated routes call require_role(). A guard returns the User, or an error
 // carrying the HTTP status the controller should send.
-import http_server.http1_1.request_parser { HttpRequest }
+import http1_1.request_parser { HttpRequest }
 
 struct User {
 	id   int
@@ -52,7 +52,8 @@ fn bearer_token(req HttpRequest) string {
 }
 
 // user_for_token resolves a token to a user. DEMO ONLY — in production validate a
-// signed JWT (see examples/auth) instead of a static table.
+// signed JWT (see examples/auth) instead of a static table. A `match` on a secret
+// is not constant-time: compare secrets with `crypto.hmac.equal`.
 fn user_for_token(token string) ?User {
 	return match token {
 		'tok-alice' {

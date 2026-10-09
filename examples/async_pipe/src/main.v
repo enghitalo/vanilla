@@ -9,36 +9,36 @@
 // Try:  curl http://localhost:8094/async   -> "async-ok"
 module main
 
-import http_server
-import http_server.core
+import server
+import core
 
 #include <unistd.h>
 
-fn C.pipe(fds &int) int
+fn C.pipe(fds &i32) int
 fn C.write(fd int, buf voidptr, n usize) int
 fn C.read(fd int, buf voidptr, n usize) int
 fn C.close(fd int) int
 
-const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
+const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'
 
 // handle parks /async on a pipe read-end and answers everything else immediately.
 fn handle(req []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if req.bytestr().contains('/async') {
-		mut fds := [2]int{}
+		mut fds := [2]i32{} // C ints: V int is 64-bit
 		if C.pipe(unsafe { &fds[0] }) != 0 {
-			out << resp_ok
+			core.append_str(mut out, resp_ok)
 			return .done
 		}
 		// Stand in for "async work finished": make the read end readable. A real
 		// consumer would instead watch a DB socket / upstream / timer that becomes
 		// ready later — the worker keeps serving others until then.
 		b := u8(1)
-		C.write(fds[1], &b, 1)
-		C.close(fds[1])
-		event_loop.watch_fd(fds[0], .readable, pipe_done, unsafe { nil })
+		C.write(int(fds[1]), &b, 1)
+		C.close(int(fds[1]))
+		event_loop.watch_fd(int(fds[0]), .readable, pipe_done, unsafe { nil })
 		return .suspend
 	}
-	out << resp_ok
+	core.append_str(mut out, resp_ok)
 	return .done
 }
 
@@ -54,9 +54,9 @@ fn pipe_done(mut out []u8, ready_fd int, _ready_fd_error bool, _watch_payload vo
 }
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:    8094
 		handler: handle
 	})!
-	server.run()
+	srv.run()
 }

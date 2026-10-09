@@ -3,7 +3,7 @@ module main
 // The composition primitive. A middleware is a function that wraps a handler;
 // chain() folds a list of them into one, ONCE at startup. No registry, no DI,
 // no per-request dispatch — Invariant 2 (zero abstraction).
-import http_server.core
+import core
 
 // Handler is the frozen core contract: bytes in (+ worker), response bytes
 // APPENDED to `out`, next Step returned.

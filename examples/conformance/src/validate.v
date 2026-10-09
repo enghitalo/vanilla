@@ -1,6 +1,6 @@
 module main
 
-import http_server.http1_1.request_parser
+import http1_1.request_parser
 
 // Conformance verdict for a decoded request. The handler maps each to a status.
 enum Verdict {
@@ -16,9 +16,12 @@ enum Verdict {
 // per-check comments for the spec reference.
 //
 // Layering: the framer (frame_request_length_lim) has already rejected the
-// grossest framing errors (missing CRLF, over-limit head/body, bad chunk-size,
-// invalid Content-Length digits) before the handler ever runs — those arrive as
-// a 400 from the backend, never reaching here. This function covers the checks
+// grossest framing errors (missing CRLF, over-limit head/body, bad chunk-size
+// line or chunk extension, malformed trailer line, invalid Content-Length
+// digits, and the ambiguous Content-Length / Transfer-Encoding framings of
+// #184) before the handler ever runs — those arrive as a 400 from the backend,
+// never reaching here. A chunked body's trailer section is framed and left in
+// req.body (trailer fields are discarded). This function covers the checks
 // that require the parsed header view: version gate, Host rules, CL/TE conflict,
 // field-name/value syntax, obsolete folding, and unknown transfer-codings.
 fn classify(req request_parser.HttpRequest) Verdict {
@@ -47,20 +50,24 @@ fn classify(req request_parser.HttpRequest) Verdict {
 	// --- Duplicate Content-Length (RFC 9112 §6.3) ---------------------------
 	// A message with more than one Content-Length field-line is malformed and
 	// MUST be rejected — the classic smuggling vector where two lengths disagree.
-	// The framer keys off the FIRST Content-Length and frames the body to it,
-	// treating the rest as pipelined, so it never rejects this on its own; count
-	// the header here. (`Content-Length: 5\r\nContent-Length: 5` — same value
-	// repeated — is technically allowed by §6.3, but we reject any repeat: it is
-	// safer and no legitimate client sends it.)
+	// On a live server the framer already answers DIFFERING values with 400 +
+	// close before the handler runs (#184); it accepts an identical repeat, which
+	// RFC 9110 §8.6 allows. This check is stricter and also covers handler-level
+	// callers: `Content-Length: 5\r\nContent-Length: 5` is rejected too — safer,
+	// and no legitimate client sends it.
 	if req.count_header('Content-Length') > 1 {
 		return .bad_request
 	}
 
 	// --- Transfer-Encoding coding check (RFC 9112 §6.1 / §7) ----------------
 	// If Transfer-Encoding is present its final coding MUST be "chunked", and a
-	// server MUST reject an unrecognized coding. The framer only acts on chunked;
-	// it treats "nonsense" or "chunked, gzip" as a bodyless request, so we gate
-	// them here (501 for unknown coding, 400 for chunked-not-final).
+	// server SHOULD answer an unrecognized coding with 501. On a live server the
+	// framer already rejects, with 400 + close, every list whose final coding is
+	// not chunked ("nonsense", "chunked, gzip"), chunked twice, TE with
+	// Content-Length, and TE on HTTP/1.0 (#184: §6.3's 400 is a MUST, the 501 a
+	// SHOULD). What still reaches here is an unknown coding BEFORE a final
+	// chunked ("foo, chunked"): the framing is sound, so this gate answers 501.
+	// The checks below also keep handler-level callers (the tests) conformant.
 	if te := req.get_header_value_slice('Transfer-Encoding') {
 		// Transfer-Encoding is an HTTP/1.1 feature; a 1.0 sender cannot use it
 		// (RFC 9112 §6.1 — a server MUST NOT interpret chunked from a 1.0 peer).

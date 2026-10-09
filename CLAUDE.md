@@ -44,15 +44,25 @@ registry.
   `buf[a..b]` (it marks the source buffer every call).
 - **Never concatenate (`+`) or interpolate (`${}`) in request-serving code** —
   not even on deliberately slow routes. Each one allocates (ints also pay
-  `.str()`). Use `const ... .bytes()` for static responses, append parts
-  straight into `out` (`push_many` + `strconv.write_dec`), and a single
+  `.str()`). Write static responses as `const` strings appended with
+  `core.append_str`, append parts straight into `out` (`core.append_str` +
+  `strconv.write_dec`), and a single
   `strings.Builder` (`write_string` / `write_decimal` / `write_u8`) when a
   dynamic string is unavoidable. `${}` is fine in `eprintln`/`error()`
   diagnostics off the request path.
 - Allocate with intent: `[]u8{cap: n}` is uninitialized/noscan; large `cap`
   costs GC pressure. Size to the realistic case.
 - **Benchmark before/after** any perf change with `-prod`; verify thread safety
-  with `valgrind --tool=helgrind`.
+  with V's race detector, `v -race` (ThreadSanitizer). CI runs the epoll e2e
+  suites under it (`.github/workflows/race_detector.yml`).
+
+## Before every commit
+
+**Always run `v fmt -w .` from the repo root and include the resulting changes
+in the commit.** CI gates merges on `v fmt -verify .`
+(`.github/workflows/pretty_fmt_checker.yml`) using the latest V, so an
+unformatted file — even a pre-existing one that a newer V formatter rule now
+rewrites — fails the whole PR.
 
 ## Commit messages
 

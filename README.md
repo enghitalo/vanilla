@@ -8,14 +8,16 @@ A minimalist, high-performance HTTP server written in [V](https://vlang.io).
 
 - **Fast**: Multi-threaded, non-blocking I/O, lock-free, copy-free, I/O multiplexing, `SO_REUSEPORT` (native load balancing on Linux)
 - **Modular**: Easy to extend with custom controllers and handlers.
+- **Routing without allocation**: route by `match` over the path's segments with [`http1_1.router`](http1_1/router/router.v), which reads the method and a zero-copy path cursor straight from the request line (the fastest, [`examples/router/`](examples/router/)), or declare `@['GET /users/:id']` methods and let [`http1_1.veb_like`](http1_1/veb_like/router.v) compile them into a trie at startup ([`examples/veb_like/`](examples/veb_like/)). Either way routing allocates nothing — a hit, a 404 or a 405 — and handlers keep the full contract (`.suspend` included).
 - **Memory Safety**: No race conditions.
 - **No Magic**: Transparent and straightforward.
-- **E2E Testing**: Test handlers in-process by passing raw requests directly to `handle_request()`, or drive a running server over a real socket with `net.dial_tcp` and a read deadline (see [`http_server/backend_behaviors_test.v`](http_server/backend_behaviors_test.v)).
+- **E2E Testing**: Test handlers in-process by passing raw requests directly to `handle_request()`, or drive a running server — TCP or unix socket — with the `vtest` scripted client (raw fds via `transport.dial_tcp`/`dial_unix`; see [`tests/backend_behaviors_test.v`](tests/backend_behaviors_test.v)).
 - **SSE Friendly**: Built-in Server-Sent Events support (sync and async).
 - **ETag Friendly**: Conditional GETs with `ETag` and `If-None-Match` headers.
 - **Database Friendly**: Example with PostgreSQL connection pool.
-- **Graceful Shutdown**: Drain in-flight requests on `SIGTERM`/`SIGINT` via `server.shutdown(grace_ms)`.
+- **Graceful Shutdown**: Drain in-flight requests on `SIGTERM`/`SIGINT` via `srv.shutdown(grace_ms)`.
 - **Multiple Backends**: epoll, io_uring (Linux), kqueue (macOS), IOCP (Windows).
+- **Local IPC**: listen on a unix domain socket (`ServerConfig.unix_socket_path`) instead of TCP — ≈3× lower RTT than TCP loopback, filesystem permissions as access control, kernel-verified peer identity (`socket.peer_cred`: pid/uid/gid via `SO_PEERCRED`/`getpeereid`); dial other local services with `transport.dial_unix`/`dial_tcp`.
 - **One Handler Contract**: a single `handler` signature covers every use case, with every input as an explicit, self-describing parameter — append the response and return `.done`, suspend/resume on any fd (DB sockets, timers, upstream proxies) with `event_loop.watch_fd(...)` + `.suspend`, and reach lock-free per-worker state (e.g. a per-thread DB connection — no shared pool, no mutex) via the `worker_state` parameter.
 - **Compliant with HTTP standards**: Follows [RFC 9112](https://datatracker.ietf.org/doc/rfc9112/) and the [IANA Field Name Registry](https://www.iana.org/assignments/http-fields/http-fields.xhtml). A dedicated [`examples/conformance/`](examples/conformance/) handler is probed in CI by [h1spec](https://github.com/dropseed/h1spec) and [Http11Probe](https://github.com/MDA2AV/Http11Probe) — see [Conformance Testing](#conformance-testing).
 
@@ -26,8 +28,8 @@ A minimalist, high-performance HTTP server written in [V](https://vlang.io).
 ### 1. Simple HTTP Server
 
 ```v
-import http_server
-import http_server.core
+import server
+import core
 
 fn handle_request(request []u8, mut response []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	// Parse the request and APPEND the complete raw HTTP response
@@ -36,24 +38,24 @@ fn handle_request(request []u8, mut response []u8, client_fd int, worker_state v
 	// single send — never free or keep it. Return `.done` when the
 	// response is complete, `.close` to flush-and-drop the connection, or
 	// `.suspend` after parking the request via `event_loop.watch_fd(...)`.
-	response << 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'.bytes()
+	core.append_str(mut response, 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok')
 	return .done
 }
 
 fn main() {
-	mut backend := unsafe { http_server.IOBackend(0) }
+	mut backend := unsafe { server.IOBackend(0) }
 	$if linux {
-		backend = http_server.IOBackend.epoll
+		backend = server.IOBackend.epoll
 	}
 	$if darwin {
-		backend = http_server.IOBackend.kqueue
+		backend = server.IOBackend.kqueue
 	}
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		handler:         handle_request
 		io_multiplexing: backend
 	})!
-	server.run()
+	srv.run()
 }
 ```
 
@@ -71,11 +73,12 @@ fn test_handle_request() {
 }
 ```
 
-Or drive a running server over a real client socket — spawn `server.run()` on a
-thread, then send raw requests with `net.dial_tcp` and read the responses under a
-deadline. This exercises the full framing / keep-alive / suspend-resume path and
+Or drive a running server over a real client socket — the `vtest` module owns
+the whole lifecycle (ephemeral bind or unix socket, readiness, shutdown) and
+dials raw non-blocking fds through `transport`, with scripts as data. This
+exercises the full framing / keep-alive / suspend-resume path and
 never hangs on a stalled stream. See
-[`http_server/backend_behaviors_test.v`](http_server/backend_behaviors_test.v)
+[`tests/backend_behaviors_test.v`](tests/backend_behaviors_test.v)
 for the pattern (pipelining, framing across TCP segments, timeouts, graceful
 shutdown) and the `*_end_to_end_test.v` files under [`examples/`](examples/) for
 per-app end-to-end tests.
@@ -83,20 +86,42 @@ per-app end-to-end tests.
 ### 3. Graceful Shutdown
 
 ```v
-import http_server
+import server
 import os
 
 fn main() {
-	mut server := http_server.new_server(http_server.ServerConfig{ ... })!
+	mut srv := server.new_server(server.ServerConfig{ ... })!
 
-	os.signal_opt(.term, fn [server] (_ os.Signal) {
-		server.shutdown(2000) // drain up to 2 s, then exit
+	// A signal handler runs in async-signal context, on whichever thread the
+	// kernel interrupts (possibly a worker), so it only writes one byte to a
+	// pipe: write(2) is async-signal-safe.
+	wake := os.pipe()!
+	on_signal := fn [wake] (_ os.Signal) {
+		saved := C.errno // leave the interrupted code's errno untouched
+		C.write(wake.write_fd, c'x', 1)
+		C.errno = saved
+	}
+	os.signal_opt(.term, on_signal)!
+	os.signal_opt(.int, on_signal)!
+
+	// An ordinary thread waits for that byte, then drains and exits.
+	spawn fn [srv, wake] () {
+		os.fd_read(wake.read_fd, 1) // blocks until SIGTERM / SIGINT
+		srv.shutdown(2000) // stop accepting, drain up to 2 s
 		exit(0)
-	}) or {}
+	}()
 
-	server.run()
+	srv.run()
 }
 ```
+
+Don't call `srv.shutdown()` or `exit()` inside the signal handler itself.
+Neither one is async-signal-safe. `exit()` runs `atexit` handlers and flushes
+stdio, so it can deadlock on a lock that the interrupted thread holds. And if the
+signal lands on a worker, that worker spins inside `shutdown()` and can't finish
+its own in-flight request, so the drain waits out the whole grace period and the
+request is dropped anyway. [`examples/graceful_shutdown/`](examples/graceful_shutdown/)
+is this pattern as a runnable program.
 
 ### 4. Startup hook (`after_server_start`)
 
@@ -110,14 +135,14 @@ client proceeds the instant the server is ready instead of polling for it:
 
 ```v
 ready := chan bool{cap: 1}
-mut server := http_server.new_server(http_server.ServerConfig{
+mut srv := server.new_server(server.ServerConfig{
 	handler:            handle_request
 	after_server_start: fn [ready] () {
 		ready <- true
 	}
 })!
-spawn fn [mut server] () {
-	server.run()
+spawn fn [mut srv] () {
+	srv.run()
 }()
 _ := <-ready // deterministic readiness — the server is now accepting
 ```
@@ -127,7 +152,7 @@ _ := <-ready // deterministic readiness — the server is now accepting
 **Run the example:**
 
 ```sh
-v -prod run examples/sse
+v -prod run examples/sse/src
 ```
 
 **Subscribe (front-end):**
@@ -163,7 +188,7 @@ docker-compose -f examples/database/docker-compose.yml up -d
 **Run the server:**
 
 ```sh
-v -prod run examples/database
+v -prod run examples/database/src
 ```
 
 **Example handler (pool captured via closure):**
@@ -172,7 +197,7 @@ v -prod run examples/database
 fn main() {
 	mut pool := new_connection_pool(pg.Config{ ... }, 5) or { panic(err) }
 
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
 		io_multiplexing: backend
 		handler:         fn [mut pool] (request []u8, mut response []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
@@ -181,7 +206,7 @@ fn main() {
 			return .done
 		}
 	})!
-	server.run()
+	srv.run()
 }
 ```
 
@@ -210,18 +235,23 @@ fn main() {
 | `examples/hexagonal/` | Hexagonal architecture |
 | `examples/ip_block/` | IP allowlist / blocklist |
 | `examples/json_api/` | JSON API with multipart upload |
+| `examples/mesh/` | Local mesh: edge on TCP calling a backend on UDS via `http1_1.client` + a pooled per-worker connection + watch/suspend |
+| `examples/https_upstream/` | A handler calling a third-party HTTPS API without blocking its worker: the `http1_1.upstream` pooled client (TLS 1.3 verify-full, keep-alive reuse, deadlines, retries, a resolver thread) |
 | `examples/middleware/` | Middleware chain (auth, RBAC, 404) |
 | `examples/observability/` | `/healthz`, `/readyz`, `/metrics` |
 | `examples/proxy_aware/` | `X-Forwarded-For` / real-IP extraction |
 | `examples/rate_limit/` | Token-bucket rate limiting |
 | `examples/redirects/` | 301/303/308 redirects |
-| `examples/request_limits/` | 413/431 body and header size limits |
+| `examples/request_limits/` | 413/431 body and header size limits, max connections, read/idle/write timeouts |
 | `examples/security_headers/` | HSTS, CSP, and other security headers |
 | `examples/sse/` | Server-Sent Events (sync broadcast) |
-| `examples/static_assets/` | CSR/WASM SPA bundle (`application/wasm`, `.br`/`.gz`, immutable caching, SPA fallback) |
+| `examples/spa_static_assets/` | CSR/WASM SPA bundle (`application/wasm`, `.br`/`.gz`, immutable caching, SPA fallback) |
 | `examples/static_files/` | Static file serving (MIME, Range, ETag, traversal safety) |
 | `examples/url_form/` | Query-string and URL-encoded form parsing |
-| `examples/veb_like/` | veb-style declarative routing |
+| `examples/router/` | Routing as code: `match` over path segments with `http1_1.router`'s zero-copy cursor — the fastest option |
+| `examples/veb_like/` | Declarative routing with `http1_1.veb_like`: `@['GET /users/:id']` methods compiled into a trie at startup, zero allocations per request |
+| `examples/websocket_echo/` | RFC 6455 WebSocket echo over the connection-takeover seam (`core.queue_takeover` — one engine, two protocols on one connection) |
+| `examples/http2_cleartext/` | HTTP/2 (cleartext, prior-knowledge, RFC 9113) over the same seam — the `PRI *` preface flips the connection, then the SAME handler serves h1 and http2 requests |
 | `examples/video_stream/` | HTTP video streaming |
 | `examples/async_sse/` | SSE via async handler (suspend/resume on fd) |
 | `examples/async_db_pg/` | PostgreSQL queries via async handler |
@@ -237,13 +267,16 @@ Two layers, no bespoke test mode on the server:
 - **In-process** — call the handler directly (`handle_request(req, mut out, ...)`)
   and assert on the bytes it appends. Deterministic, no sockets, no threads; ideal
   for routing and response-shape assertions.
-- **Over a real socket** — spawn `server.run()` on a thread, connect with
-  `net.dial_tcp`, and read responses under a per-read deadline (so a broken stream
-  fails fast instead of hanging). This drives the real backend end to end —
+- **Over a real socket** — drive the server with `vtest` (scripts as data,
+  lifecycle owned by the harness) or dial raw fds yourself with
+  `transport.dial_tcp`/`dial_unix` + `testkit`'s deadline-bounded `fd_*`
+  readers (so a broken stream fails fast instead of hanging). Either way this
+  drives the real backend end to end —
   epoll / io_uring / kqueue — including pipelining, request framing across TCP
-  segments, keep-alive, `Expect: 100-continue`, half-close, read timeouts, and the
-  async suspend/resume path. See
-  [`http_server/backend_behaviors_test.v`](http_server/backend_behaviors_test.v)
+  segments, keep-alive, `Expect: 100-continue`, half-close, read/idle timeouts
+  (not on kqueue, which does not enforce them yet), and the async
+  suspend/resume path. See
+  [`tests/backend_behaviors_test.v`](tests/backend_behaviors_test.v)
   and the `*_end_to_end_test.v` files under [`examples/`](examples/).
 
 ---
@@ -339,10 +372,10 @@ those decisions.)
 | 🟢 | Header flood | pass |
 | 🟢 | Oversized header | pass |
 
-_h1spec `--strict`, live socket · commit `c648a8a` · [run log](https://github.com/enghitalo/vanilla/actions/runs/29427386853) · regenerated by CI on every merge_
+_h1spec `--strict`, live socket · commit `c6cd018` · [run log](https://github.com/enghitalo/vanilla/actions/runs/37880652860) · regenerated by CI on every merge_
 <!-- CONFORMANCE_SCORECARD:END -->
 
-<sub>Live-probe pass/blocked split shifts run to run (the [#103](https://github.com/enghitalo/vanilla/issues/103) half-close teardown is timing-dependent); the `v test` gate and [`examples/conformance/README.md`](examples/conformance/README.md) are the stable references. Two tracked core gaps: [#103](https://github.com/enghitalo/vanilla/issues/103) (half-close) and [#104](https://github.com/enghitalo/vanilla/issues/104) (CL+TE framing).</sub>
+<sub>The live-probe pass/blocked split can shift from run to run (⚪ blocked can be socket-timing noise on a hosted runner); the `v test` gate and [`examples/conformance/README.md`](examples/conformance/README.md) are the stable references. The former core gaps [#103](https://github.com/enghitalo/vanilla/issues/103) (half-close), [#104](https://github.com/enghitalo/vanilla/issues/104) (CL+TE framing) and [#109](https://github.com/enghitalo/vanilla/issues/109) (chunk-data CRLF) are fixed, and so are the framing gaps [#184](https://github.com/enghitalo/vanilla/issues/184) (ambiguous framing), [#185](https://github.com/enghitalo/vanilla/issues/185) (chunked trailers and chunk-size lines) and [#186](https://github.com/enghitalo/vanilla/issues/186) (field-value whitespace).</sub>
 
 ---
 
@@ -365,7 +398,7 @@ cp -r ./ ~/.vmodules/enghitalo/vanilla
 3. Run an example:
 
 ```bash
-v -prod crun examples/simple
+v -prod crun examples/simple/src
 ```
 
 ### Via `v install`
@@ -373,6 +406,14 @@ v -prod crun examples/simple
 ```bash
 v install https://github.com/enghitalo/vanilla
 ```
+
+### System libraries
+
+None on Linux: the io_uring backend drives the kernel ring through the raw
+`io_uring_setup` / `io_uring_enter` / `io_uring_register` syscalls, not
+liburing, so neither building nor running a vanilla binary needs liburing
+(`ldd` lists only libc and libm). Minimal images (`-slim`, distroless) work
+as they are.
 
 ---
 
@@ -395,6 +436,7 @@ See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark 
 | Resource | Description |
 |---|---|
 | [Wiki](https://github.com/enghitalo/vanilla/wiki) | Architecture deep-dives, async reactor, memory management under `-gc none`, Postgres pipelining, and lessons learned |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The module tree, the one-direction dependency rule between modules, and where new protocols/platforms land |
 | [docs/BEST_PRACTICES.md](docs/BEST_PRACTICES.md) | How to write handlers, build responses, allocate, handle concurrency, security, testing, and benchmarking |
 | [docs/V_PERF_TOOLBOX.md](docs/V_PERF_TOOLBOX.md) | V performance attributes, array flags, the C escape hatch, profiling allocations, and known gotchas |
 | [docs/PERF_GAP_ANALYSIS.md](docs/PERF_GAP_ANALYSIS.md) | Comparison against the fastest HTTP servers (tokio, io_uring C, Zig, Rust) and what was done to close the gaps |
@@ -408,19 +450,21 @@ See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark 
 ### vanilla — future improvements
 
 - [ ] Per-worker `SO_REUSEPORT` accept on epoll — eliminate the single central accept thread (the io_uring backend already does per-worker accept; epoll still round-robins fds from one acceptor). Blocked by clean multi-server shutdown lifecycle.
-- [ ] Dynamic route matching (`/user/:id`) with a trie or radix tree
+- [x] Dynamic route matching (`/user/:id`) — `router` (segment cursor + `match`) and `veb_like` (attribute routes compiled into a segment trie); zero allocations per request, 404/405/HEAD handled
 - [ ] Query-string parser (`?key=value&…`) as a zero-copy slice view
 - [x] Case-insensitive header lookup (IANA registry compliance) — `get_header_value_slice` / `count_header` fold ASCII case
 - [x] `Host` header validation (RFC 9112 §3.2) — `validate_http1()` (exactly-one Host); demonstrated end-to-end in `examples/conformance/`
-- [ ] Reject `Content-Length` + `Transfer-Encoding` at the framing layer ([#104](https://github.com/enghitalo/vanilla/issues/104)) — the smuggling case the conformance handler can't fix alone
-- [ ] Flush a queued response before tearing down a half-closed connection ([#103](https://github.com/enghitalo/vanilla/issues/103)) — unblocks the live h1spec/Http11Probe gate
-- [x] Request timeouts — `Limits.read_timeout_ms` (408) / `write_timeout_ms`, enforced by the per-worker deadline sweep
+- [x] Reject `Content-Length` + `Transfer-Encoding` at the framing layer ([#104](https://github.com/enghitalo/vanilla/issues/104)) — the smuggling case the conformance handler can't fix alone
+- [x] Flush a queued response before tearing down a half-closed connection ([#103](https://github.com/enghitalo/vanilla/issues/103)) — unblocks the live h1spec/Http11Probe gate
+- [x] Request timeouts — `Limits.read_timeout_ms` / `write_timeout_ms` / `idle_timeout_ms`, enforced by the per-worker deadline sweep. The first request's read deadline starts at accept (it bounds a silent connect and the TLS handshake); 408 only for a partial request, silent close otherwise; idle keep-alive connections are reaped after `idle_timeout_ms` (0 = inherit `read_timeout_ms`, -1 = never). Not enforced on kqueue yet
 - [x] Chunked transfer-encoding in the request parser (`frame_chunked_total`)
-- [ ] HTTP/2 support (multiplexing, HPACK, server push)
-- [ ] WebSocket upgrade (framing, ping/pong, close handshake)
-- [x] TLS/HTTPS — epoll backend via `ServerConfig.tls_config` (e.g. `tls.new_self_signed()`); other backends are plaintext
+- [x] HTTP/2 — cleartext prior-knowledge via the takeover seam: HPACK (RFC 7541, Appendix C-verified), multiplexed streams, send-side flow control (`http2/` + `examples/http2_cleartext/`); TLS/ALPN and the HTTP/1.1 Upgrade handshake still open
+- [x] WebSocket upgrade (framing, ping/pong, close handshake) — `websocket/` codec + `examples/websocket_echo/` over the takeover seam
+- [x] TLS/HTTPS — epoll backend via `ServerConfig.tls_config`; `tls.new_self_signed()` issues a localhost/loopback certificate with proper SANs, `sans: ['IP:203.0.113.5']` targets a real host and `persist_dir:` keeps the identity across restarts (or `tls.new_from_pem` for CA-issued certs); the handshake is bounded from accept by `read_timeout_ms` (or, without one, `idle_timeout_ms`); other backends are plaintext
+- [x] PostgreSQL over TLS — `pg_async.ConnConfig.ssl_mode` (`.require` / `.verify_ca` / `.verify_full`, with `ssl_root_cert` or the system CA bundle), TLS 1.3 through the same Mbed TLS 4 shim as the server (`-d vanilla_tls`); pooled connections re-dial over TLS without blocking, zero allocations per query
 - [ ] HTTPS example (`examples/https/`)
-- [x] Body-size cap + max-connections via `Limits` (`max_body_bytes` → 413, `max_request_bytes`, `max_connections`); a per-connection request-count limit is still open
+- [x] Outbound HTTP/1.1 + HTTPS client for handlers ([#229](https://github.com/enghitalo/vanilla/issues/229)) — `http1_1.upstream`: a per-worker pool parked on the reactor (`watch_fd_persistent`), TLS 1.3 verify-full + SNI, resumable framing (`client.Framer`: HEAD, 1xx, close-delimited bodies, keep-alive), pre-use liveness probe + one safe retry, connect/response deadlines from a maintenance timer, DNS off the workers (`Resolver`), IPv4/IPv6 dialing (`transport.dial_addr`), zero allocations per exchange; `examples/https_upstream/`
+- [x] Body-size cap + max-connections via `Limits` (`max_body_bytes` → 413, `max_request_bytes`, `max_connections`); pair `max_connections` with a read or idle timeout — reaping silent and idle connections is what frees their slots. A per-connection request-count limit is still open
 - [ ] Response caching layer (ETag + `Last-Modified` auto-generation)
 - [ ] Logging middleware example (`examples/logging/`)
 - [ ] API documentation (godoc-style, inline)

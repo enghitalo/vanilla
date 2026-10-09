@@ -14,8 +14,6 @@ RUN git clone --depth 1 https://github.com/vlang/v /opt/vlang && make
 
 RUN ln -s /opt/vlang/v /usr/bin/v
 
-RUN apt -y update && apt -y install liburing-dev linux-libc-dev
-
 RUN v install https://github.com/enghitalo/vanilla
 
 WORKDIR /app
@@ -31,9 +29,9 @@ WORKDIR /app
 # Copy the built binary
 COPY --from=build /app/server /app/server
 
-# Install runtime dependencies including liburing
+# curl for the HEALTHCHECK. No liburing: the binary needs only libc (#189).
 RUN apt -y update && \
-    apt -y install curl liburing2 && \
+    apt -y install curl && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 

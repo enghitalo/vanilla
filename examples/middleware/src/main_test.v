@@ -1,13 +1,17 @@
 module main
 
 import os
-import http_server.core
+import core
+import server
+import vtest
 
-// Pure tests for the middleware reference design. Three layers:
+// Tests for the middleware reference design. Four layers:
 //   1. the composition mechanics (chain order, single-alloc header injection);
 //   2. the per-route auth policy (public / private / role-gated) end-to-end
 //      through the composed handler;
-//   3. the access log line format (method + path + status), zero-parse path.
+//   3. the access log line format (method + path + status), zero-parse path;
+//   4. the wrappers hand the engine's inputs (client_fd, worker_state) to the
+//      wrapped handler unchanged — a real server run, via vtest.
 
 const probe_headers = ('X-Content-Type-Options: nosniff\r\n').bytes()
 
@@ -42,7 +46,7 @@ fn test_inject_headers_noop_without_status_line() {
 fn tag_mw(tag string) Middleware {
 	return fn [tag] (next Handler) Handler {
 		return fn [tag, next] (req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
-			step := next(req, mut out, -1, unsafe { nil }, mut event_loop)
+			step := next(req, mut out, client_fd, worker_state, mut event_loop)
 			if step != .done {
 				return step
 			}
@@ -149,5 +153,56 @@ fn test_access_log_skips_malformed_request_line() {
 	log.record('garbage'.bytes(), 'HTTP/1.1 200 OK\r\n\r\n'.bytes())
 	log.flush()
 	assert os.read_file(tmp)! == ''
+	os.rm(tmp) or {}
+}
+
+// ── the wrappers forward every handler input ──────────────────────────────────
+
+const probe_tag = 0x5eed
+
+const probe_ok = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const probe_lost = 'HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+
+struct ProbeState {
+	tag int = probe_tag
+}
+
+fn probe_state() voidptr {
+	return voidptr(&ProbeState{})
+}
+
+// probe answers 200 only when the engine's inputs reached it intact: a real
+// connection fd and this worker's make_state value. It checks for nil before
+// dereferencing, so a wrapper that drops worker_state fails the assert below
+// instead of segfaulting the test binary.
+fn probe(_req []u8, mut out []u8, client_fd int, worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
+	if client_fd < 0 || worker_state == unsafe { nil } {
+		out << probe_lost
+		return .done
+	}
+	state := unsafe { &ProbeState(worker_state) }
+	out << if state.tag == probe_tag { probe_ok } else { probe_lost }
+	return .done
+}
+
+fn test_chain_forwards_client_fd_and_worker_state() ! {
+	tmp := os.join_path(os.temp_dir(), 'mw_access_forward.log')
+	os.rm(tmp) or {}
+	log := new_access_log(tmp)!
+	got := vtest.drive(server.ServerConfig{
+		handler:    chain(probe, with_security_headers, access_log_mw(log))
+		make_state: probe_state
+	}, [vtest.Script{
+		rounds: [vtest.Round{
+			send: 'GET /probe HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+		}]
+	}])!
+	assert got.conns[0].connect_err == ''
+	assert got.conns[0].frames.len == 1
+	resp := got.conns[0].frames[0].bytestr()
+	assert resp.starts_with('HTTP/1.1 200 OK\r\n'), resp
+	assert resp.contains('X-Frame-Options: DENY') // both wrappers ran
+	log.flush()
+	assert os.read_file(tmp)! == 'GET /probe 200\n'
 	os.rm(tmp) or {}
 }

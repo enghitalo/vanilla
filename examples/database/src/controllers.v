@@ -1,7 +1,7 @@
 module main
 
 import strings
-import http_server.http1_1.response
+import http1_1.response
 
 const http_ok_response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
 
@@ -41,15 +41,44 @@ fn get_users_controller(params []string, mut pool ConnectionPool) ![]u8 {
 	return sb
 }
 
+// `users.id` is a `serial` (int4): at most 10 digits, at most max_user_id.
+const max_user_id_digits = 10
+const max_user_id = u64(2147483647)
+
+// is_user_id reports whether `id` is a plain decimal user id: 1-10 ASCII digits
+// that fit in an int4. No sign, no spaces, no SQL comments, no query string —
+// get_user_controller answers 400 to everything else.
+fn is_user_id(id string) bool {
+	if id.len == 0 || id.len > max_user_id_digits {
+		return false
+	}
+	mut n := u64(0)
+	for c in id {
+		if c < `0` || c > `9` {
+			return false
+		}
+		n = n * 10 + u64(c - `0`)
+	}
+	return n <= max_user_id
+}
+
+// get_user_controller looks up one user. `id` is validated FIRST (400 before
+// the pool is touched; it also keeps the stack copy below in bounds), and then
+// still BOUND as a query parameter ($1), never spliced into the SQL text: two
+// independent defenses against injection.
 @[direct_array_access; manualfree]
-fn get_user_controller(params []string, mut pool ConnectionPool) ![]u8 {
-	if params.len == 0 {
+fn get_user_controller(id string, mut pool ConnectionPool) ![]u8 {
+	if !is_user_id(id) {
 		return response.tiny_bad_request_response
 	}
-	id := params[0]
+	// libpq reads parameters as NUL-terminated C strings, and `id` is a view
+	// into the request buffer (not NUL-terminated): copy the digits onto the
+	// stack. The array is zeroed, so the terminator is already in place.
+	mut param := [max_user_id_digits + 1]u8{}
+	unsafe { vmemcpy(&param[0], id.str, id.len) }
 	mut db := pool.acquire() or { return tiny_internal_server_error_response }
 	defer { pool.release(db) }
-	result := db.exec('SELECT * FROM users WHERE id = ${id}') or {
+	result := db.exec_param('SELECT * FROM users WHERE id = $1', unsafe { tos(&param[0], id.len) }) or {
 		return tiny_internal_server_error_response
 	}
 	response_body := result.map(it.str()).join('\n')
@@ -61,10 +90,7 @@ fn get_user_controller(params []string, mut pool ConnectionPool) ![]u8 {
 	sb.write_string(response_body)
 
 	defer {
-		unsafe {
-			response_body.free()
-			params.free()
-		}
+		unsafe { response_body.free() } // never `id`: it borrows the request buffer
 	}
 	return sb
 }

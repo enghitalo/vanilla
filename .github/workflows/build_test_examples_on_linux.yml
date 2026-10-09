@@ -6,26 +6,51 @@ on:
   pull_request:
     branches: [ main ]
 
+# A new push to a pull request cancels that PR's run still in progress, so
+# superseded commits don't queue for the account's runners; on main every
+# commit is its own group and runs to the end.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   examples-building-and-testing:
     runs-on: ubuntu-latest
     name: ${{ matrix.folder }}
+    timeout-minutes: 20 # backstop for a hung vtest e2e test (no client timeouts)
     strategy:
       fail-fast: false # Continue other jobs if one fails
       matrix:
         folder:
+          - examples/async_date_timerfd
+          - examples/async_db_pg/src # its e2e test runs against a fake PostgreSQL
+          - examples/async_multi_watch
           - examples/async_pipe/src
+          - examples/async_sse
+          - examples/async_time_limit
+          - examples/async_timer
           - examples/chunked_streaming/src
           - examples/compression/src
           - examples/conformance/src
+          - examples/cors/src
           - examples/database/src
           - examples/etag/src
+          - examples/graceful_shutdown/src
           - examples/hexagonal/src
+          - examples/http2_cleartext/src
+          - examples/https_upstream/src # the pooled upstream client (plain HTTP here; HTTPS in tls_backend.yml), against its fake upstream (V)
           - examples/io_uring_demo/src
+          - examples/json_api/src
+          - examples/mesh/src
           - examples/per_server_workers/src
+          - examples/rate_limit/src
+          - examples/request_limits/src
+          - examples/router/src
           - examples/simple/src
           - examples/simple2/src
           - examples/sse/src
+          - examples/veb_like/src
+          - examples/websocket_echo/src
     steps:
       - uses: actions/checkout@v4
       - name: Set up V
@@ -41,23 +66,23 @@ jobs:
           # Just the build deps. The previous `apt upgrade -y linux-generic` pulled a
           # full kernel package set (linux-image/headers/firmware) on every run — slow
           # and flaky (dpkg "cannot perform the following tasks"), and pointless for
-          # building examples: liburing-dev is userspace and linux-libc-dev already
-          # ships the io_uring headers, neither needs a running-kernel upgrade.
+          # building examples: linux-libc-dev is userspace and needs no
+          # running-kernel upgrade. (No liburing: the io_uring module drives the
+          # ring through the raw syscalls, #189.)
           sudo apt-get update
           # libbrotli1 ships the enc/dec runtime .so.1 that compress.brotli
           # dlopens, so the compression example tests the `br` path for real
           # (without it they skip gracefully).
-          sudo apt-get install -y libsqlite3-dev liburing-dev linux-libc-dev libbrotli1
+          sudo apt-get install -y libsqlite3-dev linux-libc-dev libbrotli1
       # `-cc gcc -no-parallel` makes these debug example builds deterministic.
       # Two independent V-toolchain flakes bite otherwise, both only in the
       # default (non -prod) build — real deployments ship -prod, which is
       # unaffected (verified 0 failures in 20 -prod builds):
-      #   1) Every http_server program compiles the Linux io_uring backend,
-      #      which pulls in <liburing.h> -> barrier.h -> <stdatomic.h>. V's
-      #      bundled tcc cannot parse that stdatomic.h, and its automatic
-      #      tcc->gcc fallback is a race (reproduced ~1 in 4 of the SAME source
-      #      flaking). Pinning gcc removes tcc entirely (and the wasted
-      #      tcc-then-retry double compile).
+      #   1) Until #189 every vanilla server program pulled in <liburing.h> ->
+      #      barrier.h -> <stdatomic.h>, which V's bundled tcc could not parse,
+      #      and its automatic tcc->gcc fallback is a race (reproduced ~1 in 4 of
+      #      the SAME source flaking). liburing is gone; gcc stays pinned so these
+      #      builds keep using the compiler they are validated with.
       #   2) V's PARALLEL debug codegen non-deterministically emits one array
       #      `.free()` unmangled (`array_free` instead of `builtin__array_free`,
       #      an undefined-reference link error — surfaces in backend_epoll's
@@ -71,3 +96,49 @@ jobs:
         shell: bash
         run: |
           v -cc gcc -no-parallel test $(pwd)/${{ matrix.folder }}
+
+  # The repo-root e2e suites (tests/): backend behaviours, UDS listeners +
+  # transport dials + peer_cred, vtest smoke. io_uring self-skips where
+  # io_uring_setup is sandboxed; VANILLA_NO_IOURING is the repo's kill-switch
+  # for hosted runners whose per-worker ring init fails after a passing probe
+  # (see poll_backend.yml for the full story).
+  repo-tests:
+    runs-on: ubuntu-latest
+    name: tests/ (behaviours, UDS, vtest)
+    # vtest has no client-side timeouts: a liveness regression (a connection
+    # the server never reaps) hangs instead of failing, and this is the backstop.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up V
+        uses: vlang/setup-v@v1.7
+      - name: Remove Vlang folder to avoid conflicts
+        shell: bash
+        run: |
+          rm -rf -v ./vlang || true
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-libc-dev
+      - name: Run tests/
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+        run: |
+          v -cc gcc -no-parallel test tests/
+      # The http2 module's unit tests (HPACK against the RFC 7541 Appendix C
+      # vectors, frame codec, ServerConn state machine) — pure-bytes tests
+      # with no sockets, so they run here rather than in an example lane.
+      - name: Run http2 module tests
+        shell: bash
+        run: |
+          v -cc gcc -no-parallel test http2/
+      # transport/: dial_addr over IPv4 and IPv6 loopback (tuning and
+      # close-on-exec read back), and under -gc none, where mallinfo2 sees
+      # every allocation, that a failed dial allocates nothing.
+      - name: Run transport module tests
+        shell: bash
+        run: |
+          v -cc gcc -no-parallel test transport/
+          v -cc gcc -no-parallel -gc none test transport/

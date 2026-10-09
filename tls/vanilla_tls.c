@@ -1,0 +1,1042 @@
+/*
+ * vanilla_tls — thin C adapter over Mbed TLS 4 (TLS 1.3): the HTTPS server,
+ * and pg_async's TLS client (vtls_client_setup).
+ * Cert generation ported from concept-examples/TLS/server.c.
+ */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE /* PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP (see VTLS_LOCK) */
+#endif
+#include "vanilla_tls.h"
+
+#include <mbedtls/ssl.h>
+#include <mbedtls/ssl_ciphersuites.h>
+#include <mbedtls/net_sockets.h>
+#include <mbedtls/x509_crt.h>
+#include <mbedtls/pk.h>
+#include <mbedtls/pem.h>
+#include <mbedtls/oid.h>
+#include <mbedtls/asn1.h>
+#include <mbedtls/error.h> /* mbedtls_strerror: the client's error messages */
+#include <psa/crypto.h>
+#include <psa/crypto_values.h>
+#include <stddef.h> /* offsetof */
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>  /* one-time kTLS engage/fallback log to stderr */
+#include <errno.h>
+#include <pthread.h> /* the crypto lock (see VTLS_LOCK) */
+
+/* kTLS: hand record crypto to the kernel after the userspace handshake. */
+#include <linux/tls.h>
+#include <netinet/tcp.h> /* TCP_ULP, SOL_TCP */
+#include <sys/socket.h>  /* setsockopt, SOL_TLS (via bits/socket.h) */
+#include <arpa/inet.h>   /* inet_pton for IP: SAN entries */
+#ifndef SOL_TLS
+#define SOL_TLS 282
+#endif
+#ifndef TLS_RX_EXPECT_NO_PAD
+#define TLS_RX_EXPECT_NO_PAD 4 /* linux/tls.h since 6.0; older headers lack it */
+#endif
+/* The one-time log flags and ktls_off use the generic __atomic builtins
+ * (__atomic_load/_store/_exchange): V's bundled tcc has those but not the
+ * _n forms, and defines no __ATOMIC_* order without <stdatomic.h>. tcc also
+ * miscompiles a load or exchange whose result pointer is not the address of
+ * a local or a global (a struct field, a pointer variable): the program
+ * crashes there. Load into a local, then assign. */
+#ifndef __ATOMIC_RELAXED
+#define __ATOMIC_RELAXED 0
+#endif
+
+struct vtls_ctx {
+    mbedtls_ssl_config conf;
+    mbedtls_x509_crt srvcert;
+    mbedtls_pk_context pkey;
+    mbedtls_svc_key_id_t key_id;
+    char cert_pem[4096];
+    size_t cert_pem_len;
+    // Private key as PEM, filled by vtls_use_self_signed so the caller can
+    // persist the pair and reload it through vtls_use_pem. Never logged.
+    char key_pem[2048];
+    size_t key_pem_len;
+    // ALPN: mbedtls_ssl_conf_alpn_protocols stores the POINTER, so the backing
+    // strings and the NULL-terminated pointer list must outlive the config —
+    // hence they live here in the ctx, not on the stack.
+    char alpn_buf[64];     // protocol names, NUL-separated in place
+    const char *alpn[5];   // pointers into alpn_buf, NULL-terminated
+    // 1 = keep every new session on userspace Mbed TLS (vtls_set_ktls). Read
+    // and written with __atomic builtins: an operator may flip it while
+    // workers create sessions.
+    int ktls_off;
+    // vtls_set_ktls_rx_no_pad: set before the server starts, copied into each
+    // session by vtls_session_new (plain int: no thread writes it concurrently).
+    int ktls_rx_no_pad;
+    // A client config (vtls_client_setup): the trusted CAs and how the
+    // server's certificate is checked (VTLS_VERIFY_*).
+    mbedtls_x509_crt cachain;
+    int verify;
+};
+
+// kTLS key capture: the TLS 1.3 application traffic secrets, filled by
+// on_export_keys during the handshake. server secret => TX (we encrypt),
+// client secret => RX (we decrypt). 32 bytes each for the SHA-256 suite.
+typedef struct {
+    unsigned char client_app_secret[32];
+    unsigned char server_app_secret[32];
+    int have_client;
+    int have_server;
+} vtls_keys;
+
+// Ciphertext read ahead of mbedTLS on the userspace path (see vtls_bio_recv).
+// Holds a typical request record, or a burst of small pipelined ones, in one
+// recv; larger asks bypass it.
+#define VTLS_READAHEAD 4096
+
+typedef struct {
+    mbedtls_ssl_context ssl;
+    mbedtls_net_context net;
+    vtls_keys keys;  // captured during the handshake, consumed by vtls_enable_ktls
+    int ktls;        // 1 once kTLS TX+RX are both installed (reads/writes are plaintext)
+    int ktls_failed; // 1 if a setsockopt failed AFTER the ULP attached → caller must close
+    int ktls_off;    // the config's vtls_set_ktls(0), as of this session's creation
+    int ktls_rx_no_pad; // the ctx's opt-in: enable_ktls sets TLS_RX_EXPECT_NO_PAD
+    // The socket may hold unread bytes: set by vtls_mark_readable (every
+    // readable edge), cleared by a recv that came back short or EAGAIN.
+    int readable;
+    int readahead;   // 1 once the handshake left the session on userspace mbedTLS
+    int closed;      // a recv saw EOF (1) or failed (2): reported once the read-ahead is empty
+    int defer_send;  // vtls_write is encrypting under the crypto lock: hold the send
+    int deferred;    // ...and a record is encrypted and waiting to be sent
+    int bio_want;    // the receive callback answered WANT_READ in this Mbed TLS call
+    int peer_closed; // the peer ended the session: EOF or close_notify (vtls_peer_closed)
+    int close_notify; // ...with a close_notify alert, not a bare EOF (vtls_peer_close_notify)
+    int last_err;    // the Mbed TLS error that failed the handshake (vtls_handshake_error)
+    size_t ra_off, ra_len; // unread ciphertext is ra[ra_off..ra_len]
+    unsigned char ra[VTLS_READAHEAD];
+} vtls_session;
+
+// Pin the negotiated suite to exactly TLS_AES_128_GCM_SHA256 (0x1301) so the kTLS
+// tls12_crypto_info_aes_gcm_128 layout always matches. mbedtls stores the POINTER
+// (does not copy), so this needs static lifetime.
+static const int ktls_ciphersuites[] = { MBEDTLS_TLS1_3_AES_128_GCM_SHA256, 0 };
+
+// Capture the TLS 1.3 application traffic secrets during the handshake. p_expkey is
+// &session->keys. The secret pointer is valid only for this call — copy it out.
+// client/server randoms + prf type are TLS-1.2 concerns; ignored here.
+static void on_export_keys(void *p_expkey, mbedtls_ssl_key_export_type type,
+                           const unsigned char *secret, size_t secret_len,
+                           const unsigned char client_random[32],
+                           const unsigned char server_random[32],
+                           mbedtls_tls_prf_types tls_prf_type) {
+    (void)client_random;
+    (void)server_random;
+    (void)tls_prf_type;
+    vtls_keys *k = (vtls_keys *)p_expkey;
+    if (!k || secret_len != 32) return;
+    if (type == MBEDTLS_SSL_KEY_EXPORT_TLS1_3_SERVER_APPLICATION_TRAFFIC_SECRET) {
+        memcpy(k->server_app_secret, secret, 32);
+        k->have_server = 1;
+    } else if (type == MBEDTLS_SSL_KEY_EXPORT_TLS1_3_CLIENT_APPLICATION_TRAFFIC_SECRET) {
+        memcpy(k->client_app_secret, secret, 32);
+        k->have_client = 1;
+    }
+}
+
+// ---- thread safety ------------------------------------------------------------
+//
+// PSA Crypto's state is process-wide: the key store every session's keys live
+// in, and the RNG. Built with MBEDTLS_THREADING_C, Mbed TLS locks it itself.
+// Built without it (the upstream default config, and distro packages such as
+// Arch's), two TLS workers inside Mbed TLS at once race on it and corrupt the
+// heap (#157). Then every entry point below that reaches Mbed TLS takes this
+// one process-wide lock: the workers take turns in the crypto library, while
+// their parsing, handlers and syscalls still run in parallel. On kTLS only the
+// handshake and session setup/teardown take it (the kernel does the record
+// crypto). The getters, vtls_mark_readable and vtls_read's drained fast path
+// touch only the caller's own session, and take no lock.
+//
+// The record path keeps its socket I/O out of the lock, so it is held for the
+// crypto alone (about a microsecond per small record): vtls_read refills the
+// read-ahead before taking it, and vtls_write encrypts under it but sends
+// after it. Held across the syscalls, the workers queued on each other's
+// recv/send, and four ran slower than one. With critical sections that short,
+// an adaptive mutex (glibc: spin briefly before sleeping) also avoids a futex
+// round trip on most hand-offs.
+#if defined(MBEDTLS_THREADING_C)
+#define VTLS_SERIALIZED 0
+#define VTLS_LOCK() ((void)0)
+#define VTLS_UNLOCK() ((void)0)
+#else
+#define VTLS_SERIALIZED 1
+#if defined(PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP)
+static pthread_mutex_t vtls_lock = PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP;
+#else
+static pthread_mutex_t vtls_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+#define VTLS_LOCK() pthread_mutex_lock(&vtls_lock)
+#define VTLS_UNLOCK() pthread_mutex_unlock(&vtls_lock)
+#endif
+
+int vtls_parallel_crypto(void) {
+#if defined(MBEDTLS_THREADING_C)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int vtls_global_init(void) {
+    VTLS_LOCK();
+    int ok = psa_crypto_init() == PSA_SUCCESS;
+    VTLS_UNLOCK();
+    return ok ? 0 : -1;
+}
+
+vtls_ctx *vtls_ctx_new(void) {
+    vtls_ctx *c = (vtls_ctx *)calloc(1, sizeof(vtls_ctx));
+    if (!c) return NULL;
+    mbedtls_ssl_config_init(&c->conf);
+    mbedtls_x509_crt_init(&c->srvcert);
+    mbedtls_x509_crt_init(&c->cachain);
+    mbedtls_pk_init(&c->pkey);
+    return c;
+}
+
+void vtls_ctx_free(vtls_ctx *c) {
+    if (!c) return;
+    VTLS_LOCK();
+    mbedtls_x509_crt_free(&c->srvcert);
+    mbedtls_x509_crt_free(&c->cachain);
+    if (c->key_id != 0) psa_destroy_key(c->key_id);
+    mbedtls_pk_free(&c->pkey);
+    mbedtls_ssl_config_free(&c->conf);
+    VTLS_UNLOCK();
+    free(c);
+}
+
+// Parse one "DNS:<host>" / "IP:<v4|v6>" entry into a SAN list node. IP bytes are
+// written to `ipbuf` (>= 16 bytes), which must outlive the node.
+static int vtls_parse_san(const char *s, mbedtls_x509_san_list *node, unsigned char *ipbuf) {
+    memset(node, 0, sizeof *node);
+    if (strncmp(s, "DNS:", 4) == 0) {
+        size_t len = strlen(s + 4);
+        if (len == 0) return -1;
+        node->node.type = MBEDTLS_X509_SAN_DNS_NAME;
+        node->node.san.unstructured_name.p = (unsigned char *)(s + 4);
+        node->node.san.unstructured_name.len = len;
+        return 0;
+    }
+    if (strncmp(s, "IP:", 3) == 0) {
+        node->node.type = MBEDTLS_X509_SAN_IP_ADDRESS;
+        node->node.san.unstructured_name.p = ipbuf;
+        if (inet_pton(AF_INET, s + 3, ipbuf) == 1) { node->node.san.unstructured_name.len = 4; return 0; }
+        if (inet_pton(AF_INET6, s + 3, ipbuf) == 1) { node->node.san.unstructured_name.len = 16; return 0; }
+        return -1;
+    }
+    return -1;
+}
+
+// Generate an EC P-256 key (PSA) + a self-signed X.509v3 cert into the context.
+// `sans` are "DNS:<host>" / "IP:<v4|v6>" entries (1..16); the first one's value
+// doubles as the subject CN. The cert carries subjectAltName, basicConstraints
+// CA:FALSE, keyUsage and extendedKeyUsage=serverAuth: browsers, Android, Java,
+// Go and curl all match the connection target against the SANs and ignore the
+// CN, so a SAN-less cert is rejected by everything but curl's CN fallback.
+// The private key is also exported to c->key_pem (see vtls_key_pem) so the pair
+// can be persisted and reloaded with vtls_use_pem.
+static int use_self_signed(vtls_ctx *c, char *const *sans, size_t nsans) {
+    mbedtls_x509write_cert wc;
+    unsigned char der[4096];
+    int ret;
+    enum { VTLS_MAX_SANS = 16 };
+    mbedtls_x509_san_list nodes[VTLS_MAX_SANS];
+    unsigned char ipbufs[VTLS_MAX_SANS][16];
+    char cn[160];
+
+    if (sans == NULL || nsans == 0 || nsans > VTLS_MAX_SANS) return -1;
+    mbedtls_x509write_crt_init(&wc);
+
+    for (size_t i = 0; i < nsans; i++) {
+        if ((ret = vtls_parse_san(sans[i], &nodes[i], ipbufs[i])) != 0) goto done;
+        nodes[i].next = (i + 1 < nsans) ? &nodes[i + 1] : NULL;
+    }
+    // Subject CN = first SAN value (the part after "DNS:"/"IP:"). Informational
+    // only - validation goes through the SANs - but it makes `openssl s_client`
+    // and browser dialogs show something meaningful.
+    {
+        const char *colon = strchr(sans[0], ':');
+        const char *value = colon ? colon + 1 : sans[0];
+        if (strlen(value) > 64) { ret = -1; goto done; }
+        snprintf(cn, sizeof cn, "CN=%s,O=vanilla", value);
+    }
+
+    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_SIGN_HASH | PSA_KEY_USAGE_EXPORT);
+    psa_set_key_algorithm(&attr, PSA_ALG_ECDSA(PSA_ALG_SHA_256));
+    psa_set_key_type(&attr, PSA_KEY_TYPE_ECC_KEY_PAIR(PSA_ECC_FAMILY_SECP_R1));
+    psa_set_key_bits(&attr, 256);
+    if (psa_generate_key(&attr, &c->key_id) != PSA_SUCCESS) { ret = -1; goto done; }
+    if ((ret = mbedtls_pk_wrap_psa(&c->pkey, c->key_id)) != 0) goto done;
+
+    mbedtls_x509write_crt_set_subject_key(&wc, &c->pkey);
+    mbedtls_x509write_crt_set_issuer_key(&wc, &c->pkey);
+    if ((ret = mbedtls_x509write_crt_set_subject_name(&wc, cn)) != 0) goto done;
+    if ((ret = mbedtls_x509write_crt_set_issuer_name(&wc, cn)) != 0) goto done;
+    mbedtls_x509write_crt_set_version(&wc, MBEDTLS_X509_CRT_VERSION_3);
+    mbedtls_x509write_crt_set_md_alg(&wc, MBEDTLS_MD_SHA256);
+
+    unsigned char serial[12];
+    psa_generate_random(serial, sizeof(serial));
+    // The serial is a DER INTEGER, written as given: clear the sign bit (it
+    // must be positive) and keep the first byte non-zero (a leading 0x00 is
+    // only valid before a byte >= 0x80, so a random one is non-minimal about
+    // 1 time in 500 - and OpenSSL 3 then refuses the certificate with
+    // "illegal padding"; with persist_dir that bad identity would be kept).
+    serial[0] = (unsigned char)((serial[0] & 0x7f) | 0x01);
+    if ((ret = mbedtls_x509write_crt_set_serial_raw(&wc, serial, sizeof(serial))) != 0) goto done;
+    mbedtls_x509write_crt_set_validity(&wc, "20250101000000", "20351231235959");
+
+    if ((ret = mbedtls_x509write_crt_set_subject_alternative_name(&wc, nodes)) != 0) goto done;
+    if ((ret = mbedtls_x509write_crt_set_basic_constraints(&wc, 0, -1)) != 0) goto done;
+    if ((ret = mbedtls_x509write_crt_set_key_usage(&wc,
+            MBEDTLS_X509_KU_DIGITAL_SIGNATURE | MBEDTLS_X509_KU_KEY_AGREEMENT)) != 0) goto done;
+    {
+        mbedtls_asn1_sequence eku = {
+            { MBEDTLS_ASN1_OID, MBEDTLS_OID_SIZE(MBEDTLS_OID_SERVER_AUTH), (unsigned char *)MBEDTLS_OID_SERVER_AUTH },
+            NULL
+        };
+        if ((ret = mbedtls_x509write_crt_set_ext_key_usage(&wc, &eku)) != 0) goto done;
+    }
+
+    ret = mbedtls_x509write_crt_der(&wc, der, sizeof(der));
+    if (ret < 0) goto done;
+    size_t der_len = (size_t)ret;
+    unsigned char *der_start = der + sizeof(der) - der_len;
+
+    if ((ret = mbedtls_x509_crt_parse_der(&c->srvcert, der_start, der_len)) != 0) goto done;
+    if ((ret = mbedtls_pem_write_buffer("-----BEGIN CERTIFICATE-----\n", "-----END CERTIFICATE-----\n",
+                                        der_start, der_len, (unsigned char *)c->cert_pem,
+                                        sizeof(c->cert_pem), &c->cert_pem_len)) != 0) goto done;
+    // PSA key created with PSA_KEY_USAGE_EXPORT, so the opaque key can be written
+    // out as a standard PEM that mbedtls_pk_parse_key (vtls_use_pem) reads back.
+    if ((ret = mbedtls_pk_write_key_pem(&c->pkey, (unsigned char *)c->key_pem, sizeof(c->key_pem))) != 0) goto done;
+    c->key_pem_len = strlen(c->key_pem);
+done:
+    mbedtls_x509write_crt_free(&wc);
+    return ret;
+}
+
+int vtls_use_self_signed(vtls_ctx *c, char *const *sans, size_t nsans) {
+    VTLS_LOCK();
+    int ret = use_self_signed(c, sans, nsans);
+    VTLS_UNLOCK();
+    return ret;
+}
+
+// Keep a copy of a loaded PEM in the ctx so vtls_cert_pem/vtls_key_pem work for
+// loaded identities too (persist_dir reloads go through here). `len` includes
+// the trailing NUL the V side guarantees; oversized input (a long chain) just
+// leaves the copy empty - the parsed cert/key are unaffected.
+static void vtls_keep_pem(const unsigned char *src, size_t len, char *dst, size_t cap, size_t *out_len) {
+    size_t n = len;
+    while (n > 0 && src[n - 1] == '\0') n--;
+    if (n == 0 || n >= cap) { *out_len = 0; return; }
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+    *out_len = n;
+}
+
+int vtls_use_pem(vtls_ctx *c, const unsigned char *cert, size_t clen,
+                 const unsigned char *key, size_t klen) {
+    VTLS_LOCK();
+    int ret = mbedtls_x509_crt_parse(&c->srvcert, cert, clen);
+    if (ret == 0) ret = mbedtls_pk_parse_key(&c->pkey, key, klen, NULL, 0); // Mbed TLS 4: no RNG args
+    VTLS_UNLOCK();
+    if (ret != 0) return ret;
+    vtls_keep_pem(cert, clen, c->cert_pem, sizeof(c->cert_pem), &c->cert_pem_len);
+    vtls_keep_pem(key, klen, c->key_pem, sizeof(c->key_pem), &c->key_pem_len);
+    return 0;
+}
+
+static int setup(vtls_ctx *c) {
+    int ret = mbedtls_ssl_config_defaults(&c->conf, MBEDTLS_SSL_IS_SERVER,
+                                          MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
+    if (ret != 0) return ret;
+    // TLS 1.3 only. vtls_write's unlocked flush relies on it too (all TLS 1.3
+    // suites are AEAD), as it does on renegotiation staying off: see there.
+    mbedtls_ssl_conf_min_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_3);
+    mbedtls_ssl_conf_max_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_3);
+    // Pin the single suite so the kTLS crypto_info layout always matches (0x1301).
+    mbedtls_ssl_conf_ciphersuites(&c->conf, ktls_ciphersuites);
+    // Disable TLS 1.3 NewSessionTicket. mbedtls defaults to sending 1 ticket right
+    // after Finished, which encrypts under the server app key and advances the TX
+    // record sequence to 1 before any app data — breaking the kTLS rec_seq=0 handoff.
+    // Off => the first kernel-emitted application record is sequence 0.
+#if defined(MBEDTLS_SSL_SESSION_TICKETS)
+    mbedtls_ssl_conf_new_session_tickets(&c->conf, 0);
+#endif
+    return mbedtls_ssl_conf_own_cert(&c->conf, &c->srvcert, &c->pkey);
+}
+
+int vtls_setup(vtls_ctx *c) {
+    VTLS_LOCK();
+    int ret = setup(c);
+    VTLS_UNLOCK();
+    return ret;
+}
+
+const char *vtls_key_pem(vtls_ctx *c) {
+    return (c && c->key_pem_len > 0) ? c->key_pem : NULL;
+}
+
+const char *vtls_cert_pem(vtls_ctx *c) {
+    return (c && c->cert_pem_len > 0) ? c->cert_pem : NULL;
+}
+
+// Allow or forbid kTLS for the sessions created from now on: vtls_session_new
+// copies the flag, and vtls_enable_ktls falls back cleanly when it is off.
+void vtls_set_ktls(vtls_ctx *c, int enabled) {
+    int off = enabled ? 0 : 1;
+    if (c) __atomic_store(&c->ktls_off, &off, __ATOMIC_RELAXED);
+}
+
+// Configure ALPN from a comma-separated list (e.g. "http/1.1" or "h2,http/1.1").
+// The server offers these in order; mbedTLS picks the first the client also
+// supports. The names are copied into the ctx (the config keeps the pointers).
+int vtls_set_alpn(vtls_ctx *c, const char *list) {
+    if (!c || !list) return -1;
+    size_t n = strlen(list);
+    if (n == 0 || n >= sizeof(c->alpn_buf)) return -1;
+    memcpy(c->alpn_buf, list, n + 1); // include the NUL
+    size_t count = 0;
+    char *p = c->alpn_buf;
+    c->alpn[count++] = p; // first token starts at the buffer
+    for (size_t i = 0; i < n && count < (sizeof(c->alpn) / sizeof(c->alpn[0])) - 1; i++) {
+        if (c->alpn_buf[i] == ',') {
+            c->alpn_buf[i] = '\0';                 // terminate this token
+            c->alpn[count++] = &c->alpn_buf[i + 1]; // next token
+        }
+    }
+    c->alpn[count] = NULL; // NULL-terminate the list
+    return mbedtls_ssl_conf_alpn_protocols(&c->conf, c->alpn);
+}
+
+// Opt in to TLS_RX_EXPECT_NO_PAD on kTLS sessions created from now on (see
+// enable_ktls for when that is safe). No lock: called before the server starts.
+void vtls_set_ktls_rx_no_pad(vtls_ctx *c, int enabled) {
+    if (c) c->ktls_rx_no_pad = enabled != 0;
+}
+
+// ---- per-connection session -------------------------------------------------
+
+// vtls_bio_recv is the session's receive callback. mbedTLS asks for exact
+// lengths (a 5-byte record header, then the record body), so over a plain
+// recv every record costs two syscalls, and no read ever comes back short:
+// the caller could not tell a drained socket from one with more records
+// queued without a third, EAGAIN, recv. Once the handshake is over
+// (readahead), a small ask is served from `ra`, refilled by one recv of up to
+// VTLS_READAHEAD bytes: a burst of records costs one syscall. A short recv
+// proves the socket drained (TCP returns everything queued, up to the length
+// asked), so `readable` drops and later asks return WANT_READ without a
+// syscall; bytes arriving after that recv raise a new edge (EPOLLET), whose
+// vtls_mark_readable re-arms it. During the handshake the reads stay exact:
+// vtls_enable_ktls requires that mbedTLS consumed nothing past the client's
+// Finished, or the kernel would miss those records.
+// vtls_recv is one recv into `dst`, keeping the session's bookkeeping: a
+// short read or EAGAIN drops `readable`, EOF and errors are latched in
+// `closed`. Returns the byte count, 0 at EOF, or a negative mbedTLS error.
+static int vtls_recv(vtls_session *s, unsigned char *dst, size_t want) {
+    ssize_t r;
+    do {
+        r = recv(s->net.fd, dst, want, 0);
+    } while (r < 0 && errno == EINTR);
+    if (r < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            s->readable = 0;
+            s->bio_want = 1;
+            return MBEDTLS_ERR_SSL_WANT_READ;
+        }
+        s->closed = 2;
+        return MBEDTLS_ERR_NET_RECV_FAILED;
+    }
+    if (r == 0) {
+        s->closed = 1;
+        return 0; // mbedTLS reports MBEDTLS_ERR_SSL_CONN_EOF
+    }
+    if ((size_t)r < want) s->readable = 0;
+    return (int)r;
+}
+
+// ra_fill refills the empty read-ahead with one recv.
+static int ra_fill(vtls_session *s) {
+    int r = vtls_recv(s, s->ra, VTLS_READAHEAD);
+    s->ra_off = 0;
+    s->ra_len = r > 0 ? (size_t)r : 0;
+    return r;
+}
+
+// ctx is &session->net (the send side, vtls_bio_send, needs only the fd).
+static int vtls_bio_recv(void *ctx, unsigned char *buf, size_t len) {
+    vtls_session *s = (vtls_session *)((char *)ctx - offsetof(vtls_session, net));
+    if (s->ra_off >= s->ra_len) {
+        if (s->closed) return s->closed == 1 ? 0 : MBEDTLS_ERR_NET_RECV_FAILED;
+        if (!s->readable) {
+            s->bio_want = 1;
+            return MBEDTLS_ERR_SSL_WANT_READ;
+        }
+        // Exact reads during the handshake; a large ask (a big record's body)
+        // goes straight into mbedTLS's buffer.
+        if (!s->readahead || len >= VTLS_READAHEAD) return vtls_recv(s, buf, len);
+        int r = ra_fill(s);
+        if (r <= 0) return r;
+    }
+    size_t n = s->ra_len - s->ra_off;
+    if (n > len) n = len;
+    memcpy(buf, s->ra + s->ra_off, n);
+    s->ra_off += n;
+    return (int)n;
+}
+
+// vtls_bio_send is the session's send callback: mbedtls_net_send, but with
+// MSG_NOSIGNAL. mbedtls_net_send uses write(), and once a send has met the
+// peer's reset (ECONNRESET), the next write to the dead socket — the rest of
+// a response, or the close_notify vtls_session_free sends — raises SIGPIPE,
+// whose default action ends the whole server: any client that aborts while a
+// response is in flight would take every connection down with it. (The kTLS
+// path sends with MSG_NOSIGNAL too.)
+static int vtls_bio_send(void *ctx, const unsigned char *buf, size_t len) {
+    vtls_session *s = (vtls_session *)((char *)ctx - offsetof(vtls_session, net));
+    if (s->defer_send) {
+        // vtls_write holds the crypto lock: keep the encrypted record in
+        // mbedTLS and send it once the lock is released.
+        s->deferred = 1;
+        return MBEDTLS_ERR_SSL_WANT_WRITE;
+    }
+    int fd = s->net.fd;
+    ssize_t r;
+    do {
+        r = send(fd, buf, len, MSG_NOSIGNAL);
+    } while (r < 0 && errno == EINTR);
+    if (r >= 0) return (int)r;
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return MBEDTLS_ERR_SSL_WANT_WRITE;
+    if (errno == EPIPE || errno == ECONNRESET) return MBEDTLS_ERR_NET_CONN_RESET;
+    return MBEDTLS_ERR_NET_SEND_FAILED;
+}
+
+void *vtls_session_new(vtls_ctx *c, int fd) {
+    // calloc: every read-ahead field starts empty/off.
+    vtls_session *s = (vtls_session *)calloc(1, sizeof(vtls_session));
+    if (!s) return NULL;
+    mbedtls_ssl_init(&s->ssl);
+    VTLS_LOCK();
+    int ret = mbedtls_ssl_setup(&s->ssl, &c->conf);
+    if (ret != 0) mbedtls_ssl_free(&s->ssl);
+    VTLS_UNLOCK();
+    if (ret != 0) { free(s); return NULL; }
+    s->net.fd = fd; // already accepted + non-blocking
+    s->readable = 1; // the ClientHello may have arrived with the connect
+    int ktls_off; // a local: tcc miscompiles a load into a field (see the top)
+    __atomic_load(&c->ktls_off, &ktls_off, __ATOMIC_RELAXED);
+    s->ktls_off = ktls_off;
+    s->ktls_rx_no_pad = c->ktls_rx_no_pad;
+    mbedtls_ssl_set_bio(&s->ssl, &s->net, vtls_bio_send, vtls_bio_recv, NULL);
+    // Capture the TLS 1.3 application traffic secrets for the kTLS handoff (per-ssl;
+    // there is no config-level variant in Mbed TLS 4). s->keys is zeroed by calloc.
+    mbedtls_ssl_set_export_keys_cb(&s->ssl, on_export_keys, &s->keys);
+    return s;
+}
+
+void vtls_session_free(void *sess) {
+    if (!sess) return;
+    vtls_session *s = (vtls_session *)sess;
+    // On a kTLS socket the kernel owns record framing; a userspace close_notify via
+    // mbedtls would write a spurious, wrongly-framed record. Skip it (a missing
+    // close_notify is tolerated by peers). For the plain userspace path, send it,
+    // unless the session was detached from its socket (vtls_session_reset(-1)).
+    VTLS_LOCK();
+    if (!s->ktls && s->net.fd >= 0) mbedtls_ssl_close_notify(&s->ssl);
+    mbedtls_ssl_free(&s->ssl);
+    VTLS_UNLOCK();
+    free(s);
+}
+
+// Negotiated ALPN protocol (e.g. "http/1.1"), or NULL if none was agreed.
+// Valid only after the handshake completes.
+const char *vtls_get_alpn(void *sess) {
+    return mbedtls_ssl_get_alpn_protocol(&((vtls_session *)sess)->ssl);
+}
+
+static int map_ret(int ret) {
+    if (ret == MBEDTLS_ERR_SSL_WANT_READ) return VTLS_WANT;
+    if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) return VTLS_WANT_WRITE;
+    return VTLS_ERROR;
+}
+
+// Mbed TLS also answers WANT_READ when the socket was never asked: right after
+// reading a TLS 1.3 NewSessionTicket's header (it parks the message and wants
+// to be called again to process it) and after skipping a warning alert. The
+// records behind it may already be in the read-ahead or the socket, and under
+// EPOLLET no new edge would come for them, so such a WANT_READ is called
+// again, not reported: only the receive callback's WANT_READ (bio_want) means
+// drained. A NewSessionTicket (MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET, a
+// client only) is read past too: tickets are never used to resume. The bound
+// only guards against a library loop that would make no progress.
+#define VTLS_RETRIES 64
+
+static int vtls_retry(vtls_session *s, int ret) {
+    return ret == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET
+           || (ret == MBEDTLS_ERR_SSL_WANT_READ && !s->bio_want);
+}
+
+int vtls_handshake(void *sess) {
+    vtls_session *s = (vtls_session *)sess;
+    int ret, n = 0;
+    do {
+        s->bio_want = 0;
+        VTLS_LOCK();
+        ret = mbedtls_ssl_handshake(&s->ssl);
+        VTLS_UNLOCK();
+    } while (vtls_retry(s, ret) && ++n < VTLS_RETRIES);
+    if (ret == 0) return VTLS_OK;
+    int r = map_ret(ret);
+    if (r == VTLS_ERROR) s->last_err = ret;
+    return r;
+}
+
+void vtls_mark_readable(void *sess) { ((vtls_session *)sess)->readable = 1; }
+
+int vtls_read(void *sess, unsigned char *buf, size_t len) {
+    vtls_session *s = (vtls_session *)sess;
+    int ret, n = 0;
+    do {
+        if (s->ra_off >= s->ra_len && !s->closed && mbedtls_ssl_get_bytes_avail(&s->ssl) == 0
+            && !mbedtls_ssl_check_pending(&s->ssl)) {
+            // Nothing decrypted is waiting and no record is being processed:
+            // mbedTLS needs input. Drained (the last recv came back short), it
+            // could only answer WANT_READ (a partial record needs more), so answer
+            // it here without entering the library — every burst ends so. Else
+            // fetch the input before taking the crypto lock, not under it.
+            if (!s->readable) return VTLS_WANT;
+            if (s->readahead && ra_fill(s) == MBEDTLS_ERR_SSL_WANT_READ) return VTLS_WANT;
+            // Bytes, EOF or an error: mbedTLS takes it from the read-ahead state.
+        }
+        s->bio_want = 0;
+        VTLS_LOCK();
+        ret = mbedtls_ssl_read(&s->ssl, buf, len);
+        VTLS_UNLOCK();
+    } while (vtls_retry(s, ret) && ++n < VTLS_RETRIES);
+    if (ret > 0) return ret;
+    if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) { // closed
+        // mbedtls_ssl_read answers 0 for a transport EOF without close_notify,
+        // which a truncation attack can produce (RFC 9112 §9.8).
+        s->peer_closed = 1;
+        if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) s->close_notify = 1;
+        return VTLS_ERROR;
+    }
+    return map_ret(ret); // VTLS_WANT (-2) or VTLS_ERROR (-1)
+}
+
+int vtls_peer_closed(void *sess) { return ((vtls_session *)sess)->peer_closed; }
+
+int vtls_peer_close_notify(void *sess) { return ((vtls_session *)sess)->close_notify; }
+
+int vtls_write(void *sess, const unsigned char *buf, size_t len) {
+    vtls_session *s = (vtls_session *)sess;
+    int ret;
+    do {
+        // A client's write first finishes a NewSessionTicket a read left
+        // parked (see vtls_retry); write on past it.
+        VTLS_LOCK();
+        s->defer_send = VTLS_SERIALIZED; // encrypt under the lock, send after it
+        ret = mbedtls_ssl_write(&s->ssl, buf, len);
+        s->defer_send = 0;
+        VTLS_UNLOCK();
+    } while (ret == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET);
+    if (s->deferred) {
+        // The record is encrypted and pending in mbedTLS (it saw WANT_WRITE).
+        // Called again with the same arguments, as its API requires, it only
+        // flushes that record: no crypto, so no lock. Checked against Mbed
+        // TLS 4.2.0, where the call runs ssl_check_ctr_renegotiate, sizes the
+        // record (mbedtls_ssl_get_max_out_record_payload), then
+        // mbedtls_ssl_flush_output. It stays crypto-free only while:
+        //   - renegotiation is off (the default; never enabled here), else
+        //     the counter check can start a renegotiation handshake;
+        //   - no MTU is set on the session (mbedtls_ssl_set_mtu, a DTLS
+        //     setting; never called here), else sizing the record calls
+        //     mbedtls_ssl_get_record_expansion...
+        //   - ...which reads PSA's key store only for a CBC suite: the
+        //     version is pinned to TLS 1.3 (setup, and client_setup), whose
+        //     suites are all AEAD.
+        // Change any of these and this call needs the lock too.
+        s->deferred = 0;
+        ret = mbedtls_ssl_write(&s->ssl, buf, len);
+    }
+    if (ret >= 0) return ret;
+    return map_ret(ret);
+}
+
+// ---- client (pg_async) ------------------------------------------------------
+
+// verify_chain_only is VTLS_VERIFY_CA's certificate callback. The session still
+// names the host, for SNI, so Mbed TLS checks the name as well: drop that one
+// finding on the server's own certificate, keep every chain error.
+static int verify_chain_only(void *p, mbedtls_x509_crt *crt, int depth, uint32_t *flags) {
+    (void)p;
+    (void)crt;
+    if (depth == 0) *flags &= ~(uint32_t)MBEDTLS_X509_BADCERT_CN_MISMATCH;
+    return 0;
+}
+
+static int client_setup(vtls_ctx *c, const char *ca_file, int verify) {
+    int ret = mbedtls_ssl_config_defaults(&c->conf, MBEDTLS_SSL_IS_CLIENT,
+                                          MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
+    if (ret != 0) return ret;
+    // TLS 1.3 only, as on the server: vtls_write's unlocked flush relies on it
+    // (see there). No suite list: the server picks among Mbed TLS's defaults.
+    mbedtls_ssl_conf_min_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_3);
+    mbedtls_ssl_conf_max_tls_version(&c->conf, MBEDTLS_SSL_VERSION_TLS1_3);
+    c->verify = verify;
+    if (verify == VTLS_VERIFY_NONE) {
+        mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_NONE);
+        return 0;
+    }
+    // A positive count is certificates that did not parse (a system bundle may
+    // hold a few Mbed TLS cannot read); the rest are trusted. None at all is
+    // an error, not an empty trust store.
+    ret = mbedtls_x509_crt_parse_file(&c->cachain, ca_file);
+    if (ret < 0) return ret;
+    if (c->cachain.version == 0) return MBEDTLS_ERR_X509_CERT_UNKNOWN_FORMAT;
+    mbedtls_ssl_conf_ca_chain(&c->conf, &c->cachain, NULL);
+    mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+    if (verify == VTLS_VERIFY_CA) mbedtls_ssl_conf_verify(&c->conf, verify_chain_only, NULL);
+    return 0;
+}
+
+int vtls_client_setup(vtls_ctx *c, const char *ca_file, int verify) {
+    VTLS_LOCK(); // parsing the CAs runs PSA (key import)
+    int ret = client_setup(c, ca_file, verify);
+    VTLS_UNLOCK();
+    return ret;
+}
+
+// client_rearm puts a client session's own state back to "new, on fd". The
+// client reads ahead from the first byte: there is no kTLS handoff to keep
+// the handshake's reads exact for.
+static void client_rearm(vtls_session *s, int fd) {
+    s->net.fd = fd;
+    s->readable = 1;
+    s->readahead = 1;
+    s->closed = 0;
+    s->peer_closed = 0;
+    s->close_notify = 0;
+    s->last_err = 0;
+    s->defer_send = 0;
+    s->deferred = 0;
+    s->ra_off = 0;
+    s->ra_len = 0;
+}
+
+void *vtls_client_session_new(vtls_ctx *c, int fd, const char *host) {
+    vtls_session *s = (vtls_session *)calloc(1, sizeof(vtls_session));
+    if (!s) return NULL;
+    unsigned char ip[16];
+    int is_ip = inet_pton(AF_INET, host, ip) == 1 || inet_pton(AF_INET6, host, ip) == 1;
+    mbedtls_ssl_init(&s->ssl);
+    VTLS_LOCK();
+    int ret = mbedtls_ssl_setup(&s->ssl, &c->conf);
+    // The host is the SNI and, under VERIFY_FULL, the name to check. An IP
+    // address is no SNI (RFC 6066), so it is set only when it must be checked;
+    // NULL still counts as "set" for Mbed TLS's verify-without-a-name guard.
+    if (ret == 0) ret = mbedtls_ssl_set_hostname(&s->ssl, (is_ip && c->verify != VTLS_VERIFY_FULL) ? NULL : host);
+    if (ret != 0) mbedtls_ssl_free(&s->ssl);
+    VTLS_UNLOCK();
+    if (ret != 0) {
+        free(s);
+        return NULL;
+    }
+    client_rearm(s, fd);
+    mbedtls_ssl_set_bio(&s->ssl, &s->net, vtls_bio_send, vtls_bio_recv, NULL);
+    return s;
+}
+
+int vtls_session_reset(void *sess, int fd) {
+    vtls_session *s = (vtls_session *)sess;
+    VTLS_LOCK(); // drops the old session's keys from PSA's store
+    int ret = mbedtls_ssl_session_reset(&s->ssl); // keeps the host name and the bio
+    VTLS_UNLOCK();
+    client_rearm(s, fd);
+    return ret;
+}
+
+int vtls_verify_failed(void *sess) {
+    return ((vtls_session *)sess)->last_err == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED;
+}
+
+void vtls_handshake_error(void *sess, char *buf, size_t len) {
+    vtls_session *s = (vtls_session *)sess;
+    if (len == 0) return;
+    buf[0] = '\0';
+    if (s->last_err == MBEDTLS_ERR_X509_CERT_VERIFY_FAILED) {
+        uint32_t flags = mbedtls_ssl_get_verify_result(&s->ssl);
+        if (flags != 0 && flags != (uint32_t)-1) {
+            const char *what = (flags & MBEDTLS_X509_BADCERT_NOT_TRUSTED)
+                ? "the server certificate is not trusted (it does not chain to a trusted root certificate)"
+                : (flags & MBEDTLS_X509_BADCERT_CN_MISMATCH)
+                ? "the server certificate does not match the host name"
+                : "the server certificate failed verification";
+            // Then Mbed TLS's findings, one per line: joined on one.
+            char info[512];
+            int n = mbedtls_x509_crt_verify_info(info, sizeof(info), "", flags);
+            for (int i = 0; i < n; i++) {
+                if (info[i] == '\n') info[i] = (i + 1 < n) ? ';' : '\0';
+            }
+            snprintf(buf, len, "%s: %s", what, n > 0 ? info : "");
+            return;
+        }
+    }
+    if (s->closed == 1 || s->last_err == MBEDTLS_ERR_SSL_CONN_EOF) {
+        snprintf(buf, len, "the server closed the connection during the TLS handshake");
+        return;
+    }
+    vtls_error_string(s->last_err, buf, len);
+}
+
+void vtls_error_string(int err, char *buf, size_t len) {
+    char text[160];
+    mbedtls_strerror(err, text, sizeof(text));
+    snprintf(buf, len, "%s (Mbed TLS -0x%04x)", text, (unsigned)(-err));
+}
+
+// ---- kTLS handoff -----------------------------------------------------------
+
+// HKDF-Expand-Label (RFC 8446 §7.1) over a TLS 1.3 traffic secret (already a PRK):
+// SHA-256, empty context. Driven by the PSA key-derivation API (no mbedtls/hkdf.h
+// on the target). Returns 0 on success.
+static int hkdf_expand_label(const unsigned char secret[32], const char *label,
+                             size_t label_len, unsigned char *out, size_t out_len) {
+    // HkdfLabel = uint16 length || (uint8 full_len || "tls13 "+label) || (uint8 0).
+    unsigned char info[2 + 1 + 6 + 16 + 1];
+    size_t full_len = 6 + label_len; // "tls13 " is 6 bytes incl. the trailing space
+    if (full_len > 255 || (3 + full_len + 1) > sizeof(info)) return -1;
+    info[0] = (unsigned char)(out_len >> 8);
+    info[1] = (unsigned char)(out_len & 0xff);
+    info[2] = (unsigned char)full_len;
+    memcpy(info + 3, "tls13 ", 6);
+    memcpy(info + 9, label, label_len);
+    info[3 + full_len] = 0; // empty context, length 0
+    size_t info_len = 3 + full_len + 1;
+
+    psa_key_derivation_operation_t op = PSA_KEY_DERIVATION_OPERATION_INIT;
+    int rc = -1;
+    if (psa_key_derivation_setup(&op, PSA_ALG_HKDF_EXPAND(PSA_ALG_SHA_256)) != PSA_SUCCESS)
+        goto out;
+    // HKDF-Expand: SECRET (the PRK) then INFO, in that order, no SALT.
+    if (psa_key_derivation_input_bytes(&op, PSA_KEY_DERIVATION_INPUT_SECRET, secret, 32) != PSA_SUCCESS)
+        goto out;
+    if (psa_key_derivation_input_bytes(&op, PSA_KEY_DERIVATION_INPUT_INFO, info, info_len) != PSA_SUCCESS)
+        goto out;
+    if (psa_key_derivation_output_bytes(&op, out, out_len) != PSA_SUCCESS)
+        goto out;
+    rc = 0;
+out:
+    psa_key_derivation_abort(&op);
+    return rc;
+}
+
+// Derive the AES-128-GCM key + IV from a TLS 1.3 traffic secret into a kernel
+// crypto_info. The 12-byte write_iv splits salt = first 4 bytes, iv = last 8.
+static int fill_crypto_info(const unsigned char secret[32],
+                            struct tls12_crypto_info_aes_gcm_128 *ci) {
+    unsigned char key[16], iv12[12];
+    if (hkdf_expand_label(secret, "key", 3, key, 16) != 0) return -1;
+    if (hkdf_expand_label(secret, "iv", 2, iv12, 12) != 0) {
+        memset(key, 0, 16);
+        return -1;
+    }
+    memset(ci, 0, sizeof(*ci));
+    ci->info.version = TLS_1_3_VERSION;            // 0x0304
+    ci->info.cipher_type = TLS_CIPHER_AES_GCM_128; // 51
+    memcpy(ci->key, key, 16);
+    memcpy(ci->salt, iv12, 4);     // implicit/fixed nonce prefix
+    memcpy(ci->iv, iv12 + 4, 8);   // explicit nonce
+    // rec_seq stays all-zero: tickets are disabled, so the first app record is seq 0.
+    memset(key, 0, 16);
+    memset(iv12, 0, 12);
+    return 0;
+}
+
+// One-time kTLS outcome logging so a deployment can see whether kTLS engaged or
+// silently fell back to userspace TLS (≤3 lines per process: first engage, first
+// fallback, first opt-out). The distinction matters: a benchmark on a host
+// without the `tls` kernel module would otherwise measure the userspace path and
+// look like a no-op.
+// The flags are claimed atomically: with MBEDTLS_THREADING_C the crypto lock
+// compiles out, so several workers can finish a handshake at once (a plain
+// test-then-set is a data race, which -race reports, and could log twice).
+// The deliberate opt-out (tls.Config.set_ktls(false)) has a line of its own,
+// so it never masks a real fallback (a host without the `tls` module).
+static int ktls_logged_ok = 0;
+static int ktls_logged_fb = 0;
+static int ktls_logged_off = 0;
+// ktls_first reports whether this call is the first to claim `flag`. The load
+// keeps every later call from writing the shared line.
+static int ktls_first(int *flag) {
+    int cur, one = 1, prev;
+    __atomic_load(flag, &cur, __ATOMIC_RELAXED);
+    if (cur != 0) return 0;
+    __atomic_exchange(flag, &one, &prev, __ATOMIC_RELAXED);
+    return prev == 0;
+}
+static void ktls_log_fb(const char *why) {
+    if (ktls_first(&ktls_logged_fb)) {
+        fprintf(stderr, "[ktls] fallback to userspace TLS: %s\n", why);
+    }
+}
+
+// Move record crypto into the kernel after the handshake. Returns 1 if kTLS TX+RX
+// both engaged; 0 to stay on the userspace mbedtls path (clean fallback). On a
+// setsockopt failure AFTER the ULP attached it sets ktls_failed (the socket is then
+// half-converted and unusable for userspace — the caller MUST close the connection).
+static int enable_ktls(vtls_session *s, int fd) {
+    // Derived/installed key material — scrubbed unconditionally at `done`.
+    struct tls12_crypto_info_aes_gcm_128 tx, rx;
+    memset(&tx, 0, sizeof(tx));
+    memset(&rx, 0, sizeof(rx));
+
+    // Turned off on the config (vtls_set_ktls): the same clean fallback as a host
+    // without the `tls` module, logged once under its own flag.
+    if (s->ktls_off) {
+        if (ktls_first(&ktls_logged_off)) {
+            fprintf(stderr, "[ktls] userspace TLS: disabled by tls.Config.set_ktls(false)\n");
+        }
+        goto done;
+    }
+    // Must be the pinned single suite and both traffic secrets must be captured.
+    if (mbedtls_ssl_get_ciphersuite_id_from_ssl(&s->ssl) != MBEDTLS_TLS1_3_AES_128_GCM_SHA256) {
+        ktls_log_fb("ciphersuite is not TLS_AES_128_GCM_SHA256");
+        goto done;
+    }
+    if (!s->keys.have_server || !s->keys.have_client) {
+        ktls_log_fb("traffic secrets not exported");
+        goto done;
+    }
+    // Handoff hazard: if mbedtls already decrypted-and-buffered application data, the
+    // kernel (reading raw from the socket) would never see it. Stay userspace then.
+    if (mbedtls_ssl_get_bytes_avail(&s->ssl) != 0 || mbedtls_ssl_check_pending(&s->ssl) != 0
+        || s->ra_off < s->ra_len) {
+        ktls_log_fb("mbedtls holds buffered plaintext at handoff");
+        goto done;
+    }
+    // Derive AES-128-GCM key+iv per direction: server secret => TX, client => RX.
+    if (fill_crypto_info(s->keys.server_app_secret, &tx) != 0) {
+        ktls_log_fb("key derivation failed (TX)");
+        goto done;
+    }
+    if (fill_crypto_info(s->keys.client_app_secret, &rx) != 0) {
+        ktls_log_fb("key derivation failed (RX)");
+        goto done;
+    }
+    // Attach the kTLS ULP. Failure here is the clean fallback point — nothing on the
+    // socket changed, so the connection keeps running over userspace mbedtls
+    // (errno ENOENT = the `tls` kernel module is not loaded).
+    if (setsockopt(fd, SOL_TCP, TCP_ULP, "tls", sizeof("tls")) < 0) {
+        if (ktls_first(&ktls_logged_fb)) {
+            fprintf(stderr, "[ktls] fallback to userspace TLS: TCP_ULP failed (errno=%d %s)\n",
+                    errno, strerror(errno));
+        }
+        goto done;
+    }
+    // Past the ULP attach, a TX/RX failure leaves the socket half-converted (userspace
+    // mbedtls can no longer drive it) → mark for close (the caller checks ktls_failed).
+    if (setsockopt(fd, SOL_TLS, TLS_TX, &tx, sizeof(tx)) < 0) {
+        s->ktls_failed = 1;
+        goto done;
+    }
+    if (setsockopt(fd, SOL_TLS, TLS_RX, &rx, sizeof(rx)) < 0) {
+        s->ktls_failed = 1;
+        goto done;
+    }
+    s->ktls = 1; // keys now live in the kernel
+    // TLS_RX_EXPECT_NO_PAD, only when the config opted in (vtls_set_ktls_rx_no_pad).
+    // TLS 1.3 hides a record's real content type at the end of its plaintext,
+    // after optional zero padding, so by default the kernel decrypts every record
+    // into a clear-text skb of its own, finds the type, then copies the data out:
+    // one page allocation and one full copy per record. Told to expect no
+    // padding, it decrypts straight into the recv() buffer, and a padded or
+    // non-data record (KeyUpdate, alert) is detected and decrypted again the
+    // default way (counted in TlsRxNoPadViolation in /proc/net/tls_stat). That
+    // retry is correct only from Linux commit 1c8629651cb5 ("tls: rx: restore
+    // msg_iter before TLS 1.3 optimistic retry"; v7.2, v7.1.9+, v6.18.45+).
+    // Older kernels, back to 6.0, write decrypted bytes past the length recvmsg()
+    // returns: they corrupt the buffer ktls_recv fills (the pipelined requests
+    // in it) or fail the recv with EFAULT. Peers do not pad by default (Mbed TLS,
+    // OpenSSL, BoringSSL, rustls, Go and NSS), but RFC 8446 §5.4 allows it and
+    // OpenSSL pads when configured to (RecordPadding in openssl.cnf), hence
+    // opt-in: safe on a fixed kernel, or when the peers are known not to pad.
+    // Kernels before 6.0 reject the option and keep the default path.
+    int rx_no_pad = 0;
+    if (s->ktls_rx_no_pad) {
+        int one = 1;
+        rx_no_pad = setsockopt(fd, SOL_TLS, TLS_RX_EXPECT_NO_PAD, &one, sizeof(one)) == 0;
+    }
+    if (ktls_first(&ktls_logged_ok)) {
+        fprintf(stderr, "[ktls] engaged: kernel TLS TX+RX (TLS 1.3, AES-128-GCM%s)\n",
+                rx_no_pad ? ", RX no-pad" : "");
+    }
+
+done:
+    // Scrub every userspace copy of key material on all paths: the derived
+    // crypto_info and the captured traffic secrets (the kernel owns them now on
+    // success; on fallback the userspace mbedtls path doesn't use s->keys).
+    memset(&tx, 0, sizeof(tx));
+    memset(&rx, 0, sizeof(rx));
+    memset(&s->keys, 0, sizeof(s->keys));
+    // Staying on userspace mbedTLS: from now on reads go through the read-ahead
+    // (see vtls_bio_recv). With kTLS the kernel reads the socket instead.
+    s->readahead = !s->ktls;
+    return s->ktls;
+}
+
+int vtls_enable_ktls(void *sess, int fd) {
+    VTLS_LOCK(); // the key derivation runs on PSA
+    int ret = enable_ktls((vtls_session *)sess, fd);
+    VTLS_UNLOCK();
+    return ret;
+}
+
+int vtls_ktls_active(void *sess) { return ((vtls_session *)sess)->ktls; }
+
+int vtls_ktls_failed(void *sess) { return ((vtls_session *)sess)->ktls_failed; }
+
+// A fatal internal_error alert on a kTLS socket, for a connection about to be
+// closed mid-response. The record type is set per sendmsg with a SOL_TLS /
+// TLS_SET_RECORD_TYPE control message; a record of a new type makes the kernel
+// first push the data record a MSG_MORE send left open, which close() would
+// discard with every complete answer in it (neither a 0-byte send nor
+// shutdown(SHUT_WR) pushes it). Best effort: errors are ignored, the caller
+// closes next. A no-op on a userspace session.
+void vtls_ktls_abort(void *sess) {
+    vtls_session *s = (vtls_session *)sess;
+    if (!s || !s->ktls) return;
+    unsigned char alert[2] = { 2, 80 }; // level fatal, internal_error
+    union {
+        char buf[CMSG_SPACE(1)];
+        struct cmsghdr align;
+    } ctl;
+    struct iovec iov;
+    struct msghdr msg;
+    memset(&ctl, 0, sizeof(ctl));
+    memset(&msg, 0, sizeof(msg));
+    iov.iov_base = alert;
+    iov.iov_len = sizeof(alert);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = ctl.buf;
+    msg.msg_controllen = sizeof(ctl.buf);
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+    cm->cmsg_level = SOL_TLS;
+    cm->cmsg_type = TLS_SET_RECORD_TYPE;
+    cm->cmsg_len = CMSG_LEN(1);
+    *CMSG_DATA(cm) = 21; // content type: alert
+    // Never MSG_MORE: the ULP rejects it alongside a record type.
+    (void)sendmsg(s->net.fd, &msg, MSG_NOSIGNAL);
+}

@@ -1,9 +1,9 @@
 module main
 
-import http_server
-import http_server.core
-import http_server.http1_1.response
-import http_server.http1_1.request_parser
+import server
+import core
+import http1_1.response
+import http1_1.request_parser
 import db.pg
 
 fn handle_request(req_buffer []u8, mut out []u8, mut pool ConnectionPool) core.Step {
@@ -23,8 +23,12 @@ fn handle_request(req_buffer []u8, mut out []u8, mut pool ConnectionPool) core.S
 			}
 			return .done
 		} else if path.starts_with('/user/') {
-			id := path[6..]
-			out << get_user_controller([id], mut pool) or {
+			// The raw bytes after `/user/` (query string included) are attacker
+			// input; get_user_controller answers 400 to anything but a plain
+			// integer id (`1/**/OR/**/1=1`, `1;DELETE...`, `abc`) before it
+			// touches the database.
+			id := unsafe { tos(path.str + 6, path.len - 6) } // view, no copy
+			out << get_user_controller(id, mut pool) or {
 				out << response.tiny_bad_request_response
 				return .close
 			}
@@ -59,7 +63,7 @@ fn main() {
 		dbname:   'example'
 	}, 5) or { panic('Failed to create pg pool: ${err}') }
 
-	db := pool.acquire() or { panic(err) }
+	mut db := pool.acquire() or { panic(err) }
 	db.exec('create table if not exists users (id serial primary key, name text not null)') or {
 		panic('Failed to create table users: ${err}')
 	}
@@ -67,15 +71,15 @@ fn main() {
 
 	// Create and run the server with the handle_request function
 
-	mut server := http_server.new_server(http_server.ServerConfig{
+	mut srv := server.new_server(server.ServerConfig{
 		port:            3000
-		io_multiplexing: unsafe { http_server.IOBackend(0) }
+		io_multiplexing: unsafe { server.IOBackend(0) }
 		handler:         fn [mut pool] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 			return handle_request(req_buffer, mut out, mut pool)
 		}
 	})!
 
-	server.run()
+	srv.run()
 
 	pool.close()
 }
