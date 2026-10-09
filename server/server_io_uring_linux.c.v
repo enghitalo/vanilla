@@ -222,6 +222,19 @@ fn handle_io_uring_accept(worker &io_uring.Worker, cqe &io_uring.Cqe, limits Lim
 				C.close(fd) // pool exhausted
 			}
 		}
+	} else if socket.accept_starved(-res) {
+		// Out of fds (or socket buffers, or memory). An error CQE ends the
+		// accept (no F_MORE), and re-arming it now would spin this worker: the
+		// kernel allocates the fd before it looks at the backlog, so the new
+		// accept fails the same way at once (#256). Re-arm it from a timer
+		// instead (op_accept_resume → iou_resume_accept).
+		mut w := unsafe { &io_uring.Worker(worker) }
+		w.accept_log = socket.note_accept_pause('[io_uring]', -res, w.accept_log)
+		if io_uring.prepare_timeout(&worker.ring, &worker.accept_pause_ts, io_uring.encode_user_data(io_uring.op_accept_resume,
+			unsafe { nil })) {
+			return
+		}
+		// SQ full: no timer, so re-arm below as before.
 	}
 	// Graceful shutdown: once Server.shutdown() has set the draining flag (and
 	// shut the listener, which is what completed this accept with an error), do
@@ -237,6 +250,15 @@ fn handle_io_uring_accept(worker &io_uring.Worker, cqe &io_uring.Cqe, limits Lim
 	if (cqe.flags & io_uring.ioring_cqe_f_more) == 0 {
 		io_uring.prepare_accept(&worker.ring, worker.socket_fd, worker.use_multishot)
 	}
+}
+
+// iou_resume_accept ends an accept pause (see handle_io_uring_accept): its
+// timer fired, so arm the accept again, unless the server is shutting down.
+fn iou_resume_accept(worker &io_uring.Worker) {
+	if unsafe { worker.draining != nil } && stdatomic.load_i64(&worker.draining.n) != 0 {
+		return
+	}
+	io_uring.prepare_accept(&worker.ring, worker.socket_fd, worker.use_multishot)
 }
 
 fn handle_io_uring_read(worker &io_uring.Worker, cqe &io_uring.Cqe, mut env IouEnv, limits Limits, active_conns &core.Counter) {
@@ -492,6 +514,9 @@ fn dispatch_io_uring_cqe(worker &io_uring.Worker, cqe &io_uring.Cqe, mut env Iou
 			// A watched external fd became ready: resume the parked continuation(s).
 			handle_io_uring_poll(cqe, mut env, limits, active_conns)
 		}
+		io_uring.op_accept_resume {
+			iou_resume_accept(worker)
+		}
 		else {}
 	}
 }
@@ -550,6 +575,10 @@ fn io_uring_worker_main(listener int, cpu_id int, handler core.Handler, make_sta
 	io_uring.pool_init(mut worker)
 	// Resolve the keep-alive idle budget once (iou_arm_recv reads it per arm).
 	worker.idle_ns = u64(limits.idle_ms()) * 1_000_000
+	worker.accept_pause_ts = io_uring.KernelTimespec{
+		tv_sec:  i64(socket.accept_pause / time.second)
+		tv_nsec: i64(socket.accept_pause % time.second)
+	}
 
 	ring_entries := iou_init_ring(&worker.ring) or {
 		eprintln('Failed to initialize io_uring for worker ${cpu_id}: ${err.msg()}')

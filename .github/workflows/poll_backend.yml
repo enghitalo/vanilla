@@ -85,6 +85,14 @@ jobs:
           VANILLA_NO_IOURING: '1'
         run: |
           v -cc gcc -no-parallel -d vanilla_poll -run-only 'test_poll_*' test tests/epoll_timeouts_test.v
+      # Out of fds, accept() fails with EMFILE: every worker must pause
+      # accepting instead of polling a listener that stays readable (#256).
+      - name: Accept pause when out of fds, with the poll reactor
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+        run: |
+          v -cc gcc -no-parallel -d vanilla_poll -run-only 'test_poll_*' test tests/accept_starved_test.v
       # A flag-on example build proves the -d wiring links outside tests too.
       - name: Build an example with -d vanilla_poll
         shell: bash
