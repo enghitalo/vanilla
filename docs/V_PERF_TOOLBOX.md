@@ -202,6 +202,14 @@ Keeping that fallback out of line is what keeps the fast path at 2.4–2.7 ns
 (4.6–4.8 ns for `out << r` in the same run); inlined, the check alone cost
 ~0.7 ns.
 
+The win is the `const` string's folded copy. With a runtime string there is
+nothing to fold, and the inlined check measured slower than `push_many`:
+pg_async's `put_cstr_s` (every query's SQL text and statement/portal names)
+took the codec bench's `submit` phase from 0.322 s to 0.335–0.343 s (+4%,
+aligned builds, min of 7, V 0.5.2 5516000;
+[#220](https://github.com/enghitalo/vanilla/issues/220)), so it uses
+`push_many`.
+
 Scale: ~2.3 ns per response, against 50–150 ns of in-process work per request
 ([#239](https://github.com/enghitalo/vanilla/issues/239)) and microseconds once
 syscalls count. It is still the default for static responses (see
