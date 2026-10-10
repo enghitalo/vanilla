@@ -969,8 +969,15 @@ fn drain_takeover(mut reactor Reactor, epoll_fd int, fd int, limits core.Limits,
 	mut event_loop := conn_loop(mut reactor, epoll_fd, fd)
 	for cs.read_buf.len > 0 {
 		event_loop.last_watched = -1
+		// A ConnHandler runs with the sendfile gate closed, as a continuation
+		// does (on_watch_ready): nothing takes the slot after it, so a region
+		// it queued would go out after the next response on this worker,
+		// another client's (#271). queue_file refuses instead and the
+		// ConnHandler writes its bytes itself.
+		core.set_queue_file_allowed(false)
 		mut consumed, step := cs.takeover(buf_view(cs.read_buf, 0, cs.read_buf.len), mut
 			cs.write_buf, fd, cs.takeover_state, state, mut event_loop)
+		core.set_queue_file_allowed(true)
 		if step != .suspend && event_loop.last_watched >= 0 {
 			// Watched but did not park (.done/.close after watch_fd — a contract
 			// violation): tear the stray watch down before it can fire against a

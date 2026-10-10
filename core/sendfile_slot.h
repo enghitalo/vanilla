@@ -16,8 +16,9 @@
  * worker that can only do it on some connections (TLS: sendfile(2) writes
  * plaintext, so only a kernel-TLS socket can take it, never a userspace-TLS
  * one), and around a call whose region the worker never takes (the epoll
- * worker's watch continuations). vanilla_sf_enable() opens both, so a worker
- * that never calls vanilla_sf_set_allowed() keeps every request allowed.
+ * worker's watch continuations, wake fns and ConnHandlers). vanilla_sf_enable()
+ * opens both, so a worker that never calls vanilla_sf_set_allowed() keeps
+ * every request allowed.
  *
  * Pure C11 _Thread_local (with an MSVC fallback) keeps this independent of V's
  * `-enable-globals`, and the whole thing is inert on backends/OSes that never
@@ -85,7 +86,8 @@ static inline void vanilla_sf_enable(void) {
 
 // Gates the hand-off for the call about to run: a worker that can send files
 // on some connections but not others calls it before each handler call, and
-// the epoll worker closes it around each watch continuation.
+// the epoll worker closes it around each watch continuation, wake fn and
+// ConnHandler.
 static inline void vanilla_sf_set_allowed(bool allowed) {
 	vanilla_sf.allowed = allowed;
 }
