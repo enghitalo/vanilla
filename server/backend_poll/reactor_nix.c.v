@@ -668,6 +668,11 @@ fn poll_worker(listener int, handler core.Handler, make_state fn () voidptr, lim
 						if socket.accept_starved(err) {
 							w.accept_resume = time.sys_mono_now() + u64(socket.accept_pause)
 							w.accept_log = socket.note_accept_pause(err, w.accept_log)
+						} else if socket.listener_gone(err) {
+							// Closed after this poll returned (Server.shutdown), and
+							// the number may name a file that polls readable for
+							// good: stop accepting, as on POLLNVAL (#163).
+							w.accepting = false
 						}
 						break
 					}

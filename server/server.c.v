@@ -54,8 +54,9 @@ pub mut:
 	// front in new_server so shutdown() can stop them ALL (not just worker 0's).
 	listener_fds []int
 	// Shared shutdown flag: shutdown() sets it so the io_uring accept handlers stop
-	// re-arming and the workers quit accepting. Unused by the epoll backend (which
-	// stops accepting when its single listener is closed).
+	// re-arming and the workers quit accepting. Unused by the epoll backend, whose
+	// acceptor stops once its listener reports the shutdown (EPOLLHUP) or accept()
+	// says the listener is gone (socket.listener_gone).
 	draining &core.Counter = &core.Counter{}
 	// Server push (vanilla#230): one mailbox per epoll plain worker when
 	// ServerConfig.push_mailbox_slots > 0 (empty otherwise), opaque here and
