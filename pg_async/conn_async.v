@@ -50,6 +50,7 @@ mut:
 	error         string
 	sqlstate      string
 	severity      string
+	err_stmt      int // the failing statement's index in a batch (PgError.statement)
 	rows_affected u64
 	frame_slot    int
 }
@@ -57,9 +58,10 @@ mut:
 // pg_error is the query's ErrorResponse as a typed error (call when error != '').
 fn (q &PendingQuery) pg_error() PgError {
 	return PgError{
-		severity: q.severity
-		sqlstate: q.sqlstate
-		message:  q.error
+		severity:  q.severity
+		sqlstate:  q.sqlstate
+		message:   q.error
+		statement: q.err_stmt
 	}
 }
 
@@ -104,17 +106,7 @@ pub fn (mut c PgConn) async_submit(query_text string, params []?[]u8) bool {
 	if c.state != .ready || c.inflight.len >= max_inflight {
 		return false
 	}
-	// Serialize into the per-connection reusable scratch, then copy it into the fixed
-	// send buffer. The scratch (1) keeps send_buf's backing pinned (write_* append via
-	// `<<`, which would reallocate send_buf) and (2) is reused across submits — a fresh
-	// `[]u8{cap: 256}` per submit would leak under -gc none. Reset to len 0 each submit;
-	// grows to a high-water mark if a query frame ever exceeds 512 bytes.
-	if c.submit_scratch.cap == 0 {
-		c.submit_scratch = []u8{cap: 512}
-	}
-	unsafe {
-		c.submit_scratch.len = 0
-	}
+	c.reset_scratch()
 	write_parse(mut c.submit_scratch, '', query_text)
 	write_bind(mut c.submit_scratch, '', '', params)
 	write_describe_portal(mut c.submit_scratch, '')
@@ -123,12 +115,95 @@ pub fn (mut c PgConn) async_submit(query_text string, params []?[]u8) bool {
 	if !c.append_send(c.submit_scratch) {
 		return false
 	}
+	c.push_inflight()
+	return true
+}
+
+// Stmt is one statement of a batch (async_submit_batch): its SQL and its
+// parameters, as async_submit takes them (text format, bound to $1, $2, …; a
+// none element is SQL NULL).
+pub struct Stmt {
+pub:
+	sql    string
+	params []?[]u8
+}
+
+const err_batch_empty = error('pg: async_submit_batch: the batch has no statement')
+
+const err_batch_too_large = error('pg: async_submit_batch: the batch is larger than the send buffer (send_buf_cap) and can never be sent')
+
+// async_submit_batch submits `stmts` as ONE pipelined query: each statement's
+// Parse/Bind/Describe/Execute, then a single Sync. Everything up to a Sync runs
+// as one implicit transaction, so the batch is atomic and takes one round trip:
+// the Sync commits it if every statement succeeded; after an error the server
+// skips the remaining statements and the Sync rolls back the whole batch. (A
+// BEGIN inside the batch opens an explicit transaction instead, which the Sync
+// does not end: see in_transaction.) A batch without BEGIN is as safe to
+// pipeline (acquire_pipelined) as a single query.
+//
+// The batch is one entry of the in-flight FIFO, like a query: the request
+// parks once, and async_on_readable yields it once — a Result holding every
+// statement's reply (split it with Result.statement), or the PgError of the
+// statement that failed, whose `statement` field is its index (stmts.len when
+// the commit at the Sync failed: a serialization failure found at commit, a
+// deferred constraint). On a serialization failure (40001), submit the same
+// batch again (TxRetry).
+//
+// Returns false, submitting nothing, when the connection cannot take it now —
+// broken, its pipeline full, or its send buffer too full — exactly as
+// async_submit: the caller sheds. Returns an error for a batch that can never
+// be sent, on any connection: an empty one, or one larger than the send
+// buffer (send_buf_cap) on its own.
+pub fn (mut c PgConn) async_submit_batch(stmts []Stmt) !bool {
+	if stmts.len == 0 {
+		return err_batch_empty
+	}
+	// Serialized before the shed checks, so a batch that can never fit fails
+	// the same way on every connection, never as a shed (vanilla#51).
+	c.reset_scratch()
+	for s in stmts {
+		write_parse(mut c.submit_scratch, '', s.sql)
+		write_bind(mut c.submit_scratch, '', '', s.params)
+		write_describe_portal(mut c.submit_scratch, '')
+		write_execute(mut c.submit_scratch, '', 0)
+	}
+	write_sync(mut c.submit_scratch)
+	if c.submit_scratch.len > send_buf_cap {
+		return err_batch_too_large
+	}
+	if c.state != .ready || c.inflight.len >= max_inflight || !c.append_send(c.submit_scratch) {
+		return false
+	}
+	c.push_inflight()
+	return true
+}
+
+// reset_scratch empties the per-connection submit scratch. A query is
+// serialized there, then copied into the fixed send buffer: the scratch (1)
+// keeps send_buf's backing pinned (write_* append via `<<`, which would
+// reallocate send_buf) and (2) is reused across submits — a fresh
+// `[]u8{cap: 256}` per submit would leak under -gc none. It grows to a
+// high-water mark if a query frame ever exceeds 512 bytes.
+@[inline]
+fn (mut c PgConn) reset_scratch() {
+	if c.submit_scratch.cap == 0 {
+		c.submit_scratch = []u8{cap: 512}
+	}
+	unsafe {
+		c.submit_scratch.len = 0
+	}
+}
+
+// push_inflight pushes the PendingQuery for the query just appended to the
+// send buffer onto the in-flight FIFO.
+@[inline]
+fn (mut c PgConn) push_inflight() {
 	// Borrow a reply accumulator from the per-connection pool instead of allocating
 	// one per query (which would leak under `-gc none`). The pool holds max_inflight
 	// buffers reused round-robin; a slot is only reused after a full ring cycle, by
 	// which time the query that last used it has been drained AND rendered (at most
-	// max_inflight queries are in flight, enforced by the guard above), so the borrow
-	// can never alias a still-in-use reply.
+	// max_inflight queries are in flight, enforced by the submit guards), so the
+	// borrow can never alias a still-in-use reply.
 	if c.frame_pool.len < max_inflight {
 		c.frame_pool = [][]u8{cap: max_inflight}
 		for _ in 0 .. max_inflight {
@@ -145,7 +220,6 @@ pub fn (mut c PgConn) async_submit(query_text string, params []?[]u8) bool {
 		frames:     fbuf
 		frame_slot: slot
 	}
-	return true
 }
 
 // append_send copies one serialized query frame into the fixed-capacity send
@@ -254,7 +328,8 @@ const not_ready = QueryPoll{}
 // new front needs more bytes (stay parked). A server ErrorResponse fails only
 // its own query (surfaced after that query's ReadyForQuery, keeping the stream
 // in sync) as a PgError carrying its SQLSTATE; pipelined siblings still
-// complete on subsequent calls.
+// complete on subsequent calls. The ReadyForQuery that completes a query also
+// records whether the session is left in a transaction (tx_status).
 //
 // Connection loss (EOF, a socket error, a FATAL/PANIC ErrorResponse) breaks the
 // connection (is_broken) but never discards what was already received: every
@@ -282,11 +357,20 @@ pub fn (mut c PgConn) async_on_readable() !QueryPoll {
 			bt_command_complete {
 				c.inflight[0].rows_affected = parse_command_complete(payload)
 			}
+			bt_ready_for_query {
+				// Its status byte: whether the session is now in a transaction
+				// (tx_status). One byte of the frame already in hand.
+				if payload.len > 0 {
+					c.ready_status = payload[0]
+				}
+			}
 			bt_error_response {
 				info := parse_error_response(payload)
 				c.inflight[0].error = info.message.bytestr()
 				c.inflight[0].sqlstate = info.code.bytestr()
 				c.inflight[0].severity = info.severity.bytestr()
+				// Which statement of a batch failed: the ones before it completed.
+				c.inflight[0].err_stmt = statements_done(c.inflight[0].frames)
 				if ends_session(info.severity) {
 					// FATAL/PANIC: the server ends the session, no ReadyForQuery
 					// follows. The front query fails with it below; the queries

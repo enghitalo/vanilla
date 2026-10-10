@@ -361,6 +361,24 @@ kqueue a deadline watch is a plain watch, and `cancel` fails.
   without blocking, so `release` it on every path, error or not. Decide retries
   on the typed error — `err is pg_async.PgError && err.sqlstate == '40001'` —
   and on `conn.is_broken()` for a lost connection, never on the message text.
+- Send a multi-statement write as ONE batch when no statement needs another's
+  result: `conn.async_submit_batch(stmts)` ends them with a single Sync, so
+  they commit or roll back together in one round trip, and a batch without
+  BEGIN is as safe on `acquire_pipelined()` as one query. A transaction that
+  spans park/resume (BEGIN … COMMIT) goes on `acquire()`, never
+  `acquire_pipelined()`: whatever other requests pipeline onto a shared
+  connection would run inside it. `release()` it on every path — a connection
+  left in a transaction gets a ROLLBACK before anyone else can take it. On a
+  serialization failure (40001: SERIALIZABLE, every conflict on Aurora DSQL)
+  run the whole transaction again, as `pg_async.TxRetry` decides — never by
+  sleeping on the worker. Until
+  [vanilla#247](https://github.com/enghitalo/vanilla/pull/247) lands, run the
+  next attempt at once on the connection the request holds (`acquire()`),
+  re-arming that same fd; afterwards `backoff_ms` can arm a timerfd the
+  request parks on between attempts
+  ([examples/pg_transactions](../examples/pg_transactions/src/main.v)).
+  Aurora DSQL also caps a transaction at 3,000 modified rows, 10 MiB written
+  and 5 minutes, and keeps DDL and DML apart (`pg_async/tx.v`).
 - Call third-party HTTP APIs through `http1_1.upstream`, the same shape for
   HTTP: a per-worker `Pool` per origin (built in `make_state`, maintenance
   started in `on_worker_start`), `acquire()` / `send()` + `.suspend` in the

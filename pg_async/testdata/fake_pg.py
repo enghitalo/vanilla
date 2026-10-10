@@ -20,7 +20,14 @@ What a query returns is decided by its SQL text (see answer_statement):
                                      arrives first: then ERROR 57014
                                      (query_canceled), as PostgreSQL does
   begin / commit / rollback          the transaction status in ReadyForQuery
+  insert ... / update ...            no rows, "INSERT 0 1" / "UPDATE 1" (nothing
+                                     is stored)
   anything else                      ERROR 0A000 naming the unsupported text
+
+Every message up to a Sync is one group, so several statements before one
+Sync (a batch) run as one implicit transaction, as in PostgreSQL: the first
+failing statement ends the group, the rest are skipped, and a failure inside
+BEGIN leaves the session in a failed transaction block ('E') until ROLLBACK.
 
 CancelRequest: every session's BackendKeyData (process id 1000 + the
 connection number, a random secret key of --key-len bytes) is registered; a
@@ -36,6 +43,12 @@ needs happen deterministically:
       FATAL 57P01 (administrator command) 50 ms later, then close
   --hang-after K                    the K-th and later queries of a connection
       are never answered (the connection stays open)
+  --delay-ms MS                     every reply waits MS milliseconds (a slow
+      query: a client can disconnect while its request is parked on it)
+  --conflicts N                     the first N insert/update statements (over
+      all connections) fail with ERROR 40001 serialization_failure, as a
+      conflicting concurrent transaction makes them under SERIALIZABLE (and
+      every optimistic-concurrency conflict on Aurora DSQL)
   --auth scram|trust                (default scram; password --password)
   --key-len N                       the BackendKeyData secret key's length
       (default 4, protocol 3.0's; up to 256, as protocol 3.2 allows)
@@ -52,7 +65,8 @@ TLS, per run (--ssl; certificates from gen_test_ca.sh via --cert/--key):
       messages right before every query's reply (OpenSSL's
       SSL_new_session_ticket, through ctypes: the ssl module has no call for it)
 
---stats-file PATH keeps `key=value` counters (accepted, authenticated, queries,
+--stats-file PATH keeps `key=value` counters (accepted, authenticated, queries
+— one per Sync —, statements — one per Bind —, rollbacks, conflicts,
 server_closes, ssl_requests, tls_handshakes, sni, tickets, cancel_requests,
 cancels_honored, cancels_ignored, cancelled) up to date, so a test can assert
 on what the server saw. Every connection is logged to stderr.
@@ -96,6 +110,8 @@ ARGS = None
 TLS_CTX = None
 STATS = {}
 STATS_LOCK = threading.Lock()
+CONFLICTS = [0]  # 40001s sent so far (--conflicts)
+CONFLICT_LOCK = threading.Lock()
 
 # BackendKeyData of every session: process id -> (secret key, the event a
 # matching CancelRequest sets to interrupt its pg_sleep).
@@ -351,6 +367,15 @@ def encode_param(value, cast):
     return value, OID_TEXT, -1
 
 
+def take_conflict():
+    """Whether this write fails with 40001 (--conflicts): the first N do."""
+    with CONFLICT_LOCK:
+        if CONFLICTS[0] >= ARGS.conflicts:
+            return False
+        CONFLICTS[0] += 1
+        return True
+
+
 def answer_statement(sql, params, tx, cancel_ev):
     """One statement's reply after its ParseComplete/BindComplete: returns
     (bytes, transaction status after it, whether it failed)."""
@@ -374,10 +399,17 @@ def answer_statement(sql, params, tx, cancel_ev):
         tag = b'ROLLBACK' if tx == b'E' else b'COMMIT'
         return msg(b'n') + msg(b'C', tag + b'\x00'), b'I', False
     if low in ('rollback', 'abort'):
+        bump('rollbacks')
         return msg(b'n') + msg(b'C', b'ROLLBACK\x00'), b'I', False
     if tx == b'E':
         return error_response('ERROR', '25P02', 'current transaction is aborted, commands ignored '
                               'until end of transaction block'), b'E', True
+    if low.startswith(('insert', 'update')):
+        if take_conflict():
+            bump('conflicts')
+            return error_response('ERROR', '40001', 'could not serialize access due to concurrent update'), tx, True
+        tag = b'INSERT 0 1' if low.startswith('insert') else b'UPDATE 1'
+        return msg(b'n') + msg(b'C', tag + b'\x00'), tx, False
     m = LITERAL.match(text)
     if m:
         return (row_description([('?column?', OID_INT4, 4)]) +
@@ -442,6 +474,7 @@ def serve(conn, cid, cancel_ev):
             q, _ = cstr(body, pos)
             sql = q.decode()
         elif typ == b'B':
+            bump('statements')
             stmts.append([sql, parse_bind_params(body)])
         elif typ == b'S':
             queries += 1
@@ -466,6 +499,8 @@ def serve(conn, cid, cancel_ev):
             reply += msg(b'Z', tx)
             if ARGS.tickets_per_query and isinstance(conn, ssl.SSLSocket):
                 new_session_tickets(conn, ARGS.tickets_per_query)
+            if ARGS.delay_ms:
+                time.sleep(ARGS.delay_ms / 1000)
             if ARGS.close != 'none' and queries >= ARGS.close_after:
                 close_after_reply(conn, cid, reply)
                 return
@@ -517,6 +552,8 @@ def main():
     ap.add_argument('--close', choices=('none', 'delayed', 'immediate', 'fatal'), default='none')
     ap.add_argument('--close-after', type=int, default=1)
     ap.add_argument('--hang-after', type=int, default=0)
+    ap.add_argument('--conflicts', type=int, default=0)
+    ap.add_argument('--delay-ms', type=int, default=0)
     ap.add_argument('--lifetime', type=float, default=300.0, help='exit after this many seconds')
     ap.add_argument('--ssl', choices=('off', 'tls', 'garbage'), default='off')
     ap.add_argument('--require-ssl', action='store_true')
