@@ -3,7 +3,8 @@ module pg_async
 import time
 
 // Pool maintenance, off the request path: finding connections the server
-// closed while they sat idle, and re-dialing broken ones.
+// closed while they sat idle, re-dialing broken ones, and reading the reply
+// to the ROLLBACK release() queued on a connection left in a transaction.
 //
 // Without it, a connection the server closes while idle (a restart,
 // idle_session_timeout, a managed database's lifetime cap such as Aurora
@@ -83,11 +84,19 @@ fn (mut c PgConn) probe_idle() {
 // maintain probes every idle connection (probe_idle) and advances the re-dial
 // of every idle broken one by one non-blocking step, recycles connections past
 // max_lifetime_ms (above), and returns how soon, in milliseconds, it wants to
-// run again: maintenance_busy_ms while a re-dial or a recycle is in flight,
-// the remaining backoff while one waits to retry, else maintenance_idle_ms or
-// the time to the next lifetime deadline, whichever is sooner. A connection
-// held by acquire() or carrying pipelined queries is not probed: its reader
-// finds out on its own. Never blocks on the network.
+// run again: maintenance_busy_ms while a re-dial, a recycle or a release-time
+// ROLLBACK is in flight, the remaining backoff while one waits to retry, else
+// maintenance_idle_ms or the time to the next lifetime deadline, whichever is
+// sooner. A connection held by acquire() or carrying pipelined queries is left
+// alone: its reader finds out on its own. One whose release-time ROLLBACK is
+// in flight has nobody to read the reply but the pool: maintain() reads what
+// arrived (finish_rollback), at the busy tick until the ROLLBACK is answered.
+// An idle, unheld connection left in a transaction (a BEGIN that went through
+// acquire_pipelined(), which nobody will release) gets the same ROLLBACK — so
+// a pipelined sender that keeps a transaction open across a maintenance tick
+// loses it. A connection due for recycling while its ROLLBACK is in flight is
+// recycled at a later tick, once the ROLLBACK is answered. Never blocks on the
+// network.
 pub fn (mut p PgPool) maintain() int {
 	mut next := maintenance_idle_ms
 	now := time.sys_mono_now()
@@ -101,10 +110,32 @@ pub fn (mut p PgPool) maintain() int {
 				next = maintenance_busy_ms // its turn comes after the recycle in flight
 			}
 		}
-		if !p.idle[i] || p.conns[i].inflight.len > 0 {
+		if !p.idle[i] {
+			if p.conns[i].rollback_deadline == 0 {
+				continue // held by acquire(), or the recycle in flight
+			}
+			if !p.finish_rollback(i) {
+				if maintenance_busy_ms < next {
+					next = maintenance_busy_ms
+				}
+				continue
+			}
+		}
+		if p.conns[i].inflight.len > 0 {
 			continue
 		}
 		p.conns[i].probe_idle()
+		if p.conns[i].state == .ready && p.conns[i].ready_status != tx_idle {
+			// Unheld, nothing in flight, yet in a transaction: a BEGIN sent
+			// through acquire_pipelined(), whose sender has no release() to
+			// call. Both acquire paths skip such a connection, so without this
+			// the slot would be lost: roll it back as release() would.
+			p.start_rollback(i)
+			if maintenance_busy_ms < next {
+				next = maintenance_busy_ms
+			}
+			continue
+		}
 		if p.conns[i].state == .ready || p.conns[i].redial(p.cfg) {
 			continue
 		}

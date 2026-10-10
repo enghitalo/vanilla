@@ -17,8 +17,25 @@ What a query returns is decided by its SQL text (see answer_statement):
                                      int8, bool or text, from each cast)
   show NAME                          the StartupMessage's NAME parameter (text),
                                      ERROR 42704 when it sent none
+  select pg_sleep(S)                 answered after S seconds (one void row),
+                                     unless a CancelRequest for the session
+                                     arrives first: then ERROR 57014
+                                     (query_canceled), as PostgreSQL does
   begin / commit / rollback          the transaction status in ReadyForQuery
+  insert ... / update ...            no rows, "INSERT 0 1" / "UPDATE 1" (nothing
+                                     is stored)
   anything else                      ERROR 0A000 naming the unsupported text
+
+Every message up to a Sync is one group, so several statements before one
+Sync (a batch) run as one implicit transaction, as in PostgreSQL: the first
+failing statement ends the group, the rest are skipped, and a failure inside
+BEGIN leaves the session in a failed transaction block ('E') until ROLLBACK.
+
+CancelRequest: every session's BackendKeyData (process id 1000 + the
+connection number, a random secret key of --key-len bytes) is registered; a
+CancelRequest naming a process id with the right key cancels that session's
+pg_sleep in progress (counted as cancels_honored; one with a wrong key or an
+unknown id is ignored, as cancels_ignored), plain or over TLS (--ssl tls).
 
 Failure modes are chosen per run, so a test can make the server-side event it
 needs happen deterministically:
@@ -28,9 +45,17 @@ needs happen deterministically:
       FATAL 57P01 (administrator command) 50 ms later, then close
   --hang-after K                    the K-th and later queries of a connection
       are never answered (the connection stays open)
+  --delay-ms MS                     every reply waits MS milliseconds (a slow
+      query: a client can disconnect while its request is parked on it)
+  --conflicts N                     the first N insert/update statements (over
+      all connections) fail with ERROR 40001 serialization_failure, as a
+      conflicting concurrent transaction makes them under SERIALIZABLE (and
+      every optimistic-concurrency conflict on Aurora DSQL)
   --auth scram|cleartext|trust      (default scram; password --password).
       cleartext is AuthenticationCleartextPassword (code 3), over plaintext
       too: refusing that is the client's job; a wrong password is FATAL 28P01
+  --key-len N                       the BackendKeyData secret key's length
+      (default 4, protocol 3.0's; up to 256, as protocol 3.2 allows)
 
 TLS, per run (--ssl; certificates from gen_test_ca.sh via --cert/--key):
   --ssl off                         answer SSLRequest with 'N' (the default)
@@ -44,10 +69,12 @@ TLS, per run (--ssl; certificates from gen_test_ca.sh via --cert/--key):
       messages right before every query's reply (OpenSSL's
       SSL_new_session_ticket, through ctypes: the ssl module has no call for it)
 
---stats-file PATH keeps `key=value` counters (accepted, authenticated, queries,
+--stats-file PATH keeps `key=value` counters (accepted, authenticated, queries
+— one per Sync —, statements — one per Bind —, rollbacks, conflicts,
 server_closes, ssl_requests, tls_handshakes, sni, tickets, cancel_requests,
-password_messages, terminates) up to date, so a test can assert on what the
-server saw. Every connection is logged to stderr.
+cancels_honored, cancels_ignored, cancelled, password_messages, terminates) up
+to date, so a test can assert on what the server saw. Every connection is
+logged to stderr.
 
 It exits after --lifetime seconds, or within 0.2 s of its parent process
 exiting: a test that panics never runs its deferred stop(), and a fake left
@@ -79,6 +106,7 @@ OID_BOOL = 16
 OID_INT8 = 20
 OID_INT4 = 23
 OID_TEXT = 25
+OID_VOID = 2278
 
 SALT = b'vanilla-fake-pg-salt'
 ITERATIONS = 4096
@@ -87,6 +115,13 @@ ARGS = None
 TLS_CTX = None
 STATS = {}
 STATS_LOCK = threading.Lock()
+CONFLICTS = [0]  # 40001s sent so far (--conflicts)
+CONFLICT_LOCK = threading.Lock()
+
+# BackendKeyData of every session: process id -> (secret key, the event a
+# matching CancelRequest sets to interrupt its pg_sleep).
+BACKENDS = {}
+BACKENDS_LOCK = threading.Lock()
 
 
 def log(cid, text):
@@ -227,11 +262,29 @@ def cleartext_auth(conn):
         raise EOFError
 
 
+def cancel_request(body, cid):
+    """A CancelRequest's body after its code: Int32 process id, then the secret
+    key. Sets the named session's cancel event when the key matches."""
+    pid = struct.unpack('!I', body[:4])[0]
+    key = body[4:]
+    with BACKENDS_LOCK:
+        entry = BACKENDS.get(pid)
+    if entry is not None and hmac.compare_digest(entry[0], key):
+        # Counted before the reply it causes can reach the client.
+        bump('cancels_honored')
+        entry[1].set()
+        log(cid, f'CancelRequest for process {pid}: honored')
+    else:
+        bump('cancels_ignored')
+        log(cid, f'CancelRequest for process {pid}: ignored (unknown process or wrong key)')
+
+
 def startup(conn, cid):
     """Reads the startup packet, answering an SSLRequest first (--ssl), and
-    authenticates. Returns (connection, startup parameters): the connection is
-    the TLS session once one was accepted. The parameters are None for a
-    request that ends the connection (CancelRequest)."""
+    authenticates. Returns (connection, startup parameters, cancel event): the
+    connection is the TLS session once one was accepted, and the event is set
+    by a CancelRequest for this session. The parameters are None for a request
+    that ends the connection (CancelRequest)."""
     while True:
         ln = struct.unpack('!I', recv_exact(conn, 4))[0]
         body = recv_exact(conn, ln - 4)
@@ -257,8 +310,8 @@ def startup(conn, cid):
             continue
         if code == CANCEL_REQUEST:
             bump('cancel_requests')
-            log(cid, 'CancelRequest')
-            return conn, None
+            cancel_request(body[4:], cid)
+            return conn, None, None
         if code != PROTOCOL_3_0:
             raise EOFError
         params = {}
@@ -282,13 +335,16 @@ def startup(conn, cid):
     for k, v in (('server_version', '16.0 (vanilla fake_pg)'), ('integer_datetimes', 'on'),
                  ('client_encoding', 'UTF8'), ('TimeZone', 'UTC')):
         status += msg(b'S', k.encode() + b'\x00' + v.encode() + b'\x00')
-    status += msg(b'K', struct.pack('!I', 1000 + cid) + os.urandom(4))
+    pid, key, cancel_ev = 1000 + cid, os.urandom(ARGS.key_len), threading.Event()
+    with BACKENDS_LOCK:
+        BACKENDS[pid] = (key, cancel_ev)
+    status += msg(b'K', struct.pack('!I', pid) + key)
     # Counted before the client can see ReadyForQuery, so a test that asserts
     # right after its connect returns never reads a stale counter.
     bump('authenticated')
     log(cid, f'authenticated ({ARGS.auth}) user={params.get("user", "")}')
     conn.sendall(status + msg(b'Z', b'I'))
-    return conn, params
+    return conn, params, cancel_ev
 
 
 def new_session_tickets(conn, n):
@@ -318,6 +374,7 @@ CAST = re.compile(r'\$(\d+)(?:::(\w+))?')
 LITERAL = re.compile(r'^\s*select\s+(-?\d+)(?:::int4)?\s*$', re.I)
 SERIES = re.compile(r'generate_series\(\s*1\s*,\s*(\d+)\s*\)', re.I)
 SHOW = re.compile(r'^\s*show\s+(\w+)\s*$', re.I)
+SLEEP = re.compile(r'^\s*select\s+pg_sleep\(\s*([0-9.]+)\s*\)\s*$', re.I)
 
 
 def encode_param(value, cast):
@@ -332,7 +389,16 @@ def encode_param(value, cast):
     return value, OID_TEXT, -1
 
 
-def answer_statement(sql, params, tx, settings):
+def take_conflict():
+    """Whether this write fails with 40001 (--conflicts): the first N do."""
+    with CONFLICT_LOCK:
+        if CONFLICTS[0] >= ARGS.conflicts:
+            return False
+        CONFLICTS[0] += 1
+        return True
+
+
+def answer_statement(sql, params, tx, settings, cancel_ev):
     """One statement's reply after its ParseComplete/BindComplete: returns
     (bytes, transaction status after it, whether it failed). settings are the
     StartupMessage's parameters (show NAME)."""
@@ -347,16 +413,33 @@ def answer_statement(sql, params, tx, settings):
             return error_response('ERROR', '42704', f'unrecognized configuration parameter "{name}"'), tx, True
         return (row_description([(name, OID_TEXT, -1)]) + data_row([settings[name].encode()]) +
                 msg(b'C', b'SHOW\x00')), tx, False
+    m = SLEEP.match(text)
+    if m and tx != b'E':
+        # Like a backend's SIGINT: a cancel that came while nothing ran is
+        # forgotten, one that comes during the sleep interrupts it.
+        cancel_ev.clear()
+        if cancel_ev.wait(float(m.group(1))):
+            bump('cancelled')
+            return error_response('ERROR', '57014', 'canceling statement due to user request'), tx, True
+        return (row_description([('pg_sleep', OID_VOID, 4)]) + data_row([b'']) +
+                msg(b'C', b'SELECT 1\x00')), tx, False
     if low in ('begin', 'start transaction'):
         return msg(b'n') + msg(b'C', b'BEGIN\x00'), b'T', False
     if low in ('commit', 'end'):
         tag = b'ROLLBACK' if tx == b'E' else b'COMMIT'
         return msg(b'n') + msg(b'C', tag + b'\x00'), b'I', False
     if low in ('rollback', 'abort'):
+        bump('rollbacks')
         return msg(b'n') + msg(b'C', b'ROLLBACK\x00'), b'I', False
     if tx == b'E':
         return error_response('ERROR', '25P02', 'current transaction is aborted, commands ignored '
                               'until end of transaction block'), b'E', True
+    if low.startswith(('insert', 'update')):
+        if take_conflict():
+            bump('conflicts')
+            return error_response('ERROR', '40001', 'could not serialize access due to concurrent update'), tx, True
+        tag = b'INSERT 0 1' if low.startswith('insert') else b'UPDATE 1'
+        return msg(b'n') + msg(b'C', tag + b'\x00'), tx, False
     m = LITERAL.match(text)
     if m:
         return (row_description([('?column?', OID_INT4, 4)]) +
@@ -400,7 +483,7 @@ def parse_bind_params(body):
     return params
 
 
-def serve(conn, cid, settings):
+def serve(conn, cid, settings, cancel_ev):
     tx = b'I'
     queries = 0
     stmts = []  # [sql, params] of the current group (up to Sync)
@@ -422,6 +505,7 @@ def serve(conn, cid, settings):
             q, _ = cstr(body, pos)
             sql = q.decode()
         elif typ == b'B':
+            bump('statements')
             stmts.append([sql, parse_bind_params(body)])
         elif typ == b'S':
             queries += 1
@@ -433,7 +517,7 @@ def serve(conn, cid, settings):
             reply = b''
             for stmt_sql, params in stmts:
                 reply += msg(b'1') + msg(b'2')
-                part, tx, failed = answer_statement(stmt_sql, params, tx, settings)
+                part, tx, failed = answer_statement(stmt_sql, params, tx, settings, cancel_ev)
                 reply += part
                 if failed:
                     # An explicit transaction is now aborted; an implicit one
@@ -446,6 +530,8 @@ def serve(conn, cid, settings):
             reply += msg(b'Z', tx)
             if ARGS.tickets_per_query and isinstance(conn, ssl.SSLSocket):
                 new_session_tickets(conn, ARGS.tickets_per_query)
+            if ARGS.delay_ms:
+                time.sleep(ARGS.delay_ms / 1000)
             if ARGS.close != 'none' and queries >= ARGS.close_after:
                 close_after_reply(conn, cid, reply)
                 return
@@ -473,9 +559,9 @@ def close_after_reply(conn, cid, reply):
 
 def handle(conn, cid):
     try:
-        conn, params = startup(conn, cid)
+        conn, params, cancel_ev = startup(conn, cid)
         if params is not None:
-            serve(conn, cid, params)
+            serve(conn, cid, params, cancel_ev)
     except (EOFError, OSError, ValueError, IndexError, struct.error) as e:
         if isinstance(e, ssl.SSLError):
             log(cid, f'TLS: {e}')
@@ -497,12 +583,16 @@ def main():
     ap.add_argument('--close', choices=('none', 'delayed', 'immediate', 'fatal'), default='none')
     ap.add_argument('--close-after', type=int, default=1)
     ap.add_argument('--hang-after', type=int, default=0)
+    ap.add_argument('--conflicts', type=int, default=0)
+    ap.add_argument('--delay-ms', type=int, default=0)
     ap.add_argument('--lifetime', type=float, default=300.0, help='exit after this many seconds')
     ap.add_argument('--ssl', choices=('off', 'tls', 'garbage'), default='off')
     ap.add_argument('--require-ssl', action='store_true')
     ap.add_argument('--cert', default='', help='server certificate (PEM), for --ssl tls')
     ap.add_argument('--key', default='', help='its private key (PEM)')
     ap.add_argument('--tickets-per-query', type=int, default=0)
+    ap.add_argument('--key-len', type=int, default=4,
+                    help='BackendKeyData secret key length: 4 (protocol 3.0) or up to 256 (3.2)')
     ARGS = ap.parse_args()
     if ARGS.ssl == 'tls':
         global TLS_CTX

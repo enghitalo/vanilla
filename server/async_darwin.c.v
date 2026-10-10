@@ -65,6 +65,12 @@ fn (mut r KqReactor) park(mut conn KqConn, ext_fd int) {
 // kqueue_async_register is installed into EventLoop.register on macOS: record
 // the parked request and add the ext fd to this worker's kqueue.
 fn kqueue_async_register(mut w core.EventLoop, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
+	if w.client_fd < 0 {
+		// A clientless watch (watch_fd_background): this runtime resumes
+		// connections only (kq_run_cont), so it would never run. Arm nothing.
+		w.last_watched = -1
+		return
+	}
 	mut r := unsafe { &KqReactor(w.reactor) }
 	r.watches[ext_fd] = KqWatch{
 		client_fd: w.client_fd

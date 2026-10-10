@@ -97,6 +97,8 @@ fn (mut c PgConn) redial_start(cfg ConnConfig) ! {
 	c.tls_read_blocked = false
 	c.fatal = PgError{}
 	c.loss = ''
+	c.ready_status = tx_idle // a new session is in no transaction
+	c.rollback_deadline = 0
 	c.start_auth(cfg)!
 	c.fd = dial(&cfg, true, c.addr_cursor)!
 	c.state = .connecting

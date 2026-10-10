@@ -284,12 +284,54 @@ connection). Pool connections are **persistent**: park on a pooled fd with
 disconnecting mid-query tombstones the parked request rather than closing the
 connection. The continuation still runs when the reply arrives (its response is
 discarded), so it drains the reply and releases the slot, and the pooled conn
-(and its SCRAM handshake) survives client churn. With a plain `watch_fd` the
+(and its SCRAM handshake) survives client churn. That draining run may step to
+another fd like any continuation: a `watch_fd_persistent` fd runs it the same
+way when ready. After a `watch_fd` step (a backoff timer), the runtime closes
+that fd once the run returns and the run is never resumed, and a continuation
+cannot tell that its client is gone: release the pool slot before such a
+step. Nor is a run resumed after a watch the runtime refuses, such as a
+`watch_fd` on the departed client's fd number. A `watch_fd_persistent` on
+that number is refused only while the runtime holds the number for the run
+or it is a connection of this worker; otherwise it is taken as a pooled
+connection that has the number now, which may also be another worker's
+connection. Watching a client fd stored in the payload from such a run is
+misuse. Watch one fd per step:
+a second watch on the same fd replaces the first, but a run that moves on to
+another fd and back leaves a slot on both. With a plain `watch_fd` the
 runtime closes the pooled fd and the continuation never runs: the slot leaks,
 and once every slot has leaked the worker sheds every query with 503
 ([vanilla#190](https://github.com/enghitalo/vanilla/issues/190)). Keep
 `watch_fd` for per-request fds (a timerfd, a pipe), which must be closed with
 their request.
+
+**Bound every park.** A parked request has no read, write or idle deadline:
+it waits as long as its fd does, so a database or upstream that stops
+answering holds the request, its client and its pool slot for good. Set
+`Limits.park_timeout_ms` as the server-wide bound, and give a call its own
+budget with `event_loop.watch_fd_deadline(...)` /
+`watch_fd_persistent_deadline(...)` (`timeout_ms` < 0 exempts a long poll;
+each watch arms a fresh deadline, so pass the time left to bound a multi-step
+request). When the deadline passes first, the continuation runs once with
+`event_loop.timed_out()` true: answer 504 and return `.done`. On a pooled fd
+the reply is still due, and the park's tombstone consumes it in order (the
+continuation runs again, against a discarded buffer, when it arrives), so in
+the timeout branch don't read the fd and don't release the connection:
+
+```v
+if event_loop.timed_out() {
+    // pg_async: the server abandons the query, its 57014 comes back at once,
+    // and the tombstone run consumes it (and releases the slot).
+    st.pool.conn(idx).cancel(mut event_loop) or {}
+    core.append_str(mut out, resp_504)
+    return .done
+}
+```
+
+`PgConn.cancel` sends PostgreSQL's CancelRequest on a second connection to the
+same server (over TLS when the session is), without blocking the worker: it
+runs as a background watch on the worker's loop. Park deadlines and
+background watches are enforced by the epoll plain worker; on io_uring and
+kqueue a deadline watch is a plain watch, and `cancel` fails.
 
 **Do**
 
@@ -319,6 +361,24 @@ their request.
   without blocking, so `release` it on every path, error or not. Decide retries
   on the typed error — `err is pg_async.PgError && err.sqlstate == '40001'` —
   and on `conn.is_broken()` for a lost connection, never on the message text.
+- Send a multi-statement write as ONE batch when no statement needs another's
+  result: `conn.async_submit_batch(stmts)` ends them with a single Sync, so
+  they commit or roll back together in one round trip, and a batch without
+  BEGIN is as safe on `acquire_pipelined()` as one query. A transaction that
+  spans park/resume (BEGIN … COMMIT) goes on `acquire()`, never
+  `acquire_pipelined()`: whatever other requests pipeline onto a shared
+  connection would run inside it. `release()` it on every path — a connection
+  left in a transaction gets a ROLLBACK before anyone else can take it. On a
+  serialization failure (40001: SERIALIZABLE, every conflict on Aurora DSQL)
+  run the whole transaction again, as `pg_async.TxRetry` decides — never by
+  sleeping on the worker. Until
+  [vanilla#247](https://github.com/enghitalo/vanilla/pull/247) lands, run the
+  next attempt at once on the connection the request holds (`acquire()`),
+  re-arming that same fd; afterwards `backoff_ms` can arm a timerfd the
+  request parks on between attempts
+  ([examples/pg_transactions](../examples/pg_transactions/src/main.v)).
+  Aurora DSQL also caps a transaction at 3,000 modified rows, 10 MiB written
+  and 5 minutes, and keeps DDL and DML apart (`pg_async/tx.v`).
 - Call third-party HTTP APIs through `http1_1.upstream`, the same shape for
   HTTP: a per-worker `Pool` per origin (built in `make_state`, maintenance
   started in `on_worker_start`), `acquire()` / `send()` + `.suspend` in the
@@ -369,6 +429,9 @@ their request.
 
 - Open/close a socket or connection inside every handler invocation.
 - Block the worker on a DB/upstream call — `watch` + `.suspend` instead.
+- Park on a database or an upstream with no deadline: one that stops
+  answering then holds every request parked on it, for good
+  (`Limits.park_timeout_ms`, `watch_fd_deadline`, above).
 - Return `200` with empty data for a *write* that was shed (it's a lie about a
   mutation) — `503` is the honest answer. (The backpressure policy is tracked in
   [vanilla#51](https://github.com/enghitalo/vanilla/issues/51).)
@@ -401,10 +464,21 @@ is a first-class guarantee — keep it that way.
   `valgrind --tool=helgrind`, which does not model C11 atomics and reports
   atomically published data (the BirthQueue ring, #164) as races.
 
+- Reach a connection from another thread through its `core.ConnHandle`
+  (`post_wake` / `post_bytes`, `ServerConfig.push_mailbox_slots`): the post
+  goes through the owning worker's mailbox and its wake fn writes the bytes,
+  on that worker, in order with everything else the connection sends. Keep
+  your registries keyed by handle, and drop a handle in the wake fn's
+  `.closed` (see [examples/websocket_chat](../examples/websocket_chat/src/main.v)).
+
 **Don't**
 
 - Mutate a package-level `mut` variable from a handler.
 - Assume handlers run serially — they don't.
+- `send()` to a connection's fd from another thread, or keep connections in a
+  registry by fd number: the write races the worker's own flush and skips its
+  backpressure, and a number the kernel reused after a disconnect delivers to
+  another client.
 
 ---
 

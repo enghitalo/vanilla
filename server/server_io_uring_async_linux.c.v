@@ -41,16 +41,27 @@ module server
 // Parked-connection deadlines: read/write deadlines are cleared at park (no
 // client op is armed, so neither timeout applies — nor the idle one: a parked
 // request is never idle-reaped) and re-arm naturally at resume (a read deadline
-// for a buffered partial, else the idle deadline, via iou_arm_recv). A hung
-// query on a vanished client therefore pins the slot until the
-// query returns — the same known gap as the epoll runtime (async_linux.c.v:29);
-// bound it DB-side with e.g. statement_timeout. A parked-deadline sweep is a
-// follow-up shared with epoll.
+// for a buffered partial, else the idle deadline, via iou_arm_recv). Park
+// deadlines (Limits.park_timeout_ms, watch_fd_deadline, vanilla#200) are
+// enforced by the epoll plain worker only: here a deadline watch is a plain
+// watch and event_loop.timed_out() stays false, so a hung query pins its slot
+// until the query returns; bound it DB-side with e.g. statement_timeout. A
+// deadline here would also have to retire the oneshot poll still armed on the
+// fd (IORING_OP_POLL_REMOVE), not only the watch entry.
 import io_uring
 import core
 import http1_1.request_parser
 import http1_1.response
 import sync.stdatomic
+
+#include <fcntl.h>
+#include <sys/syscall.h>
+
+fn C.fcntl(fd int, cmd int, arg int) int
+fn C.getpid() int
+
+// iou_kcmp_file is KCMP_FILE (see backend_epoll's kcmp_file).
+const iou_kcmp_file = 0
 
 // Initial size of the fd-indexed watch table (grows by doubling; same layout as
 // the epoll reactor and the pool's fd-indexed structures).
@@ -142,12 +153,20 @@ mut:
 	// readable retry (a healthy socket parked awaiting writability raises neither
 	// POLLIN nor ERR/HUP — a readable re-arm would strand it).
 	pending_polls []PendingIouPoll
-	// Set around a tombstoned slot's continuation (drain_pipelined_iou dead
-	// branch): a re-arm of the tombstone's own fd re-queues the oneshot poll and
+	// Set around a tombstoned slot's continuation (iou_run_tombstone): a
+	// re-arm of the tombstone's own fd re-queues the oneshot poll and
 	// updates only the head slot's continuation and udata, never dedups or
 	// appends (that would revive the tombstone or duplicate it). A watch on any
 	// other fd is a step away: see dead_fd.
 	rearming_dead bool
+	// dead_refused, dead_held and dead_step_fd: the epoll Reactor twins
+	// (#257), in the padding before dead_fd likewise. Whether one of the
+	// running tombstone's watches was refused, whether iou_run_tombstone holds
+	// its client's number, and the persistent fd it last stepped to (its dead
+	// slot is the tail there).
+	dead_refused bool
+	dead_held    bool
+	dead_step_fd i32 = -1
 	// dead_fd: the fd whose tombstone is running while rearming_dead is set; a
 	// watch on any other fd is the continuation stepping away (#231, the epoll
 	// Reactor.dead_fd twin).
@@ -347,40 +366,24 @@ fn (mut env IouEnv) iou_reactor_clear(ext_fd int) {
 // Runs on the ring's own worker thread (continuations execute inside the CQE
 // dispatch), so SINGLE_ISSUER holds and no synchronization is needed.
 fn iou_register_watch(mut w core.EventLoop, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
-	if ext_fd < 0 {
+	mut env := unsafe { &IouEnv(w.reactor) }
+	// A clientless watch armed during a tombstone run (watch_fd_background)
+	// takes the live path, which refuses it below.
+	if env.rearming_dead && w.client_fd >= 0 {
+		// A tombstone's continuation is running (iou_run_tombstone): its
+		// watches follow the dead-mode rules, out of line.
+		iou_register_dead_watch(mut w, mut env, ext_fd, interest, cont, udata)
+		return
+	}
+	if ext_fd < 0 || w.client_fd < 0 {
 		// A consumer handed us a failed fd (e.g. timerfd_create returned -1); never
-		// index the flat table at a negative slot. Arm nothing.
+		// index the flat table at a negative slot. Arm nothing. Nor for a
+		// clientless watch (watch_fd_background): this runtime resumes
+		// connections only, and would pin it to whichever one is running.
 		w.last_watched = -1
 		return
 	}
-	mut env := unsafe { &IouEnv(w.reactor) }
 	mask := (if interest == .writable { io_uring.pollout } else { io_uring.pollin }) | io_uring.pollerr | io_uring.pollhup
-	if env.rearming_dead {
-		if ext_fd == env.dead_fd {
-			// Tombstone re-arm (drain_pipelined_iou dead branch): the running
-			// tombstone, the head of ext_fd's queue, takes the new continuation and
-			// payload (a multi-step chain) and stays dead; the consumed oneshot poll
-			// is re-queued. Nothing else in the table changes: a dedup/append here
-			// would revive or duplicate the tombstone.
-			if env.watches[ext_fd].queue.len > 0 {
-				env.watches[ext_fd].queue[0].cont = cont
-				env.watches[ext_fd].queue[0].udata = udata
-			}
-			env.iou_queue_poll(ext_fd, mask)
-			w.last_watched = ext_fd
-			return
-		}
-		// The tombstone's continuation steps to ANOTHER fd (#231): a persistent
-		// one gets a tombstone of its own (its continuation runs in dead mode
-		// when it is ready); a request-owned one is left unrecorded and is
-		// closed by drain_pipelined_iou once the continuation returns.
-		w.last_watched = ext_fd
-		if w.persistent {
-			env.iou_reactor_tombstone(ext_fd, w.client_fd, cont, udata)
-			env.iou_queue_poll(ext_fd, mask)
-		}
-		return
-	}
 	env.iou_reactor_watch(ext_fd, cont, udata)
 	if w.persistent {
 		// Pool-owned fd (watch_persistent): never closed by the runtime. Sticky —
@@ -389,6 +392,65 @@ fn iou_register_watch(mut w core.EventLoop, ext_fd int, interest core.WatchInter
 	}
 	env.iou_queue_poll(ext_fd, mask)
 	w.last_watched = ext_fd
+}
+
+// iou_register_dead_watch is iou_register_watch while a tombstone's
+// continuation runs (rearming_dead, set by iou_run_tombstone): epoll's
+// register_dead_watch twin, out of line likewise.
+@[noinline]
+fn iou_register_dead_watch(mut w core.EventLoop, mut env IouEnv, ext_fd int, interest core.WatchInterest, cont core.WakeFn, udata voidptr) {
+	if ext_fd < 0 {
+		// A failed fd (see iou_register_watch): a step away, refused (#257).
+		w.last_watched = -1
+		env.dead_refused = true
+		return
+	}
+	mask := (if interest == .writable { io_uring.pollout } else { io_uring.pollin }) | io_uring.pollerr | io_uring.pollhup
+	if ext_fd == env.dead_fd {
+		// Tombstone re-arm (iou_run_tombstone): the running tombstone, the
+		// head of ext_fd's queue, takes the new continuation and payload (a
+		// multi-step chain) and stays dead; the consumed oneshot poll is
+		// re-queued. Nothing else in the table changes: a dedup/append here
+		// would revive or duplicate the tombstone.
+		if env.watches[ext_fd].queue.len > 0 {
+			env.watches[ext_fd].queue[0].cont = cont
+			env.watches[ext_fd].queue[0].udata = udata
+		}
+		env.iou_queue_poll(ext_fd, mask)
+		w.last_watched = ext_fd
+		return
+	}
+	if ext_fd == w.client_fd && (!w.persistent || env.dead_held
+		|| env.iou_is_live_conn_fd(ext_fd)) {
+		// A watch on the tombstone's client's own number (#257), refused as in
+		// epoll's register_dead_watch: request-owned, it can only be the
+		// client's socket; persistent, while iou_run_tombstone holds the
+		// number or it is a connection of this worker. Otherwise a pooled fd
+		// of this worker took the number before the run: a pooled step.
+		w.last_watched = -1
+		env.dead_refused = true
+		return
+	}
+	// The tombstone's continuation steps to ANOTHER fd (#231): a persistent
+	// one gets a tombstone of its own (its continuation runs in dead mode
+	// when it is ready); a request-owned one is left unrecorded and is
+	// closed by iou_run_tombstone once the continuation returns.
+	w.last_watched = ext_fd
+	if w.persistent {
+		if ext_fd == int(env.dead_step_fd) {
+			// A repeat on the fd this run already stepped to (#257): its dead
+			// slot, the tail there, takes the new continuation and payload; a
+			// second slot would take the next reply on ext_fd. The poll is
+			// queued again, for the interest now asked for.
+			last := env.watches[ext_fd].queue.len - 1
+			env.watches[ext_fd].queue[last].cont = cont
+			env.watches[ext_fd].queue[last].udata = udata
+		} else {
+			env.iou_reactor_tombstone(ext_fd, w.client_fd, cont, udata)
+			env.dead_step_fd = i32(ext_fd)
+		}
+		env.iou_queue_poll(ext_fd, mask)
+	}
 }
 
 // iou_queue_poll queues the oneshot poll SQE, falling back to the pending list on
@@ -730,6 +792,32 @@ fn handle_io_uring_poll(cqe &io_uring.Cqe, mut env IouEnv, limits Limits, active
 	}
 }
 
+// iou_hold_free_number is backend_epoll's hold_free_number (#257): it holds fd
+// number n, a dead client's, for its tombstone's run, so that no fd the run
+// creates (nor another thread) gets it. The duplicate is of this worker's
+// listener, which the run never sees: a watch on n is refused before any
+// poll. Returns n, held, or -1 when n is taken. iou_release_hold undoes it.
+fn iou_hold_free_number(src int, n int) int {
+	held := C.fcntl(src, C.F_DUPFD_CLOEXEC, n)
+	if held == n {
+		return held
+	}
+	if held >= 0 {
+		C.close(held)
+	}
+	return -1
+}
+
+// iou_release_hold is backend_epoll's release_hold: it closes the hold unless
+// the continuation closed it itself and the number may be another's by now.
+fn iou_release_hold(src int, held int) {
+	pid := C.getpid()
+	same := unsafe { C.syscall(C.SYS_kcmp, pid, pid, iou_kcmp_file, src, held) }
+	if same == 0 || (same < 0 && C.errno != C.EBADF) {
+		C.close(held)
+	}
+}
+
 // iou_is_live_conn_fd reports whether `fd` is one of this worker's live
 // connections (epoll's st.conns[fd] != nil). A scan of the pool: only the cold
 // path of a tombstone stepping to a request-owned fd asks.
@@ -744,6 +832,71 @@ fn (env &IouEnv) iou_is_live_conn_fd(fd int) bool {
 	return false
 }
 
+// iou_run_tombstone runs the continuation of the tombstone (or released or
+// reused slot) at the head of ext_fd's queue, against a throwaway buffer,
+// purely to CONSUME its in-flight query result in order (keeping the queue
+// aligned with the DB connection's FIFO), then discards it. Returns false
+// when the tombstone stays at the head (its result is not ready yet), true
+// when it was popped. Out of line, like epoll's run_tombstone: the worker
+// loop, into which drain_pipelined_iou is inlined, carries none of this cold
+// code (#257).
+@[direct_array_access; noinline]
+fn iou_run_tombstone(mut env IouEnv, ext_fd int, slot IouParkSlot, ready_err bool) bool {
+	conn := slot.conn
+	unsafe {
+		env.scratch.len = 0
+	}
+	mut dead_loop := iou_event_loop(mut env, slot.client_fd)
+	// rearming_dead: a re-arm from this tombstone's continuation updates
+	// only this head slot (continuation, udata) and re-queues the oneshot
+	// poll; a watch on another fd is a step away (dead_fd). See
+	// iou_register_watch.
+	env.rearming_dead = true
+	env.dead_fd = ext_fd
+	env.dead_step_fd = -1
+	env.dead_refused = false
+	// The dead client's number, unless its connection still holds it, is
+	// held for the run (#257): see iou_hold_free_number.
+	hold := if slot.client_fd >= 0 && (unsafe { conn == nil } || unsafe { conn.owner == nil }
+		|| conn.fd != slot.client_fd) {
+		iou_hold_free_number(env.worker.socket_fd, slot.client_fd)
+	} else {
+		-1
+	}
+	env.dead_held = hold >= 0
+	dead_step := slot.cont(mut env.scratch, ext_fd, ready_err, slot.udata, env.state, mut
+		dead_loop)
+	if hold >= 0 {
+		iou_release_hold(env.worker.socket_fd, hold)
+	}
+	env.rearming_dead = false
+	env.dead_held = false
+	env.dead_fd = -1
+	stepped := dead_loop.last_watched
+	if stepped >= 0 && stepped != ext_fd && stepped != slot.client_fd
+		&& !(stepped < env.watches.len && env.watches[stepped].active)
+		&& !env.iou_is_live_conn_fd(stepped) {
+		// A request-owned fd, left unrecorded by iou_register_watch (#231):
+		// its client is gone, so close it (iou_detach_rejected_watch's rule).
+		// The dead client's own number, or a connection's, is never closed
+		// (a watch on the former is refused, and the run held it, so no fd
+		// the run created has it: #257).
+		C.close(stepped)
+	}
+	// A step that was refused (its last watch armed nothing) moved away
+	// from ext_fd too: it read its reply there (#257).
+	if dead_step == .suspend
+		&& (stepped == ext_fd || (stepped < 0 && !env.dead_refused)) {
+		return false // result not ready yet — the tombstone stays at the head
+	}
+	// Done with ext_fd, or stepped to another fd (or tried to): pop the
+	// tombstone, which would otherwise run against the next client's
+	// reply (#231).
+	env.watches[ext_fd].queue.delete(0)
+	env.iou_reactor_clear_if_drained(ext_fd)
+	return true
+}
+
 // drain_pipelined_iou fans one readiness edge on a multiplexed pg connection out
 // to the clients queued on it, in submission order — the io_uring twin of epoll's
 // drain_pipelined. The queue head aligns with the connection's front in-flight
@@ -755,42 +908,14 @@ fn drain_pipelined_iou(mut env IouEnv, ext_fd int, ready_err bool, limits Limits
 	for env.watches[ext_fd].queue.len > 0 {
 		slot := env.watches[ext_fd].queue[0]
 		mut conn := slot.conn
-		// A tombstoned or released/reused slot: run its continuation against a
-		// throwaway buffer purely to CONSUME its in-flight query result in order
-		// (keeping the queue aligned with the DB connection's FIFO), then discard.
-		// Never dereference conn state for a dead slot — identity is the captured fd.
+		// A tombstoned or released/reused slot: its continuation runs to consume
+		// its in-flight result, which is discarded (iou_run_tombstone). Never
+		// dereference conn state for a dead slot — identity is the captured fd.
 		if slot.dead || unsafe { conn == nil } || unsafe { conn.owner == nil }
 			|| conn.fd != slot.client_fd {
-			unsafe {
-				env.scratch.len = 0
+			if !iou_run_tombstone(mut env, ext_fd, slot, ready_err) {
+				break // its result is not ready yet, so no later one is either
 			}
-			mut dead_loop := iou_event_loop(mut env, slot.client_fd)
-			// rearming_dead: a re-arm from this tombstone's continuation updates
-			// only this head slot (continuation, udata) and re-queues the oneshot
-			// poll; a watch on another fd is a step away (dead_fd). See
-			// iou_register_watch.
-			env.rearming_dead = true
-			env.dead_fd = ext_fd
-			dead_step := slot.cont(mut env.scratch, ext_fd, ready_err, slot.udata, env.state, mut
-				dead_loop)
-			env.rearming_dead = false
-			env.dead_fd = -1
-			stepped := dead_loop.last_watched
-			if stepped >= 0 && stepped != ext_fd && stepped != slot.client_fd
-				&& !(stepped < env.watches.len && env.watches[stepped].active)
-				&& !env.iou_is_live_conn_fd(stepped) {
-				// A request-owned fd, left unrecorded by iou_register_watch (#231):
-				// its client is gone, so close it (iou_detach_rejected_watch's rule).
-				// The dead client's own number, or a connection's, is never closed.
-				C.close(stepped)
-			}
-			if dead_step == .suspend && (stepped < 0 || stepped == ext_fd) {
-				break // result not ready yet — the tombstone stays at the head
-			}
-			// Done with ext_fd, or stepped to another fd: pop the tombstone, which
-			// would otherwise run against the next client's reply (#231).
-			env.watches[ext_fd].queue.delete(0)
-			env.iou_reactor_clear_if_drained(ext_fd)
 			continue
 		}
 		iou_unpark(env.worker, mut *conn)

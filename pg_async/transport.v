@@ -217,6 +217,7 @@ fn (mut c PgConn) tls_attach(cfg &ConnConfig) ! {
 	c.tls = c.tls_cfg.new_client_session(c.fd, cfg.host) or {
 		return error('pg: cannot start a TLS session')
 	}
+	c.tls_host = cfg.host // a CancelRequest's own TLS session is for the same host
 }
 
 // tls_step advances the TLS handshake as far as it goes without waiting:

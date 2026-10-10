@@ -282,9 +282,10 @@ fn attempt_password(cfg &ConnConfig) !string {
 
 // LinkState is a connection's health. A live connection is .ready. It turns
 // .broken the moment it is known lost: EOF, a socket error (a TLS error
-// included), a FATAL/PANIC ErrorResponse, or an exclusive borrower releasing
+// included), a FATAL/PANIC ErrorResponse, an exclusive borrower releasing
 // it with a query still in flight (its reply stream can no longer be matched
-// to queries). A broken connection takes no new query and fails what is still
+// to queries), or a ROLLBACK queued at release that failed or got no answer
+// (PgPool.finish_rollback). A broken connection takes no new query and fails what is still
 // in flight — after delivering every reply already buffered — and its pool
 // then re-dials it through .connecting (over TLS, .ssl_request and
 // .tls_handshake) and .starting back to .ready, without blocking (redial.v).
@@ -315,6 +316,15 @@ mut:
 	send_off int  // [0, send_off) already sent
 	send_len int  // [send_off, send_len) written, still to send
 	inflight []PendingQuery
+	// ready_status is the transaction status byte of the last ReadyForQuery
+	// that completed a query: tx_idle, tx_in_block or tx_failed (tx.v). A
+	// fresh session starts idle.
+	ready_status u8 = tx_idle
+	// rollback_deadline is set while the ROLLBACK release() queued for a
+	// connection left in a transaction is in flight (monotonic ns; 0 = none):
+	// the pool hands the connection out again only once that ROLLBACK's
+	// ReadyForQuery reports it idle (PgPool.finish_rollback).
+	rollback_deadline u64
 	// Per-connection reply-accumulator pool: max_inflight buffers (frame_buf_cap each)
 	// allocated ONCE and reused round-robin via frame_ring, so a pipelined query never
 	// allocates its accumulator per submit — essential under `-gc none`, where a
@@ -359,6 +369,14 @@ mut:
 	// io_deadline bounds the waits of the blocking bring-up over TLS
 	// (monotonic ns; 0 = wait as long as it takes).
 	io_deadline u64
+	// What cancel() needs (cancel.v): the BackendKeyData of the session (its
+	// process id, and its secret key as bytes: 4 on protocol 3.0, up to 256
+	// on 3.2), refreshed by every bring-up and re-dial; the host TLS sessions
+	// are started for (SNI and verify_full); the CancelRequest in flight.
+	backend_pid int
+	cancel_key  []u8
+	tls_host    string
+	cancel      PgCancel
 	// expires_at is when a pooled connection is due for recycling
 	// (max_lifetime_ms, monotonic ns; max_u64 = never), set each time it
 	// comes up (lifetime_deadline).
@@ -445,6 +463,7 @@ fn (mut c PgConn) teardown() {
 		c.tls.free()
 		c.tls = tls.Session{}
 	}
+	c.cancel_teardown() // before the TLS config its session comes from goes
 	if c.owns_tls && c.tls_cfg != unsafe { nil } {
 		c.tls_cfg.free()
 	}
@@ -562,8 +581,11 @@ fn (mut c PgConn) on_startup_msg(typ u8, payload []u8, cfg &ConnConfig, mut scra
 		bt_ready_for_query {
 			return true
 		}
+		bt_backend_key_data {
+			c.set_backend_key(payload)
+		}
 		else {
-			// ParameterStatus / BackendKeyData / NoticeResponse — ignored.
+			// ParameterStatus / NoticeResponse — ignored.
 		}
 	}
 	return false
@@ -658,6 +680,9 @@ pub fn (mut c PgConn) query(query_text string, params []?[]u8) !Result {
 		}
 		match msg.typ {
 			bt_ready_for_query {
+				if msg.payload.len > 0 {
+					c.ready_status = msg.payload[0]
+				}
 				break
 			}
 			bt_command_complete {

@@ -12,6 +12,9 @@
 //     sends, so shutdown() did not wait for it either);
 //   * shutdown() returns only once the parked response was written;
 //   * grace_ms still bounds the wait;
+//   * a park with an earlier deadline of its own (watch_fd_deadline, #200)
+//     holds it only until that deadline answers it (epoll: the only backend
+//     that enforces park deadlines);
 //   * a parked client that left releases its count (epoll at once; io_uring,
 //     which only notices a parked client's hangup when it resumes, then);
 //   * a continuation that re-parks (a multi-step chain) is waited for to the
@@ -53,6 +56,13 @@ const sd_delayed = 'HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: keep-ali
 const sd_long_ms = 5000
 const sd_long_req = 'GET /long HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 const sd_long_prefix = 'GET /long '.bytes()
+
+// /dl parks on the same 5 s timer, with a deadline of its own (sd_dl_ms,
+// watch_fd_deadline): its continuation answers 504 when that passes first.
+const sd_dl_ms = 300
+const sd_dl_req = 'GET /dl HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const sd_dl_prefix = 'GET /dl '.bytes()
+const sd_timed_out = 'HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 7\r\nConnection: keep-alive\r\n\r\ntimeout'.bytes()
 
 // /chain parks sd_chain_steps times in a row, sd_chain_ms each: every
 // continuation but the last re-arms a fresh timer and suspends again.
@@ -129,6 +139,11 @@ fn sd_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 		event_loop.watch_fd(sd_timer(sd_long_ms), .readable, sd_timer_done, unsafe { nil })
 		return sd_parked()
 	}
+	if sd_has_prefix(req, sd_dl_prefix) {
+		event_loop.watch_fd_deadline(sd_timer(sd_long_ms), .readable, sd_timer_done, unsafe { nil },
+			sd_dl_ms)
+		return sd_parked()
+	}
 	if sd_has_prefix(req, sd_chain_prefix) {
 		event_loop.watch_fd(sd_timer(sd_chain_ms), .readable, sd_chain_step, voidptr(usize(sd_chain_steps - 1)))
 		return sd_parked()
@@ -157,6 +172,12 @@ fn sd_parked() core.Step {
 }
 
 fn sd_timer_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	if event_loop.timed_out() {
+		// The timer has not fired: nothing to read. The request owns it.
+		C.close(ready_fd)
+		out << sd_timed_out
+		return .done
+	}
 	mut tmp := [8]u8{}
 	C.read(ready_fd, &tmp[0], 8)
 	C.close(ready_fd)
@@ -341,6 +362,32 @@ fn check_shutdown_grace_bounds_parked(backend server.IOBackend) ! {
 	assert parked == 1, '${backend}: a request parked on a watch must count as in flight, the sum was ${parked}'
 }
 
+// check_shutdown_bounded_by_park_deadline (vanilla#200): a request parked on a
+// 5 s timer with a 300 ms deadline of its own. shutdown(5000) waits for the
+// deadline, whose continuation answers 504, and not for the timer or the
+// grace. Epoll plain worker only: the other backends do not enforce park
+// deadlines.
+fn check_shutdown_bounded_by_park_deadline(backend server.IOBackend) ! {
+	sd_reset_parks()
+	mut h := vtest.start(sd_config(backend))!
+	defer {
+		h.stop()
+	}
+	fd := sd_send(h.port(), sd_dl_req)!
+	defer {
+		transport.close_fd(fd)
+	}
+	parked := sd_until_parked(mut h, 1)
+	waited := sd_shutdown(mut h, 5000)
+	got := testkit.fd_read_until(fd, 'timeout', 2000)
+	assert got.contains('HTTP/1.1 504 '), '${backend}: the parked request did not get its timeout answer: ${got}'
+	assert waited < 2500, '${backend}: shutdown(5000) waited ${waited} ms for a park with a ${sd_dl_ms} ms deadline'
+	assert waited >= sd_dl_ms - 200, '${backend}: shutdown(5000) returned after ${waited} ms, before the ${sd_dl_ms} ms deadline answered'
+	assert parked == 1, '${backend}: a request parked on a watch must count as in flight, the sum was ${parked}'
+	left := sd_until_inflight(mut h, 0)
+	assert left == 0, '${backend}: ${left} in-flight count(s) leaked by a park that timed out'
+}
+
 // check_shutdown_after_parked_client_left: the client of a parked request
 // disconnects, then shutdown(5000). Its count must not be held until the
 // grace runs out. epoll tears the watch down when the client leaves, so the
@@ -461,6 +508,10 @@ fn test_epoll_shutdown_grace_bounds_parked() ! {
 
 fn test_epoll_shutdown_after_parked_client_left() ! {
 	check_shutdown_after_parked_client_left(.epoll, sd_long_req, 2000)!
+}
+
+fn test_epoll_shutdown_bounded_by_park_deadline() ! {
+	check_shutdown_bounded_by_park_deadline(.epoll)!
 }
 
 fn test_epoll_shutdown_waits_for_reparked_chain() ! {

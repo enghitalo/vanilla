@@ -94,11 +94,81 @@ connection desyncs or corrupts:
    queries have drained with their errors — `redial.v`, vanilla#191. That
    drain is why the FIFO contract also binds a request whose flush failed: it
    still parks and consumes its error, or its slot never comes back.)
+7. **A park that times out keeps its queue position.** With a park deadline
+   (`Limits.park_timeout_ms`, `watch_fd_persistent_deadline`, vanilla#200)
+   any slot can time out, not only the head: its continuation runs once with
+   `event_loop.timed_out()` and answers 504 without touching the connection,
+   and its slot becomes a tombstone where it is, exactly as when its client
+   disconnects. Its reply is still due and still `inflight[k]`, so the
+   tombstone consumes it in order when it arrives. `PgConn.cancel()` makes
+   that reply come at once (57014) instead of when the query ends.
 
 These are also the read-bound case for the whole approach: the win is mostly CPU
 reduction (fewer syscalls/parses per query), and because Postgres replies in order
 a handful of pipelined conns saturate the link — so the per-worker 2-conn pool is
 fixable by pipelining, not by more connections.
+
+## Transactions on a pipelined pool (vanilla#199)
+Every `async_submit` carries its own Sync, so each query is its own implicit
+transaction. A pipelined connection is shared, so a transaction that spans
+queries must not be: everything pipelined behind a BEGIN runs inside it, a
+ROLLBACK undoes it, and after a failed statement every one of them fails with
+25P02 until someone rolls back.
+- **Status byte.** The ReadyForQuery that completes a query carries the
+  session's transaction status: `I` idle, `T` in a block, `E` in a failed
+  block. `async_on_readable` stores it (one byte of a frame already in hand);
+  `tx_status()` / `in_transaction()` read it. It describes the session as of
+  the last completed query, not the queries still in flight.
+- **Who may share.** `acquire()` is the exclusive borrow: held until
+  `release()`, and `acquire_pipelined()` never shares it — that is the borrow
+  for BEGIN … COMMIT across park/resume. `acquire_pipelined()` also skips a
+  connection whose status is not `I`, and `acquire()` skips one nobody holds
+  (a BEGIN that went through `acquire_pipelined()`, which the docs forbid).
+  Nobody will release such a connection, so `maintain()` rolls it back as
+  `release()` would, and the slot comes back; a pipelined sender that keeps a
+  transaction open across a maintenance tick loses it.
+- **Safe release.** `release()` of a connection not in `I` queues a ROLLBACK
+  and keeps the slot out of the idle set (`rollback_deadline` set). Nobody is
+  parked on the connection any more, so the pool reads the reply itself: the
+  next `acquire()` / `acquire_pipelined()` / `maintain()` that passes the slot
+  advances it one non-blocking step (`finish_rollback`), exactly as they
+  advance a re-dial; `maintain()` ticks at `maintenance_busy_ms` while one is
+  in flight. The slot is idle again only once the ROLLBACK's ReadyForQuery
+  reports `I`. A lost connection, an error, or no answer within
+  `rollback_timeout` (5 s) breaks the connection instead, and the re-dial
+  replaces the session. The reactor needs nothing new: the ROLLBACK's reply
+  arriving on a pooled fd with no watch is the leftover-fd case (detached,
+  not closed), and the next `watch_fd_persistent` re-adds the fd. A release
+  of an idle session stays one flag write.
+- **Batches.** `async_submit_batch` writes N × Parse/Bind/Describe/Execute and
+  ONE Sync: one implicit transaction (atomic, one round trip), and ONE entry
+  of the in-flight FIFO, so the reactor's `queue[k] ↔ inflight[k]` alignment
+  is unchanged — the request parks once and gets one Result.
+  `Result.statement(i)` splits it at each CommandComplete /
+  EmptyQueryResponse (views, no allocation); a failure is the PgError of the
+  failing statement with its index in `PgError.statement` (the batch's length
+  when the commit at the Sync failed). A batch that can never fit the fixed
+  send buffer (`send_buf_cap`), or an empty one, is an error on every
+  connection; a momentarily full connection returns false, a shed (#51). A
+  batch without BEGIN is as pipeline-safe as one query; one that opens an
+  explicit transaction leaves the session in `T` (or `E`) after its Sync and
+  belongs on `acquire()`.
+- **Retries.** A serialization failure (40001: SERIALIZABLE, and every OCC
+  conflict on Aurora DSQL, often at COMMIT) means running the whole
+  transaction again. `TxRetry` holds no state: `retry(attempt, err)` and
+  `backoff_ms(attempt)` (full jitter, from the monotonic clock).
+- **Until vanilla#247 lands, no backoff wait after a DB reply.** Before
+  #247, a continuation parked on a pooled fd cannot step to ANOTHER fd (a
+  timerfd for the wait) when it is pipelined (`drain_pipelined` keeps the
+  slot at the head, and the next reply on the connection runs it again — a
+  FIFO misalignment, seen here as requests hanging forever while every
+  backend sat idle) or when its client disconnected (a tombstone's re-arm
+  of another fd, or of its own fd with a new continuation or payload, is not
+  taken). So `examples/pg_transactions` runs the next attempt at once on the
+  connection the request holds and re-arms the same fd, counting attempts
+  in the worker state rather than in the watch payload. Once #247 is in, the
+  continuation can arm a timerfd for `backoff_ms(attempt)` and park on it in
+  both cases, and a tombstone's re-arm takes the new payload.
 
 ## Local validation harness
 `bench/pg_async/` pipeline-tests pg_async locally against a seeded PG

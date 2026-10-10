@@ -24,6 +24,7 @@ jobs:
         folder:
           - examples/async_date_timerfd
           - examples/async_db_pg/src # its e2e test runs against a fake PostgreSQL
+          - examples/async_incremental_read
           - examples/async_multi_watch
           - examples/async_pipe/src
           - examples/async_sse
@@ -43,6 +44,7 @@ jobs:
           - examples/json_api/src
           - examples/mesh/src
           - examples/per_server_workers/src
+          - examples/pg_transactions/src # its e2e test runs against fake_pg.py (python3)
           - examples/rate_limit/src
           - examples/request_limits/src
           - examples/router/src
@@ -52,6 +54,7 @@ jobs:
           - examples/static_files/src
           - examples/veb_like/src
           - examples/websocket_echo/src
+          - examples/websocket_chat/src # server push: subscriptions, the mailbox, wake_after (#230)
     steps:
       - uses: actions/checkout@v4
       - name: Set up V
