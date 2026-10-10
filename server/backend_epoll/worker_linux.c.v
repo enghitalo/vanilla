@@ -180,7 +180,7 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 // the only extra hot-path cost over the old synchronous-only worker is a
 // per-event `watches[fd].active` load.
 @[direct_array_access; manualfree]
-fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_state fn () voidptr, on_worker_start core.WorkerStartFn, limits core.Limits, counter &core.Counter, active_conns &core.Counter, listen_port int, listen_uds bool, births_q &BirthQueue) {
+fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_state fn () voidptr, on_worker_start core.WorkerStartFn, limits core.Limits, counter &core.Counter, active_conns &core.Counter, listen_port int, listen_uds bool, births_q &BirthQueue, mbox &Mailbox, push_watermark int) {
 	maybe_pin_worker(worker_id)
 	// Build THIS worker's per-thread state once (e.g. its own DB connection);
 	// every handler call on this worker receives it as the worker_state parameter.
@@ -233,6 +233,23 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 	st.listen_port = listen_port
 	st.listen_uds = listen_uds
 	st.births_q = births_q
+	// Subscriptions (push_linux.c.v): the mailbox, when posts are on, and the
+	// pending-write bound of a pushed connection.
+	st.mbox = mbox
+	st.push_watermark = if push_watermark > 0 && push_watermark < sm_max_pending_write {
+		push_watermark
+	} else if push_watermark > 0 {
+		sm_max_pending_write
+	} else {
+		push_default_watermark
+	}
+	if st.mbox != unsafe { nil } {
+		// Producers wake this worker through it (mailbox_post), and so does
+		// Server.shutdown() (mailbox_signal_shutdown).
+		if epoll.add_fd_to_epoll(epoll_fd, st.mbox.wake_fd, u32(C.EPOLLIN) | u32(C.EPOLLET)) < 0 {
+			exit(1)
+		}
+	}
 	// With a read or idle timeout on, every connection gets its state and a
 	// deadline without having to speak (conn_birth): from births_q, with its
 	// accept time, or — when the queue was full, or its first event comes
@@ -287,14 +304,26 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 			-1 // nothing armed: sleep until the next event
 		}
 		if st.timers.len > 0 && wait_ms != 0 {
-			// A park deadline is armed: block no longer than until the earliest
-			// is due (park_deadline_linux.c.v). Such a wait is not a finished
-			// grace wait; an announced sleep stays announced (at worst the
-			// accept thread writes the eventfd once more).
+			// A park deadline or wake_after timer is armed: block no longer than
+			// until the earliest is due (park_deadline_linux.c.v). Such a wait is
+			// not a finished grace wait; an announced sleep stays announced (at
+			// worst the accept thread writes the eventfd once more).
 			park_ms := st.park_wait_ms()
 			if wait_ms < 0 || park_ms < wait_ms {
 				wait_ms = park_ms
 				grace = false
+			}
+		}
+		// Posts (mailbox_linux.c.v): announce every wait that may block, then
+		// look at the ring once more: a post published before the announcement
+		// is seen here, one published after it writes the eventfd.
+		mut mbox_announced := false
+		if st.mbox != unsafe { nil } && wait_ms != 0 {
+			if st.mbox.announce() {
+				wait_ms = 0
+				grace = false
+			} else {
+				mbox_announced = true
 			}
 		}
 		mut num_events := C.epoll_wait(epoll_fd, &events[0], socket.max_connection_size,
@@ -316,6 +345,9 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 			stdatomic.store_u64(&st.births_q.sleeping, 0)
 			announced = false
 		}
+		if mbox_announced {
+			stdatomic.store_u64(&st.mbox.sleeping, 0)
+		}
 		// The batch clock: one read per iteration, reused by every deadline,
 		// while a Limits timeout or a park deadline is armed. A deadline armed
 		// in this batch reads the clock itself (arm_park_timer), so with none
@@ -336,6 +368,11 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 			} else if grace {
 				rested = true
 			}
+		}
+		if st.mbox != unsafe { nil } {
+			// Posts published so far, delivered between client bursts (one
+			// atomic load when there are none).
+			drain_mailbox(mut reactor, epoll_fd, limits, counter, active_conns, mut st, state)
 		}
 		hot = num_events > 0
 		for i in 0 .. num_events {
@@ -371,6 +408,13 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 					// slept: reset the eventfd (drain_births above took the entry).
 					mut n := u64(0)
 					C.read(fd, &n, 8)
+					continue
+				}
+				if st.mbox != unsafe { nil } && fd == st.mbox.wake_fd {
+					// A producer posted while this worker waited (drain_mailbox
+					// takes the posts), or Server.shutdown() signalled.
+					on_mailbox_wake(mut reactor, epoll_fd, limits, counter, active_conns, mut
+						st, state)
 					continue
 				}
 				if st.closed_in_batch(fd) {
@@ -445,11 +489,12 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 					st, state)
 			}
 		}
-		// Parks whose deadline passed (as of the batch clock) get their
-		// continuation, with the timeout reason.
+		// Timers due (as of the batch clock): parks whose deadline passed get
+		// their continuation, wake_after timers their wake fn, with the
+		// timeout reason.
 		if parks_due && st.timers.len > 0 && st.timers[0].at <= st.now {
-			fire_park_deadlines(handler, mut reactor, epoll_fd, limits, counter, active_conns, mut
-				st, state)
+			fire_timers(handler, mut reactor, epoll_fd, limits, counter, active_conns, mut st,
+				state)
 		}
 		// After handling this batch (or a timeout wake with num_events == 0),
 		// reap any connection whose read/write/idle deadline has passed — at most
@@ -458,6 +503,11 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 		if sweep_on && st.parked > 0 && st.now >= st.next_sweep {
 			sweep_timeouts(epoll_fd, active_conns, mut st)
 			st.next_sweep = st.now + sweep_ns
+		}
+		// Subscriptions that ended this iteration, whatever closed them, get
+		// their .closed now, before the next wait.
+		if st.closed_q.len > 0 {
+			notify_closed(mut reactor, epoll_fd, mut st, state)
 		}
 	}
 }
@@ -545,7 +595,7 @@ fn process_events_tls(worker_id int, epoll_fd int, handler core.Handler, make_st
 	}
 }
 
-pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () voidptr, on_worker_start core.WorkerStartFn, after_server_start core.AfterStartFn, port int, limits core.Limits, inflight []&core.Counter, active_conns &core.Counter, tls_config &tls.Config, mut threads []thread) {
+pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () voidptr, on_worker_start core.WorkerStartFn, after_server_start core.AfterStartFn, port int, limits core.Limits, inflight []&core.Counter, active_conns &core.Counter, tls_config &tls.Config, mailboxes []voidptr, push_watermark int, mut threads []thread) {
 	if socket_fd < 0 {
 		return
 	}
@@ -610,8 +660,15 @@ pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () v
 			threads[i] = spawn process_events_tls(i, epoll_fds[i], handler, make_state, limits,
 				counter, active_conns, tls_config)
 		} else {
+			// The worker's mailbox (new_mailbox), when posts are on.
+			mbox := if i < mailboxes.len {
+				unsafe { &Mailbox(mailboxes[i]) }
+			} else {
+				unsafe { &Mailbox(nil) }
+			}
 			threads[i] = spawn process_events_plain(i, epoll_fds[i], handler, make_state,
-				on_worker_start, limits, counter, active_conns, listen_port, listen_uds, queues[i])
+				on_worker_start, limits, counter, active_conns, listen_port, listen_uds, queues[i],
+				mbox, push_watermark)
 		}
 	}
 

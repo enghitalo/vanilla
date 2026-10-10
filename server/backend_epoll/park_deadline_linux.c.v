@@ -16,16 +16,26 @@ module backend_epoll
 // ConnState.park_timer): arming and cancelling (every park and every resume)
 // are O(log n), the earliest deadline bounds the epoll_wait timeout, and a
 // deadline fires within about a millisecond of its time. A worker with
-// nothing armed pays one length check per loop iteration.
+// nothing armed pays one length check per loop iteration. The same heap holds
+// the wake_after timers of subscribed connections (vanilla#230, timer_wake,
+// ConnState.wake_timer), which wake their wake fn with .timeout.
 import core
 import epoll
 import sync.stdatomic
 import time
 
-// ParkTimer is one armed park deadline: when it passes, and whose park it is.
+// The heap holds two kinds of timers, each a connection's own: the deadline of
+// its park (timer_park), and the wake_after timer of its subscription
+// (timer_wake, vanilla#230: its wake fn runs with .timeout). A connection
+// keeps one index per kind (ConnState.park_timer, wake_timer).
+const timer_park = u8(0)
+const timer_wake = u8(1)
+
+// ParkTimer is one armed timer: when it is due, whose it is, and of which kind.
 struct ParkTimer {
-	at u64 // monotonic ns
-	fd int // the parked client connection; its ConnState.park_timer is this entry's index
+	at   u64 // monotonic ns
+	fd   int // the client connection; its ConnState index of this kind is this entry's slot
+	kind u8  // timer_park or timer_wake
 }
 
 // arm_park_timer is park_conn's slow path: arm (or move) cs's park deadline,
@@ -121,12 +131,39 @@ fn (mut st PlainState) timer_down(start int, t ParkTimer) {
 }
 
 // timer_set stores t at slot i and tells its connection where it is. Every
-// armed entry's connection exists: close_conn cancels the deadline (through
-// unpark_conn) before it clears the slot.
+// armed entry's connection exists: close_conn cancels both kinds (the park's
+// through unpark_conn) before it clears the slot.
 @[direct_array_access; inline]
 fn (mut st PlainState) timer_set(i int, t ParkTimer) {
 	st.timers[i] = t
-	st.conns[t.fd].park_timer = i
+	if t.kind == timer_park {
+		st.conns[t.fd].park_timer = i
+	} else {
+		st.conns[t.fd].wake_timer = i
+	}
+}
+
+// arm_wake_timer arms (or moves) cs's wake_after timer, ms from now.
+@[noinline]
+fn (mut st PlainState) arm_wake_timer(mut cs ConnState, fd int, ms int) {
+	if cs.wake_timer >= 0 {
+		st.cancel_wake_timer(mut cs)
+	}
+	t := ParkTimer{
+		at:   time.sys_mono_now() + u64(ms) * 1_000_000
+		fd:   fd
+		kind: timer_wake
+	}
+	st.timers << t
+	st.timer_up(st.timers.len - 1, t)
+}
+
+// cancel_wake_timer drops cs's wake_after timer.
+@[inline]
+fn (mut st PlainState) cancel_wake_timer(mut cs ConnState) {
+	i := cs.wake_timer
+	cs.wake_timer = -1
+	st.timer_remove(i)
 }
 
 // park_wait_ms is how long the worker may block before the earliest park
@@ -142,18 +179,27 @@ fn (st &PlainState) park_wait_ms() int {
 	return int((at - now) / 1_000_000) + 1
 }
 
-// fire_park_deadlines times out every park whose deadline passed by the batch
-// clock, earliest first. A continuation that re-parks arms a deadline later
-// than st.now, so the loop ends.
+// fire_timers runs every timer due by the batch clock, earliest first: a park
+// times out (on_park_timeout), a wake_after timer wakes its subscription with
+// .timeout (deliver_wake). Whatever they re-arm is due later than st.now, so
+// the loop ends.
 @[direct_array_access]
-fn fire_park_deadlines(h core.Handler, mut reactor Reactor, epoll_fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, state voidptr) {
+fn fire_timers(h core.Handler, mut reactor Reactor, epoll_fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, state voidptr) {
 	for st.timers.len > 0 && st.timers[0].at <= st.now {
 		fd := st.timers[0].fd
+		kind := st.timers[0].kind
 		mut cs := st.conns[fd]
-		cs.park_timer = -1
-		st.timer_remove(0)
-		on_park_timeout(h, mut reactor, epoll_fd, fd, limits, counter, active_conns, mut st, mut
-			cs, state)
+		if kind == timer_park {
+			cs.park_timer = -1
+			st.timer_remove(0)
+			on_park_timeout(h, mut reactor, epoll_fd, fd, limits, counter, active_conns, mut st, mut
+				cs, state)
+		} else {
+			cs.wake_timer = -1
+			st.timer_remove(0)
+			deliver_wake(mut reactor, epoll_fd, fd, .timeout, 0, unsafe { nil }, 0, limits, counter,
+				active_conns, mut st, mut cs, state)
+		}
 	}
 }
 
@@ -202,13 +248,8 @@ fn on_park_timeout(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, li
 		return
 	}
 	unpark_conn(mut st, mut cs)
-	mut event_loop := core.EventLoop{
-		client_fd: fd
-		loop_fd:   epoll_fd
-		reactor:   unsafe { voidptr(&reactor) }
-		register:  register_watch
-		reason:    .timeout
-	}
+	mut event_loop := conn_loop(mut reactor, epoll_fd, fd)
+	event_loop.reason = .timeout
 	// The watch stays in place while the continuation runs, so a re-arm of the
 	// same fd (keep waiting, with a new deadline) updates it in place.
 	core.set_queue_file_allowed(false) // no file from a continuation (on_watch_ready)

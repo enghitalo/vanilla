@@ -26,6 +26,7 @@ pub const op_pong = u8(0xa)
 // Close status codes (RFC 6455 §7.4.1) — the ones a minimal server sends.
 pub const close_normal = u16(1000)
 pub const close_protocol_error = u16(1002)
+pub const close_going_away = u16(1001)
 pub const close_unsupported = u16(1003)
 pub const close_too_big = u16(1009)
 
@@ -195,6 +196,17 @@ pub fn write_close(mut out []u8, code u16) {
 pub fn write_pong(mut out []u8, payload []u8) {
 	write_frame_header(mut out, op_pong, payload.len)
 	out << payload
+}
+
+// write_ping appends a complete ping frame carrying `payload` (RFC 6455
+// §5.5.2): a keepalive the peer must answer with a pong echoing it. A control
+// frame's payload is at most 125 bytes: a longer one is cut to 125.
+pub fn write_ping(mut out []u8, payload []u8) {
+	n := if payload.len > 125 { 125 } else { payload.len }
+	write_frame_header(mut out, op_ping, n)
+	if n > 0 {
+		unsafe { out.push_many(payload.data, n) }
+	}
 }
 
 // append_accept_key appends the Sec-WebSocket-Accept value for `client_key`

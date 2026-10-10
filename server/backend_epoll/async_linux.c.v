@@ -592,6 +592,10 @@ fn handle_readable(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, kn
 	// up or pipelining ahead. Peek to detect a close (tear the watch down); any
 	// data stays in the socket buffer and is read once the in-flight watch resumes.
 	if cs.awaiting_fd >= 0 {
+		if cs.takeover != unsafe { nil } {
+			read_while_parked(mut reactor, epoll_fd, fd, limits, active_conns, mut st, mut cs)
+			return
+		}
 		mut probe := [1]u8{}
 		if C.recv(fd, &probe[0], 1, C.MSG_PEEK) == 0 {
 			close_client(mut reactor, epoll_fd, fd, active_conns, mut st)
@@ -606,6 +610,57 @@ fn handle_readable(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, kn
 		return
 	}
 	serve_conn(h, mut reactor, epoll_fd, fd, limits, active_conns, mut st, mut cs, state)
+}
+
+// read_while_parked takes what the client of a PARKED taken-over connection
+// sends (a WebSocket or h2 connection waiting on a database or an upstream
+// mid-frame, vanilla#230). The bytes go into its read buffer, where its
+// ConnHandler finds them, in order, once the park ends (the takeover drain
+// consumes the buffer before it reads again); nothing reaches the handler
+// meanwhile. Reading them is what notices a peer that sends frames and then
+// its FIN: a 1-byte peek (the HTTP/1.1 gate below) sees the frames, never the
+// FIN behind them, so such a connection stayed until its watch fired.
+//
+// Frame-before-FIN policy: the FIN closes the connection at once, and the
+// frames before it are dropped unprocessed. Its watch is torn down as on any
+// close (a request-owned fd closed, a persistent one's reply drained by a
+// tombstone), the continuation does not run, and a subscription gets .closed.
+// The peer is gone: a WebSocket peer that closes cleanly sends a close frame
+// first, and a bare FIN is an abnormal closure (1006) whose last frames nobody
+// could answer. Buffering stops at the request-size ceiling: the rest waits
+// in the socket until the park ends, and a FIN behind it is seen then.
+fn read_while_parked(mut reactor Reactor, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState) {
+	req_cap := if limits.max_request_bytes > 0 {
+		limits.max_request_bytes
+	} else {
+		sm_max_request_bytes
+	}
+	for {
+		if cs.read_buf.len == cs.read_buf.cap {
+			if cs.read_buf.cap >= req_cap {
+				return
+			}
+			growth := if cs.read_buf.cap > req_cap - cs.read_buf.cap {
+				req_cap - cs.read_buf.cap
+			} else {
+				cs.read_buf.cap
+			}
+			unsafe { cs.read_buf.grow_cap(growth) }
+		}
+		spare := cs.read_buf.cap - cs.read_buf.len
+		n := C.recv(fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, usize(spare), 0)
+		if n > 0 {
+			unsafe {
+				cs.read_buf.len += n
+			}
+			continue
+		}
+		if n < 0 && (C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK) {
+			return
+		}
+		close_client(mut reactor, epoll_fd, fd, active_conns, mut st) // FIN or error
+		return
+	}
 }
 
 // serve_conn drains the socket into the read buffer (edge-triggered), answers
@@ -840,6 +895,12 @@ fn update_read_deadline(limits core.Limits, mut st PlainState, mut cs ConnState)
 // the HTTP path — only the framing authority changed.
 @[direct_array_access; manualfree]
 fn serve_takeover_conn(mut reactor Reactor, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) {
+	if cs.close_after_flush {
+		// Closing: a wake fn's .close whose last bytes are still going out
+		// (deliver_wake). Nothing more reaches the ConnHandler.
+		discard_while_closing(epoll_fd, fd, active_conns, mut st, mut cs)
+		return
+	}
 	req_cap := if limits.max_request_bytes > 0 {
 		limits.max_request_bytes
 	} else {
@@ -908,12 +969,7 @@ fn serve_takeover_conn(mut reactor Reactor, epoll_fd int, fd int, limits core.Li
 // on_watch_ready, exactly like a parked h1 request).
 @[direct_array_access; manualfree]
 fn drain_takeover(mut reactor Reactor, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) bool {
-	mut event_loop := core.EventLoop{
-		client_fd: fd
-		loop_fd:   epoll_fd
-		reactor:   unsafe { voidptr(&reactor) }
-		register:  register_watch
-	}
+	mut event_loop := conn_loop(mut reactor, epoll_fd, fd)
 	for cs.read_buf.len > 0 {
 		event_loop.last_watched = -1
 		mut consumed, step := cs.takeover(buf_view(cs.read_buf, 0, cs.read_buf.len), mut
@@ -941,8 +997,9 @@ fn drain_takeover(mut reactor Reactor, epoll_fd int, fd int, limits core.Limits,
 				// The ConnHandler parked on a watch (the issue #136 follow-up):
 				// the registered continuation resumes the connection when the fd
 				// fires — the same park/resume machinery h1 requests use. Until
-				// then the connection reads nothing (handle_readable's awaiting_fd
-				// gate); unprocessed bytes wait in read_buf and the socket. The
+				// then nothing reaches the ConnHandler: what the client sends is
+				// buffered behind the unprocessed bytes in read_buf, and a FIN
+				// closes the connection (read_while_parked). The
 				// contract allows at most ONE armed watch per parked connection —
 				// the close-path teardown (close_client) tracks exactly one fd.
 				if event_loop.last_watched < 0 {
@@ -1106,12 +1163,7 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 	mut pos := 0
 	// ONE EventLoop handle per burst, not per request: every field is
 	// loop-invariant; only last_watched is reset before each handler call below.
-	mut event_loop := core.EventLoop{
-		client_fd: fd
-		loop_fd:   epoll_fd
-		reactor:   unsafe { voidptr(&reactor) }
-		register:  register_watch
-	}
+	mut event_loop := conn_loop(mut reactor, epoll_fd, fd)
 	for pos < cs.read_buf.len && cs.awaiting_fd < 0 {
 		// _idx twin: plain int, no per-request !int boxing. The error sentinel is
 		// the negated HTTP status, so `-total` recovers the old err.code() value.
@@ -1347,12 +1399,7 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 		return
 	}
 	unpark_conn(mut st, mut cs) // this call's own count (above) covers the continuation
-	mut event_loop := core.EventLoop{
-		client_fd: client_fd
-		loop_fd:   epoll_fd
-		reactor:   unsafe { voidptr(&reactor) }
-		register:  register_watch
-	}
+	mut event_loop := conn_loop(mut reactor, epoll_fd, client_fd)
 	core.set_queue_file_allowed(false) // no file from a continuation (see above)
 	cont_step := cont(mut cs.write_buf, ext_fd, ready_err, entry_udata, state, mut event_loop)
 	core.set_queue_file_allowed(true)
@@ -1579,12 +1626,7 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 		}
 		mut cs := st.conns[client_fd]
 		unpark_conn(mut st, mut cs)
-		mut event_loop := core.EventLoop{
-			client_fd: client_fd
-			loop_fd:   epoll_fd
-			reactor:   unsafe { voidptr(&reactor) }
-			register:  register_watch
-		}
+		mut event_loop := conn_loop(mut reactor, epoll_fd, client_fd)
 		core.set_queue_file_allowed(false) // no file from a continuation (on_watch_ready)
 		pipelined_step := slot.cont(mut cs.write_buf, ext_fd, ready_err, slot.udata, state, mut
 			event_loop)
