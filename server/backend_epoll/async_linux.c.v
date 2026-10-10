@@ -602,6 +602,12 @@ fn handle_readable(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, kn
 		}
 		return
 	}
+	// Closing, its last bytes still going out (a .close step, or a reply owed
+	// to a peer that half-closed): nothing more is served.
+	if cs.close_after_flush {
+		discard_while_closing(epoll_fd, fd, active_conns, mut st, mut cs)
+		return
+	}
 	// The conn-mode seam (issue #136): a taken-over connection's bytes belong to
 	// its ConnHandler, not the HTTP/1.1 state machine. nil for every connection
 	// that never upgraded — one predictable branch on the hot path.
@@ -896,8 +902,9 @@ fn update_read_deadline(limits core.Limits, mut st PlainState, mut cs ConnState)
 @[direct_array_access; manualfree]
 fn serve_takeover_conn(mut reactor Reactor, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) {
 	if cs.close_after_flush {
-		// Closing: a wake fn's .close whose last bytes are still going out
-		// (deliver_wake). Nothing more reaches the ConnHandler.
+		// Closing: a .close (a wake fn's, a ConnHandler's or a continuation's)
+		// whose last bytes are still going out. Nothing more reaches the
+		// ConnHandler.
 		discard_while_closing(epoll_fd, fd, active_conns, mut st, mut cs)
 		return
 	}
@@ -1018,10 +1025,8 @@ fn drain_takeover(mut reactor Reactor, epoll_fd int, fd int, limits core.Limits,
 				return false // parked — not closed; on_watch_ready resumes it
 			}
 			.close {
-				// Flush what the handler appended (e.g. its close frame), then close.
-				if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-					close_conn(epoll_fd, fd, active_conns, mut st)
-				}
+				// Send what the handler appended (e.g. its close frame), then close.
+				flush_then_close(epoll_fd, fd, limits, active_conns, mut st, mut cs)
 				return false
 			}
 		}
@@ -1217,12 +1222,9 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 		// The sendfile slot is thread-local too, and drained on every step for
 		// the same reason. A handler may have appended headers and handed its
 		// body off with core.queue_file: on .done and .close the region streams
-		// after write_buf drains (flush_batch). A .close response gets that one
-		// flush and then the close, parked or not, so its body is best-effort,
-		// bounded by the socket send buffer like the rest of that response (a
-		// short file is cut short by the same close). On .suspend it is dropped:
-		// a parked request has not answered yet, its continuation writes the
-		// response.
+		// after write_buf drains (flush_batch); a .close closes only once all of
+		// it is out (flush_then_close). On .suspend it is dropped: a parked
+		// request has not answered yet, its continuation writes the response.
 		if qf := core.take_queued_file() {
 			if step != .suspend {
 				cs.file_fd = qf.file_fd
@@ -1258,10 +1260,7 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 				park_conn(mut st, mut cs, fd, event_loop.last_watched, event_loop.timeout_ms) // leftover stays buffered for resume
 			}
 			.close {
-				compact_read_buf(mut cs, pos)
-				if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-					close_conn(epoll_fd, fd, active_conns, mut st)
-				}
+				flush_then_close(epoll_fd, fd, limits, active_conns, mut st, mut cs)
 				return false
 			}
 		}
@@ -1512,7 +1511,7 @@ fn resume_step(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int, cl
 			park_conn(mut st, mut cs, client_fd, event_loop.last_watched, event_loop.timeout_ms) // re-armed (multi-step); stay parked
 		}
 		.close {
-			close_conn(epoll_fd, client_fd, active_conns, mut st)
+			flush_then_close(epoll_fd, client_fd, limits, active_conns, mut st, mut cs)
 		}
 	}
 }
@@ -1730,7 +1729,7 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 			.close {
 				reactor.watches[ext_fd].queue.delete(0)
 				reactor.reactor_clear_if_drained(ext_fd)
-				close_conn(epoll_fd, client_fd, active_conns, mut st)
+				flush_then_close(epoll_fd, client_fd, limits, active_conns, mut st, mut cs)
 			}
 		}
 	}

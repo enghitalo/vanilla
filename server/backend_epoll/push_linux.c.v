@@ -255,10 +255,12 @@ fn notify_closed(mut reactor Reactor, epoll_fd int, mut st PlainState, state voi
 	}
 }
 
-// discard_while_closing reads and drops what a closing taken-over connection
+// discard_while_closing reads and drops what a closing connection
 // (close_after_flush: its last bytes still going out) receives: nothing more
-// reaches its ConnHandler, and unread bytes would turn the close into a reset
-// that can cut those last bytes off. Closes on EOF or error.
+// reaches its handler or ConnHandler, and unread bytes would turn the close
+// into a reset that can cut those last bytes off. Closes on error, and on EOF
+// once nothing is left to send: a peer that half-closed still reads (RFC 9112
+// §9.6), so with bytes owed handle_writable_plain sends them, then closes.
 fn discard_while_closing(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainState, mut cs ConnState) {
 	unsafe {
 		cs.read_buf.len = 0
@@ -269,6 +271,9 @@ fn discard_while_closing(epoll_fd int, fd int, active_conns &core.Counter, mut s
 			continue
 		}
 		if n < 0 && (C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK) {
+			return
+		}
+		if n == 0 && (cs.write_off < cs.write_buf.len || cs.file_remaining > 0) {
 			return
 		}
 		close_conn(epoll_fd, fd, active_conns, mut st)

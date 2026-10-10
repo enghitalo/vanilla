@@ -786,8 +786,10 @@ fn handle_io_uring_poll(cqe &io_uring.Cqe, mut env IouEnv, limits Limits, active
 			}
 		}
 		.close {
-			// A parked connection has no in-flight op, so releasing here is safe.
-			iou_release(env.worker, mut *conn, active_conns, limits.max_connections > 0)
+			// Flush what the continuation appended, then release (core.Step.close),
+			// as the .suspend arm above does for a resume that cannot go on.
+			conn.close_after_send = true
+			iou_finish_resume(mut env, mut *conn, limits, active_conns)
 		}
 	}
 }
@@ -979,7 +981,8 @@ fn drain_pipelined_iou(mut env IouEnv, ext_fd int, ready_err bool, limits Limits
 			.close {
 				env.watches[ext_fd].queue.delete(0)
 				env.iou_reactor_clear_if_drained(ext_fd)
-				iou_release(env.worker, mut *conn, active_conns, limits.max_connections > 0)
+				conn.close_after_send = true
+				iou_finish_resume(mut env, mut *conn, limits, active_conns)
 			}
 		}
 	}

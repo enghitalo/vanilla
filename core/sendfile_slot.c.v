@@ -60,8 +60,8 @@ pub fn set_queue_file_allowed(allowed bool) {
 // every core.Handler call (a pipelined request, or the head of a streamed
 // large body), whatever the step: a region queued by a step that returns
 // .suspend is dropped, and one queued by a step that returns .close is still
-// sent after the bytes appended to `out`, best-effort like the rest of that
-// response: one flush, then the close, so what goes out is bounded by the
+// sent after the bytes appended to `out`: the plaintext worker closes once all
+// of it is out, the TLS worker after one best-effort send, bounded by the
 // socket send buffer. A streamed-body head the worker rejects (any step but
 // .done) has its region dropped, and the worker's 400 follows whatever the
 // handler appended. Watch continuations cannot queue a file: queue_file

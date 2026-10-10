@@ -44,9 +44,12 @@ fn worker_count() int {
 //              workers have no watch reactor yet, so there a .suspend DROPS
 //              the connection (see reject_register).
 //   .close   — finish this connection: whatever is in `res` is flushed, then
-//              the connection is closed. Append an error response (e.g.
-//              response.tiny_bad_request_response) before returning .close if
-//              the client should see one.
+//              the connection is closed — from a handler or a continuation
+//              alike. The TLS worker and macOS kqueue make one best-effort
+//              write instead, bounded by the socket send buffer; every other
+//              worker closes once all of it is sent. Append an error response
+//              (e.g. response.tiny_bad_request_response) before returning
+//              .close if the client should see one.
 pub enum Step {
 	done
 	suspend

@@ -586,6 +586,25 @@ fn flush_batch(epoll_fd int, fd int, limits core.Limits, active_conns &core.Coun
 	return true
 }
 
+// flush_then_close carries out a .close step (core.Step.close): everything
+// appended goes out, the queued file region included, then the connection
+// closes. What the socket cannot take now parks on EPOLLOUT with
+// close_after_flush set: handle_writable_plain sends the rest and closes, and
+// handle_readable discards what the client sends meanwhile. No further request
+// is served, so the buffered leftover goes, and so does a read deadline, which
+// would cut the flush short (the write deadline bounds it).
+fn flush_then_close(epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState) {
+	unsafe {
+		cs.read_buf.len = 0
+	}
+	end_read_deadline(mut st, mut cs)
+	cs.close_after_flush = true
+	if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs)
+		&& cs.write_off >= cs.write_buf.len && cs.file_remaining <= 0 {
+		close_conn(epoll_fd, fd, active_conns, mut st)
+	}
+}
+
 // conn_birth creates the state of a connection that has none yet and arms
 // its accept-time deadline from `start`: READ when read_timeout_ms is set (it
 // bounds the silence and the whole first request), otherwise IDLE (a
