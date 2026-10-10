@@ -65,6 +65,10 @@ pub const op_write = u8(3)
 // watch table is fd-indexed and can be reallocated by growth (a packed pointer
 // into it would dangle); the fd is stable and re-looked-up on completion.
 pub const op_poll = u8(4)
+// op_accept_resume: the timer (prepare_timeout) that ends an accept pause. An
+// accept that ran out of fds is not re-armed at once, which would spin; this
+// CQE re-arms it (#256).
+pub const op_accept_resume = u8(5)
 
 // poll(2) event bits (asm-generic/poll.h; identical values to the epoll bits) for
 // prepare_poll masks and for decoding a poll CQE's res (which carries the RETURNED
@@ -687,6 +691,11 @@ pub mut:
 	//     re-arming once it is non-zero, so the worker quits accepting. nil ⇒ off.
 	inflight &core.Counter = unsafe { nil }
 	draining &core.Counter = unsafe { nil }
+	// Accept pause (#256): how long the accept stays unarmed after it ran out
+	// of fds (the op_accept_resume timer's duration; prepare_timeout needs it
+	// to outlive the SQE), and the rate limit of the pause notice.
+	accept_pause_ts KernelTimespec
+	accept_log      u64
 }
 
 // ==================== Connection Pool ====================
@@ -851,6 +860,27 @@ pub fn prepare_accept(ring &Ring, socket_fd int, multishot bool) bool {
 			fd:        socket_fd
 			op_flags:  if multishot { u32(C.SOCK_NONBLOCK) } else { u32(0) }
 			user_data: encode_user_data(op_accept, nil)
+		}
+	}
+	return true
+}
+
+// prepare_timeout queues a pure timer (IORING_OP_TIMEOUT, no completion
+// count): its CQE carries `user_data` and res -ETIME once `ts` has elapsed. The
+// kernel reads `ts` when the SQE is submitted, so it must stay valid until
+// then. Returns false if the SQ is full.
+pub fn prepare_timeout(ring &Ring, ts &KernelTimespec, user_data u64) bool {
+	sqe := get_sqe(ring)
+	if unsafe { sqe == nil } {
+		return false
+	}
+	unsafe {
+		*sqe = Sqe{
+			opcode:    ioring_op_timeout
+			fd:        -1
+			addr:      u64(voidptr(ts))
+			len:       1
+			user_data: user_data
 		}
 	}
 	return true
