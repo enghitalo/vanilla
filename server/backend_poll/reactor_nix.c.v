@@ -72,6 +72,10 @@ mut:
 	now        u64                // monotonic ns, read once per wake (only when a timeout is set) and reused by every arm and the sweep
 	next_sweep u64                // monotonic ns; the sweep is rate-limited to one scan per sweep interval
 	accepting  bool = true
+	// monotonic ns; >0 while accepting is paused because accept() ran out of
+	// fds (socket.accept_starved, #256): the listener stays polled, without POLLIN
+	accept_resume u64
+	accept_log    u64 // socket.note_accept_pause's rate limit
 }
 
 fn (mut w WorkerState) conn_for(fd int) &PollConn {
@@ -86,6 +90,24 @@ fn (mut w WorkerState) conn_for(fd int) &PollConn {
 	cs.fd = fd
 	w.conns << cs
 	return cs
+}
+
+// accept_pause_wait runs before each poll while accepting is paused because
+// accept() ran out of fds (see the accept burst, #256). It keeps the listener
+// at pfds[0], so a shutdown still shows (POLLNVAL/POLLHUP are reported
+// whatever the events), but drops POLLIN until the pause ends, and returns
+// the poll timeout capped at what is left of the pause. Out of line: the
+// serving loop pays one compare for it.
+@[noinline]
+fn (mut w WorkerState) accept_pause_wait(wait_ms int) int {
+	now := time.sys_mono_now()
+	if !w.accepting || now >= w.accept_resume {
+		w.accept_resume = 0
+		return wait_ms
+	}
+	w.pfds[0].events = 0
+	left := int((w.accept_resume - now + 999_999) / 1_000_000)
+	return if wait_ms < 0 || left < wait_ms { left } else { wait_ms }
 }
 
 // close_conn_at closes w.conns[i] and recycles its state (swap-remove keeps
@@ -593,12 +615,15 @@ fn poll_worker(listener int, handler core.Handler, make_state fn () voidptr, lim
 		// intervals late. w.now is the clock read after the last poll return,
 		// an EINTR included (no extra read); rounding up lands the wake at/after
 		// next_sweep.
-		wait_ms := if !(sweep_on && w.parked > 0) {
+		mut wait_ms := if !(sweep_on && w.parked > 0) {
 			-1
 		} else if w.now >= w.next_sweep {
 			0
 		} else {
 			int((w.next_sweep - w.now + 999_999) / 1_000_000)
+		}
+		if w.accept_resume != 0 {
+			wait_ms = w.accept_pause_wait(wait_ms)
 		}
 		num := poll.wait(&w.pfds[0], u64(w.pfds.len), wait_ms)
 		if num < 0 {
@@ -635,7 +660,16 @@ fn poll_worker(listener int, handler core.Handler, make_state fn () voidptr, lim
 				for {
 					client_fd := socket.accept_client(listener)
 					if client_fd < 0 {
-						break // EAGAIN/EWOULDBLOCK or a racing worker won
+						// EAGAIN/EWOULDBLOCK or a racing worker won. Out of fds (or
+						// socket buffers, or memory) the connection stays in the
+						// backlog and the listener readable, so polling it again
+						// at once would spin every worker (#256): pause instead.
+						err := C.errno
+						if socket.accept_starved(err) {
+							w.accept_resume = time.sys_mono_now() + u64(socket.accept_pause)
+							w.accept_log = socket.note_accept_pause(err, w.accept_log)
+						}
+						break
 					}
 					if limits.max_connections > 0
 						&& stdatomic.load_i64(&active_conns.n) >= i64(limits.max_connections) {

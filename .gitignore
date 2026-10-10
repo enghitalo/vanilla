@@ -22,12 +22,10 @@ bin/
 # vweb and database
 *.db
 *.js
-# ...but DO track the static_assets example's SPA bundle (a real, committed .js asset)
-!examples/static_assets/dist/*.js
+# ...but DO track the spa_static_assets example's SPA bundle (a real, committed .js asset)
+!examples/spa_static_assets/dist/*.js
 
 server_cert.pem
-examples/tiny/src/src
-examples/veb_like/src/src
 
 # generated at runtime by examples/video_stream
 sample.mp4
@@ -37,10 +35,35 @@ sample.mp4
 # Compiled bench binaries: `v bench/<dir>/<name>.v` drops `<name>` beside the
 # source (use `v run`, or `-o /tmp/...` as ci_bench.sh does, to avoid these).
 # Sources stay tracked.
+bench/client_codec/client_codec_bench
 bench/etag_hash/etag_hash
 bench/middleware/middleware_bench
+bench/pg_async/codec_bench
+bench/pg_async/e2e_server/e2e_server
 bench/request_parser/request_parser_bench
-bench/static_assets/static_assets_bench
+bench/router/router_bench
+bench/static_assets_bench/static_assets_bench
+
+# Compiled test binaries: `v tests/foo_test.v` drops `foo_test` beside the
+# source (#258). Extension-less files only: `foo_test.v` does not match, and
+# the negation keeps any `*_test/` directory visible.
+*_test
+!*_test/
+
+# Compiled example binaries: `v examples/<name>/src` drops `src/src`, and
+# `v examples/<name>` (the flat examples without a `src/`) drops `<name>`.
+examples/*/src/src
+examples/async_date_timerfd/async_date_timerfd
+examples/async_incremental_read/async_incremental_read
+examples/async_multi_watch/async_multi_watch
+examples/async_sse/async_sse
+examples/async_time_limit/async_time_limit
+examples/async_timer/async_timer
+examples/async_watch_hangup/async_watch_hangup
+examples/conformance/src/conformance
+examples/efficient_date/efficient_date
+examples/etag/simple
+examples/io_uring_demo/io_uring_demo
 
 # V build / profiling artifacts
 *.tmp.c

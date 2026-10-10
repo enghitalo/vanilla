@@ -160,6 +160,23 @@ server is closing and answer 502.
 header/body size limits. Do not rely on it to reap connections. io_uring
 enforces every timeout but the park deadlines.
 
+### Running out of file descriptors
+
+Every connection holds an fd, as do the server's own listeners and epoll/ring
+fds and whatever handlers open (database and upstream pools, files). Once the
+process reaches `RLIMIT_NOFILE` (`ulimit -n`; systemd gives services a soft
+limit of 1024 unless `LimitNOFILE=` says otherwise), `accept()` fails with
+`EMFILE` until an fd is freed. The epoll, io_uring and poll acceptors then stop
+accepting for `socket.accept_pause` (50 ms) at a time rather than retrying at
+once: new clients wait in the listen backlog and are accepted once a
+connection closes, and stderr gets one notice per acceptor at most every
+10 s. `ENFILE`, `ENOBUFS` and `ENOMEM` are handled the same way. (kqueue still
+retries at once: [#154](https://github.com/enghitalo/vanilla/issues/154).)
+
+Raise the limit to fit the connections you expect, and set `max_connections`
+below it: a client over that cap gets a prompt close instead of a wait in the
+backlog.
+
 ## TLS
 
 Set `ServerConfig.tls_config` (e.g. `tls.new_self_signed()`) and `certificates` for

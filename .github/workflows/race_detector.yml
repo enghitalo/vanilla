@@ -128,6 +128,10 @@ jobs:
         run: |
           v -race -cc "$RACE_CC" -no-parallel -run-only 'test_epoll_*' test tests/conn_push_test.v
           v -race -cc "$RACE_CC" -no-parallel test examples/websocket_chat/src
+      - name: 'accept_starved_test.v (epoll: the acceptor pauses when out of fds, #256)'
+        shell: bash
+        run: |
+          v -race -cc "$RACE_CC" -no-parallel -run-only 'test_epoll_*' test tests/accept_starved_test.v
       - name: uds_test.v (epoll) and vtest smoke
         shell: bash
         run: |
