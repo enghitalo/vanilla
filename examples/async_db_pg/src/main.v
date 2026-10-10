@@ -5,6 +5,8 @@ import strconv
 import server
 import core
 import pg_async
+import http1_1.request_parser
+import http1_1.response
 
 // End-to-end demo of the native async Postgres driver (pg_async) on the epoll
 // async runtime. Each worker owns its own connection pool (via make_state); a
@@ -77,14 +79,34 @@ fn start_maintenance(worker_state voidptr, mut event_loop core.EventLoop) {
 	st.pool.start_maintenance(mut event_loop) or { eprintln('async_db_pg: ${err}') }
 }
 
-fn targets_db(req []u8) bool {
-	return req.bytestr().contains(' /db') // crude routing — fine for a demo
+// route_is reports whether the request path, without its query string, is
+// `lit`. req.path includes the query, so the compare stops at the first `?`.
+// It compares bytes in place: the request is never copied.
+@[direct_array_access]
+fn route_is(req request_parser.HttpRequest, lit string) bool {
+	mut n := 0
+	for n < req.path.len && req.buffer[req.path.start + n] != `?` {
+		n++
+	}
+	if n != lit.len {
+		return false
+	}
+	for i in 0 .. n {
+		if req.buffer[req.path.start + i] != lit[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // handler: GET /db runs a query via the pool + a watch on the PG socket; any
 // other path replies synchronously.
 fn handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
-	if !targets_db(req) {
+	r := request_parser.decode_http_request(req) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
+	if !route_is(r, '/db') {
 		core.append_str(mut out, resp_ok)
 		return .done
 	}

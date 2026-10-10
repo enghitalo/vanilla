@@ -18,6 +18,7 @@ module core
 fn C.vanilla_to_enable()
 fn C.vanilla_to_queue(cont voidptr, state voidptr) bool
 fn C.vanilla_to_take(out_cont &voidptr, out_state &voidptr) bool
+fn C.vanilla_to_pending() bool
 
 // ConnHandler drives a taken-over connection: it runs on every readable burst,
 // consumes complete protocol frames from `buf` (a view of the connection's
@@ -31,11 +32,16 @@ fn C.vanilla_to_take(out_cont &voidptr, out_state &voidptr) bool
 //              core.WakeFn, same contract as an h1 park) resumes it when the
 //              fd fires — appending protocol bytes to the SAME write buffer —
 //              and its .done hands the socket back to the takeover drain.
-//              While parked the engine reads nothing from the client (bytes
-//              wait in the socket, mirroring a parked h1 request) and at most
-//              ONE watch may be armed per connection (the close-path teardown
-//              tracks exactly one fd). Suspending WITHOUT arming a watch
-//              closes the connection — nothing would ever resume it.
+//              While parked nothing reaches this handler: what the client
+//              sends meanwhile is buffered and handed over, in order, once
+//              the park ends; a peer that closes (FIN) meanwhile closes the
+//              connection at once, dropping the frames it sent before it
+//              (the epoll plain worker; vanilla#230). At most ONE watch may be
+//              armed per connection (the close-path teardown tracks exactly
+//              one fd). Suspending WITHOUT arming a watch closes the
+//              connection — nothing would ever resume it. To wait for
+//              application events while still reading the client, subscribe
+//              instead (core.EventLoop.subscribe).
 //   .close   — flush whatever is in `out`, then close the connection
 //
 // A partial frame is expressed by consuming fewer bytes than `buf.len` (or 0):
@@ -75,6 +81,14 @@ pub fn enable_takeover() {
 @[inline]
 pub fn queue_takeover(cont ConnHandler, takeover_state voidptr) bool {
 	return C.vanilla_to_queue(voidptr(cont), takeover_state)
+}
+
+// takeover_pending reports whether the handler running on this thread has
+// queued a takeover that the worker has not installed yet: the connection is
+// being handed over (EventLoop.subscribe uses it from the upgrade handler).
+@[inline]
+pub fn takeover_pending() bool {
+	return C.vanilla_to_pending()
 }
 
 // take_queued_takeover returns the takeover a handler queued during the

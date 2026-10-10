@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <netdb.h>
 #include <poll.h>
+#include <string.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/ioctl.h>
@@ -49,6 +50,20 @@ static inline int pg_async_pending_bytes(int fd) {
 	int n = 0;
 	if (ioctl(fd, FIONREAD, &n) != 0) return -1;
 	return n;
+}
+
+// pg_async_peer_addr copies fd's peer address (getpeername) into `out`
+// (sizeof(struct sockaddr_storage) bytes) and its family into *family: the
+// address length, or 0 if it cannot be read. A CancelRequest goes to the
+// address the connection is connected to: no name resolution, and the same
+// server behind a name that resolves to several.
+static inline unsigned int pg_async_peer_addr(int fd, void *out, int *family) {
+	struct sockaddr_storage ss;
+	socklen_t len = sizeof(ss);
+	if (getpeername(fd, (struct sockaddr *)&ss, &len) != 0 || len == 0 || len > sizeof(ss)) return 0;
+	memcpy(out, &ss, len);
+	*family = ss.ss_family;
+	return (unsigned int)len;
 }
 
 #endif

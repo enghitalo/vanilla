@@ -42,7 +42,8 @@ module upstream
 //
 // What it does per exchange: a non-blocking dial to the origin's next
 // address (transport.dial_addr), the TLS 1.3 handshake on the slot's own
-// session (verify-full + SNI with tls.Verify.full), the request written as
+// session (verify-full with tls.Verify.full; SNI for a DNS name, an IP
+// literal checked against iPAddress SANs), the request written as
 // the socket takes it, the response framed as it arrives (client.Framer: HEAD,
 // 1xx, close-delimited bodies, keep-alive), and on release the connection is
 // kept only when HTTP allows it. A kept connection is probed before reuse (an
@@ -82,9 +83,13 @@ pub struct Origin {
 pub:
 	// host is the name dialed, sent as the Host header, and — over HTTPS — the
 	// SNI and the name the certificate must carry (tls.Verify.full). An IPv4
-	// or IPv6 literal is dialed as is (plain HTTP only, for now: tls sends no
-	// SNI for it and checks it against iPAddress SANs since #233, but this
-	// pool has no HTTPS-to-IP tests yet).
+	// or IPv6 literal is dialed as is and sent as the Host header (an IPv6 one
+	// in brackets); over HTTPS it is never sent as SNI (RFC 6066 §3) and must
+	// equal one of the certificate's iPAddress SANs, never a dNSName or the CN
+	// (RFC 9525 §6.2). An IPv6 literal with a zone (`fe80::1%eth0`) is
+	// resolved instead (getaddrinfo needs the zone's interface on this host),
+	// and the Host header and the SAN match take the address alone: the zone
+	// only means something here (RFC 6874 §4).
 	host  string
 	port  int  = 443
 	https bool = true // false: plain HTTP (an internal or link-local endpoint)
@@ -184,7 +189,8 @@ mut:
 	// maintenance (maintenance_*.c.v) and the resolver hand-off (resolver.v)
 	timer_fd  int = -1
 	timer_due u64 // monotonic ns the timer is armed for (0: not armed)
-	feed_fd   int       = -1 // the resolver pipe's read end (follow)
+	feed_fd   int = -1 // the resolver pipe's read end (follow)
+	feed_rec  Record // the record on_feed reads into, reused
 	resolver  &Resolver = unsafe { nil }
 	sub_id    int       = -1
 	closed    bool
@@ -250,14 +256,8 @@ pub fn Pool.new(o Origin, tls_cfg &tls.Config) !&Pool {
 	if o.max_conns < 1 {
 		return error('upstream: max_conns must be >= 1')
 	}
-	literal := transport.ip_addr(o.host, o.port)
-	if o.https {
-		if tls_cfg == unsafe { nil } {
-			return error('upstream: an HTTPS origin needs a client TLS config (tls.new_client)')
-		}
-		if literal != none {
-			return error('upstream: HTTPS to an IP literal (${o.host}) is not supported yet: use a host name')
-		}
+	if o.https && tls_cfg == unsafe { nil } {
+		return error('upstream: an HTTPS origin needs a client TLS config (tls.new_client)')
 	}
 	mut p := &Pool{
 		origin:  o
@@ -265,7 +265,7 @@ pub fn Pool.new(o Origin, tls_cfg &tls.Config) !&Pool {
 		addrs:   []transport.Addr{cap: max_addrs}
 		staging: []transport.Addr{cap: max_addrs}
 	}
-	if a := literal {
+	if a := transport.ip_addr(o.host, o.port) {
 		p.addrs << a
 	} else {
 		found := if o.resolve != unsafe { nil } {
@@ -284,14 +284,17 @@ pub fn Pool.new(o Origin, tls_cfg &tls.Config) !&Pool {
 		}
 	}
 	// Host = uri-host [ ":" port ] (RFC 9110 §7.2): the port only when it is
-	// not the scheme's default, an IPv6 literal in brackets.
-	mut h := []u8{cap: 16 + o.host.len}
-	h << 'Host: '.bytes()
+	// not the scheme's default, an IPv6 literal in brackets and without its
+	// zone (`fe80::1%eth0`): the zone only means something on this host, so
+	// it is dialed with but never sent (RFC 6874 §4).
 	v6 := o.host.contains(':')
+	host := if v6 { o.host.all_before('%') } else { o.host }
+	mut h := []u8{cap: 16 + host.len}
+	h << 'Host: '.bytes()
 	if v6 {
 		h << `[`
 	}
-	h << o.host.bytes()
+	h << host.bytes()
 	if v6 {
 		h << `]`
 	}

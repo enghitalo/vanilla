@@ -34,6 +34,7 @@ on:
       - 'bench/ci_bench.sh'
       - 'tests/pg_async_e2e_test.v'
       - 'tests/pg_async_maintenance_test.v'
+      - 'tests/pg_async_cancel_test.v'
       # What the e2e suite and the bench server build on.
       - 'core/**'
       - 'server/**'
@@ -55,6 +56,7 @@ on:
       - 'bench/ci_bench.sh'
       - 'tests/pg_async_e2e_test.v'
       - 'tests/pg_async_maintenance_test.v'
+      - 'tests/pg_async_cancel_test.v'
       # What the e2e suite and the bench server build on.
       - 'core/**'
       - 'server/**'
@@ -115,6 +117,7 @@ jobs:
         shell: bash
         run: |
           v -cc gcc -no-parallel test tests/pg_async_e2e_test.v
+          v -cc gcc -no-parallel test tests/pg_async_cancel_test.v
       - name: Build the benchmarks
         shell: bash
         run: |
@@ -141,6 +144,7 @@ jobs:
           VRACE: 'halt_on_error=0'
         run: |
           v -race -cc "$RACE_CC" -no-parallel test tests/pg_async_e2e_test.v
+          v -race -cc "$RACE_CC" -no-parallel test tests/pg_async_cancel_test.v
           v -race -cc "$RACE_CC" -no-parallel test pg_async/
       # The decoders index the server's bytes without bounds checks
       # (@[direct_array_access]). decode_test.v feeds them mutated values in
@@ -210,6 +214,7 @@ jobs:
         run: |
           v -cc gcc -no-parallel test pg_async/
           v -cc gcc -no-parallel test tests/pg_async_maintenance_test.v
+          v -cc gcc -no-parallel test tests/pg_async_cancel_test.v
       - name: End-to-end benchmark server against PostgreSQL ${{ matrix.pg }}
         shell: bash
         run: |
@@ -379,6 +384,7 @@ jobs:
           v -cc gcc -no-parallel -d vanilla_tls test pg_async/
           v -cc gcc -no-parallel -d vanilla_tls test tests/pg_async_e2e_test.v
           v -cc gcc -no-parallel -d vanilla_tls test tests/pg_async_maintenance_test.v
+          v -cc gcc -no-parallel -d vanilla_tls test tests/pg_async_cancel_test.v
       # -gc none frees nothing: 4000 queries over TLS must leave the heap
       # where the warm-up left it (test_tls_queries_do_not_grow_the_heap, in
       # heap bytes), so pg_async allocates nothing per query over TLS and

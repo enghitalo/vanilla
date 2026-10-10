@@ -301,6 +301,14 @@ mut:
 	// io_deadline bounds the waits of the blocking bring-up over TLS
 	// (monotonic ns; 0 = wait as long as it takes).
 	io_deadline u64
+	// What cancel() needs (cancel.v): the BackendKeyData of the session (its
+	// process id, and its secret key as bytes: 4 on protocol 3.0, up to 256
+	// on 3.2), refreshed by every bring-up and re-dial; the host TLS sessions
+	// are started for (SNI and verify_full); the CancelRequest in flight.
+	backend_pid int
+	cancel_key  []u8
+	tls_host    string
+	cancel      PgCancel
 }
 
 struct Msg {
@@ -372,6 +380,7 @@ fn (mut c PgConn) teardown() {
 		c.tls.free()
 		c.tls = tls.Session{}
 	}
+	c.cancel_teardown() // before the TLS config its session comes from goes
 	if c.owns_tls && c.tls_cfg != unsafe { nil } {
 		c.tls_cfg.free()
 	}
@@ -489,8 +498,11 @@ fn (mut c PgConn) on_startup_msg(typ u8, payload []u8, mut scram ScramClient) !b
 		bt_ready_for_query {
 			return true
 		}
+		bt_backend_key_data {
+			c.set_backend_key(payload)
+		}
 		else {
-			// ParameterStatus / BackendKeyData / NoticeResponse — ignored.
+			// ParameterStatus / NoticeResponse — ignored.
 		}
 	}
 	return false

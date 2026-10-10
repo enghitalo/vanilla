@@ -2,15 +2,16 @@
 // http1_1/upstream client's end-to-end tests (../src/upstream_e2e_test.v,
 // which builds and starts it as its own process).
 //
-// usage: fake_upstream --port-file F --stats-file S [--tls CERTDIR [--cert server|wronghost]]
+// usage: fake_upstream --port-file F --stats-file S [--bind IP] [--tls CERTDIR [--cert server|wronghost]]
 //
-// Listens on 127.0.0.1:<ephemeral> (the port goes to --port-file once it
-// listens), one thread per connection. With --tls it serves TLS 1.3 through
-// vanilla's own tls server side, with CERTDIR/<cert>.crt / .key (from
-// pg_async/testdata/gen_test_ca.sh). Keep-alive HTTP/1.1; the path picks the
-// answer:
+// Listens on 127.0.0.1:<ephemeral>, or on --bind's address (::1); the port
+// goes to --port-file once it listens. One thread per connection. With --tls
+// it serves TLS 1.3 through vanilla's own tls server side, with
+// CERTDIR/<cert>.crt / .key (from pg_async/testdata/gen_test_ca.sh).
+// Keep-alive HTTP/1.1; the path picks the answer:
 //
 //   /ok           200, Content-Length JSON (HEAD: no body)
+//   /host         200, the request's Host field value as the body
 //   /chunked      200, chunked body "hello world" with a trailer
 //   /continue     100 Continue, then 201 Created "ok"
 //   /nocontent    204
@@ -28,6 +29,11 @@
 //
 // The stats file holds key=value lines: accepted, handshakes, requests, and
 // path:<path>=<count>.
+//
+// It exits within 200 ms of its parent process (the test) exiting: a test that
+// panics never runs its deferred stop(), and a fake left behind would keep the
+// test binary's stdout/stderr open, so `v test` would wait for their EOF
+// instead of reporting the failure.
 module main
 
 import os
@@ -278,14 +284,15 @@ fn head_end(buf []u8) int {
 	return -1
 }
 
-fn content_length(head string) int {
+// field is the value of the head's first `name` field (lowercase name), ''
+// when absent.
+fn field(head string, name string) string {
 	for line in head.split('\r\n')[1..] {
-		name := line.all_before(':').trim_space().to_lower()
-		if name == 'content-length' {
-			return line.all_after(':').trim_space().int()
+		if line.all_before(':').trim_space().to_lower() == name {
+			return line.all_after(':').trim_space()
 		}
 	}
-	return 0
+	return ''
 }
 
 fn serve(mut a App, fd int) {
@@ -321,7 +328,7 @@ fn serve(mut a App, fd int) {
 		path := if line.len > 1 { line[1] } else { '' }
 		a.bump('requests')
 		a.bump('path:' + path)
-		n := content_length(head)
+		n := field(head, 'content-length').int()
 		if path == '/e413' {
 			c.write_str('HTTP/1.1 413 Content Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
 			time.sleep(time.second) // reads nothing more meanwhile
@@ -344,6 +351,10 @@ fn serve(mut a App, fd int) {
 		match true {
 			path == '/ok' {
 				c.write_str(if method == 'HEAD' { ok_head } else { ok_head + ok_body })
+			}
+			path == '/host' {
+				h := field(head, 'host')
+				c.write_str('HTTP/1.1 200 OK\r\nContent-Length: ${h.len}\r\n\r\n${h}')
 			}
 			path == '/chunked' {
 				c.write_str(chunked_resp)
@@ -414,21 +425,31 @@ fn serve(mut a App, fd int) {
 }
 
 fn main() {
+	// Once the parent is gone this process is re-parented: getppid() changes.
+	parent := os.getppid()
+	spawn fn [parent] () {
+		for os.getppid() == parent {
+			time.sleep(200 * time.millisecond)
+		}
+		exit(0)
+	}()
 	mut port_file := ''
 	mut stats_file := ''
+	mut bind := '127.0.0.1'
 	mut certs := ''
 	mut cert := 'server'
 	for i := 1; i + 1 < os.args.len; i += 2 {
 		match os.args[i] {
 			'--port-file' { port_file = os.args[i + 1] }
 			'--stats-file' { stats_file = os.args[i + 1] }
+			'--bind' { bind = os.args[i + 1] }
 			'--tls' { certs = os.args[i + 1] }
 			'--cert' { cert = os.args[i + 1] }
 			else { panic('fake_upstream: unknown option ${os.args[i]}') }
 		}
 	}
 	if port_file == '' || stats_file == '' {
-		eprintln('usage: fake_upstream --port-file F --stats-file S [--tls CERTDIR [--cert server|wronghost]]')
+		eprintln('usage: fake_upstream --port-file F --stats-file S [--bind IP] [--tls CERTDIR [--cert server|wronghost]]')
 		exit(2)
 	}
 	mut app := &App{
@@ -438,16 +459,16 @@ fn main() {
 		app.cfg = tls.new_from_pem(os.read_bytes(os.join_path(certs, cert + '.crt'))!,
 			os.read_bytes(os.join_path(certs, cert + '.key'))!)!
 	}
-	lfd := C.socket(C.AF_INET, C.SOCK_STREAM, 0)
+	mut a := transport.ip_addr(bind, 0) or { panic('fake_upstream: bad --bind ${bind}') }
+	lfd := C.socket(a.family, C.SOCK_STREAM, 0)
 	one := i32(1)
 	C.setsockopt(lfd, C.SOL_SOCKET, C.SO_REUSEADDR, &one, 4)
-	mut a := transport.ip_addr('127.0.0.1', 0) or { panic('fake_upstream: address') }
 	if C.bind(lfd, voidptr(&a.data[0]), a.len) != 0 || C.listen(lfd, 128) != 0 {
 		panic('fake_upstream: cannot listen')
 	}
 	mut sl := u32(a.data.len)
 	C.getsockname(lfd, voidptr(&a.data[0]), &sl)
-	port := (int(a.data[2]) << 8) | int(a.data[3])
+	port := (int(a.data[2]) << 8) | int(a.data[3]) // sin_port / sin6_port, network order
 	os.write_file(port_file + '.tmp', port.str())!
 	os.mv(port_file + '.tmp', port_file)!
 	for {

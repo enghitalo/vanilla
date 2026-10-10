@@ -39,6 +39,10 @@ static inline bool vanilla_to_take(void** out_cont, void** out_state) {
 	(void)out_state;
 	return false;
 }
+
+static inline bool vanilla_to_pending(void) {
+	return false;
+}
 #else
 
 #if defined(_MSC_VER)
@@ -81,6 +85,12 @@ static inline bool vanilla_to_take(void** out_cont, void** out_state) {
 	*out_state = vanilla_to.state;
 	vanilla_to.queued = false;
 	return true;
+}
+
+// Whether a takeover is queued (not yet taken): the handler running now has
+// handed its connection over.
+static inline bool vanilla_to_pending(void) {
+	return vanilla_to.queued;
 }
 
 #endif // __TINYC__
