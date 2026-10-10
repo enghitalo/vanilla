@@ -115,6 +115,10 @@ jobs:
         shell: bash
         run: |
           v -race -cc "$RACE_CC" -no-parallel -run-only 'test_epoll_*' test tests/shutdown_drain_test.v
+      - name: 'park_deadline_test.v (epoll: park deadlines, timed-out continuations, tombstone drains)'
+        shell: bash
+        run: |
+          v -race -cc "$RACE_CC" -no-parallel -run-only 'test_epoll_*' test tests/park_deadline_test.v
       - name: 'accept_starved_test.v (epoll: the acceptor pauses when out of fds, #256)'
         shell: bash
         run: |
@@ -133,6 +137,7 @@ jobs:
         shell: bash
         run: |
           v -race -cc "$RACE_CC" -no-parallel test server/backend_epoll/reactor_pipelining_test.v
+          v -race -cc "$RACE_CC" -no-parallel test server/backend_epoll/park_timer_test.v
       - name: static_assets (follow_disk race test included) and core hand-off slot unit tests
         shell: bash
         run: |

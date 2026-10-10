@@ -94,6 +94,14 @@ connection desyncs or corrupts:
    queries have drained with their errors — `redial.v`, vanilla#191. That
    drain is why the FIFO contract also binds a request whose flush failed: it
    still parks and consumes its error, or its slot never comes back.)
+7. **A park that times out keeps its queue position.** With a park deadline
+   (`Limits.park_timeout_ms`, `watch_fd_persistent_deadline`, vanilla#200)
+   any slot can time out, not only the head: its continuation runs once with
+   `event_loop.timed_out()` and answers 504 without touching the connection,
+   and its slot becomes a tombstone where it is, exactly as when its client
+   disconnects. Its reply is still due and still `inflight[k]`, so the
+   tombstone consumes it in order when it arrives. `PgConn.cancel()` makes
+   that reply come at once (57014) instead of when the query ends.
 
 These are also the read-bound case for the whole approach: the win is mostly CPU
 reduction (fewer syscalls/parses per query), and because Postgres replies in order

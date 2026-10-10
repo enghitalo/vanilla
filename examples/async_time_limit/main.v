@@ -12,8 +12,10 @@ module main
 //
 // This is the building block for per-request time limits on anything async (a
 // slow upstream, a long query loop): one monotonic check per resume, no extra
-// watch. (A single hard wall-clock deadline can also be a second timerfd — but
-// v1 allows one in-flight watch per conn, so here we check the clock per step.)
+// watch. It acts only when a step resumes; to bound a step whose fd may never
+// become ready (a hung upstream), park it with event_loop.watch_fd_deadline
+// (or set Limits.park_timeout_ms): its continuation then runs with
+// event_loop.timed_out() when the deadline passes (epoll plain worker).
 import server
 import core
 import time

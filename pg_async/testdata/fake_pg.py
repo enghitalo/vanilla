@@ -15,8 +15,18 @@ What a query returns is decided by its SQL text (see answer_statement):
   select g from generate_series(1, N) g    N int4 rows: 1..N
   select $1::int4, $2::text, ...     one row echoing the parameters (int4,
                                      int8, bool or text, from each cast)
+  select pg_sleep(S)                 answered after S seconds (one void row),
+                                     unless a CancelRequest for the session
+                                     arrives first: then ERROR 57014
+                                     (query_canceled), as PostgreSQL does
   begin / commit / rollback          the transaction status in ReadyForQuery
   anything else                      ERROR 0A000 naming the unsupported text
+
+CancelRequest: every session's BackendKeyData (process id 1000 + the
+connection number, a random secret key of --key-len bytes) is registered; a
+CancelRequest naming a process id with the right key cancels that session's
+pg_sleep in progress (counted as cancels_honored; one with a wrong key or an
+unknown id is ignored, as cancels_ignored), plain or over TLS (--ssl tls).
 
 Failure modes are chosen per run, so a test can make the server-side event it
 needs happen deterministically:
@@ -27,6 +37,8 @@ needs happen deterministically:
   --hang-after K                    the K-th and later queries of a connection
       are never answered (the connection stays open)
   --auth scram|trust                (default scram; password --password)
+  --key-len N                       the BackendKeyData secret key's length
+      (default 4, protocol 3.0's; up to 256, as protocol 3.2 allows)
 
 TLS, per run (--ssl; certificates from gen_test_ca.sh via --cert/--key):
   --ssl off                         answer SSLRequest with 'N' (the default)
@@ -41,9 +53,9 @@ TLS, per run (--ssl; certificates from gen_test_ca.sh via --cert/--key):
       SSL_new_session_ticket, through ctypes: the ssl module has no call for it)
 
 --stats-file PATH keeps `key=value` counters (accepted, authenticated, queries,
-server_closes, ssl_requests, tls_handshakes, sni, tickets, cancel_requests) up
-to date, so a test can assert on what the server saw. Every connection is logged
-to stderr.
+server_closes, ssl_requests, tls_handshakes, sni, tickets, cancel_requests,
+cancels_honored, cancels_ignored, cancelled) up to date, so a test can assert
+on what the server saw. Every connection is logged to stderr.
 
 It exits after --lifetime seconds, or within 0.2 s of its parent process
 exiting: a test that panics never runs its deferred stop(), and a fake left
@@ -75,6 +87,7 @@ OID_BOOL = 16
 OID_INT8 = 20
 OID_INT4 = 23
 OID_TEXT = 25
+OID_VOID = 2278
 
 SALT = b'vanilla-fake-pg-salt'
 ITERATIONS = 4096
@@ -83,6 +96,11 @@ ARGS = None
 TLS_CTX = None
 STATS = {}
 STATS_LOCK = threading.Lock()
+
+# BackendKeyData of every session: process id -> (secret key, the event a
+# matching CancelRequest sets to interrupt its pg_sleep).
+BACKENDS = {}
+BACKENDS_LOCK = threading.Lock()
 
 
 def log(cid, text):
@@ -209,11 +227,29 @@ def scram_auth(conn):
     conn.sendall(msg(b'R', struct.pack('!I', 12) + b'v=' + base64.b64encode(sig)))
 
 
+def cancel_request(body, cid):
+    """A CancelRequest's body after its code: Int32 process id, then the secret
+    key. Sets the named session's cancel event when the key matches."""
+    pid = struct.unpack('!I', body[:4])[0]
+    key = body[4:]
+    with BACKENDS_LOCK:
+        entry = BACKENDS.get(pid)
+    if entry is not None and hmac.compare_digest(entry[0], key):
+        # Counted before the reply it causes can reach the client.
+        bump('cancels_honored')
+        entry[1].set()
+        log(cid, f'CancelRequest for process {pid}: honored')
+    else:
+        bump('cancels_ignored')
+        log(cid, f'CancelRequest for process {pid}: ignored (unknown process or wrong key)')
+
+
 def startup(conn, cid):
     """Reads the startup packet, answering an SSLRequest first (--ssl), and
-    authenticates. Returns (connection, startup parameters): the connection is
-    the TLS session once one was accepted. The parameters are None for a
-    request that ends the connection (CancelRequest)."""
+    authenticates. Returns (connection, startup parameters, cancel event): the
+    connection is the TLS session once one was accepted, and the event is set
+    by a CancelRequest for this session. The parameters are None for a request
+    that ends the connection (CancelRequest)."""
     while True:
         ln = struct.unpack('!I', recv_exact(conn, 4))[0]
         body = recv_exact(conn, ln - 4)
@@ -239,8 +275,8 @@ def startup(conn, cid):
             continue
         if code == CANCEL_REQUEST:
             bump('cancel_requests')
-            log(cid, 'CancelRequest')
-            return conn, None
+            cancel_request(body[4:], cid)
+            return conn, None, None
         if code != PROTOCOL_3_0:
             raise EOFError
         params = {}
@@ -262,13 +298,16 @@ def startup(conn, cid):
     for k, v in (('server_version', '16.0 (vanilla fake_pg)'), ('integer_datetimes', 'on'),
                  ('client_encoding', 'UTF8'), ('TimeZone', 'UTC')):
         status += msg(b'S', k.encode() + b'\x00' + v.encode() + b'\x00')
-    status += msg(b'K', struct.pack('!I', 1000 + cid) + os.urandom(4))
+    pid, key, cancel_ev = 1000 + cid, os.urandom(ARGS.key_len), threading.Event()
+    with BACKENDS_LOCK:
+        BACKENDS[pid] = (key, cancel_ev)
+    status += msg(b'K', struct.pack('!I', pid) + key)
     # Counted before the client can see ReadyForQuery, so a test that asserts
     # right after its connect returns never reads a stale counter.
     bump('authenticated')
     log(cid, f'authenticated ({ARGS.auth}) user={params.get("user", "")}')
     conn.sendall(status + msg(b'Z', b'I'))
-    return conn, params
+    return conn, params, cancel_ev
 
 
 def new_session_tickets(conn, n):
@@ -297,6 +336,7 @@ def new_session_tickets(conn, n):
 CAST = re.compile(r'\$(\d+)(?:::(\w+))?')
 LITERAL = re.compile(r'^\s*select\s+(-?\d+)(?:::int4)?\s*$', re.I)
 SERIES = re.compile(r'generate_series\(\s*1\s*,\s*(\d+)\s*\)', re.I)
+SLEEP = re.compile(r'^\s*select\s+pg_sleep\(\s*([0-9.]+)\s*\)\s*$', re.I)
 
 
 def encode_param(value, cast):
@@ -311,13 +351,23 @@ def encode_param(value, cast):
     return value, OID_TEXT, -1
 
 
-def answer_statement(sql, params, tx):
+def answer_statement(sql, params, tx, cancel_ev):
     """One statement's reply after its ParseComplete/BindComplete: returns
     (bytes, transaction status after it, whether it failed)."""
     text = sql.strip().rstrip(';').strip()
     low = text.lower()
     if '1/0' in low.replace(' ', ''):
         return error_response('ERROR', '22012', 'division by zero'), tx, True
+    m = SLEEP.match(text)
+    if m and tx != b'E':
+        # Like a backend's SIGINT: a cancel that came while nothing ran is
+        # forgotten, one that comes during the sleep interrupts it.
+        cancel_ev.clear()
+        if cancel_ev.wait(float(m.group(1))):
+            bump('cancelled')
+            return error_response('ERROR', '57014', 'canceling statement due to user request'), tx, True
+        return (row_description([('pg_sleep', OID_VOID, 4)]) + data_row([b'']) +
+                msg(b'C', b'SELECT 1\x00')), tx, False
     if low in ('begin', 'start transaction'):
         return msg(b'n') + msg(b'C', b'BEGIN\x00'), b'T', False
     if low in ('commit', 'end'):
@@ -371,7 +421,7 @@ def parse_bind_params(body):
     return params
 
 
-def serve(conn, cid):
+def serve(conn, cid, cancel_ev):
     tx = b'I'
     queries = 0
     stmts = []  # [sql, params] of the current group (up to Sync)
@@ -403,7 +453,7 @@ def serve(conn, cid):
             reply = b''
             for stmt_sql, params in stmts:
                 reply += msg(b'1') + msg(b'2')
-                part, tx, failed = answer_statement(stmt_sql, params, tx)
+                part, tx, failed = answer_statement(stmt_sql, params, tx, cancel_ev)
                 reply += part
                 if failed:
                     # An explicit transaction is now aborted; an implicit one
@@ -443,9 +493,9 @@ def close_after_reply(conn, cid, reply):
 
 def handle(conn, cid):
     try:
-        conn, params = startup(conn, cid)
+        conn, params, cancel_ev = startup(conn, cid)
         if params is not None:
-            serve(conn, cid)
+            serve(conn, cid, cancel_ev)
     except (EOFError, OSError, ValueError, IndexError, struct.error) as e:
         if isinstance(e, ssl.SSLError):
             log(cid, f'TLS: {e}')
@@ -473,6 +523,8 @@ def main():
     ap.add_argument('--cert', default='', help='server certificate (PEM), for --ssl tls')
     ap.add_argument('--key', default='', help='its private key (PEM)')
     ap.add_argument('--tickets-per-query', type=int, default=0)
+    ap.add_argument('--key-len', type=int, default=4,
+                    help='BackendKeyData secret key length: 4 (protocol 3.0) or up to 256 (3.2)')
     ARGS = ap.parse_args()
     if ARGS.ssl == 'tls':
         global TLS_CTX
