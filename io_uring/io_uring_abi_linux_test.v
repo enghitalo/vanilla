@@ -287,7 +287,36 @@ fn test_submit_and_wait_timeout_without_ext_arg_uses_a_timeout_sqe() {
 	assert cqes[0].user_data == timeout_user_data
 	assert cqes[0].res == -C.ETIME
 	// The server's dispatcher must not mistake it for one of its own ops.
-	assert decode_op_type(cqes[0].user_data) !in [op_accept, op_read, op_write, op_poll]
+	assert decode_op_type(cqes[0].user_data) !in [op_accept, op_read, op_write, op_poll,
+		op_accept_resume]
+	cq_advance(&r, n)
+}
+
+// The accept-pause timer (#256): a pure timer that completes with -ETIME after
+// its duration, tagged with the caller's user_data, even though no other CQE
+// ever arrives. The timespec it was given is gone by then: the kernel read it
+// at submit.
+fn test_prepare_timeout_fires_after_its_duration() {
+	mut r := new_test_ring(0, false) or { return }
+	defer {
+		queue_exit(&r)
+	}
+	mut ts := KernelTimespec{
+		tv_nsec: i64(20 * time.millisecond)
+	}
+	tag := encode_user_data(op_accept_resume, unsafe { nil })
+	assert prepare_timeout(&r, &ts, tag)
+	sw := time.new_stopwatch()
+	assert submit(&r) == 1
+	ts.tv_nsec = 0
+	assert submit_and_wait(&r, 1) >= 0
+	assert sw.elapsed() >= 15 * time.millisecond
+	mut cqes := unsafe { [2]&Cqe{} }
+	n := peek_batch_cqe(&r, &cqes[0], 2)
+	assert n == 1
+	assert cqes[0].user_data == tag
+	assert decode_op_type(cqes[0].user_data) == op_accept_resume
+	assert cqes[0].res == -C.ETIME
 	cq_advance(&r, n)
 }
 

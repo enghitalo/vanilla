@@ -60,6 +60,7 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 	// With accept-time births (EPOLLOUT in conn_events) the registration is
 	// tagged, so the worker knows a connection's first event. Decided once.
 	births := conn_events & u32(C.EPOLLOUT) != 0
+	mut next_log := u64(0) // rate limit of the accept-pause notice
 
 	for {
 		// Wait for events on the main epoll fd (listening socket)
@@ -91,12 +92,23 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 					println('[epoll] accept() returned ${client_conn_fd}')
 				}
 				if client_conn_fd < 0 {
+					err := C.errno
 					// Check for EAGAIN or EWOULDBLOCK, usually represented by errno 11.
-					if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
+					if err == C.EAGAIN || err == C.EWOULDBLOCK {
 						$if verbose ? {
 							println('[epoll] No more incoming connections to accept (EAGAIN/EWOULDBLOCK)')
 						}
 						break // No more incoming connections; exit loop.
+					}
+					if socket.accept_starved(err) {
+						// Out of fds (or socket buffers, or memory). Retrying now
+						// would spin: the connection stays in the backlog, and on a
+						// full fd table accept4 fails like this even with nothing
+						// pending (#256). Pause, then go back to epoll_wait, which
+						// blocks unless a client is waiting.
+						next_log = socket.note_accept_pause(err, next_log)
+						time.sleep(socket.accept_pause)
+						break
 					}
 					eprintln(@LOCATION)
 					C.perror(c'Accept failed')
