@@ -33,10 +33,14 @@ import sync.stdatomic
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
-#include <linux/kcmp.h>
 
 fn C.fcntl(fd int, cmd int, arg int) int
 fn C.getpid() int
+
+// kcmp_file is KCMP_FILE, the first of the kernel's enum kcmp_type: defined
+// here rather than taken from <linux/kcmp.h>, which needs the kernel headers
+// installed (a minimal musl image has none).
+const kcmp_file = 0
 
 // WatchEntry records one parked request: which client connection is waiting, the
 // continuation to run when the watched fd is ready, and the consumer's opaque
@@ -179,7 +183,7 @@ fn hold_free_number(epoll_fd int, n int) int {
 // closed unchecked.
 fn release_hold(src int, held int) {
 	pid := C.getpid()
-	same := unsafe { C.syscall(C.SYS_kcmp, pid, pid, C.KCMP_FILE, src, held) }
+	same := unsafe { C.syscall(C.SYS_kcmp, pid, pid, kcmp_file, src, held) }
 	if same == 0 || (same < 0 && C.errno != C.EBADF) {
 		C.close(held)
 	}

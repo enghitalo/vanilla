@@ -49,6 +49,7 @@ $if linux {
 	#include <sys/socket.h>
 	#include <sys/resource.h>
 	#include <fcntl.h>
+	#include <sys/syscall.h>
 }
 
 struct C.rlimit {
@@ -67,6 +68,7 @@ fn C.write(fd int, buf voidptr, count usize) int
 fn C.close(fd int) int
 fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
 fn C.fcntl(fd int, cmd int, arg int) int
+fn C.getpid() int
 fn C.clock() i64 // this process's CPU time, in CLOCKS_PER_SEC (1e6 on POSIX) units
 fn C.send(__fd int, __buf voidptr, __n usize, __flags int) int
 fn C.recv(__fd int, __buf voidptr, __n usize, __flags int) int
@@ -817,7 +819,11 @@ fn et_tup_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload vo
 	if step == 7 {
 		// #257, misuse: the continuation closes its client's number itself,
 		// and a new fd (another worker's connection, here a socketpair end)
-		// takes the number. The runtime must not close that fd.
+		// takes the number. The runtime must not close that fd. The number
+		// is the runtime's hold here: it was free when the run started (A's
+		// socket had just closed, and the check opens no fd meanwhile). On
+		// main, which has no hold, it is still free and this close fails
+		// with EBADF.
 		n := event_loop.client_fd
 		C.close(n)
 		fd := et_pair_at(n)
@@ -2584,12 +2590,33 @@ fn check_tombstone_steps_to_pooled_fd_on_its_number(backend server.IOBackend, li
 	assert seen.conns[0].frames.len == n
 }
 
+// et_kcmp_available reports whether kcmp(2) works here. A seccomp filter
+// (Docker's default profile) or a kernel without CONFIG_CHECKPOINT_RESTORE
+// refuses it, and the runtime then closes a tombstone's hold unchecked.
+fn et_kcmp_available() bool {
+	mut sv := [2]i32{}
+	if C.socketpair(C.AF_UNIX, C.SOCK_STREAM, 0, &sv[0]) != 0 {
+		return false
+	}
+	d := C.fcntl(int(sv[0]), C.F_DUPFD_CLOEXEC, 0)
+	pid := C.getpid()
+	same := unsafe { C.syscall(C.SYS_kcmp, pid, pid, 0, int(sv[0]), d) } // 0 = KCMP_FILE
+	C.close(d)
+	C.close(int(sv[0]))
+	C.close(int(sv[1]))
+	return d >= 0 && same == 0
+}
+
 // check_tombstone_hold_released_once (#257): a tombstone's continuation that
 // closes its client's number itself (misuse: the runtime owns that socket)
 // closes the runtime's hold on that number, and a new fd can take it, here a
 // socketpair end standing in for another worker's connection. Closing the
 // hold again once the run returned closed that fd.
 fn check_tombstone_hold_released_once(backend server.IOBackend, limits server.Limits) ! {
+	if !et_kcmp_available() {
+		eprintln('[test] kcmp(2) unavailable (a seccomp filter?): the runtime closes the hold unchecked there; skipping')
+		return
+	}
 	path := et_uds('t257c')
 	et_ch_reset()
 	mut c := unsafe { et_ch }

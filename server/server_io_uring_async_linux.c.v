@@ -54,10 +54,12 @@ import sync.stdatomic
 
 #include <fcntl.h>
 #include <sys/syscall.h>
-#include <linux/kcmp.h>
 
 fn C.fcntl(fd int, cmd int, arg int) int
 fn C.getpid() int
+
+// iou_kcmp_file is KCMP_FILE (see backend_epoll's kcmp_file).
+const iou_kcmp_file = 0
 
 // Initial size of the fd-indexed watch table (grows by doubling; same layout as
 // the epoll reactor and the pool's fd-indexed structures).
@@ -804,7 +806,7 @@ fn iou_hold_free_number(src int, n int) int {
 // the continuation closed it itself and the number may be another's by now.
 fn iou_release_hold(src int, held int) {
 	pid := C.getpid()
-	same := unsafe { C.syscall(C.SYS_kcmp, pid, pid, C.KCMP_FILE, src, held) }
+	same := unsafe { C.syscall(C.SYS_kcmp, pid, pid, iou_kcmp_file, src, held) }
 	if same == 0 || (same < 0 && C.errno != C.EBADF) {
 		C.close(held)
 	}
