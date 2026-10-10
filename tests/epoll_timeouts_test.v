@@ -2156,6 +2156,21 @@ fn check_stale_event_not_routed_to_new_watch(limits server.Limits) ! {
 	assert resp == et_ok, '${label}: /h6new answered ${resp.bytestr()}'
 }
 
+// et_await_parks makes barrier round trips (up to 8) until `want` requests
+// have parked (et_ch.tparked), and returns the frames the barrier has seen
+// (it had seen `n`). A request on a connection opened just before is not
+// always served before a barrier request sent after it on an open
+// connection: with births on, the worker sees the new connection only once
+// the accept thread has queued it, and the open one's request can come first.
+fn et_await_parks(mut h vtest.Harness, barrier vtest.Group, n int, want i64) !int {
+	mut seen := n
+	for i := 0; i < 8 && stdatomic.load_i64(unsafe { &et_ch.tparked }) < want; i++ {
+		seen++
+		h.send(barrier, et_req, vtest.frames(seen))!
+	}
+	return seen
+}
+
 // check_tombstone_steps_to_new_fd (#231): client A parks on a pooled upstream
 // (watch_fd_persistent) and hangs up; when the upstream answers, A's tombstone
 // runs the continuation, which retries on a fresh persistent fd. Numbered past
@@ -2220,9 +2235,10 @@ fn check_tombstone_steps_to_new_fd(backend server.IOBackend, limits server.Limit
 		},
 	])!
 	seen = h.send(barrier.group, et_req, vtest.frames(5))!
+	n := et_await_parks(mut h, barrier.group, 5, 2)! + 1
 	assert stdatomic.load_i64(&c.tparked) == 2, '${label}: precondition: the live client did not park'
-	seen = h.send(barrier.group, et_tfire_req, vtest.frames(6))!
-	assert seen.conns[0].frames.len == 6, '${label}: /tfire not answered'
+	seen = h.send(barrier.group, et_tfire_req, vtest.frames(n))!
+	assert seen.conns[0].frames.len == n, '${label}: /tfire not answered'
 	out := h.wait(live.group, vtest.frames(1))!
 	r := out.conns[0]
 	assert !r.unmet && r.frames.len == 1 && r.frames[0] == et_ok, "${label}: the live client was not answered (A's tombstone took its reply): ${r.raw.bytestr()}"
@@ -2265,22 +2281,27 @@ fn check_pipelined_head_steps_to_new_fd(limits server.Limits) ! {
 	barrier := h.fire([et_one(et_req)])!
 	second := h.fire([parked])!
 	mut seen := h.send(barrier.group, et_req, vtest.frames(2))!
+	mut n := et_await_parks(mut h, barrier.group, 2, 2)!
 	assert stdatomic.load_i64(&c.tparked) == 2, '${label}: precondition: both clients did not park'
 	// The first reply: its continuation steps to a fresh fd.
-	seen = h.send(barrier.group, et_tfire_req, vtest.frames(3))!
-	seen = h.send(barrier.group, et_req, vtest.frames(4))!
+	n++
+	seen = h.send(barrier.group, et_tfire_req, vtest.frames(n))!
+	n++
+	seen = h.send(barrier.group, et_req, vtest.frames(n))!
 	assert stdatomic.load_i64(&c.x) >= 0, "${label}: the first client's continuation did not step"
 	// The second reply is the second client's.
 	stdatomic.store_i64(&c.step, 0)
-	seen = h.send(barrier.group, et_tfire_req, vtest.frames(5))!
+	n++
+	seen = h.send(barrier.group, et_tfire_req, vtest.frames(n))!
 	r2 := h.wait(second.group, vtest.frames(1))!
 	assert !r2.conns[0].unmet && r2.conns[0].frames.len == 1, "${label}: the second client was not answered (the first one's stale slot took its reply): ${r2.conns[0].raw.bytestr()}"
 	// The fresh fd answers the first client, once.
-	seen = h.send(barrier.group, et_tretry_req, vtest.frames(6))!
+	n++
+	seen = h.send(barrier.group, et_tretry_req, vtest.frames(n))!
 	r1 := h.wait(first.group, vtest.frames(1))!
 	assert !r1.conns[0].unmet && r1.conns[0].frames.len == 1 && r1.conns[0].frames[0] == et_ok, '${label}: the first client: ${r1.conns[0].raw.bytestr()}'
 	assert stdatomic.load_i64(&c.retried) == 1, "${label}: the fresh fd's continuation ran ${stdatomic.load_i64(&c.retried)} times"
-	assert seen.conns[0].frames.len == 6
+	assert seen.conns[0].frames.len == n
 }
 
 // check_tombstone_multi_step_same_fd (#231): a tombstone's continuation that
@@ -2442,6 +2463,7 @@ fn check_tombstone_repeat_step_one_slot(backend server.IOBackend, limits server.
 	])!
 	n++
 	seen = h.send(barrier, et_req, vtest.frames(n))!
+	n = et_await_parks(mut h, barrier, n, 2)!
 	assert stdatomic.load_i64(&c.tparked) == 2, '${label}: precondition: the live client did not park'
 	n++
 	seen = h.send(barrier, et_tretry_req, vtest.frames(n))!
@@ -2495,6 +2517,7 @@ fn check_tombstone_refused_step_pops(backend server.IOBackend, limits server.Lim
 	])!
 	n++
 	mut seen := h.send(barrier, et_req, vtest.frames(n))!
+	n = et_await_parks(mut h, barrier, n, 2)!
 	assert stdatomic.load_i64(&c.tparked) == 2, '${label}: precondition: the live client did not park'
 	n++
 	seen = h.send(barrier, et_tfire_req, vtest.frames(n))!
@@ -2580,6 +2603,7 @@ fn check_tombstone_steps_to_pooled_fd_on_its_number(backend server.IOBackend, li
 	])!
 	n++
 	seen = h.send(barrier, et_req, vtest.frames(n))!
+	n = et_await_parks(mut h, barrier, n, 2)!
 	assert stdatomic.load_i64(&c.tparked) == 2, '${label}: precondition: the live client did not park'
 	n++
 	seen = h.send(barrier, et_tretry_req, vtest.frames(n))!
