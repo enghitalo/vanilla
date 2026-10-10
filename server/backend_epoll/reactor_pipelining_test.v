@@ -181,12 +181,13 @@ fn epoll_events_of(ep int, fd int) u32 {
 	return 0
 }
 
-// A tombstone's continuation that watches its client's own number, as its
-// client's socket, is refused, persistent or not (#257): the client is gone,
-// and the number may hold another connection by now, here one of this
-// worker's (edge-triggered in its epoll). Nothing is recorded on the number
-// and the connection's registration is left as it was. Before, a persistent
-// watch tombstoned the number and re-armed that registration for the dead
+// A tombstone's continuation that watches its client's own number is
+// refused (#257) where that number can only be the client's socket or
+// another connection: a request-owned watch always, a persistent one while it
+// is a connection of this worker (here one, edge-triggered in its epoll) or
+// while the run holds the number. Nothing is recorded on it, and the
+// connection's registration is left as it was. Before, a persistent watch
+// tombstoned the number and re-armed that registration for the dead
 // continuation.
 fn test_dead_run_refuses_its_client_number() {
 	ep := epoll.create_epoll_fd()
@@ -201,9 +202,12 @@ fn test_dead_run_refuses_its_client_number() {
 	assert epoll.add_fd_to_epoll_tagged(ep, n, u32(C.EPOLLIN) | u32(C.EPOLLET)) == 0
 	registered := epoll_events_of(ep, n)
 	assert registered != 0
+	mut st := new_plain_state()
+	state_create(mut st, n) // n is a connection of this worker
 	mut r := Reactor{
 		rearming_dead: true
 		dead_fd:       n + 1 // the pooled fd the tombstone drains
+		st:            unsafe { &st }
 	}
 	mut w := core.EventLoop{
 		client_fd: n
@@ -216,6 +220,48 @@ fn test_dead_run_refuses_its_client_number() {
 	r.dead_refused = false
 	w.watch_fd_persistent(n, .writable, noop_cont, unsafe { nil })
 	assert w.last_watched == -1 && r.dead_refused
+	// Held by the run, no longer a connection: refused as well.
+	unsafe {
+		st.conns[n] = nil
+	}
+	r.dead_held = true
+	r.dead_refused = false
+	w.watch_fd_persistent(n, .writable, noop_cont, unsafe { nil })
+	assert w.last_watched == -1 && r.dead_refused
 	assert n >= r.watches.len || !r.watches[n].active
 	assert epoll_events_of(ep, n) == registered
+}
+
+// A persistent watch on the dead client's number, where a pooled fd of this
+// worker took that number before the run (a re-dial, a lazy dial: the run
+// then cannot hold it), is a pooled step like any other (#257): the fd gets
+// a dead slot with the step's continuation and payload, and is armed.
+// Refusing it popped the tombstone with that fd's reply still in flight.
+fn test_dead_run_steps_to_a_pooled_fd_on_its_client_number() {
+	ep := epoll.create_epoll_fd()
+	mut sv := [2]i32{}
+	assert C.socketpair(C.AF_UNIX, C.SOCK_STREAM, 0, &sv[0]) == 0
+	m := int(sv[0]) // the pooled fd, on the dead client's number
+	defer {
+		C.close(m)
+		C.close(int(sv[1]))
+		C.close(ep)
+	}
+	mut st := new_plain_state()
+	mut r := Reactor{
+		rearming_dead: true
+		dead_fd:       m + 1
+		st:            unsafe { &st }
+	}
+	mut w := core.EventLoop{
+		client_fd: m
+		loop_fd:   ep
+		reactor:   unsafe { voidptr(&r) }
+		register:  register_watch
+	}
+	w.watch_fd_persistent(m, .readable, noop_cont, voidptr(usize(5)))
+	assert w.last_watched == m && !r.dead_refused
+	assert r.watches[m].active && r.watches[m].queue.len == 1
+	assert r.watches[m].queue[0].dead && r.watches[m].queue[0].udata == voidptr(usize(5))
+	assert epoll_events_of(ep, m) != 0
 }

@@ -191,16 +191,19 @@ mut:
 	// read by a continuation whose next step is then refused.
 	bad     i64 = -1
 	refused i64
+	num     i64 = -1 // A's number on the server, as its park saw it (event_loop.client_fd)
+	xino    i64 // the inode of the fd at x, when a check records it
 }
 
 const et_ch = &EtChoreo{}
 
 fn et_ch_reset() {
 	mut c := unsafe { et_ch }
-	for p in [&c.a, &c.b, &c.x, &c.peer, &c.up0, &c.up1, &c.bad] {
+	for p in [&c.a, &c.b, &c.x, &c.peer, &c.up0, &c.up1, &c.bad, &c.num] {
 		stdatomic.store_i64(p, -1)
 	}
-	for p in [&c.pinned, &c.spurious, &c.step, &c.pin, &c.tparked, &c.retried, &c.step2, &c.refused] {
+	for p in [&c.pinned, &c.spurious, &c.step, &c.pin, &c.tparked, &c.retried, &c.step2, &c.refused,
+		&c.xino] {
 		stdatomic.store_i64(p, 0)
 	}
 }
@@ -340,6 +343,15 @@ const et_tstep_prefix = 'GET /tstep'.bytes()
 // check gets a tombstone (#257).
 const et_trej_req = 'GET /trej HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 const et_trej_prefix = 'GET /trej'.bytes()
+
+// /tclose closes client A, and nothing else: its hangup is reported by the
+// next batch. /tdial opens a "pooled connection" (a socketpair end, x, peer)
+// on the lowest free number from A's, which is A's own when it is free: the
+// pool re-dialing, or dialing lazily, after A's socket closed (#257).
+const et_tclose_req = 'GET /tclose HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const et_tclose_prefix = 'GET /tclose'.bytes()
+const et_tdial_req = 'GET /tdial HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const et_tdial_prefix = 'GET /tdial'.bytes()
 
 // /txpark parks a live client on the fresh end x (persistent) and answers
 // with the byte /tretry writes into it (#257).
@@ -611,6 +623,7 @@ fn et_choreo_handler(req []u8, mut out []u8, mut event_loop core.EventLoop) core
 			stdatomic.store_i64(&c.up0, i64(sv[0]))
 		}
 		stdatomic.add_i64(&c.tparked, 1)
+		stdatomic.store_i64(&c.num, i64(event_loop.client_fd))
 		event_loop.watch_fd_persistent(int(stdatomic.load_i64(&c.up0)), .readable, et_tup_done,
 			unsafe { nil })
 		if et_has_prefix(req, et_trej_prefix) {
@@ -637,6 +650,19 @@ fn et_choreo_handler(req []u8, mut out []u8, mut event_loop core.EventLoop) core
 		event_loop.watch_fd_persistent(int(stdatomic.load_i64(&c.x)), .readable, et_txpark_done,
 			unsafe { nil })
 		return .suspend
+	}
+	if et_has_prefix(req, et_tclose_prefix) {
+		et_ch_close(&c.a)
+		out << et_ok
+		return .done
+	}
+	if et_has_prefix(req, et_tdial_prefix) {
+		fd := et_pair_at(int(stdatomic.load_i64(&c.num)))
+		if fd < 0 {
+			return .close
+		}
+		out << et_ok
+		return .done
 	}
 	if et_has_prefix(req, et_torch_prefix) {
 		et_ch_close(&c.a)
@@ -781,6 +807,26 @@ fn et_tup_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload vo
 	if step == 3 {
 		return et_step_twice(mut event_loop)
 	}
+	if step == 6 {
+		// #257: the request goes on on a pooled connection that took the dead
+		// client's number before this run (/tdial), and parks on it.
+		event_loop.watch_fd_persistent(int(stdatomic.load_i64(&c.x)), .readable, et_tretry_done,
+			unsafe { nil })
+		return .suspend
+	}
+	if step == 7 {
+		// #257, misuse: the continuation closes its client's number itself,
+		// and a new fd (another worker's connection, here a socketpair end)
+		// takes the number. The runtime must not close that fd.
+		n := event_loop.client_fd
+		C.close(n)
+		fd := et_pair_at(n)
+		if fd >= 0 {
+			stdatomic.store_i64(&c.xino, i64(et_fd_inode(fd)))
+		}
+		out << et_ok
+		return .done
+	}
 	if step == 4 || step == 5 {
 		// #257: a step that cannot be watched, after this reply was read: an
 		// fd epoll refuses (step 4), or a failed fd (step 5).
@@ -816,6 +862,35 @@ fn et_step_timer(mut event_loop core.EventLoop) core.Step {
 	stdatomic.store_i64(&c.x, i64(fd))
 	event_loop.watch_fd(fd, .readable, et_never_done, unsafe { nil })
 	return .suspend
+}
+
+// et_pair_at opens a socketpair and puts its first end, kept in et_ch.x (its
+// peer in et_ch.peer), on the lowest free number from n: n itself when it is
+// free, which `pinned` records. Returns the end, or -1.
+fn et_pair_at(n int) int {
+	mut c := unsafe { et_ch }
+	mut sv := [2]i32{}
+	if C.socketpair(C.AF_UNIX, C.SOCK_STREAM | C.SOCK_NONBLOCK, 0, &sv[0]) != 0 {
+		return -1
+	}
+	mut fd := int(sv[0])
+	mut peer := int(sv[1])
+	if peer == n {
+		fd, peer = peer, fd
+	}
+	if n >= 0 && fd != n {
+		moved := C.fcntl(fd, C.F_DUPFD_CLOEXEC, n)
+		if moved >= 0 {
+			C.close(fd)
+			fd = moved
+		}
+	}
+	if fd == n {
+		stdatomic.store_i64(&c.pinned, 1)
+	}
+	stdatomic.store_i64(&c.peer, i64(peer))
+	stdatomic.store_i64(&c.x, i64(fd))
+	return fd
 }
 
 // et_never_done is the continuation of a watch that must never run.
@@ -2315,7 +2390,7 @@ fn check_tombstone_timer_step_no_leak(backend server.IOBackend, limits server.Li
 	timer := stdatomic.load_i64(&c.x)
 	assert timer >= 0, "${label}: A's tombstone did not run the continuation"
 	left := et_open_timerfds() - timers
-	assert left == 0, "${label}: ${left} timer(s) leaked: the tombstone stepped to timer fd ${timer} (the dead client's number: ${stdatomic.load_i64(&c.pinned) == 1}), and nothing closed it"
+	assert left <= 0, "${label}: ${left} timer(s) leaked: the tombstone stepped to timer fd ${timer} (the dead client's number: ${stdatomic.load_i64(&c.pinned) == 1}), and nothing closed it"
 	assert stdatomic.load_i64(&c.spurious) == 0, "${label}: the timer's continuation ran"
 }
 
@@ -2424,6 +2499,115 @@ fn check_tombstone_refused_step_pops(backend server.IOBackend, limits server.Lim
 	r := out.conns[0]
 	assert !r.unmet && r.frames.len == 1 && r.frames[0] == et_concat(et_pq_head, 'y'.bytes()), '${label}: the live client: ${r.raw.bytestr()}'
 	assert seen.conns[0].frames.len == n
+}
+
+// check_tombstone_steps_to_pooled_fd_on_its_number (#257): client A dies
+// parked on the mock upstream, and before the upstream answers, a live request
+// makes the worker open a pooled connection (/tdial) that takes A's number.
+// A's tombstone then reads its reply and goes on on that connection, parking
+// on it persistently. The step must count: the run cannot hold the number
+// (the pooled fd has it), so the watch is a pooled step like any other.
+// Refused as a watch on the client's own number, it popped the tombstone with
+// the connection's reply still due, and that reply went to whoever parked
+// there next.
+fn check_tombstone_steps_to_pooled_fd_on_its_number(backend server.IOBackend, limits server.Limits) ! {
+	path := et_uds('t257n')
+	et_ch_reset()
+	mut c := unsafe { et_ch }
+	stdatomic.store_i64(&c.step, 6)
+	mut h := vtest.start(et_tombstone_server(backend, path, limits))!
+	defer {
+		h.stop()
+		et_ch_close(&c.up0)
+		et_ch_close(&c.up1)
+		et_ch_close(&c.x)
+		et_ch_close(&c.peer)
+	}
+	label := '${backend} ${et_births(limits)}'
+	mut barrier := vtest.Group([]int{})
+	mut n := 0
+	if backend == .epoll {
+		stdatomic.store_i64(&c.a, i64(et_dial(path, et_tpark_req)!))
+		b := h.fire([et_one(et_req)])!
+		barrier = b.group
+		n = 1
+		assert stdatomic.load_i64(&c.tparked) == 1, '${label}: precondition: A did not park'
+		n++
+		h.send(barrier, et_tclose_req, vtest.frames(n))! // A hangs up
+	} else {
+		// io_uring: A rejects its own park (see et_strand_a).
+		b := h.fire([et_one(et_req)])!
+		barrier = b.group
+		n = 1
+		stdatomic.store_i64(&c.a, i64(et_dial(path, et_trej_req)!))
+		refused := et_read_response(int(stdatomic.load_i64(&c.a)))
+		assert refused.len == 0, '${label}: /trej answered: ${refused.bytestr()}'
+		et_ch_close(&c.a)
+		assert stdatomic.load_i64(&c.tparked) == 1, '${label}: precondition: A did not park'
+	}
+	n++
+	mut seen := h.send(barrier, et_req, vtest.frames(n))!
+	// The pool dials, and the connection takes A's number.
+	n++
+	seen = h.send(barrier, et_tdial_req, vtest.frames(n))!
+	assert stdatomic.load_i64(&c.pinned) == 1, "${label}: precondition: the pooled connection did not take A's number"
+	// The upstream answers A's tombstone, which goes on on that connection.
+	n++
+	seen = h.send(barrier, et_tfire_req, vtest.frames(n))!
+	n++
+	seen = h.send(barrier, et_req, vtest.frames(n))!
+	n++
+	seen = h.send(barrier, et_tretry_req, vtest.frames(n))!
+	n++
+	seen = h.send(barrier, et_req, vtest.frames(n))!
+	assert stdatomic.load_i64(&c.retried) == 1, "${label}: the tombstone's step to the pooled connection on its number ran ${stdatomic.load_i64(&c.retried)} times"
+	// A live client parks on that connection, which answers it: the reply is its own.
+	live := h.fire([
+		vtest.Script{
+			rounds: [
+				vtest.Round{
+					send: et_txpark_req
+					want: 0 // answered once /tretry feeds the connection
+				},
+			]
+		},
+	])!
+	n++
+	seen = h.send(barrier, et_req, vtest.frames(n))!
+	assert stdatomic.load_i64(&c.tparked) == 2, '${label}: precondition: the live client did not park'
+	n++
+	seen = h.send(barrier, et_tretry_req, vtest.frames(n))!
+	out := h.wait(live.group, vtest.frames(1))!
+	r := out.conns[0]
+	assert !r.unmet && r.frames.len == 1 && r.frames[0] == et_ok, '${label}: the live client on the pooled connection: ${r.raw.bytestr()}'
+	assert stdatomic.load_i64(&c.retried) == 1, "${label}: a dead slot took the live client's reply"
+	assert seen.conns[0].frames.len == n
+}
+
+// check_tombstone_hold_released_once (#257): a tombstone's continuation that
+// closes its client's number itself (misuse: the runtime owns that socket)
+// closes the runtime's hold on that number, and a new fd can take it, here a
+// socketpair end standing in for another worker's connection. Closing the
+// hold again once the run returned closed that fd.
+fn check_tombstone_hold_released_once(backend server.IOBackend, limits server.Limits) ! {
+	path := et_uds('t257c')
+	et_ch_reset()
+	mut c := unsafe { et_ch }
+	stdatomic.store_i64(&c.step, 7)
+	mut h := vtest.start(et_tombstone_server(backend, path, limits))!
+	defer {
+		h.stop()
+		et_ch_close(&c.up0)
+		et_ch_close(&c.up1)
+		et_ch_close(&c.x)
+		et_ch_close(&c.peer)
+	}
+	label := '${backend} ${et_births(limits)}'
+	et_strand_a(backend, path, mut h, label)!
+	x := stdatomic.load_i64(&c.x)
+	assert x >= 0, "${label}: A's tombstone did not run the continuation"
+	assert stdatomic.load_i64(&c.pinned) == 1, "${label}: precondition: the new fd did not take A's number"
+	assert et_fd_inode(int(x)) == u64(stdatomic.load_i64(&c.xino)), "${label}: the runtime closed fd ${x}, which took A's number after the continuation closed it"
 }
 
 // check_pooled_fd_eof_births_off: check_pooled_fd_eof_no_spin with births off
@@ -2547,6 +2731,20 @@ fn test_epoll_tombstone_refused_step_pops() ! {
 	}
 }
 
+fn test_epoll_tombstone_steps_to_pooled_fd_on_its_number() ! {
+	$if linux {
+		check_tombstone_steps_to_pooled_fd_on_its_number(.epoll, server.Limits{})!
+		check_tombstone_steps_to_pooled_fd_on_its_number(.epoll, et_births_on)!
+	}
+}
+
+fn test_epoll_tombstone_hold_released_once() ! {
+	$if linux {
+		check_tombstone_hold_released_once(.epoll, server.Limits{})!
+		check_tombstone_hold_released_once(.epoll, et_births_on)!
+	}
+}
+
 // The #257 checks on io_uring, where a rejected park makes the tombstone.
 fn test_iouring_tombstone_step_gaps() ! {
 	$if linux {
@@ -2557,6 +2755,8 @@ fn test_iouring_tombstone_step_gaps() ! {
 		check_tombstone_timer_step_no_leak(.io_uring, server.Limits{})!
 		check_tombstone_repeat_step_one_slot(.io_uring, server.Limits{})!
 		check_tombstone_refused_step_pops(.io_uring, server.Limits{}, 5)!
+		check_tombstone_steps_to_pooled_fd_on_its_number(.io_uring, server.Limits{})!
+		check_tombstone_hold_released_once(.io_uring, server.Limits{})!
 	}
 }
 

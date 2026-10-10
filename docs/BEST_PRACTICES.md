@@ -286,9 +286,14 @@ connection. The continuation still runs when the reply arrives (its response is
 discarded), so it drains the reply and releases the slot, and the pooled conn
 (and its SCRAM handshake) survives client churn. That draining run may step to
 another fd like any continuation: a `watch_fd_persistent` fd runs it the same
-way when ready, and a `watch_fd` fd (a backoff timer) is closed by the runtime
-once the run returns. A watch on the departed client's own socket is refused,
-and a run whose watch was refused is not resumed. With a plain `watch_fd` the
+way when ready. After a `watch_fd` step (a backoff timer), the runtime closes
+that fd once the run returns and the run is never resumed, and a continuation
+cannot tell that its client is gone: release the pool slot before such a
+step. Nor is a run resumed after a watch the runtime refuses: a `watch_fd` on
+the departed client's fd number, and a `watch_fd_persistent` on it unless a
+pooled connection of this worker now has that number. Watch one fd per step:
+a second watch on the same fd replaces the first, but a run that moves on to
+another fd and back leaves a slot on both. With a plain `watch_fd` the
 runtime closes the pooled fd and the continuation never runs: the slot leaks,
 and once every slot has leaked the worker sheds every query with 503
 ([vanilla#190](https://github.com/enghitalo/vanilla/issues/190)). Keep

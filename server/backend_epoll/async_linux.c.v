@@ -32,8 +32,11 @@ import sync.stdatomic
 #include <fcntl.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
+#include <linux/kcmp.h>
 
 fn C.fcntl(fd int, cmd int, arg int) int
+fn C.getpid() int
 
 // WatchEntry records one parked request: which client connection is waiting, the
 // continuation to run when the watched fd is ready, and the consumer's opaque
@@ -109,11 +112,16 @@ mut:
 	// that was refused (a failed fd, or one epoll does not take). Reset before
 	// each run; read only when its last watch armed nothing (#257).
 	dead_refused bool
+	// dead_held: run_tombstone holds the running tombstone's client's number
+	// (hold_free_number), so a watch on that number names the hold (#257).
+	dead_held bool
 	// dead_step_fd: the persistent fd the running tombstone's continuation
-	// stepped to, which got a dead slot at the tail of its queue; -1 when none.
-	// A repeat watch on it in the same run updates that slot (#257). These two
-	// sit in the padding before dead_fd, an i32 so that they fit: the Reactor,
-	// a local of the worker loop, keeps its size and every field its offset.
+	// last stepped to, which got a dead slot at the tail of its queue; -1 when
+	// none. A repeat watch on it in the same run updates that slot (#257). Only
+	// the last one: a run that steps X, then Y, then X again queues a second
+	// slot on X (one watch per step, as on the live path). These three sit in
+	// the padding before dead_fd, an i32 so that they fit: the Reactor, a local
+	// of the worker loop, keeps its size and every field its offset.
 	dead_step_fd i32 = -1
 	// dead_fd: the fd whose tombstone is running while rearming_dead is set. A
 	// watch on any OTHER fd is the continuation stepping away (a retry on a
@@ -137,17 +145,18 @@ mut:
 }
 
 // hold_free_number holds fd number n, a dead client's, while that client's
-// tombstone runs its continuation (#257). The run must never act on n: a
-// watch on it can only mean the client's socket (register_watch refuses it),
-// and by then n may be another worker's connection. But the kernel hands the
-// first fd the run creates (a backoff timer, a fresh connection) the lowest
-// free number, on an idle server often n, and that fd was then neither armed
-// nor closed: it leaked. Held, n goes to no one, neither the run nor another
-// thread: an fd the run creates gets another number, which run_tombstone
-// closes. F_DUPFD_CLOEXEC takes the lowest free number from n and never
-// replaces an open fd. Returns n, held, or -1 when n is taken: an fd the run
-// creates then gets n only if its holder closes it meanwhile, a leak, never
-// a wrong close. Cold: one fcntl per tombstone run, plus the caller's close.
+// tombstone runs its continuation (#257). The kernel hands the first fd the
+// run creates (a backoff timer, a fresh connection) the lowest free number,
+// on an idle server often n, and the runtime never closes n for the run: a
+// watch on n can also be the continuation reaching for its client's socket,
+// and by then n may be another worker's connection. So that fd leaked. Held,
+// n goes to no one, neither the run nor another thread: an fd the run
+// creates gets another number, which run_tombstone closes, and a watch on n
+// names the hold, which register_dead_watch refuses. F_DUPFD_CLOEXEC takes
+// the lowest free number from n and never replaces an open fd. Returns n,
+// held, or -1 when n is taken: an fd the run creates then gets n only if its
+// holder closes it meanwhile, a leak, never a wrong close. Cold: one fcntl
+// per tombstone run; release_hold undoes it.
 fn hold_free_number(epoll_fd int, n int) int {
 	held := C.fcntl(epoll_fd, C.F_DUPFD_CLOEXEC, n)
 	if held == n {
@@ -157,6 +166,23 @@ fn hold_free_number(epoll_fd int, n int) int {
 		C.close(held)
 	}
 	return -1
+}
+
+// release_hold closes the hold that hold_free_number put at number held, a
+// duplicate of src, unless that number no longer refers to it: a
+// continuation that closed its client's number itself (misuse: the runtime
+// owns that socket) closed the hold, and the number may be another worker's
+// by now. kcmp(KCMP_FILE) tells whether two fds share one open file, as a
+// duplicate and its source do. An fstat inode cannot: every epoll fd, timerfd
+// and eventfd shares one. EBADF: the number is free, nothing to close. Where
+// kcmp is unavailable (ENOSYS, or a seccomp filter's EPERM), the hold is
+// closed unchecked.
+fn release_hold(src int, held int) {
+	pid := C.getpid()
+	same := unsafe { C.syscall(C.SYS_kcmp, pid, pid, C.KCMP_FILE, src, held) }
+	if same == 0 || (same < 0 && C.errno != C.EBADF) {
+		C.close(held)
+	}
 }
 
 // close_watch_fd DELs and closes a request-owned watch fd, stamping its
@@ -461,7 +487,8 @@ fn register_dead_watch(mut w core.EventLoop, mut r Reactor, ext_fd int, interest
 		// queue. It takes the new continuation and payload, as a live slot
 		// would (a multi-step chain: the next step's continuation, its state),
 		// and stays dead; the fd is re-armed for the interest asked for (an
-		// exchange that must finish sending waits on writability). Nothing else in the table changes: reactor_watch's
+		// exchange that must finish sending waits on writability). Nothing
+		// else in the table changes: reactor_watch's
 		// dedup would match a live slot, maybe a new connection's on the dead
 		// client's reused number, and skipping dead slots would append a
 		// duplicate live entry for the dead client.
@@ -476,12 +503,17 @@ fn register_dead_watch(mut w core.EventLoop, mut r Reactor, ext_fd int, interest
 		w.last_watched = ext_fd
 		return
 	}
-	if ext_fd == w.client_fd {
-		// A watch on the tombstone's client's own number (#257): this run
-		// answers no one (its client is gone, or was answered without it), and
-		// the number may be another connection's by now, on any worker.
-		// Refused: nothing is armed, recorded or closed. No fd the run creates
-		// has that number: run_tombstone holds it while it is free.
+	if ext_fd == w.client_fd && (!w.persistent || r.dead_held || (r.st != unsafe { nil }
+		&& ext_fd < r.st.conns.len && unsafe { r.st.conns[ext_fd] != nil })) {
+		// A watch on the tombstone's client's own number (#257), refused:
+		// nothing is armed, recorded or closed. Request-owned, it can only be
+		// the client's socket, which this run must not touch: the run answers
+		// no one, and the number may be another worker's connection by now.
+		// Persistent, it is refused while run_tombstone holds the number (it
+		// then names the hold) and while it is a connection of this worker
+		// (arming it would hand that connection's readiness to this run).
+		// Otherwise a pooled fd of this worker took the number before the run
+		// (a re-dial, a lazy dial), and this is a pooled step like any other.
 		w.last_watched = -1
 		r.dead_refused = true
 		return
@@ -1456,15 +1488,17 @@ fn run_tombstone(mut reactor Reactor, epoll_fd int, ext_fd int, slot ParkSlot, r
 	} else {
 		-1
 	}
+	reactor.dead_held = hold >= 0
 	// No file from a continuation (on_watch_ready).
 	core.set_queue_file_allowed(false)
 	dead_step := slot.cont(mut reactor.scratch, ext_fd, ready_err, slot.udata, state,
 		mut dead_loop)
 	core.set_queue_file_allowed(true)
 	if hold >= 0 {
-		C.close(hold)
+		release_hold(epoll_fd, hold)
 	}
 	reactor.rearming_dead = false
+	reactor.dead_held = false
 	reactor.dead_fd = -1
 	// A dead client cannot be taken over — drain the thread-local slot.
 	if _ := core.take_queued_takeover() {

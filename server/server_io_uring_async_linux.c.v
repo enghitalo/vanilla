@@ -53,8 +53,11 @@ import http1_1.response
 import sync.stdatomic
 
 #include <fcntl.h>
+#include <sys/syscall.h>
+#include <linux/kcmp.h>
 
 fn C.fcntl(fd int, cmd int, arg int) int
+fn C.getpid() int
 
 // Initial size of the fd-indexed watch table (grows by doubling; same layout as
 // the epoll reactor and the pool's fd-indexed structures).
@@ -152,11 +155,13 @@ mut:
 	// appends (that would revive the tombstone or duplicate it). A watch on any
 	// other fd is a step away: see dead_fd.
 	rearming_dead bool
-	// dead_refused and dead_step_fd: the epoll Reactor twins (#257), in the
-	// padding before dead_fd likewise. Whether one of the running tombstone's
-	// watches was refused, and the persistent fd it stepped to (its dead slot
-	// is the tail there).
+	// dead_refused, dead_held and dead_step_fd: the epoll Reactor twins
+	// (#257), in the padding before dead_fd likewise. Whether one of the
+	// running tombstone's watches was refused, whether iou_run_tombstone holds
+	// its client's number, and the persistent fd it last stepped to (its dead
+	// slot is the tail there).
 	dead_refused bool
+	dead_held    bool
 	dead_step_fd i32 = -1
 	// dead_fd: the fd whose tombstone is running while rearming_dead is set; a
 	// watch on any other fd is the continuation stepping away (#231, the epoll
@@ -407,13 +412,13 @@ fn iou_register_dead_watch(mut w core.EventLoop, mut env IouEnv, ext_fd int, int
 		w.last_watched = ext_fd
 		return
 	}
-	if ext_fd == w.client_fd {
-		// A watch on the tombstone's client's own number (#257): this run
-		// answers no one (its client is gone, or was answered without it), and
-		// the number may be another connection's by now, on any worker.
-		// Refused: nothing is polled, recorded or closed. No fd the run
-		// creates has that number: iou_run_tombstone holds it while it is
-		// free.
+	if ext_fd == w.client_fd && (!w.persistent || env.dead_held
+		|| env.iou_is_live_conn_fd(ext_fd)) {
+		// A watch on the tombstone's client's own number (#257), refused as in
+		// epoll's register_dead_watch: request-owned, it can only be the
+		// client's socket; persistent, while iou_run_tombstone holds the
+		// number or it is a connection of this worker. Otherwise a pooled fd
+		// of this worker took the number before the run: a pooled step.
 		w.last_watched = -1
 		env.dead_refused = true
 		return
@@ -783,7 +788,7 @@ fn handle_io_uring_poll(cqe &io_uring.Cqe, mut env IouEnv, limits Limits, active
 // number n, a dead client's, for its tombstone's run, so that no fd the run
 // creates (nor another thread) gets it. The duplicate is of this worker's
 // listener, which the run never sees: a watch on n is refused before any
-// poll. Returns n, held, or -1 when n is taken.
+// poll. Returns n, held, or -1 when n is taken. iou_release_hold undoes it.
 fn iou_hold_free_number(src int, n int) int {
 	held := C.fcntl(src, C.F_DUPFD_CLOEXEC, n)
 	if held == n {
@@ -793,6 +798,16 @@ fn iou_hold_free_number(src int, n int) int {
 		C.close(held)
 	}
 	return -1
+}
+
+// iou_release_hold is backend_epoll's release_hold: it closes the hold unless
+// the continuation closed it itself and the number may be another's by now.
+fn iou_release_hold(src int, held int) {
+	pid := C.getpid()
+	same := unsafe { C.syscall(C.SYS_kcmp, pid, pid, C.KCMP_FILE, src, held) }
+	if same == 0 || (same < 0 && C.errno != C.EBADF) {
+		C.close(held)
+	}
 }
 
 // iou_is_live_conn_fd reports whether `fd` is one of this worker's live
@@ -840,12 +855,14 @@ fn iou_run_tombstone(mut env IouEnv, ext_fd int, slot IouParkSlot, ready_err boo
 	} else {
 		-1
 	}
+	env.dead_held = hold >= 0
 	dead_step := slot.cont(mut env.scratch, ext_fd, ready_err, slot.udata, env.state, mut
 		dead_loop)
 	if hold >= 0 {
-		C.close(hold)
+		iou_release_hold(env.worker.socket_fd, hold)
 	}
 	env.rearming_dead = false
+	env.dead_held = false
 	env.dead_fd = -1
 	stepped := dead_loop.last_watched
 	if stepped >= 0 && stepped != ext_fd && stepped != slot.client_fd
