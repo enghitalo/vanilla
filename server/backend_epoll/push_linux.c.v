@@ -103,10 +103,8 @@ fn wake_after_conn(mut el core.EventLoop, ms int) bool {
 
 // deliver_wake runs connection fd's wake fn for `reason` (.posted with the
 // post's tag and data view, .timeout, .shutdown) and carries out its step:
-//   .close  — what it appended goes out, then the connection closes; if the
-//             socket cannot take it all now, close_after_flush closes it once
-//             handle_writable_plain has sent the rest, and the connection
-//             reads (and discards) client bytes meanwhile (serve_takeover_conn);
+//   .close  — what it appended goes out, then the connection closes
+//             (flush_then_close, as for any other .close);
 //   else    — over the push watermark the connection is closed (a subscriber
 //             that does not read); otherwise what was appended is flushed,
 //             unless a flush is already parked on EPOLLOUT, which sends it.
@@ -136,16 +134,7 @@ fn deliver_wake(mut reactor Reactor, epoll_fd int, fd int, reason core.WakeReaso
 	if _ := core.take_queued_takeover() {
 	}
 	if step == .close {
-		if cs.write_off < cs.write_buf.len {
-			if !flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-				return true // closed by the failed send
-			}
-			if cs.write_off < cs.write_buf.len {
-				cs.close_after_flush = true // parked on EPOLLOUT: closes once sent
-				return true
-			}
-		}
-		close_conn(epoll_fd, fd, active_conns, mut st)
+		flush_then_close(epoll_fd, fd, limits, active_conns, mut st, mut cs)
 		return true
 	}
 	if cs.write_buf.len - cs.write_off > st.push_watermark {
@@ -255,10 +244,13 @@ fn notify_closed(mut reactor Reactor, epoll_fd int, mut st PlainState, state voi
 	}
 }
 
-// discard_while_closing reads and drops what a closing taken-over connection
+// discard_while_closing reads and drops what a closing connection
 // (close_after_flush: its last bytes still going out) receives: nothing more
-// reaches its ConnHandler, and unread bytes would turn the close into a reset
-// that can cut those last bytes off. Closes on EOF or error.
+// reaches its handler or ConnHandler, and unread bytes would turn the close
+// into a reset that can cut those last bytes off. Closes on error, and on EOF
+// once nothing is left to send: a peer that half-closed still reads (RFC 9112
+// §9.6), so with bytes owed handle_writable_plain sends them, then closes.
+@[noinline]
 fn discard_while_closing(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainState, mut cs ConnState) {
 	unsafe {
 		cs.read_buf.len = 0
@@ -269,6 +261,9 @@ fn discard_while_closing(epoll_fd int, fd int, active_conns &core.Counter, mut s
 			continue
 		}
 		if n < 0 && (C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK) {
+			return
+		}
+		if n == 0 && (cs.write_off < cs.write_buf.len || cs.file_remaining > 0) {
 			return
 		}
 		close_conn(epoll_fd, fd, active_conns, mut st)

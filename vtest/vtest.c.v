@@ -75,6 +75,7 @@ pub mut:
 	frames      [][]u8 // complete framed responses, in arrival order
 	raw         []u8   // everything received (SSE / chunked asserts read this)
 	eof         bool   // the server closed (or reset) the connection
+	reset       bool   // ... and it was a reset (ECONNRESET), not an orderly close
 	unmet       bool   // EOF arrived before the script's expectations were satisfied
 	connect_err string // non-empty when the connect itself failed
 }
@@ -107,6 +108,7 @@ mut:
 	cum_want    int // cumulative frame target across armed want-rounds
 	acc         []u8
 	eof         bool
+	reset       bool
 	done        bool
 	half_closed bool
 	unmet       bool
@@ -362,6 +364,9 @@ fn (mut c HConn) read_burst(mut buf []u8, rev int) {
 		}
 		if n == 0 {
 			c.eof = true // orderly close from the server
+		} else if C.errno == C.ECONNRESET {
+			c.eof = true // a reset is a close too; `reset` tells the two apart
+			c.reset = true
 		} else if rev & (pollerr | pollhup) != 0 {
 			c.eof = true // reset counts as close for test purposes
 		}
@@ -437,6 +442,7 @@ fn (mut h Harness) results(group Group) Outcome {
 			frames:      extract_frames(c.acc)
 			raw:         seg(c.acc, 0, c.acc.len)
 			eof:         c.eof
+			reset:       c.reset
 			unmet:       c.unmet
 			connect_err: c.connect_err
 		}

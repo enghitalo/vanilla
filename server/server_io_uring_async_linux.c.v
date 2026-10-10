@@ -333,6 +333,13 @@ fn (mut env IouEnv) iou_detach_rejected_watch(ext_fd int, conn &io_uring.Connect
 	if env.watches[ext_fd].conn != conn {
 		return
 	}
+	if unsafe { conn != nil } && ext_fd == conn.fd {
+		// A watch on the client's own socket: drop only the watch, as epoll
+		// does. pool_release closes the socket, exactly once; closing it here
+		// would let the response go to whatever reuses the number.
+		env.iou_reactor_clear(ext_fd)
+		return
+	}
 	if env.watches[ext_fd].persistent {
 		// Pool-owned single watch: convert to a one-slot dead tombstone (the epoll
 		// reactor_orphan_single shape) so the orphaned reply is drained in order
@@ -689,7 +696,8 @@ fn iou_start_body_drain(mut env IouEnv, mut conn io_uring.Connection, total int,
 // held batch — or release / re-arm recv as the state demands. The io_uring
 // analogue of epoll's `.done → async_serve` re-drain, split from the poll handler
 // so the single-watch and pipelined paths share it. With close_after_send set
-// (a resume that suspended without a live watch) it only flushes, then releases.
+// (a .close resume, or one that suspended without a live watch) it only
+// flushes, then releases.
 fn iou_finish_resume(mut env IouEnv, mut conn io_uring.Connection, limits Limits, active_conns &core.Counter) {
 	worker := env.worker
 	if conn.read_buf.len > 0 && !conn.close_after_send {
@@ -700,13 +708,16 @@ fn iou_finish_resume(mut env IouEnv, mut conn io_uring.Connection, limits Limits
 		return
 	}
 	if conn.send_buf != unsafe { nil } || conn.response_buffer.len > conn.bytes_sent {
-		iou_flush_response(worker, mut conn, limits)
+		if !iou_flush_response(worker, mut conn, limits) {
+			// SQ full: no op is in flight, so nothing would ever release it.
+			iou_release(worker, mut conn, active_conns, limits.max_connections > 0)
+		}
 		return
 	}
 	if conn.close_after_send {
 		// .close resume (or an error) with nothing pending to send — drop directly;
 		// a parked connection has no in-flight op, so releasing here is safe.
-		iou_release(worker, mut conn, active_conns, limits.max_connections > 0)
+		iou_release_closing(worker, mut conn, active_conns, limits.max_connections > 0)
 		return
 	}
 	// Back to reading: a read deadline for a buffered partial, else the idle
@@ -786,8 +797,10 @@ fn handle_io_uring_poll(cqe &io_uring.Cqe, mut env IouEnv, limits Limits, active
 			}
 		}
 		.close {
-			// A parked connection has no in-flight op, so releasing here is safe.
-			iou_release(env.worker, mut *conn, active_conns, limits.max_connections > 0)
+			// Flush what the continuation appended, then release (core.Step.close),
+			// as the .suspend arm above does for a resume that cannot go on.
+			conn.close_after_send = true
+			iou_finish_resume(mut env, mut *conn, limits, active_conns)
 		}
 	}
 }
@@ -979,7 +992,8 @@ fn drain_pipelined_iou(mut env IouEnv, ext_fd int, ready_err bool, limits Limits
 			.close {
 				env.watches[ext_fd].queue.delete(0)
 				env.iou_reactor_clear_if_drained(ext_fd)
-				iou_release(env.worker, mut *conn, active_conns, limits.max_connections > 0)
+				conn.close_after_send = true
+				iou_finish_resume(mut env, mut *conn, limits, active_conns)
 			}
 		}
 	}

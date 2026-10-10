@@ -56,6 +56,7 @@ pub mut:
 	frames      [][]u8 // complete Content-Length-framed responses, in arrival order
 	raw         []u8   // everything received (SSE/chunked asserts read this)
 	eof         bool   // server closed the connection
+	reset       bool   // ... with a reset (ECONNRESET), not an orderly close
 	unmet       bool   // reached EOF before the script's expectations were satisfied
 	connect_err string
 }
@@ -133,7 +134,8 @@ pub fn repeat(n int, s Script) []Script
   round / mark terminal → notify the test thread over a channel when a group
   completes.
 - `EAGAIN` ends a read burst; `recv == 0` is EOF (terminal); `POLLERR`/reset is
-  recorded, never fatal to the run.
+  recorded, never fatal to the run. A reset also sets `reset`, so a test can
+  require an orderly close: a reset can cut off the tail of a response.
 - Frame counting = the Content-Length predicate `testkit` uses today, generalized
   to N and kept as a pure `fn (acc []u8) bool`.
 - Windows: `WSAPoll` behind `$if windows` (same struct). The WSAPoll

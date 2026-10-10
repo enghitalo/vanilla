@@ -292,8 +292,9 @@ fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd 
 			// .close it is this response's body, sent after resp with sendfile(2)
 			// (only a kTLS connection can queue one): by the flush below, or by
 			// the one best-effort write before the close, bounded by the socket
-			// send buffer like the rest of that response (the plain worker's
-			// rule). On .suspend it is dropped with the connection.
+			// send buffer like the rest of that response (the plain worker
+			// instead sends all of it before closing). On .suspend it is
+			// dropped with the connection.
 			if qf := core.take_queued_file() {
 				if step != .suspend {
 					conn.file_fd = qf.file_fd

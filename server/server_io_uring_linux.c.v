@@ -18,6 +18,7 @@ fn C.perror(s &char)
 fn C.sleep(seconds u32) u32
 fn C.close(fd int) int
 fn C.shutdown(sockfd int, how int) int
+fn C.recv(__fd int, __buf voidptr, __n usize, __flags int) int
 fn C.memmove(dest voidptr, src voidptr, n usize) voidptr
 // mask is a cpu_set_t* in <sched.h>; we hand it a raw u64 word array, so keep
 // the binding untyped rather than model cpu_set_t (whose header typedef would
@@ -77,6 +78,20 @@ fn iou_release(worker &io_uring.Worker, mut conn io_uring.Connection, active_con
 	}
 	iou_unpark(worker, mut conn)
 	io_uring.pool_release_from_ptr(worker, mut conn)
+}
+
+// iou_release_closing releases a connection whose last response has gone out
+// in full (close_after_send). It first reads and drops what the client sent
+// that nothing will serve: closing with unread input makes the kernel answer
+// with a reset, which can discard the response's untransmitted tail (RFC 9112
+// §9.6). A closing connection has no recv in flight, so nothing races this.
+@[noinline]
+fn iou_release_closing(worker &io_uring.Worker, mut conn io_uring.Connection, active_conns &core.Counter, track bool) {
+	if conn.read_buf.cap > 0 {
+		for C.recv(conn.fd, conn.read_buf.data, usize(conn.read_buf.cap), C.MSG_DONTWAIT) > 0 {
+		}
+	}
+	iou_release(worker, mut conn, active_conns, track)
 }
 
 // iou_arm_recv posts the next recv and arms the read deadline. Every wait for
@@ -357,7 +372,7 @@ fn handle_io_uring_read(worker &io_uring.Worker, cqe &io_uring.Cqe, mut env IouE
 	if conn.close_after_send {
 		// A .close (or error) can leave nothing pending to send — drop now
 		// rather than fall through to arming a recv on a condemned connection.
-		iou_release(worker, mut *conn, active_conns, track)
+		iou_release_closing(worker, mut *conn, active_conns, track)
 		return
 	}
 	// Nothing complete yet. A body too large to be worth buffering is STREAMED:
@@ -467,7 +482,7 @@ fn handle_io_uring_write(worker &io_uring.Worker, cqe &io_uring.Cqe, mut env Iou
 		}
 	}
 	if conn.close_after_send {
-		iou_release(worker, mut *conn, active_conns, track)
+		iou_release_closing(worker, mut *conn, active_conns, track)
 		return
 	}
 	if borrowed {
@@ -495,7 +510,7 @@ fn handle_io_uring_write(worker &io_uring.Worker, cqe &io_uring.Cqe, mut env Iou
 			return
 		}
 		if conn.close_after_send {
-			iou_release(worker, mut *conn, active_conns, track)
+			iou_release_closing(worker, mut *conn, active_conns, track)
 			return
 		}
 	}
