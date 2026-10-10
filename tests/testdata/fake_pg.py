@@ -27,6 +27,11 @@ and a suffix decides what happens to the connection after a reply:
 A close is a half-close (SHUT_WR) followed by draining whatever the client
 still sends until it hangs up, so the client always sees a clean EOF rather
 than a reset racing the bytes already sent to it.
+
+It exits after lifetime_s, or within 0.5 s of its parent process exiting: a
+test that panics never stops it, and a fake left behind would keep the test
+binary's stdout/stderr open, so `v test` would wait for their EOF instead of
+reporting the failure.
 """
 import base64
 import hashlib
@@ -153,6 +158,7 @@ def handle(conn, cid):
 
 
 def main():
+    parent = os.getppid()
     port_file = sys.argv[1]
     lifetime = float(sys.argv[2]) if len(sys.argv) > 2 else 120
     srv = socket.socket()
@@ -166,7 +172,8 @@ def main():
     deadline = time.time() + lifetime
     srv.settimeout(0.5)
     cid = 0
-    while time.time() < deadline:
+    # getppid() changes once the parent is gone: this process is re-parented.
+    while time.time() < deadline and os.getppid() == parent:
         try:
             conn, _ = srv.accept()
         except socket.timeout:
