@@ -284,7 +284,20 @@ connection). Pool connections are **persistent**: park on a pooled fd with
 disconnecting mid-query tombstones the parked request rather than closing the
 connection. The continuation still runs when the reply arrives (its response is
 discarded), so it drains the reply and releases the slot, and the pooled conn
-(and its SCRAM handshake) survives client churn. With a plain `watch_fd` the
+(and its SCRAM handshake) survives client churn. That draining run may step to
+another fd like any continuation: a `watch_fd_persistent` fd runs it the same
+way when ready. After a `watch_fd` step (a backoff timer), the runtime closes
+that fd once the run returns and the run is never resumed, and a continuation
+cannot tell that its client is gone: release the pool slot before such a
+step. Nor is a run resumed after a watch the runtime refuses, such as a
+`watch_fd` on the departed client's fd number. A `watch_fd_persistent` on
+that number is refused only while the runtime holds the number for the run
+or it is a connection of this worker; otherwise it is taken as a pooled
+connection that has the number now, which may also be another worker's
+connection. Watching a client fd stored in the payload from such a run is
+misuse. Watch one fd per step:
+a second watch on the same fd replaces the first, but a run that moves on to
+another fd and back leaves a slot on both. With a plain `watch_fd` the
 runtime closes the pooled fd and the continuation never runs: the slot leaks,
 and once every slot has leaked the worker sheds every query with 503
 ([vanilla#190](https://github.com/enghitalo/vanilla/issues/190)). Keep

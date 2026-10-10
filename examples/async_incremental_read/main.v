@@ -16,6 +16,8 @@ module main
 // is the realistic case: the bytes genuinely arrive over time.
 import server
 import core
+import http1_1.request_parser
+import http1_1.response
 
 #include <stdio.h>
 #include <fcntl.h>
@@ -32,8 +34,50 @@ const chunk_headers = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-E
 
 const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
+// last_chunk is the zero-size chunk that ends a chunked body (RFC 9112 §7.1).
+const last_chunk = '0\r\n\r\n'
+
+const hex_digits = '0123456789abcdef'
+
+// route_is reports whether the request path, without its query string, is
+// `lit`. req.path includes the query, so the compare stops at the first `?`.
+// It compares bytes in place: the request is never copied.
+@[direct_array_access]
+fn route_is(req request_parser.HttpRequest, lit string) bool {
+	mut n := 0
+	for n < req.path.len && req.buffer[req.path.start + n] != `?` {
+		n++
+	}
+	if n != lit.len {
+		return false
+	}
+	for i in 0 .. n {
+		if req.buffer[req.path.start + i] != lit[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// wx appends n in lowercase hex without leading zeros: a chunk-size
+// (RFC 9112 §7.1).
+fn wx(mut out []u8, n int) {
+	mut shift := 60
+	for shift > 0 && (n >> shift) == 0 {
+		shift -= 4
+	}
+	for shift >= 0 {
+		out << hex_digits[(n >> shift) & 0xf]
+		shift -= 4
+	}
+}
+
 fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
-	if !req.bytestr().contains('/stream') {
+	r := request_parser.decode_http_request(req) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
+	if !route_is(r, '/stream') {
 		core.append_str(mut out, not_found)
 		return .done
 	}
@@ -58,14 +102,15 @@ fn on_chunk(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidp
 	n := C.read(ready_fd, &buf[0], 4096)
 	if n > 0 {
 		// HTTP chunk = <hex length>\r\n<bytes>\r\n
-		out << '${n.hex()}\r\n'.bytes()
-		out << buf[..n]
-		out << '\r\n'.bytes()
+		wx(mut out, n)
+		core.append_str(mut out, '\r\n')
+		unsafe { out.push_many(&buf[0], n) }
+		core.append_str(mut out, '\r\n')
 		event_loop.watch_fd(ready_fd, .readable, on_chunk, watch_payload)
 		return .suspend
 	}
 	if n == 0 {
-		out << '0\r\n\r\n'.bytes() // terminating chunk
+		core.append_str(mut out, last_chunk)
 		C.pclose(watch_payload)
 		return .done
 	}
