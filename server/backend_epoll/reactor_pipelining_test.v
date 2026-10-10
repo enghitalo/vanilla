@@ -2,6 +2,13 @@
 module backend_epoll
 
 import core
+import epoll
+import os
+import strconv
+
+#include <sys/socket.h>
+
+fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
 
 // Unit tests for the cross-request pipelining reactor primitives (Option B):
 // auto-promotion of a single watch into a per-fd FIFO when a SECOND client parks
@@ -159,4 +166,56 @@ fn test_table_grows_for_high_fd() {
 	assert r.watches.len > 5000
 	assert r.watches[5000].active
 	assert r.watches[5000].client_fd == 100
+}
+
+// epoll_events_of is fd's event mask in the epoll set ep, as the kernel
+// reports it (/proc/self/fdinfo); 0 when fd is not in the set.
+fn epoll_events_of(ep int, fd int) u32 {
+	info := os.read_file('/proc/self/fdinfo/${ep}') or { return 0 }
+	for line in info.split_into_lines() {
+		f := line.fields()
+		if f.len >= 4 && f[0] == 'tfd:' && f[1] == fd.str() && f[2] == 'events:' {
+			return u32(strconv.parse_uint(f[3], 16, 32) or { 0 })
+		}
+	}
+	return 0
+}
+
+// A tombstone's continuation that watches its client's own number, as its
+// client's socket, is refused, persistent or not (#257): the client is gone,
+// and the number may hold another connection by now, here one of this
+// worker's (edge-triggered in its epoll). Nothing is recorded on the number
+// and the connection's registration is left as it was. Before, a persistent
+// watch tombstoned the number and re-armed that registration for the dead
+// continuation.
+fn test_dead_run_refuses_its_client_number() {
+	ep := epoll.create_epoll_fd()
+	mut sv := [2]i32{}
+	assert C.socketpair(C.AF_UNIX, C.SOCK_STREAM, 0, &sv[0]) == 0
+	n := int(sv[0])
+	defer {
+		C.close(n)
+		C.close(int(sv[1]))
+		C.close(ep)
+	}
+	assert epoll.add_fd_to_epoll_tagged(ep, n, u32(C.EPOLLIN) | u32(C.EPOLLET)) == 0
+	registered := epoll_events_of(ep, n)
+	assert registered != 0
+	mut r := Reactor{
+		rearming_dead: true
+		dead_fd:       n + 1 // the pooled fd the tombstone drains
+	}
+	mut w := core.EventLoop{
+		client_fd: n
+		loop_fd:   ep
+		reactor:   unsafe { voidptr(&r) }
+		register:  register_watch
+	}
+	w.watch_fd(n, .writable, noop_cont, unsafe { nil })
+	assert w.last_watched == -1 && r.dead_refused
+	r.dead_refused = false
+	w.watch_fd_persistent(n, .writable, noop_cont, unsafe { nil })
+	assert w.last_watched == -1 && r.dead_refused
+	assert n >= r.watches.len || !r.watches[n].active
+	assert epoll_events_of(ep, n) == registered
 }
