@@ -9,6 +9,13 @@ module main
 // ticks, so thousands of open streams cost ~one timerfd + a small struct each,
 // not a thread each.
 //
+// This stream is finite (5 ticks, then "bye"), so the client must be able to
+// see where it ends. Each event goes out as one HTTP chunk
+// (`Transfer-Encoding: chunked`), and a zero-size chunk ends the body
+// (RFC 9112 §7.1). The connection then stays open for the client's next
+// request. Without that framing the body would be close-delimited (§6.3): on a
+// keep-alive connection it would never end, and the client would hang.
+//
 // Run:   v run examples/async_sse/
 // Try:   curl -N http://localhost:8092/events
 //        # -> data: tick 1 of 5   (one line per second, then "bye")
@@ -17,6 +24,9 @@ module main
 // log tail would push to many clients from one thread. See core.Handler.
 import server
 import core
+import strconv
+import http1_1.request_parser
+import http1_1.response
 
 #include <sys/timerfd.h>
 #include <unistd.h>
@@ -31,12 +41,25 @@ struct Stream {
 mut:
 	tfd  int // the periodic timerfd this stream is parked on
 	sent int // events emitted so far
-	max  int // stop (and close) after this many
+	max  int // end the stream after this many
 }
 
-const sse_headers = 'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n'
+const sse_headers = 'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n'
 
 const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+
+// The literal parts of one `data: tick N of M\n\n` event.
+const tick_head = 'data: tick '
+
+const tick_of = ' of '
+
+const event_end = '\n\n'
+
+// The last event as one chunk (`data: bye\n\n` is 0xb bytes), then the
+// zero-size chunk that ends the body.
+const bye_and_end = 'b\r\ndata: bye\n\n\r\n0\r\n\r\n'
+
+const hex_digits = '0123456789abcdef'
 
 // arm_periodic programs a timerfd to fire every `ms` (it_value = it_interval).
 fn arm_periodic(tfd int, ms int) {
@@ -49,8 +72,55 @@ fn arm_periodic(tfd int, ms int) {
 	C.timerfd_settime(tfd, 0, unsafe { voidptr(&spec[0]) }, unsafe { nil })
 }
 
+// route_is reports whether the request path, without its query string, is
+// `lit`. req.path includes the query, so the compare stops at the first `?`.
+// It compares bytes in place: the request is never copied.
+@[direct_array_access]
+fn route_is(req request_parser.HttpRequest, lit string) bool {
+	mut n := 0
+	for n < req.path.len && req.buffer[req.path.start + n] != `?` {
+		n++
+	}
+	if n != lit.len {
+		return false
+	}
+	for i in 0 .. n {
+		if req.buffer[req.path.start + i] != lit[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// wi appends the decimal digits of n (zero-alloc: itoa into a stack scratch).
+fn wi(mut out []u8, n i64) {
+	mut scratch := [24]u8{}
+	mut view := unsafe { (&scratch[0]).vbytes(scratch.len) }
+	written := strconv.write_dec(n, mut view)
+	if written > 0 {
+		unsafe { out.push_many(&scratch[0], written) }
+	}
+}
+
+// wx appends n in lowercase hex without leading zeros: a chunk-size
+// (RFC 9112 §7.1).
+fn wx(mut out []u8, n int) {
+	mut shift := 60
+	for shift > 0 && (n >> shift) == 0 {
+		shift -= 4
+	}
+	for shift >= 0 {
+		out << hex_digits[(n >> shift) & 0xf]
+		shift -= 4
+	}
+}
+
 fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
-	if !req.bytestr().contains('/events') {
+	r := request_parser.decode_http_request(req) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
+	if !route_is(r, '/events') {
 		core.append_str(mut out, not_found)
 		return .done
 	}
@@ -76,11 +146,22 @@ fn sse_tick(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidp
 	C.read(ready_fd, &tmp[0], 8) // drain the timerfd expiry count
 	mut st := unsafe { &Stream(watch_payload) }
 	st.sent++
-	out << 'data: tick ${st.sent} of ${st.max}\n\n'.bytes()
+	// One chunk: `<size in hex>\r\n<event>\r\n`. The size is the literal parts
+	// plus the digits of the two counters.
+	size := tick_head.len + strconv.dec_digits(u64(st.sent)) + tick_of.len +
+		strconv.dec_digits(u64(st.max)) + event_end.len
+	wx(mut out, size)
+	core.append_str(mut out, '\r\n')
+	core.append_str(mut out, tick_head)
+	wi(mut out, st.sent)
+	core.append_str(mut out, tick_of)
+	wi(mut out, st.max)
+	core.append_str(mut out, event_end)
+	core.append_str(mut out, '\r\n')
 	if st.sent >= st.max {
-		out << 'data: bye\n\n'.bytes()
+		core.append_str(mut out, bye_and_end)
 		C.close(st.tfd) // request owns the timerfd; closing it removes it from epoll
-		return .done
+		return .done // the body is complete; the connection stays open
 	}
 	event_loop.watch_fd(st.tfd, .readable, sse_tick, watch_payload) // keep streaming
 	return .suspend
