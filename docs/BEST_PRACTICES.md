@@ -410,6 +410,20 @@ kqueue a deadline watch is a plain watch, and `cancel` fails.
   That is stricter than libpq, whose `verify-full` also takes a `DNS:` or CN
   spelling of the IP: a certificate psql accepts by IP may need an `IP:` SAN
   here.
+- For token authentication (Aurora DSQL, RDS / Aurora IAM), where the server
+  asks for a short-lived token as a cleartext password over TLS: set
+  `allowed_auth: [.cleartext_password]` with `ssl_mode: .verify_full`, and
+  `password_fn` to mint the token. It is called once per connection attempt
+  (each pooled connection's bring-up, every re-dial), on the worker thread:
+  sign locally, never fetch over the network there. pg_async refuses to send
+  a cleartext password over plaintext, or when `allowed_auth` does not list it
+  (the default is SCRAM only). Keep connections younger than the server's own
+  cap (DSQL closes them at 60 min) with `max_lifetime_ms` and
+  `lifetime_jitter_ms`, and run the maintenance timer: it recycles a due
+  connection, one at a time, after its pipelined queries drain, so no request
+  meets the server's close or waits on the re-dial. `params:
+  {'application_name': 'orders-api'}` names the sessions in
+  `pg_stat_activity`.
 
 **Don't**
 

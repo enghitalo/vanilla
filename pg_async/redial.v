@@ -24,10 +24,12 @@ import time
 //                   own, re-armed: no allocation), then the
 //                   StartupMessage over it                                → .starting
 //
-// so the worker never waits on the network; name resolution and the TLS
-// handshake's crypto steps do run inline, once per attempt. The SCRAM key
-// derivation (PBKDF2) does not: the pool's ScramCache already holds it,
-// unless the server changed the salt. A failed attempt
+// so the worker never waits on the network; name resolution, password_fn (a
+// fresh credential for every attempt) and the TLS handshake's crypto steps do
+// run inline, once per attempt. The SCRAM key derivation (PBKDF2) does not:
+// the pool's ScramCache already holds it, unless the server changed the
+// salt. A connection recycled for max_lifetime_ms takes the same path, driven
+// by maintain() alone (maintenance.v). A failed attempt
 // (refused, closed, authentication error, or redial_timeout) closes its socket
 // and is retried after redial_backoff, starting at the next resolved address
 // (addr_cursor), so a dead one is not retried first forever. The first attempt starts on the first
@@ -97,6 +99,7 @@ fn (mut c PgConn) redial_start(cfg ConnConfig) ! {
 	c.loss = ''
 	c.ready_status = tx_idle // a new session is in no transaction
 	c.rollback_deadline = 0
+	c.start_auth(cfg)!
 	c.fd = dial(&cfg, true, c.addr_cursor)!
 	c.state = .connecting
 	c.dial_deadline = time.sys_mono_now() + if cfg.connect_timeout_ms > 0 {
@@ -121,7 +124,6 @@ fn (mut c PgConn) redial_step(cfg ConnConfig) !bool {
 			if !c.send_startup(cfg)! {
 				return false // still connecting
 			}
-			c.start_scram(cfg)!
 			c.state = .starting
 		}
 	}
@@ -139,7 +141,6 @@ fn (mut c PgConn) redial_step(cfg ConnConfig) !bool {
 		if !c.send_startup(cfg)! {
 			return error('pg: re-dial: the StartupMessage did not fit an empty socket')
 		}
-		c.start_scram(cfg)!
 		c.state = .starting
 	}
 	if c.tls.active() {
@@ -169,18 +170,23 @@ fn (mut c PgConn) redial_step(cfg ConnConfig) !bool {
 		typ := c.recv_buf[c.recv_pos]
 		payload := c.recv_buf[c.recv_pos + 5..c.recv_pos + hdr.total]
 		c.recv_pos += hdr.total
-		if c.on_startup_msg(typ, payload, mut c.scram)! {
+		if c.on_startup_msg(typ, payload, &cfg, mut c.scram)! {
 			c.state = .ready
+			c.expires_at = c.lifetime_deadline(&cfg, time.sys_mono_now())
 			return true
 		}
 	}
 	return false
 }
 
-// start_scram readies this attempt's SCRAM exchange, with the pool's PBKDF2
-// result (ScramCache): no key derivation per re-dial, plain or TLS.
-fn (mut c PgConn) start_scram(cfg ConnConfig) ! {
-	c.scram = ScramClient.new(cfg.user, cfg.password)!
+// start_auth readies an attempt's authentication, for the blocking bring-up
+// and the re-dial alike: its password, asked of password_fn when set (once
+// per attempt, before dialing: a failing provider costs no connect), in a
+// SCRAM client that has the pool's PBKDF2 result (ScramCache): no key
+// derivation per re-dial, plain or TLS. A cleartext request is answered with
+// the same password.
+fn (mut c PgConn) start_auth(cfg ConnConfig) ! {
+	c.scram = ScramClient.new(cfg.user, attempt_password(&cfg)!)!
 	c.scram.cache = c.scram_cache
 }
 
@@ -195,7 +201,7 @@ fn (mut c PgConn) send_startup(cfg ConnConfig) !bool {
 	unsafe {
 		c.submit_scratch.len = 0
 	}
-	write_startup(mut c.submit_scratch, cfg.user, cfg.database)
+	write_startup(mut c.submit_scratch, cfg.user, cfg.database, cfg.params)
 	n := c.send_some(c.submit_scratch.data, c.submit_scratch.len)
 	if n == c.submit_scratch.len {
 		return true

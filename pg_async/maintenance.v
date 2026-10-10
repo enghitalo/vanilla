@@ -14,6 +14,17 @@ import time
 // unasked marks it broken right away, and the re-dial runs from the same tick,
 // so the slot is usually back before any request meets it. Drive it with
 // start_maintenance (a timer on the worker's event loop) or call it yourself.
+//
+// It also enforces max_lifetime_ms. A connection past its deadline is
+// recycled before the server's own cap can close it under a query: taken out
+// of the idle set (an idle one at the tick that finds it due, a borrowed one
+// when release() returns it), so neither acquire() nor acquire_pipelined()
+// hands it out again; once the pipelined queries already on it have drained,
+// it sends Terminate and is re-dialed in place by the re-dial state machine
+// (redial.v), one non-blocking step per tick, then rejoins the idle set. No
+// request ever advances, or waits on, that re-dial. One connection is recycled
+// at a time, so a pool of N keeps N-1 serving (a pool of 1 sheds for the length
+// of one re-dial); the others due wait their turn, still serving.
 
 // maintenance_idle_ms is the tick while every connection is healthy: how long
 // a connection the server closed can sit unnoticed.
@@ -71,24 +82,37 @@ fn (mut c PgConn) probe_idle() {
 }
 
 // maintain probes every idle connection (probe_idle) and advances the re-dial
-// of every idle broken one by one non-blocking step, and returns how soon, in
-// milliseconds, it wants to run again: maintenance_busy_ms while a re-dial is
-// in flight, the remaining backoff while one waits to retry, else
-// maintenance_idle_ms. A connection held by acquire() or carrying pipelined
-// queries is left alone: its reader finds out on its own. One whose
-// release-time ROLLBACK is in flight has nobody to read the reply but the pool:
-// maintain() reads what arrived (finish_rollback), at the busy tick until the
-// ROLLBACK is answered. An idle, unheld connection left in a transaction (a
-// BEGIN that went through acquire_pipelined(), which nobody will release) gets
-// the same ROLLBACK — so a pipelined sender that keeps a transaction open
-// across a maintenance tick loses it. Never blocks on the network.
+// of every idle broken one by one non-blocking step, recycles connections past
+// max_lifetime_ms (above), and returns how soon, in milliseconds, it wants to
+// run again: maintenance_busy_ms while a re-dial, a recycle or a release-time
+// ROLLBACK is in flight, the remaining backoff while one waits to retry, else
+// maintenance_idle_ms or the time to the next lifetime deadline, whichever is
+// sooner. A connection held by acquire() or carrying pipelined queries is left
+// alone: its reader finds out on its own. One whose release-time ROLLBACK is
+// in flight has nobody to read the reply but the pool: maintain() reads what
+// arrived (finish_rollback), at the busy tick until the ROLLBACK is answered.
+// An idle, unheld connection left in a transaction (a BEGIN that went through
+// acquire_pipelined(), which nobody will release) gets the same ROLLBACK — so
+// a pipelined sender that keeps a transaction open across a maintenance tick
+// loses it. A connection due for recycling while its ROLLBACK is in flight is
+// recycled at a later tick, once the ROLLBACK is answered. Never blocks on the
+// network.
 pub fn (mut p PgPool) maintain() int {
 	mut next := maintenance_idle_ms
 	now := time.sys_mono_now()
+	p.clock = now
 	for i in 0 .. p.conns.len {
+		if p.idle[i] && p.conns[i].expires_at <= now && p.conns[i].state == .ready {
+			if p.recycling < 0 {
+				p.idle[i] = false // due: no new query lands on it
+				p.recycling = i
+			} else {
+				next = maintenance_busy_ms // its turn comes after the recycle in flight
+			}
+		}
 		if !p.idle[i] {
 			if p.conns[i].rollback_deadline == 0 {
-				continue // held by acquire()
+				continue // held by acquire(), or the recycle in flight
 			}
 			if !p.finish_rollback(i) {
 				if maintenance_busy_ms < next {
@@ -124,5 +148,47 @@ pub fn (mut p PgPool) maintain() int {
 			next = wait
 		}
 	}
+	if p.recycling >= 0 {
+		wait := p.recycle_step(now)
+		if wait < next {
+			next = wait
+		}
+	}
+	// Wake up at the next lifetime deadline (+1 ms): an idle connection is
+	// recycled right then, and a borrowed one meets the clock at release().
+	for i in 0 .. p.conns.len {
+		expires_at := p.conns[i].expires_at
+		if expires_at > now && expires_at - now < u64(next) * u64(time.millisecond) {
+			next = int((expires_at - now) / u64(time.millisecond)) + 1
+		}
+	}
 	return next
+}
+
+// recycle_step advances the recycle of connection p.recycling: it waits for
+// the pipelined queries already on it to drain (their requests collect the
+// replies), says goodbye (Terminate, one attempt), re-dials in place (one
+// non-blocking step per call, a fresh password_fn credential) and returns the
+// connection to the idle set once it is ready. Returns the milliseconds until
+// it next has work.
+fn (mut p PgPool) recycle_step(now u64) int {
+	i := p.recycling
+	mut c := &p.conns[i]
+	if c.inflight.len > 0 {
+		return maintenance_busy_ms
+	}
+	if c.state == .ready {
+		c.send_terminate()
+		c.lose('recycled: max_lifetime_ms reached')
+		c.retry_at = 0
+	}
+	if c.redial(p.cfg) {
+		p.idle[i] = true
+		p.recycling = -1
+		return maintenance_idle_ms
+	}
+	if c.state == .broken && c.retry_at > now {
+		return int((c.retry_at - now) / u64(time.millisecond)) + 1
+	}
+	return maintenance_busy_ms
 }

@@ -34,6 +34,8 @@ pub const bt_ready_for_query = u8(`Z`)
 pub const bt_row_description = u8(`T`)
 
 // AuthType is the Int32 sub-code carried by an Authentication ('R') message.
+// The methods a client answers are .sasl (SCRAM-SHA-256) and
+// .cleartext_password (TLS only); ConnConfig.allowed_auth picks which.
 pub enum AuthType as u32 {
 	ok                 = 0
 	cleartext_password = 3
@@ -758,9 +760,10 @@ fn put_cstr_s(mut buf []u8, s string) {
 }
 
 // write_startup appends a StartupMessage (protocol 3.0): no type byte, Int32
-// length, Int32 protocol version, then user/database key-value pairs and a
-// terminating 0 byte.
-pub fn write_startup(mut buf []u8, user string, database string) {
+// length, Int32 protocol version, then user/database and the `params`
+// key-value pairs (run-time parameters such as application_name; checked by
+// check_startup_params: no NUL, no empty name) and a terminating 0 byte.
+pub fn write_startup(mut buf []u8, user string, database string, params map[string]string) {
 	lenpos := buf.len
 	buf << [u8(0), 0, 0, 0]
 	put_u32(mut buf, 0x0003_0000)
@@ -769,6 +772,10 @@ pub fn write_startup(mut buf []u8, user string, database string) {
 	if database.len > 0 {
 		put_cstr_s(mut buf, 'database')
 		put_cstr_s(mut buf, database)
+	}
+	for name, value in params {
+		put_cstr_s(mut buf, name)
+		put_cstr_s(mut buf, value)
 	}
 	buf << u8(0) // end of parameters
 	msg_len := u32(buf.len - lenpos)
@@ -846,6 +853,15 @@ pub fn write_sasl_initial(mut buf []u8, mechanism string, client_first []u8) {
 	put_cstr_s(mut buf, mechanism)
 	put_u32(mut buf, u32(client_first.len))
 	buf << client_first
+	finish_msg(mut buf, lp)
+}
+
+// write_password appends a PasswordMessage ('p'): the password as a C
+// string, the answer to AuthenticationCleartextPassword. A password holding a
+// NUL would end early: the caller refuses it.
+pub fn write_password(mut buf []u8, password string) {
+	lp := begin_msg(mut buf, `p`)
+	put_cstr_s(mut buf, password)
 	finish_msg(mut buf, lp)
 }
 

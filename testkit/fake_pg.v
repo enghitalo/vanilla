@@ -118,7 +118,7 @@ pub fn test_certs() !string {
 // stat returns one of the fake server's counters (accepted, authenticated,
 // queries — one per Sync —, statements — one per Bind —, rollbacks,
 // conflicts, server_closes, ssl_requests, tls_handshakes, sni, tickets,
-// cancel_requests), 0 when not seen yet.
+// cancel_requests, password_messages, terminates), 0 when not seen yet.
 pub fn (f &FakePg) stat(key string) int {
 	content := os.read_file(f.stats_path) or { return 0 }
 	for line in content.split_into_lines() {

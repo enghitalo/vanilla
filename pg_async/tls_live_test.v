@@ -128,6 +128,75 @@ fn test_live_tls_large_async_result() {
 	assert (it1.next() or { panic('row') }).int4(0)! == 1
 }
 
+// AuthenticationCleartextPassword against a real server: a role whose
+// pg_hba.conf line is `hostssl ... password` (PG_CLEARTEXT_USER and
+// PG_CLEARTEXT_PASSWORD name it: pw_user in the tls lane of pg_async.yml and
+// in `PG_TLS=1 throwaway_pg.sh start`) logs in with the password from
+// password_fn, once per connection; the default allowed_auth refuses to send
+// it, and a wrong one is the server's 28P01. The run-time parameters reach the
+// session.
+fn test_live_tls_cleartext_password() {
+	cfg := tls_live_cfg() or { return }
+	user := os.getenv('PG_CLEARTEXT_USER')
+	password := os.getenv('PG_CLEARTEXT_PASSWORD')
+	if user == '' {
+		eprintln('pg_async: skipping the live cleartext test (set PG_CLEARTEXT_USER and PG_CLEARTEXT_PASSWORD)')
+		return
+	}
+	mut calls := &LiveCalls{}
+	pw_cfg := ConnConfig{
+		...cfg
+		user:         user
+		password:     ''
+		password_fn:  live_password_fn(mut calls, password)
+		allowed_auth: [.cleartext_password]
+		params:       {
+			'application_name': 'pg_async_cleartext'
+		}
+	}
+	mut c := PgConn.connect(pw_cfg)!
+	res := c.query("select count(*)::int4, current_user::text, current_setting('application_name') from pg_async_demo",
+		[]?[]u8{})!
+	mut it := res.rows()
+	row := it.next() or { panic('row') }
+	assert row.int4(0)! == 3
+	assert row.text(1)!.bytestr() == user
+	assert row.text(2)!.bytestr() == 'pg_async_cleartext'
+	c.close()
+	assert calls.n == 1
+	mut pool := PgPool.connect(pw_cfg, 2)!
+	pool.close()
+	assert calls.n == 3, 'one password_fn call per pooled connection'
+	if _ := PgConn.connect(ConnConfig{ ...pw_cfg, allowed_auth: [AuthType.sasl] }) {
+		assert false, 'the default allowed_auth sent a cleartext password'
+	} else {
+		assert err.msg().contains('allowed_auth does not allow'), err.msg()
+	}
+	mut wrong := &LiveCalls{}
+	if _ := PgConn.connect(ConnConfig{
+		...pw_cfg
+		password_fn: live_password_fn(mut wrong, password + 'x')
+	})
+	{
+		assert false, 'a wrong password logged in'
+	} else {
+		assert err.msg().contains('28P01'), err.msg()
+	}
+}
+
+@[heap]
+struct LiveCalls {
+mut:
+	n int
+}
+
+fn live_password_fn(mut calls LiveCalls, password string) PasswordFn {
+	return fn [mut calls, password] () !string {
+		calls.n++
+		return password
+	}
+}
+
 // pg_terminate_backend on a pooled TLS connection: its next query fails with
 // 57P01, and the pool re-dials it over TLS without blocking (SSLRequest, TLS
 // handshake, SCRAM: one step per acquire) — a new backend, on TLS again.

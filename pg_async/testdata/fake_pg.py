@@ -3,11 +3,11 @@
 
 Python 3, standard library only. It speaks protocol 3.0 the way pg_async uses
 it: StartupMessage, then SCRAM-SHA-256 (the server signature is computed for
-real, so pg_async's verification passes) or trust auth, ParameterStatus,
-BackendKeyData, ReadyForQuery; then the extended-query flow — every message up
-to a Sync is one group, answered with ParseComplete, BindComplete,
-RowDescription, DataRows, CommandComplete (or an ErrorResponse) and
-ReadyForQuery. Results are binary, as pg_async's Bind asks for.
+real, so pg_async's verification passes), a cleartext password or trust auth,
+ParameterStatus, BackendKeyData, ReadyForQuery; then the extended-query flow
+— every message up to a Sync is one group, answered with ParseComplete,
+BindComplete, RowDescription, DataRows, CommandComplete (or an ErrorResponse)
+and ReadyForQuery. Results are binary, as pg_async's Bind asks for.
 
 What a query returns is decided by its SQL text (see answer_statement):
   select 1/0 ...                     ERROR 22012 division_by_zero
@@ -15,6 +15,8 @@ What a query returns is decided by its SQL text (see answer_statement):
   select g from generate_series(1, N) g    N int4 rows: 1..N
   select $1::int4, $2::text, ...     one row echoing the parameters (int4,
                                      int8, bool or text, from each cast)
+  show NAME                          the StartupMessage's NAME parameter (text),
+                                     ERROR 42704 when it sent none
   select pg_sleep(S)                 answered after S seconds (one void row),
                                      unless a CancelRequest for the session
                                      arrives first: then ERROR 57014
@@ -49,7 +51,9 @@ needs happen deterministically:
       all connections) fail with ERROR 40001 serialization_failure, as a
       conflicting concurrent transaction makes them under SERIALIZABLE (and
       every optimistic-concurrency conflict on Aurora DSQL)
-  --auth scram|trust                (default scram; password --password)
+  --auth scram|cleartext|trust      (default scram; password --password).
+      cleartext is AuthenticationCleartextPassword (code 3), over plaintext
+      too: refusing that is the client's job; a wrong password is FATAL 28P01
   --key-len N                       the BackendKeyData secret key's length
       (default 4, protocol 3.0's; up to 256, as protocol 3.2 allows)
 
@@ -68,8 +72,9 @@ TLS, per run (--ssl; certificates from gen_test_ca.sh via --cert/--key):
 --stats-file PATH keeps `key=value` counters (accepted, authenticated, queries
 — one per Sync —, statements — one per Bind —, rollbacks, conflicts,
 server_closes, ssl_requests, tls_handshakes, sni, tickets, cancel_requests,
-cancels_honored, cancels_ignored, cancelled) up to date, so a test can assert
-on what the server saw. Every connection is logged to stderr.
+cancels_honored, cancels_ignored, cancelled, password_messages, terminates) up
+to date, so a test can assert on what the server saw. Every connection is
+logged to stderr.
 
 It exits after --lifetime seconds, or within 0.2 s of its parent process
 exiting: a test that panics never runs its deferred stop(), and a fake left
@@ -243,6 +248,20 @@ def scram_auth(conn):
     conn.sendall(msg(b'R', struct.pack('!I', 12) + b'v=' + base64.b64encode(sig)))
 
 
+def cleartext_auth(conn):
+    """AuthenticationCleartextPassword (code 3): PostgreSQL's `password`
+    method, what Aurora DSQL and RDS IAM authentication ask for."""
+    conn.sendall(msg(b'R', struct.pack('!I', 3)))
+    typ, body = read_typed(conn)  # PasswordMessage
+    if typ != b'p':
+        raise EOFError
+    bump('password_messages')
+    password, _ = cstr(body, 0)
+    if password != ARGS.password.encode():
+        conn.sendall(error_response('FATAL', '28P01', 'password authentication failed for user'))
+        raise EOFError
+
+
 def cancel_request(body, cid):
     """A CancelRequest's body after its code: Int32 process id, then the secret
     key. Sets the named session's cancel event when the key matches."""
@@ -309,6 +328,8 @@ def startup(conn, cid):
         raise EOFError
     if ARGS.auth == 'scram':
         scram_auth(conn)
+    elif ARGS.auth == 'cleartext':
+        cleartext_auth(conn)
     conn.sendall(msg(b'R', struct.pack('!I', 0)))
     status = b''
     for k, v in (('server_version', '16.0 (vanilla fake_pg)'), ('integer_datetimes', 'on'),
@@ -352,6 +373,7 @@ def new_session_tickets(conn, n):
 CAST = re.compile(r'\$(\d+)(?:::(\w+))?')
 LITERAL = re.compile(r'^\s*select\s+(-?\d+)(?:::int4)?\s*$', re.I)
 SERIES = re.compile(r'generate_series\(\s*1\s*,\s*(\d+)\s*\)', re.I)
+SHOW = re.compile(r'^\s*show\s+(\w+)\s*$', re.I)
 SLEEP = re.compile(r'^\s*select\s+pg_sleep\(\s*([0-9.]+)\s*\)\s*$', re.I)
 
 
@@ -376,13 +398,21 @@ def take_conflict():
         return True
 
 
-def answer_statement(sql, params, tx, cancel_ev):
+def answer_statement(sql, params, tx, settings, cancel_ev):
     """One statement's reply after its ParseComplete/BindComplete: returns
-    (bytes, transaction status after it, whether it failed)."""
+    (bytes, transaction status after it, whether it failed). settings are the
+    StartupMessage's parameters (show NAME)."""
     text = sql.strip().rstrip(';').strip()
     low = text.lower()
     if '1/0' in low.replace(' ', ''):
         return error_response('ERROR', '22012', 'division by zero'), tx, True
+    m = SHOW.match(text)
+    if m:
+        name = m.group(1).lower()
+        if name not in settings:
+            return error_response('ERROR', '42704', f'unrecognized configuration parameter "{name}"'), tx, True
+        return (row_description([(name, OID_TEXT, -1)]) + data_row([settings[name].encode()]) +
+                msg(b'C', b'SHOW\x00')), tx, False
     m = SLEEP.match(text)
     if m and tx != b'E':
         # Like a backend's SIGINT: a cancel that came while nothing ran is
@@ -453,7 +483,7 @@ def parse_bind_params(body):
     return params
 
 
-def serve(conn, cid, cancel_ev):
+def serve(conn, cid, settings, cancel_ev):
     tx = b'I'
     queries = 0
     stmts = []  # [sql, params] of the current group (up to Sync)
@@ -461,6 +491,7 @@ def serve(conn, cid, cancel_ev):
     while True:
         typ, body = read_typed(conn)
         if typ == b'X':
+            bump('terminates')
             log(cid, 'Terminate')
             return
         if typ == b'Q':
@@ -486,7 +517,7 @@ def serve(conn, cid, cancel_ev):
             reply = b''
             for stmt_sql, params in stmts:
                 reply += msg(b'1') + msg(b'2')
-                part, tx, failed = answer_statement(stmt_sql, params, tx, cancel_ev)
+                part, tx, failed = answer_statement(stmt_sql, params, tx, settings, cancel_ev)
                 reply += part
                 if failed:
                     # An explicit transaction is now aborted; an implicit one
@@ -530,7 +561,7 @@ def handle(conn, cid):
     try:
         conn, params, cancel_ev = startup(conn, cid)
         if params is not None:
-            serve(conn, cid, cancel_ev)
+            serve(conn, cid, params, cancel_ev)
     except (EOFError, OSError, ValueError, IndexError, struct.error) as e:
         if isinstance(e, ssl.SSLError):
             log(cid, f'TLS: {e}')
@@ -547,7 +578,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--port-file', required=True, help='written with the listening port once ready')
     ap.add_argument('--stats-file', default='')
-    ap.add_argument('--auth', choices=('scram', 'trust'), default='scram')
+    ap.add_argument('--auth', choices=('scram', 'cleartext', 'trust'), default='scram')
     ap.add_argument('--password', default='secret')
     ap.add_argument('--close', choices=('none', 'delayed', 'immediate', 'fatal'), default='none')
     ap.add_argument('--close-after', type=int, default=1)
