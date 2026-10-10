@@ -11,6 +11,8 @@ module main
 
 import server
 import core
+import http1_1.request_parser
+import http1_1.response
 
 #include <unistd.h>
 
@@ -21,9 +23,35 @@ fn C.close(fd int) int
 
 const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'
 
+const resp_async = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 8\r\nConnection: keep-alive\r\n\r\nasync-ok'
+
+// route_is reports whether the request path, without its query string, is
+// `lit`. req.path includes the query, so the compare stops at the first `?`.
+// It compares bytes in place: the request is never copied.
+@[direct_array_access]
+fn route_is(req request_parser.HttpRequest, lit string) bool {
+	mut n := 0
+	for n < req.path.len && req.buffer[req.path.start + n] != `?` {
+		n++
+	}
+	if n != lit.len {
+		return false
+	}
+	for i in 0 .. n {
+		if req.buffer[req.path.start + i] != lit[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // handle parks /async on a pipe read-end and answers everything else immediately.
 fn handle(req []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut event_loop core.EventLoop) core.Step {
-	if req.bytestr().contains('/async') {
+	r := request_parser.decode_http_request(req) or {
+		out << response.tiny_bad_request_response
+		return .close
+	}
+	if route_is(r, '/async') {
 		mut fds := [2]i32{} // C ints: V int is 64-bit
 		if C.pipe(unsafe { &fds[0] }) != 0 {
 			core.append_str(mut out, resp_ok)
@@ -48,8 +76,7 @@ fn pipe_done(mut out []u8, ready_fd int, _ready_fd_error bool, _watch_payload vo
 	mut tmp := [8]u8{}
 	C.read(ready_fd, &tmp[0], 8)
 	C.close(ready_fd)
-	body := 'async-ok'
-	out << 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ${body.len}\r\nConnection: keep-alive\r\n\r\n${body}'.bytes()
+	core.append_str(mut out, resp_async)
 	return .done
 }
 
