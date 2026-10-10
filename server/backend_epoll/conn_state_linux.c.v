@@ -116,11 +116,11 @@ mut:
 	// (-1 = not parked). Lets the worker tear the watch down if the client
 	// closes mid-await.
 	awaiting_fd int = -1
-	// Set when the client half-closed its write side (recv → 0 / EOF) while a
-	// response was still pending: the request half is done, but we still owe the
-	// already-computed reply on the open write half (RFC 9112 §9.6). The flush
-	// paths close the connection once the buffer drains instead of keeping it
-	// alive — a half-closed peer will never send another request. See issue #103.
+	// The connection is closing (begin_close): a .close step, an error response,
+	// or a reply owed to a client that half-closed (RFC 9112 §9.6, issue #103).
+	// What is appended still goes out, then the connection closes — flush_batch
+	// or handle_writable_plain, whichever sends the last byte — and nothing more
+	// is served meanwhile (handle_readable discards what the client sends).
 	close_after_flush bool
 	// Set once a 100 Continue interim response has been sent for the request
 	// currently mid-read, so a peer that sends `Expect: 100-continue` and dribbles
@@ -543,8 +543,9 @@ fn materialise_file(mut cs ConnState) bool {
 
 // flush_batch writes all pending response bytes then streams any deferred file
 // body with sendfile(2), or parks the remainder for EPOLLOUT. The write buffer
-// is reset (capacity kept) once everything is sent. Returns false if the
-// connection was closed (callers must not touch it).
+// is reset (capacity kept) once everything is sent; a closing connection
+// (close_after_flush) is then closed. Returns false if the connection was
+// closed (callers must not touch it).
 @[manualfree]
 fn flush_batch(epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState) bool {
 	// Phase 1: the buffered response bytes (status line, headers, small bodies).
@@ -583,26 +584,46 @@ fn flush_batch(epoll_fd int, fd int, limits core.Limits, active_conns &core.Coun
 		cs.write_deadline = 0
 		st.parked--
 	}
+	if cs.close_after_flush {
+		close_drained(epoll_fd, fd, active_conns, mut st, mut cs)
+		return false
+	}
 	return true
 }
 
-// flush_then_close carries out a .close step (core.Step.close): everything
-// appended goes out, the queued file region included, then the connection
-// closes. What the socket cannot take now parks on EPOLLOUT with
-// close_after_flush set: handle_writable_plain sends the rest and closes, and
-// handle_readable discards what the client sends meanwhile. No further request
-// is served, so the buffered leftover goes, and so does a read deadline, which
-// would cut the flush short (the write deadline bounds it).
-fn flush_then_close(epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState) {
+// begin_close puts the connection in the closing state (close_after_flush):
+// what is already appended still goes out, then the connection closes. No
+// further request is served, so the buffered leftover goes, and so does a read
+// deadline, which would cut the flush short (the write deadline bounds it).
+@[inline]
+fn begin_close(mut st PlainState, mut cs ConnState) {
 	unsafe {
 		cs.read_buf.len = 0
 	}
 	end_read_deadline(mut st, mut cs)
 	cs.close_after_flush = true
-	if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs)
-		&& cs.write_off >= cs.write_buf.len && cs.file_remaining <= 0 {
-		close_conn(epoll_fd, fd, active_conns, mut st)
+}
+
+// flush_then_close finishes a connection the way core.Step.close asks:
+// everything appended goes out, the queued file region included, then the
+// connection closes. What the socket cannot take now parks on EPOLLOUT, and
+// handle_writable_plain closes once it is sent. The connection is closed or
+// closing on return: callers must not touch it.
+@[noinline]
+fn flush_then_close(epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState) {
+	begin_close(mut st, mut cs)
+	flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs)
+}
+
+// close_drained closes a closing connection once its last response has been
+// handed to the kernel. It first reads and drops what the client sent that
+// nothing will serve: closing with unread input makes the kernel answer with a
+// reset, which can discard the response's untransmitted tail (RFC 9112 §9.6).
+@[noinline]
+fn close_drained(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainState, mut cs ConnState) {
+	for C.recv(fd, cs.read_buf.data, usize(cs.read_buf.cap), C.MSG_DONTWAIT) > 0 {
 	}
+	close_conn(epoll_fd, fd, active_conns, mut st)
 }
 
 // conn_birth creates the state of a connection that has none yet and arms
@@ -749,11 +770,10 @@ fn handle_writable_plain(epoll_fd int, fd int, known &ConnState, active_conns &c
 		cs.write_deadline = 0
 		st.parked--
 	}
-	// The client half-closed (issue #103) and this was the last, backpressured
-	// chunk of its reply — the response is now fully out, so close instead of
-	// keeping the connection alive for a request that can never come.
+	// A closing connection (begin_close) and this was the last, backpressured
+	// chunk of its reply: the response is fully out, so close.
 	if cs.close_after_flush {
-		close_conn(epoll_fd, fd, active_conns, mut st)
+		close_drained(epoll_fd, fd, active_conns, mut st, mut cs)
 		return false
 	}
 	epoll.mod_fd_in_epoll(epoll_fd, fd, (u32(C.EPOLLIN) | u32(C.EPOLLET))) // stop watching writability

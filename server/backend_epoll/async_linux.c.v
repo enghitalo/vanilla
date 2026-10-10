@@ -774,14 +774,13 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 			return
 		}
 		if n == 0 {
-			// Client half-closed its write side (EOF). If a response is already
-			// pending, we still owe it on the open write half (RFC 9112 §9.6, issue
-			// #103): mark the connection to close once the buffer drains and break to
-			// the end-of-burst flush below, instead of dropping the reply. With no
-			// pending response there is nothing to send — close now.
+			// Client half-closed its write side (EOF). A response already pending
+			// is still owed on the open write half (RFC 9112 §9.6, issue #103):
+			// send it, then close. With nothing pending there is nothing to send —
+			// close now.
 			if cs.body_drain == 0 && (cs.write_buf.len > cs.write_off || cs.file_remaining > 0) {
-				cs.close_after_flush = true
-				break
+				flush_then_close(epoll_fd, fd, limits, active_conns, mut st, mut cs)
+				return
 			}
 			close_conn(epoll_fd, fd, active_conns, mut st)
 			return
@@ -806,10 +805,13 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 			break // upgraded mid-burst — flush the 101 below, then hand the socket off
 		}
 		if cs.read_buf.len > req_cap {
-			cs.write_buf << response.status_413_response
-			if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-				close_conn(epoll_fd, fd, active_conns, mut st)
+			// The 413 follows any file region still owed to an earlier response
+			// (emitted as bytes first, as drain_requests does); after a short read
+			// of it, only what is there goes out.
+			if cs.file_remaining <= 0 || materialise_file(mut cs) {
+				cs.write_buf << response.status_413_response
 			}
+			flush_then_close(epoll_fd, fd, limits, active_conns, mut st, mut cs)
 			return
 		}
 		// Expect: 100-continue (RFC 9110 §10.1.1). drain_requests left a partial
@@ -840,19 +842,6 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 		if !flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
 			return
 		}
-		// Half-closed peer (issue #103): the reply is out (or, if the socket
-		// buffer was full, flush_batch parked it on EPOLLOUT and handle_writable_plain
-		// will finish + close via close_after_flush). If it drained synchronously
-		// here — write_off caught up and nothing parked — close now; the peer can
-		// send nothing more.
-		if cs.close_after_flush && cs.write_off >= cs.write_buf.len && cs.file_remaining <= 0 {
-			close_conn(epoll_fd, fd, active_conns, mut st)
-			return
-		}
-	} else if cs.close_after_flush {
-		// EOF with nothing left to flush (already sent) — close.
-		close_conn(epoll_fd, fd, active_conns, mut st)
-		return
 	}
 	// Upgraded mid-burst (the takeover break above): the switching response just
 	// flushed; the takeover drain now consumes any bytes pipelined behind the
@@ -902,9 +891,10 @@ fn update_read_deadline(limits core.Limits, mut st PlainState, mut cs ConnState)
 @[direct_array_access; manualfree]
 fn serve_takeover_conn(mut reactor Reactor, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) {
 	if cs.close_after_flush {
-		// Closing: a .close (a wake fn's, a ConnHandler's or a continuation's)
-		// whose last bytes are still going out. Nothing more reaches the
-		// ConnHandler.
+		// Closing, its last bytes still going out: nothing more reaches the
+		// ConnHandler. handle_readable gates its own entry; this one covers a
+		// resume (resume_step, drain_pipelined) of a connection that a wake fn's
+		// .close put in that state while it was parked.
 		discard_while_closing(epoll_fd, fd, active_conns, mut st, mut cs)
 		return
 	}
@@ -1011,10 +1001,8 @@ fn drain_takeover(mut reactor Reactor, epoll_fd int, fd int, limits core.Limits,
 				// the close-path teardown (close_client) tracks exactly one fd.
 				if event_loop.last_watched < 0 {
 					// Suspended without arming a watch: nothing would ever resume
-					// this connection — flush what was appended, then close.
-					if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-						close_conn(epoll_fd, fd, active_conns, mut st)
-					}
+					// this connection — send what was appended, then close.
+					flush_then_close(epoll_fd, fd, limits, active_conns, mut st, mut cs)
 					return false
 				}
 				park_conn(mut st, mut cs, fd, event_loop.last_watched, event_loop.timeout_ms)
@@ -1031,6 +1019,9 @@ fn drain_takeover(mut reactor Reactor, epoll_fd int, fd int, limits core.Limits,
 			}
 		}
 
+		// Peer floods without reading: bail before the batch is unbounded. One
+		// flush, then the close — not flush_then_close: a peer that reads
+		// nothing would hold the connection open.
 		if cs.write_buf.len - cs.write_off > sm_max_pending_write {
 			if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
 				close_conn(epoll_fd, fd, active_conns, mut st)
@@ -1059,9 +1050,7 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 	// drain_requests. It also keeps drain_off honest, since everything before
 	// it answers earlier requests. A short read closes, as there.
 	if cs.file_remaining > 0 && !materialise_file(mut cs) {
-		if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-			close_conn(epoll_fd, fd, active_conns, mut st)
-		}
+		flush_then_close(epoll_fd, fd, limits, active_conns, mut st, mut cs)
 		return 2
 	}
 	// max_body_bytes must hold on the STREAMED path too: the framed path rejects
@@ -1072,9 +1061,7 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 	// unrecoverable (same reason the framed 413 closes).
 	if limits.max_body_bytes > 0 && content_length > limits.max_body_bytes {
 		cs.write_buf << response.status_413_response
-		if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-			close_conn(epoll_fd, fd, active_conns, mut st)
-		}
+		flush_then_close(epoll_fd, fd, limits, active_conns, mut st, mut cs)
 		return 2
 	}
 	head := buf_view(cs.read_buf, 0, head_len)
@@ -1125,9 +1112,7 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 			detach_rejected_watch(mut reactor, epoll_fd, event_loop.last_watched, fd)
 		}
 		cs.write_buf << response.tiny_bad_request_response
-		if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-			close_conn(epoll_fd, fd, active_conns, mut st)
-		}
+		flush_then_close(epoll_fd, fd, limits, active_conns, mut st, mut cs)
 		return 2
 	}
 	if qf.len > 0 {
@@ -1177,6 +1162,15 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 		if total == -1 {
 			break // incomplete — wait for more bytes
 		}
+		// A file deferred by an earlier request in this batch must be emitted (as
+		// bytes, in order) BEFORE anything else is appended: this next response,
+		// or the error that ends the batch. A short read (the file shrank) would
+		// leave that body shorter than its Content-Length, with what follows read
+		// as its tail: stop answering, send what is there and close.
+		if cs.file_remaining > 0 && !materialise_file(mut cs) {
+			flush_then_close(epoll_fd, fd, limits, active_conns, mut st, mut cs)
+			return false
+		}
 		if total < -1 {
 			match -total {
 				413 { cs.write_buf << response.status_413_response }
@@ -1184,22 +1178,7 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 				else { cs.write_buf << response.tiny_bad_request_response }
 			}
 
-			compact_read_buf(mut cs, pos)
-			if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-				close_conn(epoll_fd, fd, active_conns, mut st)
-			}
-			return false
-		}
-		// A file deferred by an earlier request in this batch must be emitted (as
-		// bytes, in order) BEFORE this next response is appended — same ordering
-		// rule as the synchronous drain_requests. A short read (the file shrank)
-		// would leave that body shorter than its Content-Length, with this
-		// response read as its tail: stop answering, flush and close.
-		if cs.file_remaining > 0 && !materialise_file(mut cs) {
-			compact_read_buf(mut cs, pos)
-			if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-				close_conn(epoll_fd, fd, active_conns, mut st)
-			}
+			flush_then_close(epoll_fd, fd, limits, active_conns, mut st, mut cs)
 			return false
 		}
 		req := buf_view(cs.read_buf, pos, total)
@@ -1248,13 +1227,10 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 			.suspend {
 				if event_loop.last_watched < 0 {
 					// Suspended without a live watch (watch_fd refused its fd, or was
-					// never called): nothing would ever resume this request. Flush
+					// never called): nothing would ever resume this request. Send
 					// what was appended and close, as drain_takeover does, instead
 					// of answering the next pipelined request in its place.
-					compact_read_buf(mut cs, pos)
-					if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
-						close_conn(epoll_fd, fd, active_conns, mut st)
-					}
+					flush_then_close(epoll_fd, fd, limits, active_conns, mut st, mut cs)
 					return false
 				}
 				park_conn(mut st, mut cs, fd, event_loop.last_watched, event_loop.timeout_ms) // leftover stays buffered for resume
@@ -1265,7 +1241,9 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 			}
 		}
 
-		// Peer pipelines without reading responses: bail before the batch is unbounded.
+		// Peer pipelines without reading responses: bail before the batch is
+		// unbounded. One flush, then the close — not flush_then_close: a peer
+		// that reads nothing would hold the connection open.
 		if cs.write_buf.len - cs.write_off > sm_max_pending_write {
 			compact_read_buf(mut cs, pos)
 			if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
@@ -1483,11 +1461,9 @@ fn resume_step(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int, cl
 			if event_loop.last_watched < 0 {
 				// Suspended without re-arming a watch (watch_fd failed, or was never
 				// called): nothing would ever resume this connection, and a parked
-				// connection holds no deadline — flush what was appended, then
+				// connection holds no deadline — send what was appended, then
 				// close (the same rule as drain_takeover).
-				if flush_batch(epoll_fd, client_fd, limits, active_conns, mut st, mut cs) {
-					close_conn(epoll_fd, client_fd, active_conns, mut st)
-				}
+				flush_then_close(epoll_fd, client_fd, limits, active_conns, mut st, mut cs)
 				return
 			}
 			if cs.write_buf.len > cs.write_off {
