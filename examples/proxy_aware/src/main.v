@@ -27,9 +27,9 @@ module main
 // WORKS TODAY end to end: the core exposes `socket.peer_ipv4(fd)` — the
 // connection's peer IPv4 address as a u32, for exactly this kind of decision:
 // one getpeername syscall, no allocation. handle() feeds it to the pure trust
-// logic (`real_client_ip`), which tests drive directly with injected peers. A
-// peer with no IPv4 address (getpeername failure, a UDS listener) is none: an
-// UNTRUSTED peer with identity 'unknown'.
+// logic (`real_client_ip`, `real_scheme`), which tests drive directly with
+// injected peers. A peer with no IPv4 address (getpeername failure, a UDS
+// listener) is none: an UNTRUSTED peer with identity 'unknown'.
 //
 // IPv4 ONLY: addresses are u32s end to end, compared to the CIDRs by mask and
 // printed straight into the response. A right-most untrusted hop that is not
@@ -175,6 +175,44 @@ fn real_client_ip(req request_parser.HttpRequest, peer ?u32) ?u32 {
 	return leftmost
 }
 
+// real_scheme applies the same trust rule to X-Forwarded-Proto, over the same
+// INJECTED peer: the header is believed only from a trusted proxy, and only
+// as `http` or `https` in any case (schemes are case-insensitive, RFC 3986
+// §3.1). The answer is one of those two literals, never the header bytes, so
+// nothing the client writes reaches the response. Anything else (an
+// untrusted or unknown peer, no header, `ftp`, `https, http`) is the
+// listener's own scheme, default_proto.
+fn real_scheme(req request_parser.HttpRequest, peer ?u32) string {
+	p := peer or { return default_proto }
+	if !ip_in_cidrs(p, trusted_cidrs) {
+		return default_proto
+	}
+	s := req.get_header_value_slice('X-Forwarded-Proto') or { return default_proto }
+	if ci_eq(req.buffer, s, 'https') {
+		return 'https'
+	}
+	if ci_eq(req.buffer, s, 'http') {
+		return 'http'
+	}
+	return default_proto
+}
+
+// ci_eq reports whether the Slice holds `lit` in any ASCII case, compared IN
+// PLACE. `| 0x20` lowercases an ASCII letter and maps no other byte onto a
+// lowercase one, so `lit` must be lowercase letters only.
+@[direct_array_access]
+fn ci_eq(buf []u8, s request_parser.Slice, lit string) bool {
+	if s.len != lit.len {
+		return false
+	}
+	for i in 0 .. lit.len {
+		if (buf[s.start + i] | 0x20) != lit[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // ---- response (consts + core.append_str/wi — BEST_PRACTICES §3b) ------------
 // Only two fields vary (client, scheme). Content-Length = const overhead plus
 // their lengths (ipv4_len for the address), so the body is framed ONCE,
@@ -184,7 +222,7 @@ const body_pre = '{"client_ip":"'
 const body_mid = '","scheme":"'
 const body_tail = '"}'
 const body_overhead = body_pre.len + body_mid.len + body_tail.len
-const default_proto = 'http'
+const default_proto = 'http' // the listener's own scheme: it serves plain HTTP
 const unknown_client = 'unknown'
 
 // wi appends n's decimal digits into `out` — itoa into a stack scratch, then
@@ -233,17 +271,10 @@ fn handle(req_buffer []u8, mut out []u8, client_fd int, _worker_state voidptr, m
 		return .close
 	}
 	// socket.peer_ipv4: one getpeername syscall, no allocation. The trust
-	// logic itself stays pure.
-	client := real_client_ip(req, socket.peer_ipv4(client_fd))
-	// X-Forwarded-Proto as a zero-copy view (len > 0 guard), const fallback.
-	// It is client-settable like XFF — a production service should gate it on
-	// the same peer trust; the demo echoes it to show the read.
-	mut proto := default_proto
-	if p := req.get_header_value_slice('X-Forwarded-Proto') {
-		if p.len > 0 {
-			proto = unsafe { tos(&req.buffer[p.start], p.len) } // view
-		}
-	}
+	// logic itself stays pure, and both forwarding headers go through it.
+	peer := socket.peer_ipv4(client_fd)
+	client := real_client_ip(req, peer)
+	proto := real_scheme(req, peer) // 'http' or 'https', never the header bytes
 	client_len := if ip := client { ipv4_len(ip) } else { unknown_client.len }
 	core.append_str(mut out, response_prefix)
 	wi(mut out, body_overhead + client_len + proto.len)
@@ -255,7 +286,7 @@ fn handle(req_buffer []u8, mut out []u8, client_fd int, _worker_state voidptr, m
 		core.append_str(mut out, unknown_client)
 	}
 	core.append_str(mut out, body_mid)
-	core.append_str(mut out, proto) // the view lands in `out` now, before the buffer recycles
+	core.append_str(mut out, proto)
 	core.append_str(mut out, body_tail)
 	return .done
 }
