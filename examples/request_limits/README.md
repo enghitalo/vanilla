@@ -132,8 +132,8 @@ its deadline.
 - **Free when off.** Every field defaults to `0` (unlimited); with no timeout
   set there are no clock reads and no sweep. The kqueue (macOS) backend does
   not yet enforce `max_connections` or the timeouts.
-- The handler appends a `'...'.bytes()` literal with `out <<`; a `const`
-  string with `core.append_str` is the allocation-free form
+- The handler appends a `const` string with `core.append_str`: no
+  allocation per request
   ([BEST_PRACTICES §3a](../../docs/BEST_PRACTICES.md#3a-static-responses--a-const-string-appended-with-coreappend_str)).
 
 ## Tests
@@ -142,7 +142,8 @@ its deadline.
 v test examples/request_limits/src
 ```
 
-[main_test.v](src/main_test.v) checks that the handler is a trivial 200,
+[main_test.v](src/main_test.v) checks that the handler is a trivial 200 that
+allocates nothing,
 then drives each limit end to end against a real server through `vtest`:
 slowloris reaped by the read deadline (never a 200), a silent connection
 closed without a 408, idle keep-alive reaped (inherited and explicit

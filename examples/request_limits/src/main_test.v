@@ -52,6 +52,26 @@ fn test_handler_is_trivial_200() {
 	assert serve(req).bytestr().contains('200 OK')
 }
 
+// The trivial handler appends a const: 20k requests through one reused buffer
+// must not move the collector's lifetime allocation counter.
+fn test_handler_allocates_nothing() {
+	$if gcboehm ? {
+		mut out := []u8{cap: 4096}
+		mut event_loop := core.EventLoop{}
+		handle(get_req, mut out, -1, unsafe { nil }, mut event_loop) // warm-up
+		rounds := 20_000
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. rounds {
+			unsafe {
+				out.len = 0
+			}
+			handle(get_req, mut out, -1, unsafe { nil }, mut event_loop)
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert grown < 4096, 'the handler allocated ${grown} bytes over ${rounds} requests'
+	}
+}
+
 // serve adapts the raw-handler contract (writes into a caller-owned buffer) to
 // the return-a-buffer shape the assertions expect.
 fn serve(req []u8) []u8 {

@@ -39,12 +39,16 @@ module main
 import server
 import core
 
+// A static response is a const string, appended with core.append_str: no
+// per-request copy (docs/BEST_PRACTICES.md §3a).
+const ok_response = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+
 // The handler is now trivial: the CORE enforces the size limits before the
 // handler ever runs — over-large bodies are rejected (413) from Content-Length
 // WITHOUT buffering them, and oversized header blocks get 431. That's the whole
 // point: limits belong in the read loop, not bolted onto each handler.
 fn handle(_req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
-	out << 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+	core.append_str(mut out, ok_response)
 	return .done
 }
 
