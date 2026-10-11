@@ -62,45 +62,76 @@ fn safe(url string) ?string {
 
 // ---- pure logic --------------------------------------------------------------
 
-fn test_parse_range() {
-	if s, e := parse_range('bytes=0-99'.bytes(), 1000) {
-		assert s == 0 && e == 99
-	} else {
-		assert false
-	}
-	if s, e := parse_range('bytes=500-'.bytes(), 1000) {
-		assert s == 500 && e == 999 // open-ended -> to last byte
-	} else {
-		assert false
-	}
-	if s, e := parse_range('bytes=-100'.bytes(), 1000) {
-		assert s == 900 && e == 999 // suffix range -> last 100 bytes
-	} else {
-		assert false
-	}
+// range_of is parse_range as a string: `start-end` for a satisfiable range,
+// else the outcome's name.
+fn range_of(spec string, size i64) string {
+	kind, s, e := parse_range(spec.bytes(), size)
+	return if kind == .satisfiable { '${s}-${e}' } else { '${kind}' }
 }
 
-fn test_parse_range_rejects_bad_input() {
-	if _, _ := parse_range('bytes=900-100'.bytes(), 1000) { // start > end
-		assert false
-	} else {
-		assert true
+// On a 28-byte file (the README's index.html). RFC 9110 §14.1.2: a LAST at or
+// past the end, or none, runs to the last byte (#294), and a SUFFIX longer
+// than the file is the whole file.
+fn test_parse_range() {
+	assert range_of('bytes=0-8', 28) == '0-8'
+	assert range_of('bytes=4-4', 28) == '4-4'
+	assert range_of('bytes=10-1000', 28) == '10-27'
+	assert range_of('bytes=0-27', 28) == '0-27'
+	assert range_of('bytes=0-99', 28) == '0-27'
+	assert range_of('bytes=10-', 28) == '10-27' // open-ended
+	assert range_of('bytes=27-', 28) == '27-27'
+	assert range_of('bytes=-7', 28) == '21-27' // suffix: the last 7 bytes
+	assert range_of('bytes=-28', 28) == '0-27'
+	assert range_of('bytes=-100', 28) == '0-27'
+}
+
+// RFC 9110 §14.1.2: unsatisfiable are a FIRST at or past the end, so any
+// FIRST on an empty file, and a SUFFIX of 0.
+fn test_parse_range_unsatisfiable() {
+	assert range_of('bytes=500-600', 28) == 'unsatisfiable'
+	assert range_of('bytes=28-', 28) == 'unsatisfiable'
+	assert range_of('bytes=28-30', 28) == 'unsatisfiable'
+	assert range_of('bytes=-0', 28) == 'unsatisfiable'
+	assert range_of('bytes=0-', 0) == 'unsatisfiable'
+	assert range_of('bytes=0-0', 0) == 'unsatisfiable'
+	assert range_of('bytes=-0', 0) == 'unsatisfiable'
+}
+
+// A SUFFIX above 0 on an empty file is satisfiable (RFC 9110 §14.1.2) but
+// selects no byte a 206 could carry, so it is ignored: a 200 with the empty
+// file (§14.2 lets a server ignore Range on an empty representation).
+fn test_parse_range_suffix_on_empty_file_is_ignored() {
+	assert range_of('bytes=-5', 0) == 'ignore'
+	assert range_of('bytes=-1', 0) == 'ignore'
+	assert range_of('bytes=-99999999999999999999999', 0) == 'ignore'
+	assert range_of('bytes=-1', 1) == '0-0' // one byte is enough for a 206
+}
+
+// Not one valid byte range: ignored, so the caller serves a 200. LAST below
+// FIRST, another unit (the unit is matched lowercase), more than one range,
+// a side that is not all digits, no number at all.
+fn test_parse_range_ignores_invalid_specs() {
+	for spec in ['bytes=900-100', 'bytes=9-3', 'items=0-9', 'Bytes=0-9', 'bytes=0-99-100',
+		'bytes=0-1,5-6', 'bytes=0-1,5', 'bytes=-1,-2', 'bytes=0-0,-1', 'bytes=-', 'bytes=', 'bytes=5',
+		'bytes=a-b', 'bytes=5x-10', 'bytes=0-9x', 'bytes= 7-9', 'bytes=7 -9', '-5'] {
+		assert range_of(spec, 28) == 'ignore', spec
 	}
-	if _, _ := parse_range('items=0-9'.bytes(), 1000) { // wrong unit
-		assert false
-	} else {
-		assert true
-	}
-	if _, _ := parse_range('bytes=0-99-100'.bytes(), 1000) { // two dashes
-		assert false
-	} else {
-		assert true
-	}
-	if _, _ := parse_range('bytes=0-9999'.bytes(), 1000) { // end past the file
-		assert false
-	} else {
-		assert true
-	}
+	assert range_of('bytes=5-2', 0) == 'ignore' // invalid comes first, even on an empty file
+}
+
+// RFC 9110 §14.1.2: a recipient expects numbers of any length. Past max_i64
+// a position saturates instead of wrapping (2^64 would wrap to offset 0).
+fn test_parse_range_saturates_huge_numbers() {
+	assert range_of('bytes=18446744073709551616-', 28) == 'unsatisfiable'
+	assert range_of('bytes=99999999999999999999999-99999999999999999999999', 28) == 'unsatisfiable'
+	assert range_of('bytes=0-18446744073709551615', 28) == '0-27'
+	assert range_of('bytes=-18446744073709551616', 28) == '0-27'
+	assert range_of('bytes=18446744073709551616-0', 28) == 'ignore' // LAST < FIRST
+	assert parse_dec('9223372036854775807'.bytes(), 0, 19) == max_i64
+	assert parse_dec('9223372036854775808'.bytes(), 0, 19) == max_i64
+	assert parse_dec('922337203685477580'.bytes(), 0, 18) == 922337203685477580
+	assert parse_dec('0'.bytes(), 0, 1) == 0
+	assert parse_dec('12'.bytes(), 0, 0) == -1 // empty window
 }
 
 fn test_mime_type() {
@@ -264,19 +295,93 @@ fn test_range_window_from_the_middle() {
 	assert suffix.ends_with('"\r\n\r\n' + fixture_body[11..])
 }
 
-fn test_head_range_sends_headers_only() {
-	out :=
-		serve('HEAD /index.html HTTP/1.1\r\nHost: x\r\nRange: bytes=4-8\r\n\r\n'.bytes()).bytestr()
-	assert out.contains('206 Partial Content')
-	assert out.contains('Content-Length: 5')
-	assert out.ends_with('"\r\n\r\n')
+// RFC 9110 §14.2 defines range handling for GET only, and a server MUST
+// ignore Range on any other method: a HEAD with a Range, whatever it asks
+// for, gets exactly the plain HEAD response (200 headers, no body).
+fn test_head_ignores_range() {
+	for path in ['/index.html', '/empty.txt'] {
+		plain := serve('HEAD ${path} HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()).bytestr()
+		assert plain.starts_with('HTTP/1.1 200 OK\r\n'), path
+		assert plain.ends_with('\r\n\r\n'), path
+		for rng in ['bytes=4-8', 'bytes=10-1000', 'bytes=-3', 'bytes=500-600', 'bytes=-0', 'bytes=0-',
+			'bytes=-5', 'bytes=9-3', 'bytes=0-1,5-6', 'items=0-4'] {
+			out := serve('HEAD ${path} HTTP/1.1\r\nHost: x\r\nRange: ${rng}\r\n\r\n'.bytes()).bytestr()
+			assert out == plain, '${path} ${rng}'
+		}
+	}
 }
 
-fn test_invalid_range_falls_back_to_200() {
+// A LAST past the end of the file runs to its last byte (#294), and so does a
+// SUFFIX longer than the file: a 206, never a 200 of the whole file.
+fn test_range_end_past_the_file_is_clamped() {
+	etag := hex16(wyhash.wyhash_c(fixture_body.str, u64(fixture_body.len), 0))[..].bytestr()
 	out :=
-		serve('GET /index.html HTTP/1.1\r\nHost: x\r\nRange: bytes=900-100\r\n\r\n'.bytes()).bytestr()
-	assert out.contains('200 OK') // unusable spec -> full response, as before
-	assert out.ends_with(fixture_body)
+		serve('GET /index.html HTTP/1.1\r\nHost: x\r\nRange: bytes=10-1000\r\n\r\n'.bytes()).bytestr()
+	assert out == 'HTTP/1.1 206 Partial Content\r\nContent-Type: text/html; charset=utf-8\r\nContent-Range: bytes 10-13/14\r\nAccept-Ranges: bytes\r\nContent-Length: 4\r\nETag: "${etag}"\r\n\r\n${fixture_body[10..]}'
+	for rng in ['bytes=0-13', 'bytes=0-99', 'bytes=0-', 'bytes=-14', 'bytes=-100'] {
+		whole :=
+			serve('GET /index.html HTTP/1.1\r\nHost: x\r\nRange: ${rng}\r\n\r\n'.bytes()).bytestr()
+		assert whole.starts_with('HTTP/1.1 206 Partial Content\r\n'), rng
+		assert whole.contains('\r\nContent-Range: bytes 0-13/14\r\n'), rng
+		assert whole.contains('\r\nContent-Length: 14\r\n'), rng
+		assert whole.ends_with('"\r\n\r\n' + fixture_body), rng
+	}
+}
+
+// A GET whose range is unsatisfiable gets 416 with the file's length and no
+// body: a FIRST at or past the end (any FIRST on an empty file), a SUFFIX of
+// 0. A huge FIRST saturates rather than wrapping to 0.
+fn test_unsatisfiable_range_416() {
+	want := 'HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */14\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+	for rng in ['bytes=500-600', 'bytes=14-', 'bytes=-0', 'bytes=18446744073709551616-'] {
+		out := serve('GET /index.html HTTP/1.1\r\nHost: x\r\nRange: ${rng}\r\n\r\n'.bytes()).bytestr()
+		assert out == want, rng
+	}
+	empty := 'HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */0\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+	for rng in ['bytes=0-', 'bytes=0-0', 'bytes=-0'] {
+		out := serve('GET /empty.txt HTTP/1.1\r\nHost: x\r\nRange: ${rng}\r\n\r\n'.bytes()).bytestr()
+		assert out == empty, rng
+	}
+}
+
+// A SUFFIX above 0 on the empty file is ignored (parse_range says why): the
+// GET gets the plain 200 of the empty file, byte for byte.
+fn test_suffix_on_empty_file_gets_200() {
+	plain := serve('GET /empty.txt HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()).bytestr()
+	assert plain.starts_with('HTTP/1.1 200 OK\r\n')
+	assert plain.contains('\r\nContent-Length: 0\r\n')
+	for rng in ['bytes=-5', 'bytes=-1'] {
+		out := serve('GET /empty.txt HTTP/1.1\r\nHost: x\r\nRange: ${rng}\r\n\r\n'.bytes()).bytestr()
+		assert out == plain, rng
+	}
+}
+
+// Range is evaluated after If-None-Match (RFC 9110 §14.2): a cached copy that
+// is still current gets its 304, even when the range would get a 416.
+fn test_if_none_match_wins_over_416() {
+	etag := hex16(wyhash.wyhash_c(fixture_body.str, u64(fixture_body.len), 0))[..].bytestr()
+	out := serve('GET /index.html HTTP/1.1\r\nHost: x\r\nRange: bytes=500-600\r\nIf-None-Match: "${etag}"\r\n\r\n'.bytes()).bytestr()
+	assert out == 'HTTP/1.1 304 Not Modified\r\nETag: "${etag}"\r\n\r\n'
+	stale := serve('GET /index.html HTTP/1.1\r\nHost: x\r\nRange: bytes=500-600\r\nIf-None-Match: "0000000000000000"\r\n\r\n'.bytes()).bytestr()
+	assert stale.starts_with('HTTP/1.1 416 Range Not Satisfiable\r\n')
+}
+
+// A spec that is not one valid byte range is ignored (RFC 9110 §14.2 allows
+// it): the whole file comes back as a 200. A LAST below its FIRST, more than
+// one range, a malformed spec, another unit.
+fn test_invalid_range_falls_back_to_200() {
+	for rng in ['bytes=900-100', 'bytes=9-3', 'bytes=0-1,5-6', 'bytes=0-0,-1', 'bytes=a-b', 'bytes=-',
+		'items=0-4'] {
+		out :=
+			serve('GET /index.html HTTP/1.1\r\nHost: x\r\nRange: ${rng}\r\n\r\n'.bytes()).bytestr()
+		assert out.starts_with('HTTP/1.1 200 OK\r\n'), rng
+		assert out.contains('\r\nContent-Length: 14\r\n'), rng
+		assert out.ends_with(fixture_body), rng
+	}
+	// An empty file is no exception: an invalid spec on it is ignored too.
+	out := serve('GET /empty.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=5-2\r\n\r\n'.bytes()).bytestr()
+	assert out.starts_with('HTTP/1.1 200 OK\r\n')
+	assert out.contains('\r\nContent-Length: 0\r\n')
 }
 
 fn test_if_none_match_roundtrip_304() {
@@ -292,8 +397,8 @@ fn test_if_none_match_roundtrip_304() {
 	assert out == 'HTTP/1.1 304 Not Modified\r\nETag: ${etag}\r\n\r\n'
 }
 
-// A pipelined response already in `out` is left alone: a 304 rolls back only
-// what this request appended, and a 206 moves only its own window.
+// A pipelined response already in `out` is left alone: a 304 or a 416 rolls
+// back only what this request appended, and a 206 moves only its own window.
 fn test_earlier_responses_in_out_are_kept() {
 	earlier := 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'
 	etag := hex16(wyhash.wyhash_c(fixture_body.str, u64(fixture_body.len), 0))[..].bytestr()
@@ -308,6 +413,11 @@ fn test_earlier_responses_in_out_are_kept() {
 	got := out.bytestr()
 	assert got.starts_with(earlier + 'HTTP/1.1 206 Partial Content\r\n')
 	assert got.ends_with('"\r\n\r\n' + fixture_body[4..9])
+	out = earlier.bytes()
+	handle('GET /index.html HTTP/1.1\r\nHost: x\r\nRange: bytes=500-600\r\n\r\n'.bytes(), mut
+		out, -1, fresh_state(), mut event_loop)
+	assert out.bytestr() == earlier +
+		'HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */14\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 }
 
 fn test_path_traversal_gets_404() {
@@ -345,7 +455,8 @@ fn test_malformed_request_errors() {
 
 // ---- the point of the design: serving allocates nothing ----------------------
 
-// Every outcome — 200, 206, 304, HEAD, 404 for each refusal, 405, 400 — runs
+// Every outcome — 200, 206 (a clamped one too), 304, 416, HEAD (with a Range
+// it ignores too), an ignored Range, 404 for each refusal, 405, 400 — runs
 // 20k times through one worker State and one reused `out`, as a worker would
 // serve them; the collector's lifetime allocation counter must not move.
 // (Under `-gc none`, vanilla's production build, the same allocation would be
@@ -358,6 +469,14 @@ fn test_serving_allocates_nothing() {
 			'GET / HTTP/1.1\r\nHost: x\r\n\r\n',
 			'HEAD /index.html HTTP/1.1\r\nHost: x\r\n\r\n',
 			'GET /index.html?v=1 HTTP/1.1\r\nHost: x\r\nRange: bytes=4-8\r\n\r\n',
+			'GET /index.html HTTP/1.1\r\nHost: x\r\nRange: bytes=10-1000\r\n\r\n',
+			'GET /index.html HTTP/1.1\r\nHost: x\r\nRange: bytes=500-600\r\n\r\n',
+			'GET /index.html HTTP/1.1\r\nHost: x\r\nRange: bytes=-0\r\n\r\n',
+			'HEAD /index.html HTTP/1.1\r\nHost: x\r\nRange: bytes=-0\r\n\r\n',
+			'GET /empty.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=0-\r\n\r\n',
+			'GET /empty.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=-5\r\n\r\n',
+			'GET /index.html HTTP/1.1\r\nHost: x\r\nRange: bytes=0-1,5-6\r\n\r\n',
+			'GET /index.html HTTP/1.1\r\nHost: x\r\nRange: bytes=99999999999999999999999-\r\n\r\n',
 			'GET /index.html HTTP/1.1\r\nHost: x\r\nIf-None-Match: "${etag}"\r\n\r\n',
 			'GET /alias.html HTTP/1.1\r\nHost: x\r\n\r\n',
 			'GET /empty.txt HTTP/1.1\r\nHost: x\r\n\r\n',

@@ -4,7 +4,7 @@ module main
 //
 // This is deceptively deep: doing it correctly means MIME detection, byte
 // Range requests (how video/audio seek works), conditional GET (ETag /
-// If-Modified-Since for caching), and — above all — path-traversal safety.
+// If-None-Match for caching), and — above all — path-traversal safety.
 //
 // SECURITY FIRST
 //   The single most important line in a static server is the one that prevents
@@ -27,24 +27,24 @@ module main
 //     into the other (its caller-buffer form: no malloc, no string). The
 //     containment check reads a `tos` view of that buffer.
 //   - Responses append straight into `out`: consts for 404/405; `core.append_str`/`wi`
-//     framing for 200/206/304. The file is read with pread(2) straight into
-//     `out`, after its header block (core.append_file_region): no
+//     framing for 200/206/304/416. The file is read with pread(2) straight
+//     into `out`, after its header block (core.append_file_region): no
 //     os.read_bytes, no copy. The ETag, which hashes the body, fills a
-//     16-byte placeholder left in that header block; a 304 rolls `out` back
-//     to where this response began (`out.len = mark`), a 206 moves its window
-//     down over the bytes before it, and HEAD drops the body.
+//     16-byte placeholder left in that header block; a 304 or a 416 rolls
+//     `out` back to where this response began (`out.len = mark`), a 206 moves
+//     its window down over the bytes before it, and HEAD drops the body.
 //   - The ETag is a 64-bit wyhash hex-encoded into a STACK scratch (`hex16`) —
 //     no `.hex()` string per request. Hashing the whole file per request is
 //     O(filesize) BY DESIGN — it is the conditional-GET pedagogy; for
-//     precomputed validators use `server.static_assets`.
+//     precomputed validators use the `static_assets` module.
 //
 // ZERO-COPY IS NOW AVAILABLE: large files no longer have to bounce through a
 // userspace []u8. The epoll core can stream a file straight to the socket with
 // `sendfile(2)` (EPOLLOUT-driven, so a 4 GB file never sits in RAM) — a handler
 // hands the file off via `core.queue_file(fd, off, len)`. The reusable
-// `server.static_assets` module does exactly this for files past a size
-// threshold; see `examples/spa_static_assets`. This example reads each file
-// into `out` instead, because its ETag hashes the body on every request.
+// `static_assets` module does exactly this for files past a size threshold;
+// see `examples/spa_static_assets`. This example reads each file into `out`
+// instead, because its ETag hashes the body on every request.
 import server
 import core
 import http1_1.request_parser
@@ -289,36 +289,60 @@ fn etag_matches(buf []u8, s request_parser.Slice, etag [16]u8) bool {
 }
 
 // ---- Range -------------------------------------------------------------------
-// dec_prefix parses the leading decimal digits of buf[from..to] (0 when none),
-// mirroring string.i64()'s ignore-the-tail behavior.
+// parse_dec parses buf[from..to] as a decimal number: at least one byte, all
+// of them digits, else -1. RFC 9110 §14.1.2 tells a recipient to expect
+// numbers of any length without overflowing, so the value saturates at
+// max_i64: a huge number reads as larger than any file, never as a
+// wrapped-around one.
 @[direct_array_access]
-fn dec_prefix(buf []u8, from int, to int) i64 {
+fn parse_dec(buf []u8, from int, to int) i64 {
+	if from >= to {
+		return -1
+	}
 	mut v := i64(0)
-	for i := from; i < to; i++ {
+	for i in from .. to {
 		c := buf[i]
 		if c < `0` || c > `9` {
-			break
+			return -1
 		}
-		v = v * 10 + int(c - `0`)
+		d := i64(c - `0`)
+		v = if v > (max_i64 - d) / 10 { max_i64 } else { v * 10 + d }
 	}
 	return v
 }
 
-// Parse "Range: bytes=START-END" -> (start, end) inclusive, clamped to size.
-// Operates on a byte VIEW of the header value — no substr, no split(), no
-// intermediate strings. Semantics identical to the previous string version:
-// exactly one '-'; empty left side = suffix range ("bytes=-N" -> last N
-// bytes); empty right side = open-ended ("bytes=N-" -> to the last byte);
-// start > end or end past the file rejects (the caller falls back to 200).
+// RangeSpec is what parse_range makes of a Range header value.
+enum RangeSpec {
+	ignore        // a Range the caller ignores: it serves the whole file (200)
+	satisfiable   // the inclusive window start..end, inside the file (206)
+	unsatisfiable // valid but unsatisfiable (RFC 9110 §14.1.2): the caller answers 416
+}
+
+// parse_range reads a Range header value through a byte VIEW: no substr, no
+// split(), no intermediate strings, no error() to box. It takes one byte
+// range, `bytes=FIRST-LAST`, `bytes=FIRST-` or `bytes=-SUFFIX`, each number
+// all digits (RFC 9110 §14.1.1). RFC 9110 §14.2 lets a server ignore a Range
+// header; §14.1.2 says which ones are unsatisfiable:
+//   - .ignore: anything else (a unit other than a lowercase `bytes`, a
+//     malformed spec, more than one range, a LAST below its FIRST), and a
+//     SUFFIX above 0 on an empty file: satisfiable, but it selects no byte
+//     a 206 could carry, and §14.2 lets a server ignore Range on an empty
+//     representation.
+//   - .unsatisfiable: a FIRST at or past the end of the file, so any FIRST on
+//     an empty file, or a SUFFIX of 0.
+//   - .satisfiable, start, end: the rest, with 0 <= start <= end < size. A
+//     LAST at or past the end of the file, or none, means up to the last
+//     byte, and a SUFFIX longer than the file means the whole file (both
+//     §14.1.2).
 @[direct_array_access]
-fn parse_range(h []u8, size i64) ?(i64, i64) {
+fn parse_range(h []u8, size i64) (RangeSpec, i64, i64) {
 	prefix := 'bytes='
 	if h.len < prefix.len {
-		return none
+		return .ignore, 0, 0
 	}
 	for i in 0 .. prefix.len {
 		if h[i] != prefix[i] {
-			return none
+			return .ignore, 0, 0
 		}
 	}
 	// Exactly one '-' separates the two sides (split-free scan).
@@ -326,29 +350,44 @@ fn parse_range(h []u8, size i64) ?(i64, i64) {
 	for i in prefix.len .. h.len {
 		if h[i] == `-` {
 			if dash >= 0 {
-				return none
+				return .ignore, 0, 0
 			}
 			dash = i
 		}
 	}
 	if dash < 0 {
-		return none
+		return .ignore, 0, 0
 	}
 	mut start := i64(0)
 	mut end := size - 1
 	if dash == prefix.len {
 		// suffix range "bytes=-N": the LAST N bytes
-		n := dec_prefix(h, dash + 1, h.len)
+		n := parse_dec(h, dash + 1, h.len)
+		if n < 0 || (n > 0 && size == 0) {
+			return .ignore, 0, 0
+		}
 		start = if n >= size { i64(0) } else { size - n }
-		end = size - 1
 	} else {
-		start = dec_prefix(h, prefix.len, dash)
-		end = if dash == h.len - 1 { size - 1 } else { dec_prefix(h, dash + 1, h.len) }
+		start = parse_dec(h, prefix.len, dash)
+		if start < 0 {
+			return .ignore, 0, 0
+		}
+		if dash < h.len - 1 { // "bytes=N-M"; open-ended "bytes=N-" keeps end
+			last := parse_dec(h, dash + 1, h.len)
+			if last < 0 || last < start {
+				return .ignore, 0, 0
+			}
+			if last < end {
+				end = last
+			}
+		}
 	}
-	if start < 0 || end >= size || start > end {
-		return none
+	// start > end: a FIRST at or past the end of the file (end = -1 on an
+	// empty one), or a SUFFIX of 0.
+	if start > end {
+		return .unsatisfiable, 0, 0
 	}
-	return start, end
+	return .satisfiable, start, end
 }
 
 fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
@@ -363,8 +402,10 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, m
 	}
 	// Method routing IN PLACE over the request buffer — no `.to_string()`.
 	// Every view below is taken from `req_buffer`, the handler's own
-	// parameter, never from `req.buffer`: a view of `req.buffer` handed on to
-	// a callee moves `req` to the heap (docs/V_PERF_TOOLBOX.md).
+	// parameter, never from `req.buffer`: a view of `req.buffer` can move
+	// `req` to the heap (a memdup per request) only when it reaches a callee
+	// that returns it or returns `!T`/`?T` (docs/V_PERF_TOOLBOX.md), and a
+	// view of `req_buffer` cannot.
 	is_get := slice_eq(req_buffer, req.method, 'GET')
 	if !is_get && !slice_eq(req_buffer, req.method, 'HEAD') {
 		core.append_str(mut out, resp_405)
@@ -404,23 +445,27 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, m
 
 	// Range request: serve 206 Partial Content (this is how seeking works).
 	// It needs only the size, so the status line is known before the body.
+	// Only a GET looks at Range: RFC 9110 §14.2 defines range handling for
+	// GET alone, and a server MUST ignore Range on any other method, so a HEAD
+	// answers as if it had none.
+	mut spec := RangeSpec.ignore
 	mut start := i64(0)
-	mut end := size - 1
-	mut partial := false
-	if rng := req.get_header_value_slice('Range') {
-		if rng.len > 0 {
-			rview := unsafe { (&req_buffer[rng.start]).vbytes(rng.len) } // view
-			if s, e := parse_range(rview, size) {
-				start, end, partial = s, e, true
+	mut end := i64(0)
+	if is_get {
+		if rng := req.get_header_value_slice('Range') {
+			if rng.len > 0 {
+				rview := unsafe { (&req_buffer[rng.start]).vbytes(rng.len) } // view
+				spec, start, end = parse_range(rview, size)
 			}
 		}
 	}
 
 	// The header block goes first, with a 16-byte placeholder for the ETag,
-	// which hashes the body read after it.
+	// which hashes the body read after it. An unsatisfiable range appends no
+	// header block: its 416 comes after the If-None-Match check below.
 	mark := out.len
 	mut tag_at := 0
-	if partial {
+	if spec == .satisfiable {
 		core.append_str(mut out, 'HTTP/1.1 206 Partial Content\r\nContent-Type: ')
 		core.append_str(mut out, ctype)
 		core.append_str(mut out, '\r\nContent-Range: bytes ')
@@ -435,7 +480,7 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, m
 		tag_at = out.len
 		unsafe { out.grow_len(16) }
 		core.append_str(mut out, '"\r\n\r\n')
-	} else {
+	} else if spec == .ignore {
 		core.append_str(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: ')
 		core.append_str(mut out, ctype)
 		core.append_str(mut out, '\r\nContent-Length: ')
@@ -455,12 +500,15 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, m
 		return .done
 	}
 	// ETag = 64-bit wyhash of the content, hex-encoded into a stack scratch —
-	// a cheap, strong opaque validator (same as server.static_assets);
-	// a crypto digest here is pure cost, and md5 is broken anyway.
+	// a cheap, strong opaque validator (static_assets hashes a body it holds
+	// in memory the same way); a crypto digest here is pure cost, and md5 is
+	// broken anyway.
 	etag := hex16(wyhash.wyhash_c(unsafe { &u8(out.data) + body_at }, u64(size), 0))
 
 	// Conditional GET: if the client's cached ETag matches, save the bytes —
-	// drop all this response appended and answer 304 instead.
+	// drop all this response appended and answer 304 instead. Range is
+	// evaluated only after this check (RFC 9110 §14.2), so a 304 wins over
+	// a 206 and over a 416.
 	if inm := req.get_header_value_slice('If-None-Match') {
 		if etag_matches(req_buffer, inm, etag) {
 			unsafe {
@@ -472,12 +520,24 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, m
 			return .done
 		}
 	}
+	// An unsatisfiable range, which only a GET can have (see above): 416, with
+	// the file's length in Content-Range (RFC 9110 §15.5.17, §14.4) and no
+	// body.
+	if spec == .unsatisfiable {
+		unsafe {
+			out.len = mark
+		}
+		core.append_str(mut out, 'HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */')
+		wi(mut out, size)
+		core.append_str(mut out, '\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n')
+		return .done
+	}
 	unsafe { vmemcpy(&u8(out.data) + tag_at, &etag[0], 16) }
 	if !is_get {
 		unsafe {
 			out.len = body_at // HEAD gets the headers only
 		}
-	} else if partial {
+	} else if spec == .satisfiable {
 		// Keep only the range window, moved down over the bytes before it —
 		// no content[start..end+1] slice-marking. In bounds and non-empty:
 		// parse_range guarantees 0 <= start <= end < size.
