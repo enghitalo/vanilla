@@ -1,6 +1,7 @@
 module main
 
 import core
+import http1_1.response
 import net
 
 // SOLUTION: in-memory state test (denylist) + handler gate.
@@ -33,24 +34,26 @@ fn test_block_rejects_what_is_not_ipv4() {
 	assert b.ips.len == 0
 }
 
-fn serve(fd int, mut b Blocklist) string {
+const get_req = 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'
+
+// serve runs one request through handle and returns the response and the step.
+fn serve(req string, fd int, mut b Blocklist) (string, core.Step) {
 	mut resp := []u8{}
 	mut event_loop := core.EventLoop{}
-	assert handle('GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(), mut resp, fd, unsafe { nil }, mut
-		event_loop, mut b) == .done
-	return resp.bytestr()
+	step := handle(req.bytes(), mut resp, fd, unsafe { nil }, mut event_loop, mut b)
+	return resp.bytestr(), step
 }
 
 fn test_peer_without_ipv4_is_allowed() {
 	mut b := Blocklist{}
 	b.block('127.0.0.1') or { panic(err) }
 	// fd -1 => socket.peer_ipv4 is none: on no IPv4 list => allowed.
-	out := serve(-1, mut b)
-	assert out.contains('200 OK')
-	assert out.contains('allowed')
+	out, step := serve(get_req, -1, mut b)
+	assert out == ok_response
+	assert step == .done
 }
 
-fn test_blocked_peer_gets_403_and_others_200() ! {
+fn test_blocked_peer_gets_403_and_close_others_200() ! {
 	mut l := net.listen_tcp(.ip, '127.0.0.1:0')!
 	defer { l.close() or {} }
 	mut c := net.dial_tcp(l.addr()!.str())!
@@ -59,15 +62,45 @@ fn test_blocked_peer_gets_403_and_others_200() ! {
 	defer { s.close() or {} }
 	mut b := Blocklist{}
 	b.block('10.0.0.5')!
-	assert serve(s.sock.handle, mut b).contains('200 OK') // 127.0.0.1 is not listed
+	// 127.0.0.1 is not listed: the 200, and the connection stays open.
+	out, step := serve(get_req, s.sock.handle, mut b)
+	assert out == ok_response
+	assert step == .done
+	// Listed: the 403 and .close, as its `Connection: close` says, so a
+	// request pipelined behind it is never answered (#293).
 	b.block('127.0.0.1')!
-	assert serve(s.sock.handle, mut b).contains('403 Forbidden')
+	out2, step2 := serve(get_req, s.sock.handle, mut b)
+	assert out2 == forbidden_response
+	assert step2 == .close
 }
 
-// Blocked and allowed peers both run 20k times through one reused buffer, as a
-// worker serves them: the collector's allocation counter must not move. A
-// blocked client must not be able to make the server allocate (or log) per
-// request.
+// An allowed peer must send a request the parser accepts: the issue's
+// `garbage\r\n\r\n` (#293), which the framer passes whole, gets the canned 400
+// and .close, not the 200. A blocked peer is denied before the parse, so the
+// same bytes get its 403.
+fn test_malformed_request_gets_400_and_close() ! {
+	mut b := Blocklist{}
+	for bad in ['garbage\r\n\r\n', 'garbage garbage\r\n\r\n', 'GET / HTTP/1.1\r\n'] {
+		out, step := serve(bad, -1, mut b)
+		assert out.bytes() == response.tiny_bad_request_response, bad
+		assert step == .close, bad
+	}
+	mut l := net.listen_tcp(.ip, '127.0.0.1:0')!
+	defer { l.close() or {} }
+	mut c := net.dial_tcp(l.addr()!.str())!
+	defer { c.close() or {} }
+	mut s := l.accept()!
+	defer { s.close() or {} }
+	b.block('127.0.0.1')!
+	out, step := serve('garbage\r\n\r\n', s.sock.handle, mut b)
+	assert out == forbidden_response
+	assert step == .close
+}
+
+// Blocked and allowed peers, and an allowed peer's malformed request, each run
+// 20k times through one reused buffer, as a worker serves them: the
+// collector's allocation counter must not move. A blocked client must not be
+// able to make the server allocate (or log) per request.
 fn test_ip_block_allocates_nothing() ! {
 	$if gcboehm ? {
 		mut l := net.listen_tcp(.ip, '127.0.0.1:0')!
@@ -81,7 +114,8 @@ fn test_ip_block_allocates_nothing() ! {
 		deny.block('127.0.0.1')!
 		mut allow := Blocklist{}
 		allow.block('10.0.0.5')!
-		req := 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+		req := get_req.bytes()
+		garbage := 'garbage\r\n\r\n'.bytes()
 		mut out := []u8{cap: 4096}
 		mut event_loop := core.EventLoop{}
 		handle(req, mut out, fd, unsafe { nil }, mut event_loop, mut deny) // warm-up
@@ -95,10 +129,14 @@ fn test_ip_block_allocates_nothing() ! {
 			unsafe {
 				out.len = 0
 			}
+			handle(garbage, mut out, fd, unsafe { nil }, mut event_loop, mut allow)
+			unsafe {
+				out.len = 0
+			}
 			handle(req, mut out, fd, unsafe { nil }, mut event_loop, mut deny)
 		}
 		grown := gc_heap_usage().total_bytes - before
 		assert out.bytestr() == forbidden_response
-		assert grown < 4096, 'allocated ${grown} bytes over ${rounds * 2} requests'
+		assert grown < 4096, 'allocated ${grown} bytes over ${rounds * 3} requests'
 	}
 }
