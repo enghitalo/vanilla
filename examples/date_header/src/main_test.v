@@ -63,8 +63,10 @@ fn test_respond_allocates_nothing() {
 
 // The ticker's refresh allocates nothing either, once each buffer has been
 // formatted (the first full write pays V's weekday lookup; see refresh): 20k
-// refreshes, the clock's second boundaries included, must not move the
-// collector's lifetime allocation counter.
+// refreshes must not move the collector's lifetime allocation counter. 20k
+// calls take well under a second, so the loop marks both buffers a second
+// stale first: every refresh then takes update_http_header's digit rewrite,
+// not its same-second early return.
 fn test_refresh_allocates_nothing() {
 	$if gcboehm ? {
 		mut c := &DateCache{}
@@ -74,6 +76,8 @@ fn test_refresh_allocates_nothing() {
 		rounds := 20_000
 		before := gc_heap_usage().total_bytes
 		for _ in 0 .. rounds {
+			c.secs[0]--
+			c.secs[1]--
 			c.refresh()
 		}
 		grown := gc_heap_usage().total_bytes - before

@@ -19,9 +19,12 @@ module main
 //
 // LOCK-FREE & GC-SAFE via DOUBLE BUFFERING: the cache holds two fixed 37-byte
 // buffers. The ticker formats the INACTIVE buffer, then atomically flips an index
-// to publish it. A reader atomically loads the index and copies that buffer — it's
-// never the one being written (the writer touches `1 - active`), so there are no
-// torn reads, no mutex, and no pointer-as-integer tricks for the GC to mishandle.
+// to publish it. A reader atomically loads the index and copies that buffer. The
+// writer only touches `1 - active`, so the buffer a reader was just handed is
+// rewritten one tick (~1 s) later at the earliest: a torn read would need a
+// reader preempted in the middle of its 37-byte copy for about a second. That is
+// a timing bound, not a lock, but far past any realistic stall — and it needs no
+// mutex and no pointer-as-integer tricks for the GC to mishandle.
 import server
 import core
 import time

@@ -82,9 +82,8 @@ fn route_len(buf []u8, path request_parser.Slice) int {
 // targets. Two byte checks on a VIEW — no copy, no string API needed.
 // NOTE: get_query_slice does no percent-decoding, so `%2F%2Fevil.com` does not
 // start with `/` and is rejected — same posture as checking after an explicit
-// decode. A bare LF in the request-target could still reach the Location line
-// (the parser only terminates the path at SP/CR); rejecting bytes < 0x21 here
-// would close that, left out to keep the guard minimal.
+// decode. A bare LF in the request-target never reaches the Location line: the
+// request framer answers such a request with 400 before any handler runs.
 @[direct_array_access]
 fn safe_next(next []u8) []u8 {
 	if next.len > 0 && next[0] == u8(`/`) && !(next.len > 1 && next[1] == u8(`/`)) {

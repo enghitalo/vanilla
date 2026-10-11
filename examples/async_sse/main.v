@@ -5,7 +5,7 @@ module main
 // the continuation appends ONE `data:` event and re-arms — and because a
 // continuation that wrote bytes before returning `.suspend` has them flushed
 // immediately (not buffered until `.done`), the client receives each event the
-// instant it is produced. The single worker keeps serving everyone else between
+// instant it is produced. Each worker keeps serving everyone else between
 // ticks, so thousands of open streams cost one timerfd each, not a thread each.
 //
 // This stream is finite (5 ticks, then "bye"), so the client must be able to

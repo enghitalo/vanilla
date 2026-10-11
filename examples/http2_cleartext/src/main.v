@@ -1,6 +1,6 @@
 module main
 
-// HTTP/2 over cleartext TCP with prior knowledge (RFC 9113 §3.4) — the second
+// HTTP/2 over cleartext TCP with prior knowledge (RFC 9113 §3.3) — the second
 // consumer of the conn-mode seam (issue #136), and the reason the seam
 // reserved an http2 arm: one engine, one application handler, now three wire
 // protocols (HTTP/1.1, WebSocket, HTTP/2) on the same port.

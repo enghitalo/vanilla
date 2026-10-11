@@ -106,10 +106,9 @@ the response the handler composes contains the status line, the Date line
 and `Content-Length: 2`; and neither `respond` nor `refresh` allocates
 (`test_respond_allocates_nothing`, `test_refresh_allocates_nothing`: a
 `gc_heap_usage()` delta over 20k calls each). The 20k refreshes finish in
-under a millisecond, so they rarely cross a second boundary and mostly measure
-the flip; the digit rewrite itself is the `time.update_http_header` call that
-[efficient_date](../efficient_date/)'s allocation test forces on every other
-request.
+well under a second, so the test marks both buffers a second stale before
+each one: every refresh goes through `time.update_http_header`'s digit
+rewrite, not its same-second early return.
 
 ## See also
 
