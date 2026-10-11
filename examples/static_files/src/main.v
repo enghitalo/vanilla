@@ -4,7 +4,7 @@ module main
 //
 // This is deceptively deep: doing it correctly means MIME detection, byte
 // Range requests (how video/audio seek works), conditional GET (ETag /
-// If-Modified-Since for caching), and — above all — path-traversal safety.
+// If-None-Match for caching), and — above all — path-traversal safety.
 //
 // SECURITY FIRST
 //   The single most important line in a static server is the one that prevents
@@ -36,15 +36,15 @@ module main
 //   - The ETag is a 64-bit wyhash hex-encoded into a STACK scratch (`hex16`) —
 //     no `.hex()` string per request. Hashing the whole file per request is
 //     O(filesize) BY DESIGN — it is the conditional-GET pedagogy; for
-//     precomputed validators use `server.static_assets`.
+//     precomputed validators use the `static_assets` module.
 //
 // ZERO-COPY IS NOW AVAILABLE: large files no longer have to bounce through a
 // userspace []u8. The epoll core can stream a file straight to the socket with
 // `sendfile(2)` (EPOLLOUT-driven, so a 4 GB file never sits in RAM) — a handler
 // hands the file off via `core.queue_file(fd, off, len)`. The reusable
-// `server.static_assets` module does exactly this for files past a size
-// threshold; see `examples/spa_static_assets`. This example reads each file
-// into `out` instead, because its ETag hashes the body on every request.
+// `static_assets` module does exactly this for files past a size threshold;
+// see `examples/spa_static_assets`. This example reads each file into `out`
+// instead, because its ETag hashes the body on every request.
 import server
 import core
 import http1_1.request_parser
@@ -363,8 +363,10 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, m
 	}
 	// Method routing IN PLACE over the request buffer — no `.to_string()`.
 	// Every view below is taken from `req_buffer`, the handler's own
-	// parameter, never from `req.buffer`: a view of `req.buffer` handed on to
-	// a callee moves `req` to the heap (docs/V_PERF_TOOLBOX.md).
+	// parameter, never from `req.buffer`: a view of `req.buffer` can move
+	// `req` to the heap (a memdup per request) only when it reaches a callee
+	// that returns it or returns `!T`/`?T` (docs/V_PERF_TOOLBOX.md), and a
+	// view of `req_buffer` cannot.
 	is_get := slice_eq(req_buffer, req.method, 'GET')
 	if !is_get && !slice_eq(req_buffer, req.method, 'HEAD') {
 		core.append_str(mut out, resp_405)
@@ -455,8 +457,9 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, m
 		return .done
 	}
 	// ETag = 64-bit wyhash of the content, hex-encoded into a stack scratch —
-	// a cheap, strong opaque validator (same as server.static_assets);
-	// a crypto digest here is pure cost, and md5 is broken anyway.
+	// a cheap, strong opaque validator (static_assets hashes a body it holds
+	// in memory the same way); a crypto digest here is pure cost, and md5 is
+	// broken anyway.
 	etag := hex16(wyhash.wyhash_c(unsafe { &u8(out.data) + body_at }, u64(size), 0))
 
 	// Conditional GET: if the client's cached ETag matches, save the bytes —
