@@ -81,6 +81,13 @@ fn start_fake(certs string, cert string) !Fake {
 
 // start_fake_on is start_fake listening on `ip`.
 fn start_fake_on(ip string, certs string, cert string) !Fake {
+	return start_fake_args(ip, certs, cert, [])
+}
+
+// start_fake_args is start_fake_on with more fake_upstream options. Over TLS
+// the fake sends two TLS 1.3 NewSessionTickets after each handshake, as
+// OpenSSL-based servers do by default (#236); `extra` may override it.
+fn start_fake_args(ip string, certs string, cert string, extra []string) !Fake {
 	bin := fake_bin()!
 	dir := os.join_path(os.temp_dir(), 'vanilla_fake_upstream_${os.getpid()}_${time.sys_mono_now()}')
 	os.mkdir_all(dir)!
@@ -88,8 +95,9 @@ fn start_fake_on(ip string, certs string, cert string) !Fake {
 	mut a := ['--bind', ip, '--port-file', os.join_path(dir, 'port'), '--stats-file',
 		os.join_path(dir, 'stats')]
 	if certs != '' {
-		a << ['--tls', certs, '--cert', cert]
+		a << ['--tls', certs, '--cert', cert, '--tickets', '2']
 	}
+	a << extra
 	p.set_args(a)
 	p.run()
 	for _ in 0 .. 500 {
@@ -121,8 +129,8 @@ fn (mut f Fake) stop() {
 	os.rmdir_all(f.dir) or {}
 }
 
-// stat is one of the fake's counters (accepted, handshakes, requests,
-// path:<path>), 0 when not seen yet.
+// stat is one of the fake's counters (accepted, handshakes, held_handshakes,
+// tickets, requests, path:<path>), 0 when not seen yet.
 fn (f &Fake) stat(key string) int {
 	content := os.read_file(os.join_path(f.dir, 'stats')) or { return 0 }
 	for line in content.split_into_lines() {
@@ -161,12 +169,17 @@ fn setup(https bool, cert string, o upstream.Origin) !Env {
 
 // setup_limits is setup with the edge's own Limits.
 fn setup_limits(https bool, cert string, o upstream.Origin, limits server.Limits) !Env {
+	return setup_fake(https, cert, o, limits, [])
+}
+
+// setup_fake is setup_limits with more fake_upstream options.
+fn setup_fake(https bool, cert string, o upstream.Origin, limits server.Limits, fake_args []string) !Env {
 	mut e := Env{}
 	if https {
 		e.certs = testkit.test_certs()!
 		e.cfg = tls.new_client(os.join_path(e.certs, 'ca.crt'), .full)!
 	}
-	e.fake = start_fake(e.certs, cert)!
+	e.fake = start_fake_args('127.0.0.1', e.certs, cert, fake_args)!
 	origin := upstream.Origin{
 		...o
 		host:  if https { 'localhost' } else { '127.0.0.1' }
@@ -336,6 +349,7 @@ fn test_reuse() {
 		assert e.fake.stat('accepted') == 1
 		if https {
 			assert e.fake.stat('handshakes') == 1
+			assert e.fake.stat('tickets') == 2 // read past ahead of the first answer
 		}
 		assert status_of(get(p, '/connclose')) == 200
 		assert status_of(get(p, '/ok')) == 200
@@ -581,6 +595,37 @@ fn test_large_request_body() {
 			20_000)
 		assert status_of(r) == 200, r
 		assert body_of(r) == '${body.len} ${sha256.sum(body).hex()}', r
+	}
+}
+
+// TLS 1.3 session tickets that arrive while a 4 MiB request body is going out
+// (#236): the fake holds its last handshake step for 200 ms, so the client,
+// done with its side, is sending the body (and the socket fills) when the two
+// tickets come, ahead of the answer. The body arrives byte-exact, and the
+// kept connection serves the next exchange.
+fn test_tickets_mid_upload() {
+	for https in variants() {
+		if !https {
+			continue
+		}
+		mut e := setup_fake(https, 'server', upstream.Origin{
+			max_request_bytes: 8 << 20
+		}, server.Limits{}, ['--ticket-delay-ms', '200']) or { panic(err) }
+		defer {
+			e.stop()
+		}
+		mut body := []u8{len: 4 << 20}
+		for i in 0 .. body.len {
+			body[i] = u8(`a` + i % 26)
+		}
+		p := e.h.port()
+		r, _ := call(p, 'POST /fill/${body.len}/echo HTTP/1.1\r\nHost: edge\r\n\r\n', 20_000)
+		assert status_of(r) == 200, r
+		assert body_of(r) == '${body.len} ${sha256.sum(body).hex()}', r
+		assert status_of(get(p, '/ok')) == 200
+		assert e.fake.stat('handshakes') == 1
+		assert e.fake.stat('held_handshakes') == 1
+		assert e.fake.stat('tickets') == 2
 	}
 }
 

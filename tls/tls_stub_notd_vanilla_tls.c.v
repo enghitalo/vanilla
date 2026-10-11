@@ -60,6 +60,14 @@ pub fn (c &Config) set_ktls(enabled bool) {}
 // it before serving. The stub does nothing.
 pub fn (c &Config) set_ktls_rx_no_pad(enabled bool) {}
 
+// set_session_tickets makes a server config send `n` TLS 1.3
+// NewSessionTickets at the end of each handshake (0, the default: none), for
+// tests of clients; such sessions never enable kTLS. Not atomic: call it
+// before serving. The stub returns an error.
+pub fn (c &Config) set_session_tickets(n int) ! {
+	return error(not_built)
+}
+
 // cert_pem returns the server certificate as PEM, for clients that must trust
 // it; '' for a client config, or when new_from_pem's PEM did not fit 4 KiB.
 // Allocates a V string. The stub returns ''.

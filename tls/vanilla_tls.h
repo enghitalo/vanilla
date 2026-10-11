@@ -190,4 +190,15 @@ void vtls_set_ktls(vtls_ctx *ctx, int enabled);
 // setting when created, so call it before the server starts.
 void vtls_set_ktls_rx_no_pad(vtls_ctx *ctx, int enabled);
 
+// Make a server context send `n` TLS 1.3 NewSessionTickets at the end of each
+// handshake (0, the default: none, as PostgreSQL and the HTTPS server send).
+// For tests of clients against servers that send them, as OpenSSL-based ones
+// do. The tickets are never accepted for resumption by anything here. Each
+// session copies the setting when created, and a session that sends tickets
+// never enables kTLS (a ticket advances the record sequence before any
+// application data). Not atomic: call it before the server starts. Returns 0,
+// or an Mbed TLS error (a library built without MBEDTLS_SSL_TICKET_C, or n
+// outside 0..65535).
+int vtls_set_session_tickets(vtls_ctx *ctx, int n);
+
 #endif /* VANILLA_TLS_H */

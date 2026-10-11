@@ -103,7 +103,8 @@ with `-d vanilla_tls`).
 scriptable fake API in V that the test builds and runs as its own process
 (with `-d vanilla_tls` it serves TLS 1.3 through vanilla's own `tls` server
 side, with a throwaway test CA from `pg_async/testdata/gen_test_ca.sh`, which
-needs openssl):
+needs openssl, and sends two TLS 1.3 session tickets after each handshake, as
+OpenSSL-based servers do: `tls.Config.set_session_tickets`):
 
 ```sh
 v test examples/https_upstream/src                         # plain HTTP
