@@ -89,7 +89,10 @@ loaded, and `sans` is ignored.
 - **One field makes it HTTPS.** `tls_config: cfg` in `ServerConfig`, where
   `cfg` comes from `tls.new_self_signed` or `tls.new_from_pem`. Leave
   `io_multiplexing` unset: the Linux default, epoll, is the backend that
-  serves TLS.
+  serves TLS. HTTPS connections run on the same worker as plain ones, so
+  everything else a handler can do works here too: `.suspend` on a database
+  or an upstream, WebSocket takeover, server push, `on_worker_start`, file
+  bodies handed off with `core.queue_file`.
 - **The handshake has a deadline.** A connection's first read deadline starts
   at accept, so `read_timeout_ms` also bounds the handshake: a client that
   connects and never finishes it is closed silently after 10 s. Without a read
@@ -127,7 +130,7 @@ with no HTTP answer.
 
 ## See also
 
-- [server/README.md — TLS](../../server/README.md#tls): what the TLS worker
-  does, kTLS and the threading build
+- [server/README.md — TLS](../../server/README.md#tls): TLS on the epoll
+  worker, kTLS and the threading build
 - [examples/https_upstream](../https_upstream/): the client side, calling an
   HTTPS API from a handler

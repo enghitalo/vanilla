@@ -1,9 +1,11 @@
 module backend_epoll
 
-// Plain (non-TLS) per-connection state for the epoll worker: the persistent
-// buffers, the batched flush/EPOLLOUT machinery, sendfile streaming and the
-// timeout sweep. The request-serving loop that drives it lives in
-// async_linux.c.v (handle_readable / drain_requests / serve_conn).
+// Per-connection state for the epoll worker, plain HTTP and HTTPS alike: the
+// persistent buffers, the batched flush/EPOLLOUT machinery, sendfile
+// streaming and the timeout sweep. The request-serving loop that drives it
+// lives in async_linux.c.v (handle_readable / drain_requests / serve_conn);
+// what TLS adds (the handshake, record I/O through Mbed TLS or kTLS) lives in
+// tls_conn_linux.c.v, behind conn_recv / conn_send.
 //
 // Shared-nothing hot path modeled on the fastest HTTP/1.1 servers
 // (see docs/PERF_GAP_ANALYSIS.md):
@@ -24,6 +26,7 @@ import epoll
 import http1_1.response
 import sync.stdatomic
 import time
+import tls
 
 #include <errno.h>
 #include <string.h>
@@ -77,6 +80,29 @@ fn buf_view(buf []u8, start int, length int) []u8 {
 	return v
 }
 
+// conn_recv reads from a client connection with recv(2)'s contract: the byte
+// count, 0 at the end of the stream, or -1 with errno set (EAGAIN: nothing
+// more for now). A TLS connection reads through tls_recv (Mbed TLS, or a kTLS
+// socket); a plain one is the syscall, one predictable branch away.
+@[inline]
+fn conn_recv(mut cs ConnState, fd int, ptr &u8, len int) int {
+	if cs.tls != tls_plain {
+		return tls_recv(mut cs, fd, ptr, len)
+	}
+	return C.recv(fd, ptr, usize(len), 0)
+}
+
+// conn_send writes to a client connection with the contract of send(2) with
+// MSG_NOSIGNAL: the byte count, or -1 with errno set (EAGAIN: the socket is
+// full). A TLS connection writes through tls_send.
+@[inline]
+fn conn_send(mut cs ConnState, fd int, ptr &u8, len int) int {
+	if cs.tls != tls_plain {
+		return tls_send(mut cs, fd, ptr, len)
+	}
+	return C.send(fd, ptr, usize(len), C.MSG_NOSIGNAL)
+}
+
 // A request whose framed size exceeds this is STREAMED, not buffered: the head
 // is answered and the body is drained (recv'd into the fixed buffer and
 // discarded) instead of growing read_buf into a multi-MB scanned block — the
@@ -125,6 +151,19 @@ mut:
 	// (drain_requests consumed it, or its streamed body finished), so the next
 	// Expect request on a keep-alive connection gets its own 100.
 	sent_100 bool
+	// tls is how the connection's bytes move (tls_plain for plain HTTP; see
+	// tls_conn_linux.c.v): beside the flags above, in what was their padding,
+	// so the readable edge's check costs no extra cache line.
+	tls u8
+	// no_sendfile: sendfile(2) cannot reach this connection (a userspace-TLS
+	// one, or a kTLS socket that refused it), so a queued file region goes out
+	// as bytes (tls_file_chunk). Never set on a plain connection.
+	no_sendfile bool
+	// held: a TLS connection whose file region did not fit the socket when
+	// its next request (or a 100 Continue) was due; nothing more is read or
+	// answered until it drains (tls_send_file_first). Never set on a plain
+	// connection.
+	held bool
 	// The conn-mode seam (issue #136): nil (the default) means the HTTP/1.1
 	// state machine drives this connection — the hot path pays exactly one
 	// predictable nil-check in handle_readable. Set (via core.queue_takeover
@@ -155,6 +194,12 @@ mut:
 	wake_fn    core.WakeFn = unsafe { nil }
 	sub_state  voidptr
 	wake_timer int = -1
+	// TLS only (tls_conn_linux.c.v): the length a userspace write that
+	// returned WANT_WRITE must be retried with (0 = none pending), and the
+	// session (zero for a plain connection, and until a TLS connection's
+	// first event).
+	tls_pend int
+	sess     tls.Session
 }
 
 // PlainState is the per-worker connection table. `parked` counts armed
@@ -223,6 +268,9 @@ mut:
 	closed_q       []ClosedNote
 	push_watermark int
 	shutdown_seen  bool
+	// tls_cfg is the server's TLS config, nil for plain HTTP. An HTTPS
+	// server's connections start with their handshake (state_create).
+	tls_cfg &tls.Config = unsafe { nil }
 }
 
 // birth_queue_cap is the capacity of a worker's BirthQueue (a power of two).
@@ -339,7 +387,7 @@ fn (mut st PlainState) tick() {
 }
 
 // new_plain_state returns an empty PlainState, its tables at conn_table_min
-// fds (they grow by doubling as higher fds arrive): one per plain worker,
+// fds (they grow by doubling as higher fds arrive): one per worker,
 // built on that worker's thread.
 pub fn new_plain_state() PlainState {
 	return PlainState{
@@ -429,20 +477,33 @@ fn state_create(mut st PlainState, fd int) &ConnState {
 	if unsafe { st.conns[fd] == nil } {
 		// Reuse a retired ConnState (buffers retained, fields reset by close_conn)
 		// before allocating — see PlainState.free_conns.
+		mut cs := unsafe { &ConnState(nil) }
 		if st.free_conns.len > 0 {
-			st.conns[fd] = st.free_conns.pop()
-			return st.conns[fd]
+			cs = st.free_conns.pop()
+		} else {
+			cs = &ConnState{
+				read_buf:  []u8{len: 0, cap: if st.tls_cfg == unsafe { nil } {
+					read_buf_cap
+				} else {
+					tls_read_buf_cap
+				}}
+				write_buf: []u8{len: 0, cap: if st.tls_cfg == unsafe { nil } {
+					write_buf_cap
+				} else {
+					tls_write_buf_cap
+				}}
+			}
+			// Both buffers stay in no-scan GC blocks across growth, with no flag
+			// to set: they are pointer-free `[]u8`, so under the default GC V
+			// allocates them with the no-scan constructor, which sets
+			// `.noscan_data`, and grow_cap keeps it. Thousands of big scanned
+			// per-conn buffers at high keep-alive conn counts would make GC
+			// scanning the bottleneck (the "static cliff"); see the same note in
+			// io_uring_linux.c.v.
 		}
-		mut cs := &ConnState{
-			read_buf:  []u8{len: 0, cap: read_buf_cap}
-			write_buf: []u8{len: 0, cap: write_buf_cap}
+		if st.tls_cfg != unsafe { nil } {
+			cs.tls = tls_handshake // HTTPS: the handshake comes first
 		}
-		// Both buffers stay in no-scan GC blocks across growth, with no flag to
-		// set: they are pointer-free `[]u8`, so under the default GC V allocates
-		// them with the no-scan constructor, which sets `.noscan_data`, and
-		// grow_cap keeps it. Thousands of big scanned per-conn buffers at high
-		// keep-alive conn counts would make GC scanning the bottleneck (the
-		// "static cliff"); see the same note in io_uring_linux.c.v.
 		st.conns[fd] = cs
 	}
 	return st.conns[fd]
@@ -501,9 +562,17 @@ fn park_write(epoll_fd int, fd int, limits core.Limits, mut st PlainState, mut c
 // sendfile(2), advancing file_off/file_remaining. Returns:
 //   1  fully sent (file_remaining == 0)
 //   0  partial — EAGAIN, more to send on the next writable edge
+//   2  the next part of the file is in write_buf, as bytes: send it, then
+//      drain again (no_sendfile, see tls_file_chunk)
+//   3  the file came up short and what it had is in write_buf: send it,
+//      then close
 //  -1  hard error — caller must close the connection
+// 2 and 3 only come on a TLS connection that sendfile(2) cannot reach.
 @[inline]
 fn drain_file(fd int, mut cs ConnState) int {
+	if cs.no_sendfile {
+		return tls_file_chunk(mut cs)
+	}
 	for cs.file_remaining > 0 {
 		want := if cs.file_remaining > sm_sendfile_chunk {
 			usize(sm_sendfile_chunk)
@@ -517,6 +586,9 @@ fn drain_file(fd int, mut cs ConnState) int {
 		}
 		if sent < 0 && (C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK) {
 			return 0
+		}
+		if cs.tls == tls_kernel {
+			return tls_file_failed(mut cs, sent)
 		}
 		return -1 // sent == 0 (unexpected EOF) or a hard error
 	}
@@ -548,34 +620,44 @@ fn materialise_file(mut cs ConnState) bool {
 // closed (callers must not touch it).
 @[manualfree]
 fn flush_batch(epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState) bool {
-	// Phase 1: the buffered response bytes (status line, headers, small bodies).
-	for cs.write_off < cs.write_buf.len {
-		n := C.send(fd, unsafe { &u8(cs.write_buf.data) + cs.write_off },
-			usize(cs.write_buf.len - cs.write_off), C.MSG_NOSIGNAL)
-		if n > 0 {
-			cs.write_off += n
-			continue
-		}
-		if n < 0 && (C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK) {
-			park_write(epoll_fd, fd, limits, mut st, mut cs)
-			return true // parked, still alive
-		}
-		close_conn(epoll_fd, fd, active_conns, mut st)
-		return false
-	}
-	// Phase 2: stream the deferred file body straight from the page cache.
-	if cs.file_remaining > 0 {
-		match drain_file(fd, mut cs) {
-			0 {
+	for {
+		// Phase 1: the buffered response bytes (status line, headers, small bodies).
+		for cs.write_off < cs.write_buf.len {
+			n := conn_send(mut cs, fd, unsafe { &u8(cs.write_buf.data) + cs.write_off },
+				cs.write_buf.len - cs.write_off)
+			if n > 0 {
+				cs.write_off += n
+				continue
+			}
+			if n < 0 && (C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK) {
 				park_write(epoll_fd, fd, limits, mut st, mut cs)
-				return true // parked mid-file, still alive
+				return true // parked, still alive
 			}
-			-1 {
-				close_conn(epoll_fd, fd, active_conns, mut st)
-				return false
-			}
-			else {}
+			close_conn(epoll_fd, fd, active_conns, mut st)
+			return false
 		}
+		// Phase 2: stream the deferred file body straight from the page cache.
+		if cs.file_remaining > 0 {
+			match drain_file(fd, mut cs) {
+				0 {
+					park_write(epoll_fd, fd, limits, mut st, mut cs)
+					return true // parked mid-file, still alive
+				}
+				-1 {
+					close_conn(epoll_fd, fd, active_conns, mut st)
+					return false
+				}
+				2 {
+					continue // the next part of the file, as bytes in write_buf (TLS)
+				}
+				3 {
+					begin_close(mut st, mut cs) // send what the short file had, then close
+					continue
+				}
+				else {}
+			}
+		}
+		break
 	}
 	// len = 0, capacity kept for the next batch. Not if a handler ever sliced
 	// `out` (`out[a..]`): that marks the buffer for good, and V's clear() then
@@ -725,6 +807,10 @@ fn handle_writable_plain(epoll_fd int, fd int, known &ConnState, active_conns &c
 		// the same batch.
 		return false
 	}
+	if cs.tls >= tls_handshake {
+		// A TLS connection still in its handshake (tls_conn_linux.c.v).
+		return tls_on_writable(epoll_fd, fd, mut cs, active_conns, mut st)
+	}
 	if cs.body_drain > 0 {
 		// A streamed upload's response is buffered in write_buf but MUST stay held
 		// until the body is fully drained (drain-then-respond). If an earlier batch
@@ -740,32 +826,42 @@ fn handle_writable_plain(epoll_fd int, fd int, known &ConnState, active_conns &c
 		epoll.mod_fd_in_epoll(epoll_fd, fd, (u32(C.EPOLLIN) | u32(C.EPOLLET)))
 		return true
 	}
-	// Phase 1: finish the buffered bytes.
-	for cs.write_off < cs.write_buf.len {
-		n := C.send(fd, unsafe { &u8(cs.write_buf.data) + cs.write_off },
-			usize(cs.write_buf.len - cs.write_off), C.MSG_NOSIGNAL)
-		if n > 0 {
-			cs.write_off += n
-			continue
-		}
-		if n < 0 && (C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK) {
-			return true // still parked
-		}
-		close_conn(epoll_fd, fd, active_conns, mut st)
-		return false
-	}
-	// Phase 2: finish the deferred file body.
-	if cs.file_remaining > 0 {
-		match drain_file(fd, mut cs) {
-			0 {
-				return true
-			} // still parked mid-file
-			-1 {
-				close_conn(epoll_fd, fd, active_conns, mut st)
-				return false
+	for {
+		// Phase 1: finish the buffered bytes.
+		for cs.write_off < cs.write_buf.len {
+			n := conn_send(mut cs, fd, unsafe { &u8(cs.write_buf.data) + cs.write_off },
+				cs.write_buf.len - cs.write_off)
+			if n > 0 {
+				cs.write_off += n
+				continue
 			}
-			else {}
+			if n < 0 && (C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK) {
+				return true // still parked
+			}
+			close_conn(epoll_fd, fd, active_conns, mut st)
+			return false
 		}
+		// Phase 2: finish the deferred file body.
+		if cs.file_remaining > 0 {
+			match drain_file(fd, mut cs) {
+				0 {
+					return true
+				} // still parked mid-file
+				-1 {
+					close_conn(epoll_fd, fd, active_conns, mut st)
+					return false
+				}
+				2 {
+					continue // the next part of the file, as bytes in write_buf (TLS)
+				}
+				3 {
+					begin_close(mut st, mut cs) // send what the short file had, then close
+					continue
+				}
+				else {}
+			}
+		}
+		break
 	}
 	cs.write_buf.clear()
 	cs.write_off = 0
@@ -816,8 +912,10 @@ fn sweep_timeouts(epoll_fd int, active_conns &core.Counter, mut st PlainState) {
 			} else {
 				cs.write_off >= cs.write_buf.len && cs.file_remaining <= 0
 			}
+			// Over TLS the close is silent too: the 408 would go out as
+			// plaintext, outside the session.
 			if cs.takeover == unsafe { nil } && (cs.read_buf.len > 0 || cs.body_drain > 0)
-				&& at_boundary {
+				&& at_boundary && cs.tls == tls_plain {
 				response.send_status_408_response(fd) // couldn't finish the request in time
 			}
 			close_conn(epoll_fd, fd, active_conns, mut st)
@@ -869,6 +967,9 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			if cs.idle_deadline != 0 {
 				st.parked--
 			}
+			if cs.sess.active() {
+				tls_close(mut cs) // before release_conn closes the fd: its close_notify
+			}
 			// Reuse instead of free: reset to a pristine state and return to the
 			// per-worker pool, KEEPING the read/write buffers (just length-zeroed,
 			// capacity retained). Freeing + re-allocating them per reconnect leaks
@@ -895,6 +996,12 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			cs.sent_100 = false
 			cs.takeover = unsafe { nil }
 			cs.takeover_state = unsafe { nil }
+			// sess was reset by tls_close; state_create sets tls for an HTTPS
+			// server's next connection.
+			cs.tls = tls_plain
+			cs.no_sendfile = false
+			cs.held = false
+			cs.tls_pend = 0
 			st.conns[fd] = unsafe { nil }
 			st.free_conns << cs
 		}

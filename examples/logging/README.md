@@ -142,7 +142,7 @@ but they are already in the file.
   not as it ended. Record it from its continuation instead.
 - No client address: `getpeername` would be a syscall per request. Behind a
   proxy, take it from `X-Forwarded-For` (`examples/proxy_aware`).
-- The Linux epoll plain worker only, the one that runs `on_worker_start`.
+- The Linux epoll worker only, the one that runs `on_worker_start`.
 
 ## Tests
 

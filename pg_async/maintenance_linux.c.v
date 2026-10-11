@@ -11,7 +11,7 @@ fn C.read(fd int, buf voidptr, count usize) int
 
 // start_maintenance drives maintain() from a timerfd on this worker's event
 // loop. Call it from the server's on_worker_start, with the pool the worker's
-// make_state built (a clientless watch; the epoll plain worker runs those):
+// make_state built (a clientless watch; the epoll worker runs those):
 //
 //   fn on_start(worker_state voidptr, mut event_loop core.EventLoop) {
 //       mut pool := unsafe { &pg_async.PgPool(worker_state) }
@@ -34,7 +34,7 @@ pub fn (mut p PgPool) start_maintenance(mut event_loop core.EventLoop) ! {
 	event_loop.watch_fd(fd, .readable, maintenance_tick, voidptr(p))
 	if event_loop.last_watched != fd {
 		C.close(fd)
-		return error('pg pool: this event loop cannot watch the maintenance timer (epoll plain worker only)')
+		return error('pg pool: this event loop cannot watch the maintenance timer (epoll worker only)')
 	}
 	p.timer_fd = fd
 }

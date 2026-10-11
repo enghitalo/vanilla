@@ -91,7 +91,7 @@ real	0m0.356s
   `event_loop.watch_fd_deadline(fd, .readable, cont, payload, ms_left)` or set
   `Limits.park_timeout_ms`: the continuation then runs once with
   `event_loop.timed_out()` true, and answers 504. Deadlines are enforced by
-  the epoll plain worker
+  the epoll worker
   ([BEST_PRACTICES §5](../../docs/BEST_PRACTICES.md#5-side-effects-go-through-the-async-runtime--pools-off-the-hot-path)).
 
 ## Tests

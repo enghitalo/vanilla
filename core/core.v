@@ -40,14 +40,14 @@ fn worker_count() int {
 //              (event_loop.watch_fd); the connection stays parked until that
 //              fd is ready or the park's deadline passes (park_timeout_ms,
 //              watch_fd_deadline; multi-step chains re-suspend). Supported on Linux
-//              epoll + io_uring and macOS kqueue; the TLS and Windows/IOCP
-//              workers have no watch reactor yet, so there a .suspend DROPS
-//              the connection (see reject_register).
+//              epoll (plain HTTP and HTTPS) + io_uring and macOS kqueue; the
+//              Windows/IOCP worker has no watch reactor yet, so there a
+//              .suspend DROPS the connection (see reject_register).
 //   .close   — finish this connection: whatever is in `res` is flushed, then
 //              the connection is closed — from a handler or a continuation
-//              alike. The TLS worker and macOS kqueue make one best-effort
-//              write instead, bounded by the socket send buffer; every other
-//              worker closes once all of it is sent. Append an error response
+//              alike. macOS kqueue makes one best-effort write instead,
+//              bounded by the socket send buffer; every other worker closes
+//              once all of it is sent. Append an error response
 //              (e.g. response.tiny_bad_request_response) before returning
 //              .close if the client should see one.
 pub enum Step {
@@ -218,7 +218,7 @@ pub fn (mut event_loop EventLoop) watch_fd_persistent(fd int, interest WatchInte
 // chain, a reply that arrives in pieces) gets a fresh one, so pass the time
 // left to bound a whole request.
 //
-// Enforced by the epoll plain worker. Elsewhere (io_uring, kqueue) it is a
+// Enforced by the epoll worker. Elsewhere (io_uring, kqueue) it is a
 // plain watch_fd: the deadline is not enforced and timed_out() stays false.
 // A clientless background watch (on_worker_start, watch_fd_background) has no
 // deadline.
@@ -277,7 +277,7 @@ pub fn (event_loop &EventLoop) timed_out() bool {
 // .suspend to keep watching; .done/.close and the runtime detaches AND closes
 // the fd. Fire-and-forget I/O tied to the worker, e.g. pg_async's
 // CancelRequest. Returns false, arming nothing, where the worker cannot run
-// clientless watches (every backend but the epoll plain worker): the fd is
+// clientless watches (every backend but the epoll worker): the fd is
 // then still the caller's to close.
 pub fn (mut event_loop EventLoop) watch_fd_background(fd int, interest WatchInterest, continuation WakeFn, watch_payload voidptr) bool {
 	mut bg := EventLoop{
@@ -293,8 +293,8 @@ pub fn (mut event_loop EventLoop) watch_fd_background(fd int, interest WatchInte
 	return bg.last_watched == fd
 }
 
-// reject_register is the EventLoop.register stub for workers that have NO
-// watch reactor (the TLS worker and the Windows/IOCP worker): it arms nothing
+// reject_register is the EventLoop.register stub where nothing can be watched
+// (the Windows/IOCP worker, poll, a .closed notification): it arms nothing
 // and leaves last_watched at -1, so a handler that suspends anyway is simply
 // dropped by the caller — parking cannot be resumed where nothing watches.
 // Shared here so the reactorless backends cannot drift apart.
@@ -381,7 +381,7 @@ pub:
 	// the earliest, so it fires within ~1 ms of its time and needs no other
 	// timeout set. Read, write and idle deadlines never apply to a parked
 	// request, so without it a park waits as long as its fd does. 0 ⇒ none.
-	// Epoll plain worker only (io_uring and kqueue do not enforce it).
+	// Epoll worker only (io_uring and kqueue do not enforce it).
 	park_timeout_ms int
 }
 
@@ -395,7 +395,8 @@ pub const default_max_request_bytes = 8 * 1024 * 1024
 // responses exceed it is closed, since a peer that pipelines requests but
 // never reads the answers would otherwise grow its write buffer without bound.
 // Fixed, not a Limits field; it also caps ServerConfig.push_watermark_bytes.
-// Enforced by the plain epoll, io_uring, poll and IOCP backends.
+// Enforced by the epoll (plain HTTP and HTTPS), io_uring, poll and IOCP
+// backends.
 pub const max_pending_write_bytes = 8 * 1024 * 1024
 
 // idle_ms resolves the keep-alive idle budget: idle_timeout_ms when > 0,

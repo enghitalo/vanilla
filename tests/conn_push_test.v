@@ -1,5 +1,5 @@
 // vtest build: linux
-// Server push (vanilla#230) on the epoll plain worker: a taken-over
+// Server push (vanilla#230) on the epoll worker: a taken-over
 // connection subscribes (event_loop.subscribe) and is woken by posts from any
 // thread (ConnHandle.post_wake / post_bytes through the worker's mailbox), by
 // its wake_after timer, by Server.shutdown(), and, last, by its close.

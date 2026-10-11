@@ -1,20 +1,19 @@
 // vtest build: linux && vanilla_tls?
-// Static files over HTTPS on the epoll TLS worker. A static_assets body of at
-// least sendfile_min_bytes leaves a kernel-TLS connection with sendfile(2):
-// the headers go out with MSG_MORE and the kernel encrypts the file into
-// their record, with no userspace copy. A userspace-TLS connection never takes
-// a file (sendfile writes plaintext): its handler appends the bytes, from RAM
-// (memory_fallback, the /static/ mount here) or read from disk (the /disk/
-// mount). Every case runs on both paths: with the default config, which
-// engages kTLS when the kernel has TLS (the `tls` module loaded, or built in:
+// Static files over HTTPS on the epoll worker. A static_assets body of at
+// least sendfile_min_bytes is handed to the worker with core.queue_file on
+// either kind of TLS connection. A kernel-TLS one sends it with sendfile(2),
+// which the kernel encrypts with no userspace copy. A userspace-TLS one
+// cannot (sendfile writes plaintext): the worker reads the file and sends it
+// through Mbed TLS a chunk at a time, so it never holds a large body whole.
+// Every case runs on both paths: with the default config, which engages kTLS
+// when the kernel has TLS (the `tls` module loaded, or built in:
 // /proc/net/tls_stat exists), and with cfg.set_ktls(false). Each case checks
 // the path it got: the connection's TCP ULP (a handler route reads it) and,
 // on kTLS, a rise of TlsTxSw in /proc/net/tls_stat; a case that serves static
-// bodies also checks that static_assets handed some to sendfile on kTLS and
-// none on userspace TLS. Without kernel TLS both runs take the userspace path
-// and the kTLS-only asserts are skipped. Under tcc the sendfile slot is inert
-// (core/sendfile_slot.h): kTLS still engages, but every handler appends its
-// bytes, so the hand-off asserts expect none there.
+// bodies also checks that static_assets handed some to the worker. Without
+// kernel TLS both runs take the userspace path and the kTLS-only asserts are
+// skipped. Under tcc the sendfile slot is inert (core/sendfile_slot.h): every
+// handler appends its bytes, so the hand-off asserts expect none there.
 //
 // Only runs with `-d vanilla_tls` on Linux (see tls_timeouts_test.v; the
 // client and backstops follow tls_pipelining_test.v). The leak case only
@@ -73,6 +72,10 @@ const ts_short_len = 10
 const ts_short_promise = i64(100000)
 const ts_close_len = 2000
 const ts_huge_len = i64(64 << 20)
+// GET /past_cap: the first ts_past_cap_len bytes of the huge file, a body
+// past the 8 MiB pending-write cap (core.max_pending_write_bytes).
+const ts_past_cap_len = i64(12 << 20)
+const ts_past_cap_head = 'HTTP/1.1 200 OK\r\nContent-Length: 12582912\r\nConnection: keep-alive\r\n\r\n'.bytes()
 const ts_short_head = 'HTTP/1.1 200 OK\r\nContent-Length: 100000\r\nConnection: keep-alive\r\n\r\n'.bytes()
 const ts_close_head = 'HTTP/1.1 200 OK\r\nContent-Length: 2000\r\nConnection: close\r\n\r\n'.bytes()
 const ts_huge_head = 'HTTP/1.1 200 OK\r\nContent-Length: 67108864\r\nConnection: keep-alive\r\n\r\n'.bytes()
@@ -98,7 +101,7 @@ const ts_backstop = time.Duration(5 * time.second)
 // Every exchange below completes in milliseconds on loopback (the slow
 // reader's in a few hundred); this bound stays far below the backstop.
 const ts_bound_ms = 3000
-// How long a client that stops reading waits for the TLS worker to park
+// How long a client that stops reading waits for the worker to park
 // (see tls_pipelining_test.v): only reaching the park depends on it.
 const ts_park_wait = time.Duration(200 * time.millisecond)
 // The peer-reset case: clients that each take this much of GET /huge off the
@@ -268,11 +271,13 @@ fn ts_handed_off(req []u8, res []u8, from int) bool {
 //             file was truncated under it): sendfile(2) sends nothing;
 //   /close    a whole file, by a step that returns .close;
 //   /huge     a ts_huge_len sparse file;
-//   /suspend  queues a file, then returns .suspend (the TLS worker drops it);
+//   /past_cap the first ts_past_cap_len bytes of it;
+//   /suspend  queues a file, then returns .suspend with no watch (the worker
+//             drops the file and closes);
 //   /ulp      "tls" when the connection runs kTLS, else "---";
 //   anything else: ts_ok_resp.
-// A route whose hand-off the worker refuses (core.queue_file false: a
-// userspace-TLS connection) appends the bytes itself.
+// A route whose hand-off the worker refuses (core.queue_file false: a tcc
+// build) appends the bytes itself.
 fn ts_handler(fx &TsFixture) core.Handler {
 	return fn [fx] (req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 		if ts_target_is(req, '/static/') {
@@ -325,6 +330,15 @@ fn ts_handler(fx &TsFixture) core.Handler {
 			}
 			return .close
 		}
+		if ts_target_is(req, '/past_cap') {
+			res << ts_past_cap_head
+			if core.queue_file(fx.huge_file.fd, 0, ts_past_cap_len) {
+				stdatomic.add_i64(&fx.accepted.n, 1)
+			} else {
+				core.append_file_region(mut res, fx.huge_file.fd, 0, ts_past_cap_len)
+			}
+			return .done
+		}
 		if ts_target_is(req, '/huge') {
 			res << ts_huge_head
 			if core.queue_file(fx.huge_file.fd, 0, ts_huge_len) {
@@ -358,7 +372,7 @@ fn ts_handler(fx &TsFixture) core.Handler {
 	}
 }
 
-// ts_start serves fx over HTTPS on one epoll TLS worker (so every connection
+// ts_start serves fx over HTTPS on one epoll worker (so every connection
 // of a case shares one thread's sendfile slot). ktls false turns kernel TLS
 // off on the config: every connection stays on userspace Mbed TLS. SIGPIPE
 // is not ignored here: new_server ignores it process-wide before any client
@@ -378,7 +392,7 @@ fn ts_start(fx &TsFixture, ktls bool) !&vtest.Harness {
 			handler:         ts_handler(fx)
 		})
 	} $else {
-		return error('the TLS worker is the Linux epoll backend')
+		return error('TLS is the Linux epoll backend')
 	}
 }
 
@@ -389,14 +403,16 @@ fn ts_expect_ktls(ktls bool) bool {
 	return ktls && os.exists('/proc/net/tls_stat')
 }
 
-// ts_expect_sendfile reports whether a run asked for kTLS hands file bodies
-// to sendfile(2): on kTLS, except under tcc, which compiles the sendfile slot
-// inert (core/sendfile_slot.h), so every handler appends its bytes there.
-fn ts_expect_sendfile(ktls bool) bool {
+// ts_expect_handoffs reports whether the worker takes file bodies handed off
+// with core.queue_file: on kTLS (sent with sendfile(2)) and on userspace TLS
+// (sent as bytes, a chunk at a time) alike, except under tcc, which compiles
+// the sendfile slot inert (core/sendfile_slot.h), so every handler appends
+// its bytes there.
+fn ts_expect_handoffs() bool {
 	$if tinyc {
 		return false
 	}
-	return ts_expect_ktls(ktls)
+	return true
 }
 
 // ts_tls_tx is the kernel's count of TLS TX sessions installed in software so
@@ -503,17 +519,16 @@ fn ts_mode_ok(mut c openssl.SSLConn, ktls bool, tx0 i64) (bool, string) {
 	return true, ''
 }
 
-// ts_handoffs_ok reports whether static_assets left bodies to sendfile(2)
-// when, and only when, the connection can take them: at least once on a kTLS
-// run (every case that calls it serves a body above the threshold), never on
-// a userspace one, whose handler appends every body (nor under tcc, see
-// ts_expect_sendfile). The second value says what was counted.
+// ts_handoffs_ok reports whether static_assets left bodies to the worker
+// (core.queue_file): at least once on either path (every case that calls it
+// serves a body above the threshold), never under tcc (see
+// ts_expect_handoffs). The second value says what was counted.
 fn ts_handoffs_ok(fx &TsFixture, ktls bool) (bool, string) {
 	n := stdatomic.load_i64(&fx.handed.n)
-	if ts_expect_sendfile(ktls) {
-		return n > 0, 'kTLS: static_assets never handed a body to core.queue_file'
+	if ts_expect_handoffs() {
+		return n > 0, 'ktls=${ktls}: static_assets never handed a body to core.queue_file'
 	}
-	return n == 0, 'userspace TLS: static_assets handed ${n} bodies to core.queue_file'
+	return n == 0, 'tcc: static_assets handed ${n} bodies to core.queue_file'
 }
 
 // ts_reset_mid_body sends GET /huge on a new connection, takes `n` bytes of
@@ -547,7 +562,7 @@ fn ts_reset_mid_body(port int, n int, mut buf []u8) !int {
 
 // ts_slow_reader locks the client's receive buffer small (tp_slow_reader in
 // tls_pipelining_test.v): a ts_unbufferable_len body is then certain to park
-// the TLS worker while the client is not reading.
+// the worker while the client is not reading.
 fn ts_slow_reader(c &openssl.SSLConn) {
 	v := 32 * 1024
 	C.setsockopt(c.handle, C.SOL_SOCKET, C.SO_RCVBUF, &v, sizeof(v))
@@ -588,8 +603,8 @@ fn ts_drain(mut c openssl.SSLConn, reqs [][]u8, lens []int, count int, mut buf [
 // --- scenarios ---------------------------------------------------------------
 
 // Bodies above the threshold arrive byte-exact on one keep-alive connection:
-// with sendfile(2) on kTLS (from either mount), from RAM or read from disk on
-// userspace TLS.
+// with sendfile(2) on kTLS, read and sent in chunks on userspace TLS (from
+// either mount).
 fn check_large_files(ktls bool) ! {
 	mut fx := ts_fixture('large', false)!
 	defer {
@@ -679,7 +694,7 @@ fn check_slow_reader_parks_mid_file(ktls bool, same_write bool) ! {
 	mode_ok, mode_why := ts_mode_ok(mut c, ktls, tx0)
 	assert mode_ok, mode_why
 	ts_slow_reader(c)
-	// From RAM (memory_fallback) or read from disk on userspace TLS.
+	// Both mounts hand the file off: sendfile(2) on kTLS, chunks on userspace TLS.
 	req := if same_write { ts_get('/static/huge.bin', '') } else { ts_get('/disk/huge.bin', '') }
 	want := ts_expect(fx, req)!
 	sw := time.new_stopwatch()
@@ -703,6 +718,75 @@ fn check_slow_reader_parks_mid_file(ktls bool, same_write bool) ! {
 	assert elapsed < ts_bound_ms, 'ktls=${ktls} same_write=${same_write}: took ${elapsed}ms'
 	handed_ok, handed_why := ts_handoffs_ok(fx, ktls)
 	assert handed_ok, handed_why
+}
+
+// A body far past the 8 MiB pending-write cap (core.max_pending_write_bytes)
+// reaches a client that pauses before it reads, then the connection answers
+// the next request. With `pipelined`, that request is not sent afterwards but
+// behind the file: in the same write (1), or once the worker is mid-file and
+// parked (2). On userspace TLS the worker sends the file a chunk at a time,
+// so what it holds unsent stays far below the cap (appended whole, the body
+// would trip it: the connection closed after one write); on kTLS sendfile(2)
+// streams it. Either way a request behind the file is answered only once the
+// file is out: the plain path would read the rest of the file into the write
+// buffer to keep that order, and past the cap that closes the connection. Not
+// under tcc, where the handler appends the body whole (the sendfile slot is
+// inert), so the cap applies.
+fn check_past_cap_file(ktls bool, pipelined int) ! {
+	$if tinyc {
+		return
+	}
+	mut fx := ts_fixture('pastcap', false)!
+	defer {
+		ts_cleanup(mut fx)
+	}
+	mut h := ts_start(fx, ktls)!
+	defer {
+		h.stop()
+	}
+	tx0 := ts_tls_tx()
+	mut c := ts_dial(h.port())!
+	defer {
+		ts_close(mut c)
+	}
+	mode_ok, mode_why := ts_mode_ok(mut c, ktls, tx0)
+	assert mode_ok, mode_why
+	want_file := ts_past_cap_head.len + int(ts_past_cap_len)
+	mut got := []u8{}
+	match pipelined {
+		1 {
+			mut burst := ts_get('/past_cap', '')
+			burst << ts_ok_req
+			c.write(burst)!
+		}
+		2 {
+			c.write(ts_get('/past_cap', ''))!
+			got << ts_read_n(mut c, 1024) // the worker is in the file now
+			c.write(ts_ok_req)!
+		}
+		else {
+			c.write(ts_get('/past_cap', ''))!
+		}
+	}
+	time.sleep(ts_park_wait) // not reading: the worker parks mid-file
+	want := want_file + if pipelined > 0 { ts_ok_resp.len } else { 0 }
+	got << ts_read_n(mut c, want - got.len)
+	assert got.len == want, 'ktls=${ktls} pipelined=${pipelined}: ${got.len} of ${want} bytes'
+	assert got[..ts_past_cap_head.len] == ts_past_cap_head
+	mut zeros := true
+	for b in got[ts_past_cap_head.len..want_file] {
+		if b != 0 {
+			zeros = false
+			break
+		}
+	}
+	assert zeros, 'ktls=${ktls} pipelined=${pipelined}: the sparse file must arrive as zeros'
+	if pipelined > 0 {
+		assert got[want_file..] == ts_ok_resp, 'ktls=${ktls} pipelined=${pipelined}: the request behind the file must be answered after it'
+	}
+	assert ts_exchange(mut c, ts_ok_req, ts_ok_resp.len) == ts_ok_resp, 'ktls=${ktls} pipelined=${pipelined}: the connection must serve the next request'
+	accepted := stdatomic.load_i64(&fx.accepted.n)
+	assert accepted == 1, 'ktls=${ktls} pipelined=${pipelined}: ${accepted} hand-offs, want 1'
 }
 
 // A file replaced on disk (rename of a same-length file) is served on the
@@ -767,8 +851,8 @@ fn check_follows_the_disk(ktls bool) ! {
 // A file shorter than the Content-Length already sent for it (it shrank
 // after the head was built) ends the connection promptly instead of leaving
 // the client waiting for bytes that do not exist: on kTLS sendfile(2) hits
-// EOF and the worker closes; on userspace TLS nothing is ever queued, and the
-// handler's short read closes.
+// EOF, on userspace TLS the worker's chunked read comes up short, and the
+// worker closes after what the file had.
 fn check_shrunk_file_closes(ktls bool) ! {
 	mut fx := ts_fixture('shrunk', false)!
 	defer {
@@ -797,7 +881,7 @@ fn check_shrunk_file_closes(ktls bool) ! {
 	// sending some of it (Linux 6.5+), else by the worker's fatal alert (see
 	// check_failed_file_keeps_earlier_answers).
 	assert ts_same(got, whole), 'ktls=${ktls}: got ${got.len} of the ${whole.len} bytes of the head and file, or not byte-exact'
-	want_accepted := if ts_expect_sendfile(ktls) { i64(1) } else { i64(0) }
+	want_accepted := if ts_expect_handoffs() { i64(1) } else { i64(0) }
 	accepted := stdatomic.load_i64(&fx.accepted.n)
 	assert accepted == want_accepted, 'ktls=${ktls}: ${accepted} hand-offs, want ${want_accepted}'
 }
@@ -805,11 +889,10 @@ fn check_shrunk_file_closes(ktls bool) ! {
 // A file that fails in the sendfile phase ends the connection, but what the
 // batch carried ahead of it still arrives: the complete answer pipelined
 // before it, then its head. Here the region starts at the file's end, so
-// sendfile(2) sends nothing (an EOF pushes the open record only once some of
-// the file went out). On kTLS those bytes wait in the record the batch's
-// MSG_MORE send held open, which a bare close discards (the client would get
-// no byte): the worker sends a fatal alert first, which pushes it.
-// On userspace TLS the handler appends nothing and closes after the same bytes.
+// sendfile(2) sends nothing, and on kTLS the worker sends a fatal alert
+// before it closes: it pushes out a record that sendfile(2) may have left
+// open, which a bare close would discard. On userspace TLS the worker's read
+// of the region comes up empty, and it closes after the same bytes.
 fn check_failed_file_keeps_earlier_answers(ktls bool) ! {
 	mut fx := ts_fixture('failed', false)!
 	defer {
@@ -837,16 +920,16 @@ fn check_failed_file_keeps_earlier_answers(ktls bool) ! {
 	eof := ts_at_eof(mut c)
 	assert ts_same(got, want), 'ktls=${ktls}: got ${got.len} of the ${want.len} bytes of the answer pipelined ahead of the failed file and its head, or not byte-exact'
 	assert eof && elapsed < ts_bound_ms, 'ktls=${ktls}: a failed file must end the connection promptly (eof ${eof} after ${elapsed}ms)'
-	want_accepted := if ts_expect_sendfile(ktls) { i64(1) } else { i64(0) }
+	want_accepted := if ts_expect_handoffs() { i64(1) } else { i64(0) }
 	accepted := stdatomic.load_i64(&fx.accepted.n)
 	assert accepted == want_accepted, 'ktls=${ktls}: ${accepted} hand-offs, want ${want_accepted}'
 }
 
-// The sendfile slot is thread-local, so the TLS worker drains it after EVERY
+// The sendfile slot is thread-local, so the worker drains it after EVERY
 // handler step. One worker: every connection below shares its slot.
 //   1. GET /close queues a file and returns .close: the answer still carries
-//      the whole file (on kTLS sent with sendfile(2) after the head, in the
-//      one write before the close), then EOF.
+//      the whole file (on kTLS sent with sendfile(2) after the head), then
+//      EOF.
 //   2. GET /ok twice on a fresh connection: exactly ts_ok_resp each time. A
 //      file left queued by step 1 would be sent after the first answer.
 //   3. GET /suspend queues a file and suspends: no bytes, EOF.
@@ -898,7 +981,7 @@ fn check_slot_cleared_on_close(ktls bool) ! {
 	}
 	assert ts_exchange(mut d, ts_ok_req, ts_ok_resp.len) == ts_ok_resp
 	assert ts_exchange(mut d, ts_ok_req, ts_ok_resp.len) == ts_ok_resp, 'ktls=${ktls}: a file queued by a .suspend step leaked into the next request'
-	want_accepted := if ts_expect_sendfile(ktls) { i64(2) } else { i64(0) }
+	want_accepted := if ts_expect_handoffs() { i64(2) } else { i64(0) }
 	accepted := stdatomic.load_i64(&fx.accepted.n)
 	assert accepted == want_accepted, 'ktls=${ktls}: ${accepted} hand-offs, want ${want_accepted}'
 }
@@ -942,7 +1025,7 @@ fn check_peer_reset_mid_file(ktls bool) ! {
 	mode_ok, mode_why := ts_mode_ok(mut c, ktls, tx0)
 	assert mode_ok, mode_why
 	assert ts_exchange(mut c, ts_ok_req, ts_ok_resp.len) == ts_ok_resp, 'ktls=${ktls}: the server must survive clients that reset mid-file'
-	want_accepted := if ts_expect_sendfile(ktls) { i64(ts_reset_clients) } else { i64(0) }
+	want_accepted := if ts_expect_handoffs() { i64(ts_reset_clients) } else { i64(0) }
 	accepted := stdatomic.load_i64(&fx.accepted.n)
 	assert accepted == want_accepted, 'ktls=${ktls}: ${accepted} hand-offs, want ${want_accepted}'
 }
@@ -1059,6 +1142,17 @@ fn test_tls_static_slow_reader_parks_mid_file() ! {
 			check_slow_reader_parks_mid_file(true, false)!
 			check_slow_reader_parks_mid_file(false, true)!
 			check_slow_reader_parks_mid_file(false, false)!
+		}
+	}
+}
+
+fn test_tls_static_past_cap_file() ! {
+	$if linux {
+		$if vanilla_tls ? {
+			for pipelined in 0 .. 3 {
+				check_past_cap_file(true, pipelined)!
+				check_past_cap_file(false, pipelined)!
+			}
 		}
 	}
 }

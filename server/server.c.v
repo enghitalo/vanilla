@@ -72,7 +72,7 @@ pub mut:
 	// acceptor stops once its listener reports the shutdown (EPOLLHUP) or accept()
 	// says the listener is gone (socket.listener_gone).
 	draining &core.Counter = &core.Counter{}
-	// Server push (vanilla#230): one mailbox per epoll plain worker when
+	// Server push (vanilla#230): one mailbox per epoll worker when
 	// ServerConfig.push_mailbox_slots > 0 (empty otherwise), opaque here and
 	// never freed (ConnHandles may outlive the server).
 	mailboxes []voidptr
@@ -237,7 +237,7 @@ pub:
 	// on_worker_start runs once per worker (after make_state, before the loop) to
 	// arm CLIENTLESS background watches — e.g. a periodic timerfd that refreshes
 	// per-worker state with no shared state and no extra thread. Linux/epoll
-	// only. See core.WorkerStartFn.
+	// only, with or without TLS. See core.WorkerStartFn.
 	on_worker_start core.WorkerStartFn = unsafe { nil }
 	// after_server_start runs ONCE on the main thread the moment the server is
 	// accepting connections (all listeners bound + listening, workers spawned),
@@ -246,12 +246,12 @@ pub:
 	// to log readiness, register in service discovery, write a PID/ready file,
 	// notify a supervisor, or signal a channel in tests. See core.AfterStartFn.
 	after_server_start core.AfterStartFn = unsafe { nil }
-	// push_mailbox_slots > 0 gives every epoll plain worker a mailbox of that
-	// many slots (rounded up to a power of two; ~280 B each: 4096 slots are
-	// ~1.1 MiB per worker), through which any thread can post to a subscribed
+	// push_mailbox_slots > 0 gives every epoll worker a mailbox of that many
+	// slots (rounded up to a power of two; ~280 B each: 4096 slots are ~1.1 MiB
+	// per worker), through which any thread can post to a subscribed
 	// connection (core.ConnHandle.post_wake / post_bytes, vanilla#230). 0 (the
 	// default) = off: posts report .unsupported; subscriptions, wake_after and
-	// .closed still work. The epoll plain worker only.
+	// .closed still work. The epoll backend only, with or without TLS.
 	push_mailbox_slots int
 	// push_watermark_bytes bounds what a subscribed connection may have
 	// waiting to be sent after its wake fn ran: past it the connection is
@@ -299,7 +299,7 @@ pub fn new_server(config ServerConfig) !Server {
 		return error('provide a handler')
 	}
 	// on_worker_start arms clientless background watches on the epoll worker's
-	// reactor; the TLS worker has none, so it is epoll + plaintext only for now.
+	// reactor (plain HTTP or HTTPS); no other backend runs it.
 	if config.on_worker_start != unsafe { nil } {
 		$if linux {
 			if config.io_multiplexing != .epoll {
@@ -307,9 +307,6 @@ pub fn new_server(config ServerConfig) !Server {
 			}
 		} $else {
 			return error('on_worker_start is only supported on the Linux epoll backend')
-		}
-		if config.tls_config != unsafe { nil } {
-			return error('on_worker_start is not yet supported with TLS')
 		}
 	}
 
@@ -427,13 +424,11 @@ pub fn new_server(config ServerConfig) !Server {
 		}
 	}
 
-	// Server push mailboxes (vanilla#230): one per epoll plain worker, built
-	// once the listeners are open, here so shutdown() can reach them; never
-	// freed.
+	// Server push mailboxes (vanilla#230): one per epoll worker, built once the
+	// listeners are open, here so shutdown() can reach them; never freed.
 	mut mailboxes := []voidptr{}
 	$if linux {
-		if config.push_mailbox_slots > 0 && io_multiplexing == .epoll
-			&& config.tls_config == unsafe { nil } {
+		if config.push_mailbox_slots > 0 && io_multiplexing == .epoll {
 			mailboxes = new_push_mailboxes(n_workers, config.push_mailbox_slots)
 		}
 	}

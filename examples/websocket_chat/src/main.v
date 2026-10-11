@@ -40,7 +40,7 @@ const switching_prefix = 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket
 const head_end = '\r\n\r\n'
 const home_response = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 45\r\nConnection: keep-alive\r\n\r\nWebSocket chat: connect to /chat?name=<you>\r\n'
 const not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
-// 501: no takeover here (not the epoll plain worker, or a tcc build), or no
+// 501: no takeover here (not the epoll worker, or a tcc build), or no
 // subscription (the chat needs one to receive anything).
 const cannot_upgrade_response = 'HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
 const bad_upgrade_response = 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'

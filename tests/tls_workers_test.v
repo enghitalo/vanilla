@@ -48,7 +48,7 @@ fn tw_start() !&vtest.Harness {
 			handler:         tw_handler
 		})
 	} $else {
-		return error('the TLS worker is the Linux epoll backend')
+		return error('TLS is the Linux epoll backend')
 	}
 }
 

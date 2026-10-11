@@ -95,7 +95,7 @@ fn (mut c PgConn) set_backend_key(payload []u8) {
 // or its tombstone after a park deadline — sees `err is PgError &&
 // err.sqlstate == '57014'`. event_loop is the worker's, as handed to a handler
 // or a continuation: the exchange runs as a background watch on it, which the
-// epoll plain worker runs (elsewhere cancel fails and sends nothing). A cancel
+// epoll worker runs (elsewhere cancel fails and sends nothing). A cancel
 // already in flight on this connection makes this a no-op.
 pub fn (mut c PgConn) cancel(mut event_loop core.EventLoop) ! {
 	if c.state != .ready || c.fd < 0 {
@@ -144,7 +144,7 @@ pub fn (mut c PgConn) cancel(mut event_loop core.EventLoop) ! {
 	if !event_loop.watch_fd_background(fd, c.cancel_interest(), cancel_ready, voidptr(c)) {
 		c.cancel_finish()
 		C.close(fd)
-		return error('pg: cancel needs a worker that runs background watches (the epoll plain worker)')
+		return error('pg: cancel needs a worker that runs background watches (the epoll worker)')
 	}
 }
 

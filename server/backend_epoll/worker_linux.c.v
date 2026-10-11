@@ -167,11 +167,10 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 					}
 					continue
 				}
-				// A plain worker is told about the connection through its birth
-				// queue instead of an EPOLLOUT edge (which would wake it once more
-				// per connection); the entry's close_seq is read BEFORE the fd is
-				// registered (see BirthQueue). A full queue falls back to EPOLLOUT,
-				// as does the TLS worker (no queue).
+				// A worker is told about the connection through its birth queue
+				// instead of an EPOLLOUT edge (which would wake it once more per
+				// connection); the entry's close_seq is read BEFORE the fd is
+				// registered (see BirthQueue). A full queue falls back to EPOLLOUT.
 				mut q := queues[worker]
 				queued := q != unsafe { nil } && q.has_room()
 				seq := if queued { stdatomic.load_u64(&q.close_seq) } else { u64(0) }
@@ -202,14 +201,16 @@ fn stop_accepting(main_epoll_fd int) {
 	}
 }
 
-// Plain (HTTP) worker: owns the per-fd connection state table (persistent
-// buffers, cross-edge reads, EPOLLOUT writes), plus the watch registry that
-// resumes parked requests when a watched fd fires. ONE worker, ONE handler
-// contract: a handler that never suspends just appends and returns .done, so
-// the only extra hot-path cost over the old synchronous-only worker is a
-// per-event `watches[fd].active` load.
+// The epoll worker, for plain HTTP and HTTPS alike (tls_cfg nil or set):
+// owns the per-fd connection state table (persistent buffers, cross-edge
+// reads, EPOLLOUT writes), plus the watch registry that resumes parked
+// requests when a watched fd fires. ONE worker, ONE handler contract: a
+// handler that never suspends just appends and returns .done, so the only
+// extra hot-path cost over the old synchronous-only worker is a per-event
+// `watches[fd].active` load. TLS adds its handshake and record I/O per
+// connection (tls_conn_linux.c.v); every other part of the worker serves both.
 @[direct_array_access; manualfree]
-fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_state fn () voidptr, on_worker_start core.WorkerStartFn, limits core.Limits, counter &core.Counter, active_conns &core.Counter, listen_port int, listen_uds bool, births_q &BirthQueue, mbox &Mailbox, push_watermark int) {
+fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_state fn () voidptr, on_worker_start core.WorkerStartFn, limits core.Limits, counter &core.Counter, active_conns &core.Counter, listen_port int, listen_uds bool, births_q &BirthQueue, mbox &Mailbox, push_watermark int, tls_cfg &tls.Config) {
 	maybe_pin_worker(worker_id)
 	// Build THIS worker's per-thread state once (e.g. its own DB connection);
 	// every handler call on this worker receives it as the worker_state parameter.
@@ -229,6 +230,7 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut st := new_plain_state()
 	st.inflight = counter // parked requests count toward the shutdown drain (park_conn)
+	st.tls_cfg = tls_cfg // HTTPS: every connection starts with its handshake
 	st.reactor = unsafe { &reactor }
 	reactor.st = unsafe { &st }
 	// Arm clientless background watches (timerfd refresh, signalfd, ...) on THIS
@@ -512,6 +514,13 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 				if !handle_writable_plain(epoll_fd, fd, cs, active_conns, mut st) {
 					continue // connection closed — skip the EPOLLIN half of this event
 				}
+				if cs.held && cs.write_off >= cs.write_buf.len && cs.file_remaining <= 0 {
+					// HTTPS: the file that held the connection is out
+					// (tls_send_file_first): serve what waited behind it now, as
+					// if the client had spoken; no edge reports bytes already read.
+					cs.held = false
+					ev |= u32(C.EPOLLIN)
+				}
 			}
 			if ev & u32(C.EPOLLIN) != 0 {
 				handle_readable(handler, mut reactor, epoll_fd, fd, cs, limits, counter, active_conns, mut
@@ -541,93 +550,10 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 	}
 }
 
-// TLS (HTTPS) worker: owns the per-fd TLS session map (handshake + ssl read/write).
-// The TLS worker has no watch reactor, so handlers here must complete
-// synchronously: .suspend closes the connection (async-over-TLS is a follow-up).
-@[direct_array_access; manualfree]
-fn process_events_tls(worker_id int, epoll_fd int, handler core.Handler, make_state fn () voidptr, limits core.Limits, counter &core.Counter, active_conns &core.Counter, cfg &tls.Config) {
-	maybe_pin_worker(worker_id)
-	// Build THIS worker's per-thread state ONCE — same as the plaintext worker;
-	// every handler call reaches it via worker.state.
-	mut state := voidptr(unsafe { nil })
-	if make_state != unsafe { nil } {
-		state = make_state()
-	}
-	// This worker can stream file bodies with sendfile(2) on kernel-TLS
-	// connections, where the kernel encrypts what sendfile writes. The
-	// hand-off (core.queue_file) is gated per request: handle_readable_fd_tls
-	// closes it for a userspace-TLS connection before calling the handler.
-	core.enable_sendfile()
-	mut events := [socket.max_connection_size]C.epoll_event{}
-	mut sessions := map[int]&TlsConn{}
-	// Resolved once: the keep-alive idle budget (0 = off) and the sweep cadence
-	// (0 = no deadline is ever armed: no sweep, no clock reads, no wakes).
-	idle_ms := limits.idle_ms()
-	sweep_ms := limits.sweep_interval_ms()
-	sweep_on := sweep_ms > 0
-	sweep_ns := u64(sweep_ms) * 1_000_000
-	mut next_sweep := u64(0)
-	mut sweep_wait := sweep_ms // ms until next_sweep, as of the last sweep call
-	// Reused by every sweep (cleared, never reallocated past its high-water
-	// mark): the sweep allocates nothing, which -gc none requires.
-	mut expired := []int{cap: 64}
-	unsafe { expired.flags.set(.noslices) } // a growth frees the old block
-	for {
-		// Every session may carry a deadline (from accept on), so while any
-		// exists wake no later than the next sweep is due; otherwise sleep
-		// until the next event. (sessions only changes in the batch or the
-		// sweep, and the sweep runs after any batch that leaves one, so
-		// sweep_wait is current whenever it is used.)
-		wait_ms := if sweep_on && sessions.len > 0 { sweep_wait } else { -1 }
-		mut num_events := C.epoll_wait(epoll_fd, &events[0], socket.max_connection_size,
-			wait_ms)
-		if num_events < 0 {
-			if C.errno != C.EINTR {
-				C.perror(c'epoll_wait')
-				break
-			}
-			// Interrupted: an empty batch, so the sweep below still runs on a
-			// fresh clock and recomputes sweep_wait (a stream of signals must not
-			// keep re-arming a stale full-length wait).
-			num_events = 0
-		}
-		for i in 0 .. num_events {
-			fd := epoll.event_fd(events[i])
-			ev := events[i].events
-			if ev & (u32(C.EPOLLHUP) | u32(C.EPOLLERR)) != 0 {
-				close_tls(epoll_fd, fd, active_conns, mut sessions)
-				continue
-			}
-			mut resume := false
-			if ev & u32(C.EPOLLOUT) != 0 {
-				// Also the birth of a connection accept registered with EPOLLOUT.
-				resume = handle_writable_fd_tls(epoll_fd, fd, limits, idle_ms, active_conns,
-					cfg, mut sessions)
-				if fd !in sessions {
-					continue // session closed — skip the EPOLLIN half of this event
-				}
-			}
-			// resume: a parked response drained (or the handshake completed), so
-			// read even without EPOLLIN — bytes left unread meanwhile get no new edge.
-			if ev & u32(C.EPOLLIN) != 0 || resume {
-				handle_readable_fd_tls(handler, state, epoll_fd, fd, limits, idle_ms, counter,
-					active_conns, cfg, mut sessions)
-			}
-		}
-		// After the batch (or a timeout wake), reap expired connections — at
-		// most once per sweep interval: one clock read per busy batch, not a
-		// walk of every session.
-		if sweep_on && sessions.len > 0 {
-			next_sweep, sweep_wait = sweep_timeouts_tls(epoll_fd, active_conns, next_sweep,
-				sweep_ns, mut expired, mut sessions)
-		}
-	}
-}
-
 // run_epoll_backend is the Linux epoll backend behind Server.run (call that
 // instead): the calling thread accepts and hands each connection round-robin
-// to one epoll loop per worker thread (threads.len), plain HTTP or, with
-// tls_config, HTTPS. It prints the listening line and calls
+// to one epoll loop per worker thread (threads.len), serving plain HTTP or,
+// with tls_config, HTTPS. It prints the listening line and calls
 // after_server_start, then blocks for good: after Server.shutdown the
 // acceptor parks. It returns only if epoll_wait fails, or at once for a
 // negative socket_fd; exit(1) when the epoll or eventfd setup fails.
@@ -656,9 +582,9 @@ pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () v
 	// One worker epoll fd per worker thread. threads was sized by new_server from
 	// config.workers (default nr_cpus), so its length is this server's worker count.
 	mut epoll_fds := []int{len: threads.len, cap: threads.len}
-	// One birth queue per plain worker, only when accept-time births are on
-	// (see BirthQueue); the TLS worker is told by an EPOLLOUT edge instead.
-	queue_births := tls_config == unsafe { nil } && accept_events(limits) & u32(C.EPOLLOUT) != 0
+	// One birth queue per worker, only when accept-time births are on (see
+	// BirthQueue).
+	queue_births := accept_events(limits) & u32(C.EPOLLOUT) != 0
 	mut queues := []&BirthQueue{len: threads.len, init: unsafe { nil }}
 	if queue_births {
 		for i in 0 .. threads.len {
@@ -671,8 +597,8 @@ pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () v
 			}
 		}
 	}
-	// The listener's own address (once, here): a plain worker never detaches
-	// a socket accepted on it (PlainState.leftover_fd).
+	// The listener's own address (once, here): a worker never detaches a
+	// socket accepted on it (PlainState.leftover_fd).
 	listen_family, listen_port, _ := sock_local(socket_fd)
 	listen_uds := listen_family == C.AF_UNIX
 
@@ -689,23 +615,16 @@ pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () v
 			exit(1)
 		}
 
-		// Spawn the right concrete worker: HTTPS or plain HTTP. The plain worker
-		// has no TLS code at all, so the plain hot path carries zero TLS cost.
 		counter := inflight[i] // this worker's own in-flight counter
-		if tls_config != unsafe { nil } {
-			threads[i] = spawn process_events_tls(i, epoll_fds[i], handler, make_state, limits,
-				counter, active_conns, tls_config)
+		// The worker's mailbox (new_mailbox), when posts are on.
+		mbox := if i < mailboxes.len {
+			unsafe { &Mailbox(mailboxes[i]) }
 		} else {
-			// The worker's mailbox (new_mailbox), when posts are on.
-			mbox := if i < mailboxes.len {
-				unsafe { &Mailbox(mailboxes[i]) }
-			} else {
-				unsafe { &Mailbox(nil) }
-			}
-			threads[i] = spawn process_events_plain(i, epoll_fds[i], handler, make_state,
-				on_worker_start, limits, counter, active_conns, listen_port, listen_uds, queues[i],
-				mbox, push_watermark)
+			unsafe { &Mailbox(nil) }
 		}
+		threads[i] = spawn process_events_plain(i, epoll_fds[i], handler, make_state,
+			on_worker_start, limits, counter, active_conns, listen_port, listen_uds, queues[i],
+			mbox, push_watermark, tls_config)
 	}
 
 	if tls_config != unsafe { nil } && threads.len > 1 && !tls.parallel_crypto() {
@@ -734,10 +653,10 @@ pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () v
 // so the kernel queues exactly one event on ADD and the worker learns about
 // the connection immediately. The registration is tagged
 // (epoll.add_fd_to_epoll_tagged), and the worker treats that first tagged
-// EPOLLOUT on an fd without state as the connection's birth: the plain worker
-// creates the state and arms the deadline, with no syscall; the TLS worker
-// creates its session there and switches the fd back to EPOLLIN|EPOLLET. A
-// plain worker is told through its BirthQueue instead (registered with
+// EPOLLOUT on an fd without state as the connection's birth: the worker
+// creates the state and arms the deadline, with no syscall (an HTTPS
+// connection's session comes with its first EPOLLIN, the ClientHello). A
+// worker is told through its BirthQueue instead (registered with
 // EPOLLIN|EPOLLET, tagged), so this mask is only its fallback when the queue is
 // full. With no timeouts the mask is unchanged and nothing is tagged, so the
 // default path pays nothing.

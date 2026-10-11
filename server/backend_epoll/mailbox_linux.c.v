@@ -1,7 +1,7 @@
 module backend_epoll
 
-// The per-worker mailbox (vanilla#230): how any thread posts to a connection a
-// plain worker owns (core.ConnHandle.post_wake / post_bytes) without touching
+// The per-worker mailbox (vanilla#230): how any thread posts to a connection an
+// epoll worker owns (core.ConnHandle.post_wake / post_bytes) without touching
 // the connection. Opt-in, ServerConfig.push_mailbox_slots (0 = off: no ring,
 // no eventfd, posts report .unsupported).
 //
@@ -51,7 +51,7 @@ mut:
 	data  [mailbox_inline]u8
 }
 
-// Mailbox is one plain worker's ring. The fields producers and the worker
+// Mailbox is one worker's ring. The fields producers and the worker
 // both write each sit on their own cache line.
 @[heap]
 struct Mailbox {
@@ -76,7 +76,7 @@ mut:
 }
 
 // new_mailbox builds a mailbox of at least `slots` slots (rounded up to a
-// power of two, at least 2) and its eventfd. Called once per plain worker
+// power of two, at least 2) and its eventfd. Called once per worker
 // when the server is built; never freed.
 pub fn new_mailbox(slots int) voidptr {
 	mut n := 2
@@ -98,7 +98,7 @@ pub fn new_mailbox(slots int) voidptr {
 	return voidptr(m)
 }
 
-// mailbox_post is core.PostFn for the epoll plain worker: enqueue, never
+// mailbox_post is core.PostFn for the epoll worker: enqueue, never
 // block, from any thread.
 fn mailbox_post(mbox voidptr, fd int, epoch u64, tag u64, data []u8) core.PostResult {
 	mut m := unsafe { &Mailbox(mbox) }

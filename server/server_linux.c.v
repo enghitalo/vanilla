@@ -46,7 +46,7 @@ pub fn (mut srv Server) run() {
 	run_selected_backend(srv, mut srv.threads)
 }
 
-// new_push_mailboxes builds one push mailbox per epoll plain worker
+// new_push_mailboxes builds one push mailbox per epoll worker
 // (ServerConfig.push_mailbox_slots, vanilla#230).
 fn new_push_mailboxes(workers int, slots int) []voidptr {
 	mut out := []voidptr{cap: workers}

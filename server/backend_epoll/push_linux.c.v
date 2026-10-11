@@ -1,6 +1,6 @@
 module backend_epoll
 
-// Subscriptions on the epoll plain worker (vanilla#230): a taken-over
+// Subscriptions on the epoll worker (vanilla#230): a taken-over
 // connection registers a wake fn (core.EventLoop.subscribe) that this worker
 // calls between client bursts for every event that is not a client byte —
 // a post from any thread through the worker's mailbox (mailbox_linux.c.v),
@@ -256,7 +256,7 @@ fn discard_while_closing(epoll_fd int, fd int, active_conns &core.Counter, mut s
 		cs.read_buf.len = 0
 	}
 	for {
-		n := C.recv(fd, cs.read_buf.data, usize(cs.read_buf.cap), 0)
+		n := conn_recv(mut cs, fd, &u8(cs.read_buf.data), cs.read_buf.cap)
 		if n > 0 {
 			continue
 		}

@@ -120,7 +120,7 @@ fn on_worker_start(worker_state voidptr, mut el core.EventLoop) {
 	el.watch_fd(fd, .readable, tick, unsafe { nil })
 	if el.last_watched != fd {
 		C.close(fd)
-		eprintln('logging: worker ${w.id} cannot watch a timer (the epoll plain worker can)')
+		eprintln('logging: worker ${w.id} cannot watch a timer (the epoll worker can)')
 		return
 	}
 	w.timer_fd = fd

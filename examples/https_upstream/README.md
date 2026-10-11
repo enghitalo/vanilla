@@ -93,9 +93,9 @@ return .done
 
 ## Platform
 
-The Linux epoll plaintext worker: it parks requests and runs
-`on_worker_start`. Terminate TLS in front of vanilla (a load balancer), or use
-the epoll plain worker behind it, as with `pg_async`.
+The Linux epoll worker, the one that parks requests and runs
+`on_worker_start`, serving plain HTTP or HTTPS (`ServerConfig.tls_config`, built
+with `-d vanilla_tls`).
 
 ## Tests
 

@@ -192,10 +192,21 @@ concatenates, interpolates or allocates per request. The
 
 ### 16. Integrate TLS into the Server — 🟡 PARTIAL
 - **Done:** TLS lives in the backend worker, not in the request/response
-  codecs: `server/backend_epoll/tls_conn_linux.c.v` (handshake, record I/O,
-  pipelining, `sendfile` over kTLS, deadline sweep), enabled with
-  `ServerConfig.tls_config`. PRs #96, #158, #159, #160, #181, #182.
-- **Testing:** `tests/tls_pipelining_test.v`, `tls_static_test.v`,
+  codecs, enabled with `ServerConfig.tls_config`. HTTPS connections run on
+  the epoll worker's own connection state, reactor and timeouts, the same as
+  plain HTTP: `server/backend_epoll/tls_conn_linux.c.v` adds only the
+  handshake and the record I/O (Mbed TLS, or kTLS with `sendfile(2)`) behind
+  `conn_recv` / `conn_send`. So `.suspend` with park deadlines, takeover
+  (WebSocket over TLS), server push, `on_worker_start`, streamed uploads,
+  `Expect: 100-continue` and a `.close` that sends everything first
+  ([#275](https://github.com/enghitalo/vanilla/issues/275)'s TLS gap) all
+  work over HTTPS; on userspace TLS a `core.queue_file` region goes out in
+  64 KiB chunks, and a request pipelined behind a file waits until the file
+  is out (no 8 MiB write-cap truncation). The plaintext path did not get
+  slower: callgrind counts 792 → 789 instructions per request. PRs #96,
+  #158, #159, #160, #181, #182, #320.
+- **Testing:** `tests/tls_async_test.v` (the async features above, over
+  userspace TLS and kTLS), `tls_pipelining_test.v`, `tls_static_test.v`,
   `tls_timeouts_test.v`, `tls_workers_test.v` (`.github/workflows/tls_backend.yml`).
 - **Also done:** `new_server` refuses `tls_config` on every backend but
   epoll, before it binds anything; io_uring and kqueue used to accept it and
@@ -206,8 +217,6 @@ concatenates, interpolates or allocates per request. The
   - TLS on io_uring and kqueue (refused for now), and on IOCP ([#115](https://github.com/enghitalo/vanilla/issues/115)),
     HTTP/2 over TLS + ALPN ([#142](https://github.com/enghitalo/vanilla/issues/142)),
     kTLS + `sendfile` for every static path ([#76](https://github.com/enghitalo/vanilla/issues/76)).
-  - A TLS `.close` is one best-effort write ([#275](https://github.com/enghitalo/vanilla/issues/275)).
-  - `on_worker_start` and server push are not available with TLS.
 
 ### 17. Self-Signed Certificate Generation — ✅ RESOLVED
 - **Resolution:** `tls.new_self_signed(SelfSignedOpts)` generates an X.509 v3
@@ -281,7 +290,7 @@ concatenates, interpolates or allocates per request. The
   original plan (a fixed 5-second `epoll_wait`/`kevent` timeout) was not used:
   a rate-limited sweep costs nothing when no timeout is configured (PR #151).
   Parked requests are bounded by `Limits.park_timeout_ms` /
-  `watch_fd_deadline` (PR #249, #200; epoll plain worker only).
+  `watch_fd_deadline` (PR #249, #200; epoll worker only).
 - **Still open:** the kqueue (darwin) backend enforces none of these timeouts
   (nor `max_connections`): `wait_kqueue(..., -1)` never wakes for a sweep, and
   `accept` busy-spins on `EMFILE`.
@@ -308,7 +317,8 @@ concatenates, interpolates or allocates per request. The
     still drops a client on a short `C.send`.
   - Close paths: the untransmitted tail is lost when the client keeps sending
     after `close()` ([#272](https://github.com/enghitalo/vanilla/issues/272));
-    gaps after #268 ([#275](https://github.com/enghitalo/vanilla/issues/275));
+    gaps after #268 ([#275](https://github.com/enghitalo/vanilla/issues/275);
+    its TLS `.close` gap is fixed);
     `.close` ordering on parked push connections
     ([#270](https://github.com/enghitalo/vanilla/issues/270));
     `core.queue_file` sent after another client's response
@@ -604,7 +614,7 @@ Open and partial items only.
 
 ### Phase 2: TLS/HTTPS
 - [x] #15 - TLS bindings
-- [ ] #16 - TLS everywhere on epoll, then other backends (#156 done)
+- [ ] #16 - TLS on io_uring, kqueue and IOCP, h2 over TLS (#156 and async over TLS done)
 - [x] #17 - Self-signed certificates
 - [x] #34 - HTTPS example
 
