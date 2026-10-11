@@ -249,6 +249,18 @@ syscall wrappers, and sidestepping V codegen quirks. Example in the tree:
 [`epoll/epoll_shim.h`](../epoll/epoll_shim.h) keeps the
 `union epoll_data` access in C so V's GC never mislabels the union.
 
+**A V `int` is 64-bit; a C `int` is not.** `sizeof(int)` is 8 and `int` is
+`i64` in the emitted C, so declare a C `int*` parameter or return as `&i32`,
+with an `i32` local behind it: `fn C.pipe(fds &i32) int`,
+`fn C.vanilla_sf_take(out_fd &i32, …)` in
+[`core/sendfile_slot.c.v`](../core/sendfile_slot.c.v). V patches only some
+`&int` declarations (V 0.5.2 e5f8d31, 2026-10-11). `&x` goes through a C `int`
+temporary that is copied back, which `-O3` folds away. A `[]int`'s `.data`
+goes through a `calloc`'d copy, an allocation on every call. `&a[0]` of a
+`[N]int` is passed as a plain cast, so C's `int`s land packed in `a[0]`. A
+returned `&int` gets nothing: `*p = e` stores 8 bytes, over the `int` after
+it (errno through `__errno_location()`).
+
 ## Beyond `[]u8`
 
 Arrays aren't the only structure. Consider: `map`, fixed `[N]T` (stack), channels,

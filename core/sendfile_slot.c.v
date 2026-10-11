@@ -21,7 +21,7 @@ module core
 fn C.vanilla_sf_enable()
 fn C.vanilla_sf_set_allowed(allowed bool)
 fn C.vanilla_sf_queue(file_fd int, off i64, len i64) bool
-fn C.vanilla_sf_take(out_fd &int, out_off &i64, out_len &i64) bool
+fn C.vanilla_sf_take(out_fd &i32, out_off &i64, out_len &i64) bool
 
 // QueuedFile is a borrowed file region a worker should send after the headers
 // already appended to the write buffer. The fd is NOT owned by the worker.
@@ -80,12 +80,12 @@ pub fn queue_file(file_fd int, off i64, len i64) bool {
 // next request.
 @[inline]
 pub fn take_queued_file() ?QueuedFile {
-	mut fd := 0
+	mut fd := i32(0) // a C int
 	mut off := i64(0)
 	mut len := i64(0)
 	if C.vanilla_sf_take(&fd, &off, &len) {
 		return QueuedFile{
-			file_fd: fd
+			file_fd: int(fd)
 			off:     off
 			len:     len
 		}
