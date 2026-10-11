@@ -30,10 +30,9 @@ fn (controller App) get_users_controller(_ request_parser.HttpRequest, mut out [
 	core.append_str(mut out, http_ok_response)
 }
 
-fn (controller App) get_user_controller(req request_parser.HttpRequest, mut out []u8) {
-	path := unsafe { tos(&req.buffer[req.path.start], req.path.len) }
-	id := unsafe { tos(path.str + 6, path.len - 6) } // path is "/user/{id}"; a view, no copy
-
+// get_user_controller echoes the id back as text/plain. `id` is a view into
+// the request buffer: read here, never retained.
+fn (controller App) get_user_controller(id string, mut out []u8) {
 	core.append_str(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ')
 	wi(mut out, id.len)
 	core.append_str(mut out, '\r\nConnection: keep-alive\r\n\r\n')
