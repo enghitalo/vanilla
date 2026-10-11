@@ -7,11 +7,12 @@ with the router in [main.v](src/main.v) and the controllers in
 [controllers.v](src/controllers.v).
 
 It is written the straightforward way, to read easily: the router compares
-`string` views, and each controller **returns** a `[]u8` that the router then
-appends to `out`. The next two examples change one thing each:
-[simple2](../simple2/) keeps these routes but rewrites them to the project's
-byte discipline, and [simple3](../simple3/) keeps this code but hangs the
-handler on an `App` struct that owns shared resources.
+`string` views of the request with `==`, and each controller appends its
+response straight into `out`. It still allocates nothing per request. The
+next two examples change one thing each: [simple2](../simple2/) routes by
+byte offsets instead of building string views, and [simple3](../simple3/)
+keeps this code but hangs the handler on an `App` struct that owns shared
+resources.
 
 ## File layout
 
@@ -72,17 +73,17 @@ The id is everything after `/user/`, query included: `/user/7?x=1` echoes
 - **One handler is the router.** `handle_request` decodes the request with
   `request_parser.decode_http_request` (a malformed one gets
   `response.tiny_bad_request_response` and `.close`), takes the method and
-  path as `tos` views into the request buffer (no copy), and branches with
-  `==` and `starts_with`.
-- **Controllers return the whole response.** `home_controller` and
-  `create_user_controller` return `const` responses (`.bytes()`);
-  `get_user_controller` builds its reply in a `strings.Builder`. The router
-  appends the returned bytes with `out << ...`.
-- **This is the readable version, not the fast one.** `/user/:id` allocates
-  per request: `path[6..]` copies the id, `[id]` allocates the params array,
-  `.str()` formats the length, and the builder plus the return-then-copy into
-  `out` add more. [BEST_PRACTICES §1](../../docs/BEST_PRACTICES.md#1-handlers-append-into-the-connections-write-buffer-zero-alloc)
-  explains why that matters at scale; [simple2](../simple2/) removes all of it.
+  path as `tos` views of the handler's `req_buffer` (no copy), and branches
+  with `==` and `starts_with`. The views come from `req_buffer`, not
+  `req.buffer`: a view of `req.buffer` that reaches a callee makes V copy the
+  whole request struct to the heap on every request.
+- **Controllers append the whole response.** Each takes `mut out []u8`:
+  `home_controller` and `create_user_controller` append `const` strings with
+  `core.append_str`, and `get_user_controller` gets the id as a view of the
+  path (`tos(path.str + 6, ...)`, not `path[6..]`, which copies) and frames
+  its reply with `core.append_str` plus the local `wi` for `Content-Length`.
+  Nothing is returned to be copied into `out` again
+  ([BEST_PRACTICES §1](../../docs/BEST_PRACTICES.md#1-handlers-append-into-the-connections-write-buffer-zero-alloc)).
 - `get_users_controller` is defined but no route reaches it (the compiler
   notes it as unused).
 
@@ -93,15 +94,15 @@ v test examples/simple/src
 ```
 
 [main_test.v](src/main_test.v) calls `handle_request` directly on four raw
-requests (home, user, create, an unknown `INVALID` method) and compares the
-bytes. [server_end_to_end_test.v](src/server_end_to_end_test.v) sends the same
+requests (home, user, create, an unknown `INVALID` method), compares the
+bytes, and checks that no route allocates (a `gc_heap_usage()` delta over 20k
+rounds). [server_end_to_end_test.v](src/server_end_to_end_test.v) sends the same
 four over real sockets with `vtest.drive` (ephemeral port, all connections
 concurrent across the workers) and checks each response byte for byte.
 
 ## See also
 
-- [examples/simple2](../simple2/) — the same routes, zero-copy routing and
-  controllers that append straight into `out`
+- [examples/simple2](../simple2/) — the same routes, routed by byte offsets
 - [examples/simple3](../simple3/) — the same code with the handler as a method
   on an `App` struct holding a SQLite pool
 - [examples/router](../router/), [examples/veb_like](../veb_like/) — routing
