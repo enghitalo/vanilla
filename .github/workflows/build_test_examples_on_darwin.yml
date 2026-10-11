@@ -102,3 +102,30 @@ jobs:
         shell: bash
         run: |
           v test $(pwd)/${{ matrix.folder }}
+
+  # new_server's config checks on kqueue (no example lane runs server/ here):
+  # tls_config is refused instead of served as plaintext (#156), and the
+  # after_server_start hook fires once the server is accepting.
+  server-tests:
+    runs-on: macos-latest
+    name: server/server_test.v
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache V toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/hostedtoolcache/v
+          key: v-toolchain-${{ runner.os }}-${{ runner.arch }}
+      - name: Set up V
+        uses: vlang/setup-v@v1.7
+        with:
+          clean: false
+      - name: Remove Vlang folder to avoid conflicts
+        shell: bash
+        run: |
+          rm -rf -v ./vlang || true
+      - name: Test server/server_test.v
+        shell: bash
+        run: |
+          v test server/server_test.v

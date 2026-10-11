@@ -26,6 +26,10 @@ bin/
 !examples/spa_static_assets/dist/*.js
 
 server_cert.pem
+# examples/https writes its self-signed identity to certs/ in the working
+# directory (the repo root, or the example's own folder)
+/certs/
+examples/https/certs/
 
 # generated at runtime by examples/video_stream
 sample.mp4
