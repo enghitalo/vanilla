@@ -643,9 +643,12 @@ concatenates, interpolates or allocates per request. The
   [BEST_PRACTICES](docs/BEST_PRACTICES.md). Each command was run against the
   built server, and the PostgreSQL ones against a throwaway `postgres:16`.
   Bugs found while writing them: #292, #293, #294.
-  The READMEs of the examples #279 rewrote were re-read against the new code
-  and corrected in the same commits: helper names, per-worker state and
-  allocation claims.
+  The READMEs of the 24 examples #279 rewrote were then re-verified on their
+  own against the new code: every command re-run and every response diffed,
+  every name and allocation claim checked against the source and tests. 17
+  needed fixes, among them `ip_block`'s edit to see the 403 (`block` now
+  returns a Result) and `async_db_pg`'s Docker setup (wait for
+  `pg_isready`).
 
 ---
 
