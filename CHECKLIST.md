@@ -588,9 +588,10 @@ concatenates, interpolates or allocates per request. The
   `ulimit -n`, `net.core.somaxconn` and other sysctls, buffer sizing.
 
 ### 46. Example Walkthroughs — 🔴 OPEN
-- **Issue:** 12 of 50 example directories have a README (`conformance`,
+- **Issue:** 13 of 50 example directories have a README (`conformance`,
   `etag`, `hexagonal`, `https_upstream`, `json_api`, `mesh`, `middleware`,
-  `router`, `spa_static_assets`, `sse`, `veb_like`, `video_stream`).
+  `router`, `security_headers`, `spa_static_assets`, `sse`, `veb_like`,
+  `video_stream`).
 - **Priority:** 🟡 MEDIUM
 - **Strategy:** most of the other 38 open `main.v` with a long explanatory
   comment that can seed the README; start with the security examples (#37),
