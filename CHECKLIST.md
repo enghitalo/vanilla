@@ -2,7 +2,7 @@
 
 > Comprehensive roadmap of improvements, features, and implementations
 >
-> **Last Updated:** 2026-10-10
+> **Last Updated:** 2026-10-11
 > **Project:** Vanilla HTTP Server v0.0.1
 
 Each item carries a status in its heading:
@@ -560,11 +560,39 @@ concatenates, interpolates or allocates per request. The
 
 ## 📖 Documentation
 
-### 42. Complete API Documentation — 🟡 PARTIAL
-- **Done:** about 85% of library `pub fn`s carry a doc comment; most modules
-  are at 93-100%.
-- **Remains:** `tls/` (~44%) and `server/` (~61%), then `socket/` and
-  `pg_async/`. Same style as the parser:
+### 42. Complete API Documentation — ✅ RESOLVED (`tls/`, `server/`)
+- **Resolution:** every `pub fn` / `struct` / `enum` / `const` / `type` in
+  `tls/` and `server/` (with `server/backend_epoll` and `backend_poll`) has a
+  doc comment that starts with its name, and so does every pub field. The
+  comments give what the symbol returns and how it errors, plus allocation,
+  threading and backend support where they matter: `Server.run` per backend,
+  `Session.read_into` / `write_from` retry rules, and which `Config` setters
+  are atomic. `v doc tls` renders the default build's stub
+  (`tls_stub_notd_vanilla_tls.c.v`), so the stub carries the user-facing
+  contract, followed by what it does without `-d vanilla_tls`.
+- **Measured** with `scripts/doc_coverage.sh` (`-v` lists what is missing; a
+  "loose" comment is one that does not start with the name), against origin/main
+  d82b7bb:
+
+  | module | before | after |
+  |---|---|---|
+  | `tls` | 29/67 (43%), 3 loose | 67/67 (100%) |
+  | `server` | 9/20 (45%), 3 loose; fields 18/37 | 20/20 (100%); fields 37/37 |
+  | `server/backend_epoll` | 5/7 (71%) | 7/7 (100%) |
+  | `server/backend_poll` | 1/1 (100%) | 1/1 (100%) |
+  | whole repo | 439/689 (64%); fields 135/281 | 490/689 (71%); fields 154/281 |
+- **Found while documenting:**
+  - [#287](https://github.com/enghitalo/vanilla/issues/287): `ServerConfig.certificates`
+    is never read. The field is now documented as ignored, and
+    `server/README.md` no longer says to set it.
+  - [#297](https://github.com/enghitalo/vanilla/issues/297): `set_alpn`
+    silently merges a 5th protocol into the 4th.
+  - [#298](https://github.com/enghitalo/vanilla/issues/298): kqueue's `run()`
+    returns silently when a kqueue cannot be created.
+- **Next modules** (same style, outside this item): `socket/` (62%) and
+  `pg_async/` (62%); then the lowest, `kqueue` (0%), `http1_1/response` (10%),
+  `poll` (14%), `epoll` (36%), `websocket` (39%) and `io_uring` (42%). The
+  style follows the parser's:
   ```v
   // frame_request_length_lim_idx returns the length of the first complete
   // request in buf, -1 if it is incomplete, or -400 / -413 / -431 when it must
@@ -628,7 +656,7 @@ Open and partial items only.
 | Priority | Count | Items |
 |----------|-------|-------|
 | 🔴 HIGH | 2 | #16 (#156: plaintext on io_uring/kqueue), #34 |
-| 🟡 MEDIUM | 7 | #4, #19, #23, #39, #40, #42, #44 |
+| 🟡 MEDIUM | 6 | #4, #19, #23, #39, #40, #44 |
 | 🟢 LOW | 0 | — |
 
 ---
@@ -675,7 +703,7 @@ Open and partial items only.
 - [x] #41 - Benchmarks
 
 ### Phase 6: Documentation
-- [ ] #42 - API docs (`tls/`, `server/`)
+- [x] #42 - API docs (`tls/`, `server/`)
 - [x] #43 - Architecture doc
 - [ ] #44 - SECURITY.md
 - [x] #45 - Performance tuning page
@@ -685,13 +713,14 @@ Open and partial items only.
 
 ## 📈 Progress Tracking
 
-### Resolved: 28/37 (76%)
-- ✅ 24 done: #2, #3, #5, #8, #10, #11, #15, #17, #18, #20, #21 (except
-  kqueue), #25, #27, #28, #29, #33, #35, #36, #37, #38, #41, #43, #45, #46
+### Resolved: 29/37 (78%)
+- ✅ 25 done: #2, #3, #5, #8, #10, #11, #15, #17, #18, #20, #21 (except
+  kqueue), #25, #27, #28, #29, #33, #35, #36, #37, #38, #41, #42, #43, #45,
+  #46
 - ⚪ 4 obsolete: #1, #6, #26, #32
 
-### Partial: 7/37 (19%)
-#16, #19, #23, #39, #40, #42, #44
+### Partial: 6/37 (16%)
+#16, #19, #23, #39, #40, #44
 
 ### Open: 2/37 (5%)
 #4, #34
@@ -727,7 +756,7 @@ Server push / close paths:
 
 For contributors wanting to learn:
 
-- **Intermediate:** #34, #40, #42
+- **Intermediate:** #34, #40
 - **Advanced:** #4/#19 (kqueue, #154), #16 (#156), #23
 
 ---
