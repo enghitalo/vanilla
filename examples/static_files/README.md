@@ -111,8 +111,8 @@ same 404. `curl -i -X POST localhost:3000/index.html` gets
   `realpath(3)` resolves it into a second one, so `..` and symlinks are
   followed before the check. The candidate must be the root **plus a path
   separator**: a bare `starts_with` would let `./public2` pass for `./public`
-  (#228). A path that does not resolve (missing file, symlink loop), holds a
-  NUL or is longer than `PATH_MAX` is refused, and so is anything `fstat`
+  (#228). A path that does not resolve (missing file, symlink loop), ends in
+  `/`, holds a NUL or is longer than `PATH_MAX` is refused, and so is anything `fstat`
   says is not a regular file. Every refusal is a 404, the same answer as a
   missing file.
 - **No percent-decoding.** The core hands the path over raw, so `%2e%2e` is

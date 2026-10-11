@@ -210,6 +210,12 @@ fn safe_path(mut st State, url_path []u8) ?int {
 	if st.root.len + url_path.len + 2 > st.resolved.len {
 		return none
 	}
+	// Only regular files are served, and a path ending in '/' names a
+	// directory: refuse it here. realpath(3) refuses `file/` on Linux
+	// (ENOTDIR) but resolves it to the file on macOS.
+	if url_path.len > 0 && url_path[url_path.len - 1] == `/` {
+		return none
+	}
 	// A NUL would end the C string early, so realpath would resolve a shorter
 	// path than the one requested: refuse it.
 	if url_path.len > 0 && unsafe { C.memchr(url_path.data, 0, usize(url_path.len)) } != nil {
