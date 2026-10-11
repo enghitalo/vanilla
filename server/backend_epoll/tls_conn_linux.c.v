@@ -40,7 +40,6 @@ import time
 
 #include <sys/epoll.h>
 
-const tls_max_request_bytes = 8 * 1024 * 1024
 // One full TLS record of plaintext (2^14). Responses to pipelined requests
 // are appended into one buffer and sent together; once it holds this much it
 // is sent before the next request is served: mbedTLS encrypts at most one
@@ -49,6 +48,11 @@ const tls_max_request_bytes = 8 * 1024 * 1024
 // caps how far a read that fills the read buffer grows it (a pipelined burst
 // is then read a record at a time, not a few hundred bytes at a time).
 const tls_record_bytes = 16 * 1024
+// First capacities of a connection's read and response buffers (the response
+// one is allocated at its first complete request). Both grow as needed and are
+// pooled with the connection.
+const tls_read_buf_cap = 256
+const tls_resp_buf_cap = 4096
 
 // TlsFlush is how a send of a whole response batch ended (tls_flush).
 enum TlsFlush {
@@ -227,7 +231,7 @@ fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd 
 		}
 		conn.read_buf = []u8{}
 	} else {
-		buf = []u8{len: 0, cap: 256}
+		buf = []u8{len: 0, cap: tls_read_buf_cap}
 		// Both buffers live and die with this connection, so a growth must free
 		// the block it outgrew: under -gc none it would leak otherwise, once
 		// per connection. Safe: the handler only ever sees views of buf, and
@@ -244,7 +248,7 @@ fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd 
 	req_cap := if limits.max_request_bytes > 0 {
 		limits.max_request_bytes
 	} else {
-		tls_max_request_bytes
+		core.default_max_request_bytes
 	}
 	// The TLS worker has no watch reactor: register is a stub that arms nothing,
 	// so a handler that calls event_loop.watch_fd and suspends is dropped below.
@@ -277,7 +281,7 @@ fn handle_readable_fd_tls(handler core.Handler, state voidptr, epoll_fd int, fd 
 			// armed at accept) is over.
 			conn.read_deadline = 0
 			if resp.cap == 0 {
-				resp = []u8{len: 0, cap: 4096}
+				resp = []u8{len: 0, cap: tls_resp_buf_cap}
 				unsafe { resp.flags.set(.noslices) } // see buf above
 			}
 			// sendfile(2) writes plaintext, which only a kTLS socket encrypts: the

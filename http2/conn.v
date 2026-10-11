@@ -48,8 +48,8 @@ pub const max_concurrent_streams = 128
 const max_header_block = 64 * 1024
 
 // A request body larger than this closes the connection — mirrors the h1
-// engine's built-in request ceiling (sm_max_request_bytes).
-const max_body_bytes = 8 * 1024 * 1024
+// engine's built-in request ceiling.
+const max_body_bytes = core.default_max_request_bytes
 
 @[heap]
 struct StreamState {

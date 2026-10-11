@@ -48,9 +48,6 @@ pub fn iou_backend_available() bool {
 	return io_uring.io_uring_available_for(max_thread_pool_size)
 }
 
-// Default ceiling on a single buffered request (headers+body) when the server
-// configures no max_request_bytes. Mirrors the epoll backend (sm_max_request_bytes).
-const iou_max_request_bytes = 8 * 1024 * 1024
 // A request body larger than this is STREAMED, not buffered: the head is answered
 // on its own and the body is drained off the socket into the fixed read buffer and
 // discarded (see start_iou_body_drain). Keeps a multi-MB upload at O(read_buf_cap)
@@ -59,9 +56,6 @@ const iou_max_request_bytes = 8 * 1024 * 1024
 // Content-Length (request_parser.HttpRequest.content_length()), since no body is
 // passed to them — the /upload profile is exactly this shape.
 const iou_stream_body_above = 1024 * 1024
-// Close a peer that pipelines requests but never drains responses, before its
-// response batch grows without bound.
-const iou_max_pending_write = 8 * 1024 * 1024
 
 // iou_release decrements the global connection count (only when max_connections
 // accounting is active) and returns the connection to its pool. pool_release is
@@ -358,7 +352,7 @@ fn handle_io_uring_read(worker &io_uring.Worker, cqe &io_uring.Cqe, mut env IouE
 	req_cap := if limits.max_request_bytes > 0 {
 		limits.max_request_bytes
 	} else {
-		iou_max_request_bytes
+		core.default_max_request_bytes
 	}
 	// Enforce the single-request ceiling on a leftover partial that never frames
 	// (mirrors the epoll backend's req_cap check).

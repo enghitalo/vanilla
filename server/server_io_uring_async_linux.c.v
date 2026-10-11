@@ -604,7 +604,7 @@ fn iou_drain_requests(mut env IouEnv, mut conn io_uring.Connection, limits Limit
 		}
 		// Peer pipelines requests but never reads responses: bail before the pending
 		// batch grows without bound.
-		if conn.response_buffer.len - conn.bytes_sent > iou_max_pending_write {
+		if conn.response_buffer.len - conn.bytes_sent > core.max_pending_write_bytes {
 			conn.close_after_send = true
 		}
 	}

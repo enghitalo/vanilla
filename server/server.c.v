@@ -230,7 +230,8 @@ pub:
 	push_mailbox_slots int
 	// push_watermark_bytes bounds what a subscribed connection may have
 	// waiting to be sent after its wake fn ran: past it the connection is
-	// closed (a subscriber that stopped reading). 0 = 1 MiB; at most 8 MiB.
+	// closed (a subscriber that stopped reading). 0 = 1 MiB; at most
+	// core.max_pending_write_bytes (8 MiB).
 	push_watermark_bytes int
 	certificates         Certificates
 	limits               Limits

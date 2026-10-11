@@ -18,6 +18,13 @@ import http1_1.response
 import core
 import sync.stdatomic
 
+// Most events one kevent() call returns to a worker; the rest wait for the
+// next call.
+const kq_max_events = 1024
+// First capacity of a connection's response buffer (KqConn.out); it grows as
+// needed and is freed when the connection closes.
+const kq_out_cap = 4096
+
 // KqConn holds a connection's response buffer across a suspend (the macOS sync
 // path allocates a fresh buffer per request; an async request must keep it while
 // the watch is pending). awaiting_fd is the ext fd this conn is parked on (-1 if
@@ -94,9 +101,9 @@ fn process_kqueue_worker(kq int, handler core.Handler, make_state fn () voidptr,
 		watches:  map[int]KqWatch{}
 		inflight: inflight
 	}
-	mut events := [1024]C.kevent{}
+	mut events := [kq_max_events]C.kevent{}
 	for {
-		nev := kqueue.wait_kqueue(kq, &events[0], 1024, -1)
+		nev := kqueue.wait_kqueue(kq, &events[0], kq_max_events, -1)
 		if nev < 0 {
 			if C.errno == C.EINTR {
 				continue
@@ -181,7 +188,7 @@ fn kq_handle_request(h core.Handler, mut reactor KqReactor, kq int, fd int, limi
 	}
 	mut conn := reactor.conns[fd] or {
 		c := &KqConn{
-			out: []u8{len: 0, cap: 4096}
+			out: []u8{len: 0, cap: kq_out_cap}
 		}
 		reactor.conns[fd] = c
 		c

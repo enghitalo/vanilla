@@ -639,7 +639,7 @@ fn read_while_parked(mut reactor Reactor, epoll_fd int, fd int, limits core.Limi
 	req_cap := if limits.max_request_bytes > 0 {
 		limits.max_request_bytes
 	} else {
-		sm_max_request_bytes
+		core.default_max_request_bytes
 	}
 	for {
 		if cs.read_buf.len == cs.read_buf.cap {
@@ -680,7 +680,7 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 	req_cap := if limits.max_request_bytes > 0 {
 		limits.max_request_bytes
 	} else {
-		sm_max_request_bytes
+		core.default_max_request_bytes
 	}
 	// Drain requests ALREADY buffered before reading more. A `.done` resume hands
 	// this function a read_buf holding the requests that were pipelined BEHIND the
@@ -901,7 +901,7 @@ fn serve_takeover_conn(mut reactor Reactor, epoll_fd int, fd int, limits core.Li
 	req_cap := if limits.max_request_bytes > 0 {
 		limits.max_request_bytes
 	} else {
-		sm_max_request_bytes
+		core.default_max_request_bytes
 	}
 	// Bytes pipelined behind the upgrade request (or left from the previous
 	// burst) first — no readable edge is coming for them (vanilla#100 lesson).
@@ -1029,7 +1029,7 @@ fn drain_takeover(mut reactor Reactor, epoll_fd int, fd int, limits core.Limits,
 		// Peer floods without reading: bail before the batch is unbounded. One
 		// flush, then the close — not flush_then_close: a peer that reads
 		// nothing would hold the connection open.
-		if cs.write_buf.len - cs.write_off > sm_max_pending_write {
+		if cs.write_buf.len - cs.write_off > core.max_pending_write_bytes {
 			if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
 				close_conn(epoll_fd, fd, active_conns, mut st)
 			}
@@ -1251,7 +1251,7 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 		// Peer pipelines without reading responses: bail before the batch is
 		// unbounded. One flush, then the close — not flush_then_close: a peer
 		// that reads nothing would hold the connection open.
-		if cs.write_buf.len - cs.write_off > sm_max_pending_write {
+		if cs.write_buf.len - cs.write_off > core.max_pending_write_bytes {
 			compact_read_buf(mut cs, pos)
 			if flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) {
 				close_conn(epoll_fd, fd, active_conns, mut st)

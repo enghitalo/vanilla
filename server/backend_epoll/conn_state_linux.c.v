@@ -18,7 +18,7 @@ module backend_epoll
 //   • backpressure — a batch that can't be sent in one go is parked and
 //     drained on EPOLLOUT (write_timeout guarded), never truncated; a peer
 //     that pipelines requests without reading responses is closed once its
-//     pending batch exceeds sm_max_pending_write.
+//     pending batch exceeds core.max_pending_write_bytes.
 import core
 import epoll
 import http1_1.response
@@ -46,13 +46,9 @@ fn C.memmove(__dest voidptr, __src voidptr, __n usize) voidptr
 // because a pipelined response must follow it in order.
 fn C.sendfile(out_fd int, in_fd int, offset &i64, count usize) isize
 
-const sm_max_request_bytes = 8 * 1024 * 1024
 // Bound a single sendfile(2) call so one connection can't monopolize the worker;
 // the remainder streams on the next writable edge.
 const sm_sendfile_chunk = 1024 * 1024
-// Write-side cap: close a connection whose peer pipelines requests but never
-// drains responses (otherwise write_buf would grow without bound).
-const sm_max_pending_write = 8 * 1024 * 1024
 const read_buf_cap = 8 * 1024
 const write_buf_cap = 16 * 1024
 const conn_table_min = 1024

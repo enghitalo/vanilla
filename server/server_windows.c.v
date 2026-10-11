@@ -58,10 +58,6 @@ pub enum IOBackend {
 
 const win_read_buf_cap = 8 * 1024
 const win_write_buf_cap = 16 * 1024
-const win_max_request_bytes = 8 * 1024 * 1024
-// Write-side cap: close a connection whose peer pipelines requests but never
-// drains responses (otherwise write_buf would grow without bound).
-const win_max_pending_write = 8 * 1024 * 1024
 // A request whose framed size exceeds this is STREAMED, not buffered: the head
 // is answered and the body is drained (recv'd into the fixed buffer and
 // discarded) instead of growing read_buf into a multi-MB block.
@@ -409,7 +405,7 @@ fn win_drain_requests(h core.Handler, mut cs WinConn, limits core.Limits, state 
 			break
 		}
 		// Peer pipelines without reading responses: bail before the batch is unbounded.
-		if cs.write_buf.len - cs.write_off > win_max_pending_write {
+		if cs.write_buf.len - cs.write_off > core.max_pending_write_bytes {
 			cs.close_after = true
 			break
 		}
@@ -479,7 +475,7 @@ fn win_arm_recv(h core.Handler, mut st WinState, mut cs WinConn, limits core.Lim
 		req_cap := if limits.max_request_bytes > 0 {
 			limits.max_request_bytes
 		} else {
-			win_max_request_bytes
+			core.default_max_request_bytes
 		}
 		target := request_parser.frame_expected_total(cs.read_buf)
 		if target > win_stream_body_above && target <= req_cap {
@@ -558,7 +554,7 @@ fn win_on_recv(h core.Handler, mut st WinState, mut cs WinConn, n int, limits co
 		req_cap := if limits.max_request_bytes > 0 {
 			limits.max_request_bytes
 		} else {
-			win_max_request_bytes
+			core.default_max_request_bytes
 		}
 		if cs.read_buf.len > req_cap {
 			cs.write_buf << response.status_413_response

@@ -265,10 +265,10 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 	// Subscriptions (push_linux.c.v): the mailbox, when posts are on, and the
 	// pending-write bound of a pushed connection.
 	st.mbox = mbox
-	st.push_watermark = if push_watermark > 0 && push_watermark < sm_max_pending_write {
+	st.push_watermark = if push_watermark > 0 && push_watermark < core.max_pending_write_bytes {
 		push_watermark
 	} else if push_watermark > 0 {
-		sm_max_pending_write
+		core.max_pending_write_bytes
 	} else {
 		push_default_watermark
 	}

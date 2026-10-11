@@ -33,8 +33,6 @@ fn C.recv(__fd int, __buf voidptr, __n usize, __flags int) int
 fn C.send(__fd int, __buf voidptr, __n usize, __flags int) int
 fn C.memmove(__dest voidptr, __src voidptr, __n usize) voidptr
 
-const pl_max_request_bytes = 8 * 1024 * 1024
-const pl_max_pending_write = 8 * 1024 * 1024
 const pl_stream_body_above = 1024 * 1024
 const pl_read_buf_cap = 8 * 1024
 const pl_write_buf_cap = 16 * 1024
@@ -282,7 +280,7 @@ fn drain_requests(h core.Handler, mut cs PollConn, limits core.Limits, state voi
 		if !alive {
 			break
 		}
-		if cs.write_buf.len - cs.write_off > pl_max_pending_write {
+		if cs.write_buf.len - cs.write_off > core.max_pending_write_bytes {
 			alive = false // peer pipelines without reading responses
 			break
 		}
@@ -350,7 +348,7 @@ fn serve_readable(h core.Handler, mut w WorkerState, i int, limits core.Limits, 
 	req_cap := if limits.max_request_bytes > 0 {
 		limits.max_request_bytes
 	} else {
-		pl_max_request_bytes
+		core.default_max_request_bytes
 	}
 	mut must_close := false
 	for {

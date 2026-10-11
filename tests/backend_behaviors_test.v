@@ -365,8 +365,7 @@ fn check_idle_opt_out(backend server.IOBackend) ! {
 // receive window (tcp_rmem default, 128 KiB) — so the server's synchronous
 // send hits EAGAIN and the response is finished by the writable drain
 // (EPOLLOUT / POLLOUT). It stays under the backends' 8 MiB pending-write cap
-// (sm_max_pending_write / pl_max_pending_write), which would close the
-// connection instead.
+// (core.max_pending_write_bytes), which would close the connection instead.
 const bb_big_len = 7 * 1024 * 1024
 
 // bb_big_handler answers with a bb_big_len body, built into the server-owned

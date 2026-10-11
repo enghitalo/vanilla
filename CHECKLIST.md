@@ -311,7 +311,7 @@ concatenates, interpolates or allocates per request. The
 
 ### 23. Handle Partial Send/Recv — 🟡 PARTIAL
 - **Done:** epoll (`park_write` / `flush_batch`, capped by
-  `sm_max_pending_write`), io_uring (partial-send remainder + write deadline),
+  `core.max_pending_write_bytes`), io_uring (partial-send remainder + write deadline),
   poll (`write_off` + `POLLOUT`) and IOCP keep the unsent bytes and resume when
   the socket is writable — never a busy retry on `EAGAIN`. Partial reads are
   framed by `request_parser.frame_request_length_lim_idx` on every backend but
@@ -358,17 +358,16 @@ concatenates, interpolates or allocates per request. The
   elsewhere. Tested by `test_frame_idx_error_sentinels` and
   `test_frame_wrapper_codes_match_idx`.
 
-### 27. Replace Magic Numbers with Constants — 🟡 PARTIAL
-- **Done:** the tunables are `core.Limits` fields; each backend names its own
-  sizes (`sm_*`, `read_buf_cap`, `write_buf_cap` in `server/backend_epoll`,
-  `iou_*` in io_uring, `pl_*` in poll, `win_*` in IOCP, `tls_*`).
-- **Remains:**
-  - The 8 MiB request cap and 8 MiB pending-write cap are separate consts in
-    five places; one shared `core` const each would keep them in step.
-  - Unnamed literals in `server/async_darwin.c.v` (`[1024]C.kevent`,
-    `cap: 4096`) — they go with #154 — and `cap: 4096` in
-    `server/backend_epoll/tls_conn_linux.c.v`.
-- **Priority:** 🟢 LOW
+### 27. Replace Magic Numbers with Constants — ✅ RESOLVED
+- **Resolution:** the tunables are `core.Limits` fields; each backend names its
+  own sizes (`sm_*`, `read_buf_cap`, `write_buf_cap` in `server/backend_epoll`,
+  `iou_*` in io_uring, `pl_*` in poll, `win_*` in IOCP, `tls_*` for HTTPS,
+  `kq_*` in kqueue). The two caps every backend shares are one `core` const
+  each: `core.default_max_request_bytes` (8 MiB, the request ceiling when
+  `Limits.max_request_bytes` is 0; also kqueue's `http1_1.request` reader and
+  the h2 body cap) and `core.max_pending_write_bytes` (8 MiB, the write-side
+  cap, which also bounds `push_watermark_bytes`).
+- **Note:** kqueue's sizes are named, not changed; its backpressure is #154.
 
 ### 28. Remove Dead Code — ✅ RESOLVED
 - **Resolution:** `examples/veb_like/main.v` and its commented-out blocks were
@@ -607,7 +606,7 @@ Open and partial items only.
 |----------|-------|-------|
 | 🔴 HIGH | 2 | #16 (#156: plaintext on io_uring/kqueue), #34 |
 | 🟡 MEDIUM | 9 | #4, #19, #23, #36, #39, #40, #42, #44, #46 |
-| 🟢 LOW | 3 | #5, #27, #45 |
+| 🟢 LOW | 2 | #5, #45 |
 
 ---
 
@@ -643,7 +642,7 @@ Open and partial items only.
 ### Phase 5: Quality & Testing
 - [x] #25 - Bounds checking
 - [x] #26 - Error handling (obsolete)
-- [ ] #27 - Magic numbers
+- [x] #27 - Magic numbers
 - [x] #28 - Dead code
 - [x] #29 - Response buffers
 - [x] #32 - Response caching (obsolete)
@@ -663,13 +662,13 @@ Open and partial items only.
 
 ## 📈 Progress Tracking
 
-### Resolved: 23/37 (62%)
-- ✅ 19 done: #2, #3, #8, #10, #11, #15, #17, #18, #20, #21 (except kqueue),
-  #25, #28, #29, #33, #35, #37, #38, #41, #43
+### Resolved: 24/37 (65%)
+- ✅ 20 done: #2, #3, #8, #10, #11, #15, #17, #18, #20, #21 (except kqueue),
+  #25, #27, #28, #29, #33, #35, #37, #38, #41, #43
 - ⚪ 4 obsolete: #1, #6, #26, #32
 
-### Partial: 11/37 (30%)
-#5, #16, #19, #23, #27, #36, #39, #40, #42, #44, #45
+### Partial: 10/37 (27%)
+#5, #16, #19, #23, #36, #39, #40, #42, #44, #45
 
 ### Open: 3/37 (8%)
 #4, #34, #46

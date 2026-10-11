@@ -1,5 +1,6 @@
 module request
 
+import core
 import http1_1.request_parser
 
 #include <errno.h>
@@ -8,8 +9,8 @@ fn C.recv(__fd int, __buf voidptr, __n usize, __flags int) int
 
 // Hard ceiling on a single request: a backstop against unbounded memory growth
 // from a hostile peer. `read_request` does not take `core.Limits.max_request_bytes`
-// yet, so this const is the ceiling here.
-const max_request_bytes = 8 * 1024 * 1024
+// yet (kqueue, #154), so the engine's built-in default is the ceiling here.
+const max_request_bytes = core.default_max_request_bytes
 
 // read_request reads one complete HTTP/1.1 message from the socket.
 //

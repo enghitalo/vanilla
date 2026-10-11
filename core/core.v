@@ -366,7 +366,7 @@ pub struct Limits {
 pub:
 	max_header_bytes  int // > 0 ⇒ 431 Request Header Fields Too Large
 	max_body_bytes    int // > 0 ⇒ 413 Payload Too Large (rejected from Content-Length, before buffering)
-	max_request_bytes int // > 0 ⇒ ceiling on a single buffered request (headers+body); 0 ⇒ built-in default (8 MiB)
+	max_request_bytes int // > 0 ⇒ ceiling on a single buffered request (headers+body); 0 ⇒ default_max_request_bytes (8 MiB)
 	max_connections   int // > 0 ⇒ refuse new connections past this many concurrent (checked at accept). Pair with read_timeout_ms: without a deadline, connections that never send (or peers that vanish) hold their slots forever
 	read_timeout_ms   int // > 0 ⇒ a request (head + body) must arrive complete within this long, else close — 408 if part of it arrived and no earlier response is still being sent (plaintext epoll/poll/iocp), silently otherwise. The FIRST request's clock starts at accept (it bounds a silent connect and the TLS handshake); a later request's starts at its first byte. Not refreshed on progress: size it for your largest upload
 	write_timeout_ms  int // > 0 ⇒ close a connection whose parked response can't drain in this long
@@ -384,6 +384,20 @@ pub:
 	// Epoll plain worker only (io_uring and kqueue do not enforce it).
 	park_timeout_ms int
 }
+
+// default_max_request_bytes is the ceiling on a single buffered request
+// (headers+body) when Limits.max_request_bytes is 0: past it the request is
+// refused, so a hostile peer can't grow a read buffer without bound. Every
+// backend falls back to it (kqueue's http1_1.request reader always applies
+// it), and http2 caps a stream's body at it.
+pub const default_max_request_bytes = 8 * 1024 * 1024
+
+// max_pending_write_bytes is the write-side cap: a connection whose unsent
+// responses exceed it is closed, since a peer that pipelines requests but
+// never reads the answers would otherwise grow its write buffer without bound.
+// Fixed, not a Limits field; it also caps ServerConfig.push_watermark_bytes.
+// Enforced by the plain epoll, io_uring, poll and IOCP backends.
+pub const max_pending_write_bytes = 8 * 1024 * 1024
 
 // idle_ms resolves the keep-alive idle budget: idle_timeout_ms when > 0,
 // read_timeout_ms when idle_timeout_ms is 0, and 0 (off) when idle_timeout_ms
