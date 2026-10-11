@@ -388,8 +388,7 @@ pub:
 // default_max_request_bytes is the ceiling on a single buffered request
 // (headers+body) when Limits.max_request_bytes is 0: past it the request is
 // refused, so a hostile peer can't grow a read buffer without bound. Every
-// backend falls back to it (kqueue's http1_1.request reader always applies
-// it), and http2 caps a stream's body at it.
+// backend falls back to it, and http2 caps a stream's body at it.
 pub const default_max_request_bytes = 8 * 1024 * 1024
 
 // max_pending_write_bytes is the write-side cap: a connection whose unsent

@@ -159,7 +159,13 @@ fn kq_handle_request(h core.Handler, mut reactor KqReactor, kq int, fd int, limi
 	defer {
 		stdatomic.add_i64(&reactor.inflight.n, -1)
 	}
-	request_buffer := request.read_request(fd, limits.max_header_bytes, limits.max_body_bytes) or {
+	req_cap := if limits.max_request_bytes > 0 {
+		limits.max_request_bytes
+	} else {
+		core.default_max_request_bytes
+	}
+	request_buffer := request.read_request(fd, limits.max_header_bytes, limits.max_body_bytes,
+		req_cap) or {
 		match err.code() {
 			413 {
 				response.send_status_413_response(fd)
