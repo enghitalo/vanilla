@@ -79,17 +79,34 @@ fn route_len(buf []u8, path request_parser.Slice) int {
 }
 
 // SECURITY: only allow same-site relative redirects from user-supplied
-// targets. Two byte checks on a VIEW — no copy, no string API needed.
+// targets. Byte checks on a VIEW — no copy, no string API needed. The target
+// must start with `/`, and its second byte must not make a browser read it as
+// protocol-relative (`//host`, off-site), so these are refused there:
+//   - `/`: `//evil.com`;
+//   - `\`: browsers treat it as `/` in http(s) URLs (WHATWG URL), so
+//     `/\evil.com` is `//evil.com`;
+//   - TAB, LF, CR: the URL parser removes them before parsing, so
+//     `/<TAB>/evil.com` is `//evil.com`. A raw TAB reaches the handler (the
+//     request-target ends only at SP or CR); a raw CR or LF does not (below).
+// Past the second byte they are path bytes: `/a\b` stays same-site.
 // NOTE: get_query_slice does no percent-decoding, so `%2F%2Fevil.com` does not
 // start with `/` and is rejected — same posture as checking after an explicit
-// decode. A bare LF in the request-target never reaches the Location line: the
-// request framer answers such a request with 400 before any handler runs.
+// decode — and `/%5Cevil.com` is a plain path: browsers do not decode `%5C` in
+// a Location. A raw CR or LF never reaches the Location line: the request-line
+// parser ends the target at the first CR, and the request framer answers a
+// bare LF with 400 before any handler runs.
 @[direct_array_access]
 fn safe_next(next []u8) []u8 {
-	if next.len > 0 && next[0] == u8(`/`) && !(next.len > 1 && next[1] == u8(`/`)) {
-		return next // relative, same-origin
+	if next.len == 0 || next[0] != u8(`/`) {
+		return slash_bytes // reject absolute / empty targets
 	}
-	return slash_bytes // reject absolute / protocol-relative / empty targets
+	if next.len > 1 {
+		c := next[1]
+		if c == u8(`/`) || c == u8(`\\`) || c == u8(`\t`) || c == u8(`\n`) || c == u8(`\r`) {
+			return slash_bytes // reject protocol-relative targets
+		}
+	}
+	return next // relative, same-origin
 }
 
 fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
