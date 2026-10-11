@@ -8,10 +8,13 @@ module server
 // The end-to-end behavior tests that used to live here (keep-alive GET → 404
 // routing, body delivery, malformed request → 400 + close) moved to
 // tests/server_default_backend_test.v, on vtest.
+import os
 import net
 import time
 import testkit
 import core
+import socket
+import tls
 
 fn dummy_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if req.bytestr().contains('/notfound') {
@@ -82,5 +85,63 @@ fn test_new_server_ignores_sigpipe_only_when_default() ! {
 		b.shutdown(0)
 		set := C.signal(C.SIGPIPE, C.SIG_IGN)
 		assert set == C.SIG_IGN, 'new_server left the default SIGPIPE action in place'
+	}
+}
+
+// lowest_free_fd is the number the kernel gives the next new fd: the same
+// value before and after a refused new_server means it opened nothing. POSIX
+// only in effect: a Windows socket is not a C file descriptor, so there the
+// check sees nothing.
+fn lowest_free_fd() !int {
+	mut f := os.open(os.executable())!
+	fd := f.fd
+	f.close()
+	return fd
+}
+
+// tls_config is served by the Linux epoll backend only. new_server must refuse
+// it everywhere else, before it binds anything: io_uring and kqueue used to
+// accept it and serve PLAINTEXT to a server configured for HTTPS (#156). An
+// empty Config stands in for a certificate (new_server never reads it), so
+// the test needs no `-d vanilla_tls`.
+fn test_new_server_refuses_tls_where_it_is_not_served() ! {
+	cfg := &tls.Config{}
+	mut refused := []IOBackend{}
+	$if linux {
+		refused << .io_uring
+	} $else $if darwin {
+		refused << .kqueue
+	} $else $if windows {
+		refused << .iocp
+	}
+	for backend in refused {
+		before := lowest_free_fd()!
+		srv := new_server(ServerConfig{
+			port:            0
+			io_multiplexing: backend
+			handler:         dummy_handler
+			tls_config:      cfg
+		}) or {
+			assert err.msg().contains('TLS is not yet supported'), '${backend}: ${err.msg()}'
+			assert lowest_free_fd()! == before, '${backend}: the refused config left an fd open'
+			continue
+		}
+		for fd in srv.listener_fds {
+			socket.close_socket(fd)
+		}
+		assert false, 'new_server accepted tls_config on ${backend}, which would serve it plaintext'
+	}
+	$if linux {
+		// The default backend (epoll) still takes it.
+		srv := new_server(ServerConfig{
+			port:       0
+			workers:    1
+			handler:    dummy_handler
+			tls_config: cfg
+		})!
+		assert srv.io_multiplexing == .epoll
+		for fd in srv.listener_fds {
+			socket.close_socket(fd)
+		}
 	}
 }

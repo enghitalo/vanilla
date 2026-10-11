@@ -266,8 +266,8 @@ pub:
 	limits Limits
 	// tls_config, when set, serves HTTPS (e.g. tls.new_self_signed()); the
 	// program must be built with `-d vanilla_tls`. The Linux epoll backend
-	// only: new_server rejects it on poll, IOCP and a unix socket, while
-	// io_uring and kqueue serve plain HTTP (#156).
+	// only: new_server rejects it on io_uring, poll, kqueue, IOCP and a unix
+	// socket.
 	tls_config &tls.Config = unsafe { nil }
 	// workers sets how many worker threads THIS server runs. 0 (default) =
 	// `VANILLA_WORKERS` env → `runtime.nr_cpus()` (the process-wide default). Set it
@@ -322,7 +322,10 @@ pub fn new_server(config ServerConfig) !Server {
 		}
 	}
 
-	// Set default backend based on OS
+	// Check the backend against the OS, and TLS against the backend. Nothing is
+	// bound yet, so a rejected config leaves no listener behind. The zero
+	// IOBackend is the platform default (epoll, kqueue, IOCP): no defaulting
+	// happens here.
 	io_multiplexing := config.io_multiplexing
 	$if windows {
 		if io_multiplexing != .iocp {
@@ -347,9 +350,19 @@ pub fn new_server(config ServerConfig) !Server {
 				return error('Linux only supports epoll and io_uring backends')
 			}
 		}
+		// TLS lives in the epoll worker only (backend_epoll/tls_conn_linux.c.v).
+		// The io_uring backend never reads tls_config, so accepting it would
+		// serve PLAINTEXT to a server configured for HTTPS (#156).
+		if io_multiplexing == .io_uring && config.tls_config != unsafe { nil } {
+			return error('TLS is not yet supported on the io_uring backend; use the epoll backend')
+		}
 	} $else $if darwin {
 		if io_multiplexing != .kqueue {
 			return error('macOS only supports kqueue backend')
+		}
+		// Same as io_uring: kqueue has no TLS, and would serve plaintext (#156).
+		if config.tls_config != unsafe { nil } {
+			return error('TLS is not yet supported on the macOS/kqueue backend')
 		}
 	}
 

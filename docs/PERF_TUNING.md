@@ -125,7 +125,7 @@ differ in how connections arrive and in what is supported (full table:
 | | `.epoll` (default) | `.io_uring` |
 |---|---|---|
 | accept | one acceptor thread (`accept4`) hands fds round-robin to the workers | each worker has its own `SO_REUSEPORT` listener and a multishot accept |
-| TLS | yes | no (plaintext only, [#156](https://github.com/enghitalo/vanilla/issues/156)) |
+| TLS | yes | no (`new_server` refuses a `tls_config`) |
 | park deadlines, server push, `on_worker_start` | yes | no |
 | 408 on a read timeout | yes (plaintext) | no, closes silently |
 | profiling with valgrind/callgrind | yes | no (valgrind does not emulate io_uring) |
@@ -378,9 +378,8 @@ huge pages are `always`, RSS moves in 2 MiB steps with no allocation at all
 ## 8. TLS and kTLS
 
 - TLS is served by the **epoll** backend only, and only in a build with
-  `-d vanilla_tls`. The poll and IOCP backends refuse a `tls_config`;
-  io_uring and kqueue accept it and serve plaintext
-  ([#156](https://github.com/enghitalo/vanilla/issues/156)).
+  `-d vanilla_tls`. `new_server` refuses a `tls_config` on every other
+  backend (io_uring, poll, kqueue, IOCP).
 - **Handshakes in parallel** need Mbed TLS built with `MBEDTLS_THREADING_C`
   and `MBEDTLS_THREADING_PTHREAD`. Distro packages usually are not, and then
   every worker takes turns in the crypto library. The server says so at

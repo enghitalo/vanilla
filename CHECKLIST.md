@@ -188,8 +188,7 @@ concatenates, interpolates or allocates per request. The
 - **PRs:** commit `794d685`, #16 (opt-in build), #74, #79, #178, #227, #245.
 - **Testing:** `tls/tls_test.v`, `tls/tls_client_nix_test.v`.
 - **Note:** [#13](https://github.com/enghitalo/vanilla/issues/13) ("support
-  https") is still open although HTTPS works on epoll; it can be closed or
-  narrowed to the example (#34).
+  https") is closed by the HTTPS example (#34).
 
 ### 16. Integrate TLS into the Server — 🟡 PARTIAL
 - **Done:** TLS lives in the backend worker, not in the request/response
@@ -198,10 +197,13 @@ concatenates, interpolates or allocates per request. The
   `ServerConfig.tls_config`. PRs #96, #158, #159, #160, #181, #182.
 - **Testing:** `tests/tls_pipelining_test.v`, `tls_static_test.v`,
   `tls_timeouts_test.v`, `tls_workers_test.v` (`.github/workflows/tls_backend.yml`).
+- **Also done:** `new_server` refuses `tls_config` on every backend but
+  epoll, before it binds anything; io_uring and kqueue used to accept it and
+  serve plaintext ([#156](https://github.com/enghitalo/vanilla/issues/156)).
+  Tested by `test_new_server_refuses_tls_where_it_is_not_served` in
+  `server/server_test.v`, on Linux, Windows and in a macOS job.
 - **Remains:**
-  - io_uring and kqueue accept `tls_config` and serve **plaintext**:
-    `new_server` must reject it ([#156](https://github.com/enghitalo/vanilla/issues/156), security).
-  - TLS on IOCP ([#115](https://github.com/enghitalo/vanilla/issues/115)),
+  - TLS on io_uring and kqueue (refused for now), and on IOCP ([#115](https://github.com/enghitalo/vanilla/issues/115)),
     HTTP/2 over TLS + ALPN ([#142](https://github.com/enghitalo/vanilla/issues/142)),
     kTLS + `sendfile` for every static path ([#76](https://github.com/enghitalo/vanilla/issues/76)).
   - A TLS `.close` is one best-effort write ([#275](https://github.com/enghitalo/vanilla/issues/275)).
@@ -386,45 +388,21 @@ concatenates, interpolates or allocates per request. The
 - **Note:** [#14](https://github.com/enghitalo/vanilla/issues/14) ("support
   static file server") is done by this and can be closed.
 
-### 34. HTTPS Example — 🔴 OPEN ([#13](https://github.com/enghitalo/vanilla/issues/13))
-- **Issue:** the HTTPS server works on epoll (#15, #16) but no example serves
-  TLS: it is shown only in `server/README.md` and the `tests/tls_*` suites.
-  `examples/https_upstream/` is the client side.
-- **Priority:** 🔴 HIGH
-- **Effort:** 1-2 hours
-- **Strategy:** `examples/https/src/main.v`, built with `-d vanilla_tls`:
-  ```v
-  module main
-
-  import core
-  import server
-  import tls
-
-  const resp_200 = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, HTTPS!'
-
-  fn handle(_req []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
-  	core.append_str(mut out, resp_200)
-  	return .done
-  }
-
-  fn main() {
-  	// localhost/127.0.0.1/::1 SANs; persist_dir keeps the identity across
-  	// restarts, so `curl --cacert certs/cert.pem` keeps working
-  	cfg := tls.new_self_signed(persist_dir: './certs')!
-  	mut srv := server.new_server(server.ServerConfig{
-  		port:            8443
-  		handler:         handle
-  		io_multiplexing: .epoll // the only backend that serves TLS (#156)
-  		tls_config:      cfg
-  		limits:          server.Limits{
-  			read_timeout_ms: 10_000 // bounds the handshake and slowloris
-  		}
-  	})!
-  	srv.run()
-  }
-  ```
-- **Testing:** `curl --cacert certs/cert.pem https://localhost:8443/`, plus a
-  `main_test.v` run by `.github/workflows/tls_backend.yml`.
+### 34. HTTPS Example — ✅ RESOLVED
+- **Resolution:** `examples/https/` (README) serves `GET`/`HEAD /` over TLS 1.3
+  on `:8443`, built with `-d vanilla_tls`. On first run it issues a
+  self-signed certificate for localhost, 127.0.0.1 and ::1 and persists it in
+  `certs/`, so `curl --cacert certs/cert.pem` keeps working across restarts;
+  `HTTPS_CERT` / `HTTPS_KEY` load a CA-issued PEM pair instead. The handler is
+  plain HTTP (`http1_1/router`, const responses); `read_timeout_ms` bounds
+  the handshake. Closes [#13](https://github.com/enghitalo/vanilla/issues/13).
+- **Testing:** `src/main_test.v` (the handler, any build: the answers'
+  bytes, no allocation, `load_tls` refusing half a pair) and
+  `src/https_e2e_test.v` (`-d vanilla_tls`, run by
+  `.github/workflows/tls_backend.yml`): a client that verifies the
+  certificate against `cert.pem` as localhost and 127.0.0.1, keep-alive, a
+  restart that keeps the identity, the `HTTPS_CERT`/`HTTPS_KEY` path, and a
+  plaintext request closed at once with no HTTP answer.
 
 ### 35. Middleware Example — ✅ RESOLVED
 - **Resolution:** `examples/middleware/` (handler chain, security-header
@@ -589,7 +567,7 @@ concatenates, interpolates or allocates per request. The
   pool keeps grown per-connection buffers for good; io_uring frees them).
 
 ### 46. Example Walkthroughs — ✅ RESOLVED
-- **Resolution:** all 51 example directories have a README, on one template
+- **Resolution:** every example directory has a README, on one template
   (see `examples/tiny/README.md`): what the example shows and why, the run
   command, every endpoint with a curl call and the real response it got, the
   design points as they appear in the code, the test command and links into
@@ -611,8 +589,8 @@ Open and partial items only.
 
 | Priority | Count | Items |
 |----------|-------|-------|
-| 🔴 HIGH | 2 | #16 (#156: plaintext on io_uring/kqueue), #34 |
-| 🟡 MEDIUM | 6 | #4, #19, #23, #39, #40, #44 |
+| 🔴 HIGH | 0 | — |
+| 🟡 MEDIUM | 7 | #4, #16, #19, #23, #39, #40, #44 |
 | 🟢 LOW | 0 | — |
 
 ---
@@ -626,9 +604,9 @@ Open and partial items only.
 
 ### Phase 2: TLS/HTTPS
 - [x] #15 - TLS bindings
-- [ ] #16 - TLS on every backend (#156 first)
+- [ ] #16 - TLS everywhere on epoll, then other backends (#156 done)
 - [x] #17 - Self-signed certificates
-- [ ] #34 - HTTPS example
+- [x] #34 - HTTPS example
 
 ### Phase 3: Core Examples
 - [x] #33 - Static file server
@@ -665,15 +643,15 @@ Open and partial items only.
 
 ## 📈 Progress Tracking
 
-### Resolved: 25/33 (76%)
+### Resolved: 26/33 (79%)
 #2, #3, #5, #8, #10, #11, #15, #17, #18, #20, #21 (except kqueue), #25, #27,
-#28, #29, #33, #35, #36, #37, #38, #41, #42, #43, #45, #46
+#28, #29, #33, #34, #35, #36, #37, #38, #41, #42, #43, #45, #46
 
 ### Partial: 6/33 (18%)
 #16, #19, #23, #39, #40, #44
 
-### Open: 2/33 (6%)
-#4, #34
+### Open: 1/33 (3%)
+#4
 
 ---
 
@@ -685,8 +663,7 @@ kqueue parity (#154):
     → kqueue joins tests/backend_behaviors_test.v (#39, #40)
 
 TLS:
-  #156 (reject tls_config where TLS isn't served) → #16 on more backends (#115, #142)
-  #34 (HTTPS example) → independent, epoll only
+  #156 (reject tls_config where TLS isn't served, done) → #16 on more backends (#115, #142)
 
 Server push / close paths:
   #23 (outbound queue) ← #270, #271, #272, #275
@@ -696,9 +673,7 @@ Server push / close paths:
 
 ## 💡 Quick Wins (< 1 hour each)
 
-1. #34 - HTTPS example from the sketch above (1 hour)
-
-**Total Quick Wins:** ~1 hour for 1 improvement
+None left: every open item is a multi-hour change.
 
 ---
 
@@ -706,8 +681,8 @@ Server push / close paths:
 
 For contributors wanting to learn:
 
-- **Intermediate:** #34, #40
-- **Advanced:** #4/#19 (kqueue, #154), #16 (#156), #23
+- **Intermediate:** #40
+- **Advanced:** #4/#19 (kqueue, #154), #16, #23
 
 ---
 
@@ -732,6 +707,6 @@ For questions about implementation strategies:
 
 ---
 
-**Last Updated:** 2026-10-10
+**Last Updated:** 2026-10-11
 **Maintainer:** @enghitalo
 **Version:** 0.0.1

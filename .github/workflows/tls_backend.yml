@@ -40,6 +40,7 @@ on:
       - 'tests/tls_workers_test.v'
       - 'tests/tls_static_test.v'
       - 'examples/https_upstream/**'
+      - 'examples/https/**'
       - '.github/workflows/tls_backend.yml'
   pull_request:
     branches: [ main ]
@@ -58,6 +59,7 @@ on:
       - 'tests/tls_workers_test.v'
       - 'tests/tls_static_test.v'
       - 'examples/https_upstream/**'
+      - 'examples/https/**'
       - '.github/workflows/tls_backend.yml'
 
 env:
@@ -211,6 +213,16 @@ jobs:
           VANILLA_NO_IOURING: '1'
         run: |
           v -cc gcc -no-parallel -d vanilla_tls test tests/tls_workers_test.v
+      # examples/https over TLS, to a client that verifies the certificate
+      # against the cert.pem the example persisted (curl --cacert): as
+      # localhost and 127.0.0.1, keep-alive, a restart that keeps the
+      # identity, HTTPS_CERT/HTTPS_KEY, and no plaintext answer on the port.
+      - name: HTTPS example e2e
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+        run: |
+          v -cc gcc -no-parallel -d vanilla_tls test examples/https/src
       # The pooled HTTPS client (http1_1/upstream, #229) through
       # examples/https_upstream's edge, against its fake upstream (a V
       # program the test builds, serving TLS with the test CA): response

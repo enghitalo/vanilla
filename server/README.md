@@ -183,7 +183,8 @@ per-connection memory that `max_connections` bounds.
 
 Set `ServerConfig.tls_config` (`tls.new_self_signed()`, or
 `tls.new_from_pem(cert, key)` for a CA-issued certificate) for HTTPS on the
-**epoll** backend; the other backends are plaintext. (`ServerConfig.certificates`
+**epoll** backend; `new_server` refuses it on the other backends rather than
+serve plaintext. (`ServerConfig.certificates`
 is not read: [#287](https://github.com/enghitalo/vanilla/issues/287).) The handshake
 is bounded from accept, before any TLS record arrives: by `read_timeout_ms`,
 or, when that is 0, by `idle_timeout_ms` (a new connection's idle deadline runs
