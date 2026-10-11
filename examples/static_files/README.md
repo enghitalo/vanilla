@@ -7,7 +7,8 @@ so a cached file costs a 304 instead of its bytes) and, above all,
 **path-traversal safety**, so `GET /../../etc/passwd` never leaves the web root.
 
 This example does all four in one readable handler that reads the file into
-memory per request. That keeps the logic visible; for production serving with
+the connection's write buffer on every request, with no allocation. That keeps
+the logic visible; for production serving with
 precomputed validators and `sendfile(2)` for large files, use the
 [`static_assets`](../../static_assets/static_assets.v) module (see
 [examples/spa_static_assets](../spa_static_assets/)).
@@ -102,14 +103,18 @@ same 404. `curl -i -X POST localhost:3000/index.html` gets
 
 ## How it works
 
-- **Traversal guard: resolve, then check containment.** `safe_path` joins the
-  URL path under `web_root`, then `resolve`s both the root and the candidate
-  with `realpath(3)`, so `..` and symlinks are followed before the check. The
-  candidate must be the root **plus a path separator**: a bare `starts_with`
-  would let `./public2` pass for `./public` (#228). `resolve` fails closed: a
-  path that does not resolve (missing file, symlink loop) is refused, unlike
-  `os.real_path`, which returns its input unchanged. Every refusal is a 404,
-  the same answer as a missing file.
+- **Traversal guard: resolve, then check containment.** The web root is
+  resolved once, in `main`, with `realpath(3)`; `resolve` fails closed, so a
+  root that does not resolve stops the server, unlike `os.real_path`, which
+  returns its input unchanged. Per request, `safe_path` builds root + `/` +
+  URL path + NUL in a per-worker buffer (`State`, from `make_state`) and
+  `realpath(3)` resolves it into a second one, so `..` and symlinks are
+  followed before the check. The candidate must be the root **plus a path
+  separator**: a bare `starts_with` would let `./public2` pass for `./public`
+  (#228). A path that does not resolve (missing file, symlink loop), holds a
+  NUL or is longer than `PATH_MAX` is refused, and so is anything `fstat`
+  says is not a regular file. Every refusal is a 404, the same answer as a
+  missing file.
 - **No percent-decoding.** The core hands the path over raw, so `%2e%2e` is
   never turned back into `..`; it is just a file name that does not exist.
 - **MIME by extension, in place.** `mime_type` scans back to the last `.` of
@@ -121,18 +126,21 @@ same 404. `curl -i -X POST localhost:3000/index.html` gets
   value in place against `"<16 hex>"`: an exact match only, no `W/` weak
   tags or lists. Hashing the whole file on every request is O(file size) on
   purpose here; `static_assets` precomputes it.
+- **The file goes straight into `out`.** The header block is appended first,
+  with a 16-byte placeholder for the ETag, then `core.append_file_region`
+  reads the whole file with `pread(2)` after it: no `os.read_bytes`, no copy.
+  The ETag hashes those bytes and fills the placeholder. A 304 rolls `out`
+  back to where the response began (`out.len = mark`); a 206 moves its window
+  down over the bytes before it (never `content[a..b]`); HEAD drops the body.
 - **Range.** `parse_range` reads the header through a `vbytes` view of the
-  request buffer (no substring, no `split`); the window is appended with
-  `out.push_many(&content[start], len)`, never `content[a..b]`.
+  request buffer (no substring, no `split`).
 - **Bytes in place, framing appended.** Method check (`slice_eq`) and query
-  strip (`path_len_without_query`) work on request offsets; the path reaches
-  `safe_path` as a `tos` view. 404 and 405 are `const` strings appended with
-  `core.append_str`; 200/206/304 are framed with `core.append_str` plus the
-  local `wi` for integers
+  strip (`path_len_without_query`) work on request offsets, and every view is
+  taken from the handler's `req_buffer` parameter. 404 and 405 are `const`
+  strings appended with `core.append_str`; 200/206/304 are framed with
+  `core.append_str` plus the local `wi` for integers
   ([BEST_PRACTICES §3b](../../docs/BEST_PRACTICES.md#3b-dynamic-responses--append-parts-straight-into-out)).
-  The `os` path calls (`join_path`, `norm_path`, `realpath`) and
-  `os.read_bytes` still allocate per request: this route is disk-bound and
-  written for clarity, not as a zero-allocation path.
+  A request allocates nothing (`test_serving_allocates_nothing`).
 - HEAD gets the same headers as GET with no body (`is_get`).
 
 ## Tests
@@ -147,7 +155,8 @@ calls `handle` directly. It covers `parse_range` (normal, suffix,
 open-ended, rejected specs), `mime_type`, traversal (`..`, the `public2`
 sibling, an escaping symlink, unresolvable paths and symlink loops), and
 raw-request cases: index, query strip, HEAD, 404, 405, 206, fallback to 200,
-the ETag → 304 round trip and the canned 400 on garbage.
+the ETag → 304 round trip, the canned 400 on garbage, and that serving
+allocates nothing (a `gc_heap_usage()` delta over 20k rounds of requests).
 
 ## See also
 
