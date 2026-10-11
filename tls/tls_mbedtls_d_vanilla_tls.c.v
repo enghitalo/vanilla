@@ -49,16 +49,21 @@ fn C.vtls_session_reset(sess voidptr, fd int) int
 fn C.vtls_handshake_error(sess voidptr, buf &char, len usize)
 fn C.vtls_error_string(err int, buf &char, len usize)
 
-// init performs process-wide crypto init (psa_crypto_init). Call once at startup.
 // parallel_crypto reports whether TLS workers can run their crypto in
 // parallel: true when the linked Mbed TLS was built with MBEDTLS_THREADING_C
 // (it locks PSA's process-wide state itself). When false, every call into Mbed
 // TLS takes one process-wide lock, so several workers stay correct but take
 // turns in the crypto library (handshakes, and record crypto without kTLS).
+// Either way every function here is safe from several threads on distinct
+// sessions.
 pub fn parallel_crypto() bool {
 	return C.vtls_parallel_crypto() == 1
 }
 
+// initialize runs the process-wide crypto init (psa_crypto_init). It is
+// idempotent and every constructor (new_self_signed, new_from_pem,
+// new_client) calls it, so an application needs it only to fail early.
+// Errors when PSA Crypto cannot start.
 pub fn initialize() ! {
 	if C.vtls_global_init() != 0 {
 		return error('vtls: psa_crypto_init failed')
@@ -140,7 +145,11 @@ fn persist_identity(cfg &Config, dir string) ! {
 	}
 }
 
-// new_from_pem builds a config from PEM-encoded certificate and private key.
+// new_from_pem builds a server config from a PEM certificate (chain) and its
+// PEM private key, e.g. os.read_bytes of the files a CA issued. It copies
+// both (the inputs may be freed) and advertises default_alpn. Errors when
+// either does not parse. It does not check that the key matches the
+// certificate: a mismatched pair starts, then every handshake fails (#284).
 pub fn new_from_pem(cert []u8, key []u8) !&Config {
 	initialize()!
 	ctx := C.vtls_ctx_new()
@@ -176,7 +185,9 @@ pub fn new_from_pem(cert []u8, key []u8) !&Config {
 
 // set_alpn overrides the advertised ALPN list (comma-separated, preference
 // order — e.g. 'h2,http/1.1'). Defaults to `http/1.1`. Only advertise protocols
-// the server can actually serve. Call before accepting connections.
+// the server can actually serve. At most 63 bytes, which errors past it, and 4
+// protocols: a 5th and later are merged into the 4th, with no error (#297).
+// Not atomic: call it before accepting connections.
 pub fn (c &Config) set_alpn(protos string) ! {
 	if C.vtls_set_alpn(c.ctx, &char(protos.str)) != 0 {
 		return error('vtls: failed to set ALPN to "${protos}"')
@@ -187,7 +198,8 @@ pub fn (c &Config) set_alpn(protos string) ! {
 // created from now on. Forbidden, every connection stays on userspace Mbed TLS
 // after its handshake, as on a host without the `tls` kernel module (the
 // fallback is logged once): for tests of that path, and as an operator kill
-// switch. Connections already established keep the mode they have.
+// switch. Connections already established keep the mode they have. Atomic:
+// it may flip while workers create sessions.
 pub fn (c &Config) set_ktls(enabled bool) {
 	C.vtls_set_ktls(c.ctx, int(enabled))
 }
@@ -199,7 +211,8 @@ pub fn (c &Config) set_ktls(enabled bool) {
 // data when a record turns out padded or not application data. Peers do not
 // pad by default, but TLS 1.3 allows it (OpenSSL's RecordPadding), so enable
 // it on a fixed kernel, or when the peers are known not to pad. Kernels before
-// 6.0 lack the option and keep the default path. Call before the server starts.
+// 6.0 lack the option and keep the default path. Not atomic, and each session
+// copies it when created: call it before the server starts.
 pub fn (c &Config) set_ktls_rx_no_pad(enabled bool) {
 	C.vtls_set_ktls_rx_no_pad(c.ctx, int(enabled))
 }
@@ -208,7 +221,9 @@ pub fn (c &Config) set_ktls_rx_no_pad(enabled bool) {
 // a self-signed server: `curl --cacert server.pem`, an Android
 // network-security-config trust anchor, a browser exception. Pair it with
 // `persist_dir` in new_self_signed, otherwise the PEM is only valid for the
-// current process - the next start generates a different certificate.
+// current process - the next start generates a different certificate. ''
+// when the PEM given to new_from_pem did not fit 4 KiB (a long chain; the
+// config still serves it), and for a client config. Allocates a V string.
 pub fn (c &Config) cert_pem() string {
 	p := C.vtls_cert_pem(c.ctx)
 	if p == unsafe { nil } {
@@ -220,7 +235,8 @@ pub fn (c &Config) cert_pem() string {
 // key_pem returns the private key as PEM - exported for new_self_signed
 // configs, a copy of the input for new_from_pem ones. It is what
 // `persist_dir` writes to key.pem; treat it like any private key - never
-// log it. Empty only if the key did not fit the 2 KiB buffer.
+// log it. Empty if the key did not fit the 2 KiB buffer, and for a client
+// config. Allocates a V string.
 pub fn (c &Config) key_pem() string {
 	p := C.vtls_key_pem(c.ctx)
 	if p == unsafe { nil } {
@@ -229,10 +245,18 @@ pub fn (c &Config) key_pem() string {
 	return unsafe { cstring_to_vstring(p) }
 }
 
+// free releases the config (certificate, key, CA chain, Mbed TLS state).
+// Call it once, and only after every session created from it is freed: they
+// point into it.
 pub fn (c &Config) free() {
 	C.vtls_ctx_free(c.ctx)
 }
 
+// new_session starts a server session on `fd`, an accepted NON-BLOCKING
+// socket; drive it with handshake(). It copies the config's set_ktls and
+// set_ktls_rx_no_pad settings as they are now. The session (Mbed TLS state
+// plus a 4 KiB read-ahead) lives on the C heap until free(). none when the
+// allocation or Mbed TLS's setup fails.
 pub fn (c &Config) new_session(fd int) ?Session {
 	s := C.vtls_session_new(c.ctx, fd)
 	if s == unsafe { nil } {
@@ -243,13 +267,21 @@ pub fn (c &Config) new_session(fd int) ?Session {
 	}
 }
 
-// handshake drives the TLS handshake. Returns 0 (done), `want` (retry), or `closed`.
+// handshake drives the TLS handshake as far as the socket allows. Returns 0
+// once it is complete, `want` / `want_write` when it must wait for the socket
+// (call it again when it is ready), or `closed` when it failed
+// (handshake_error and verify_failed say why).
 pub fn (s &Session) handshake() int {
 	return C.vtls_handshake(s.sess)
 }
 
-// read_into decrypts up to `len` bytes into `ptr`. Returns >=0 bytes, `want`,
-// or `closed`. Raw pointer so the read loop can fill a buffer's spare capacity.
+// read_into decrypts up to `len` bytes into `ptr` and returns how many, never
+// 0: the peer's close (EOF or close_notify) is `closed` with peer_closed()
+// true, so `len` must be > 0. `want`: the socket is drained, read again after
+// the next readable edge's mark_readable. `want_write`: Mbed TLS must send
+// first, call again once the socket is writable (on a server session it only
+// precedes a fatal error). Raw pointer so the read loop can fill a buffer's
+// spare capacity.
 pub fn (s &Session) read_into(ptr &u8, len int) int {
 	return C.vtls_read(s.sess, ptr, usize(len))
 }
@@ -261,8 +293,11 @@ pub fn (s &Session) mark_readable() {
 	C.vtls_mark_readable(s.sess)
 }
 
-// write_from encrypts `len` bytes from `ptr`. Returns bytes written (>=0),
-// `want`, or `closed`.
+// write_from encrypts and sends up to `len` bytes from `ptr` and returns how
+// many it took: one record at most (16 KiB), so loop until all is sent.
+// `want_write` (or `want`): the record is encrypted and pending inside Mbed
+// TLS, so call again with the SAME `ptr` and `len` once the socket is ready,
+// which only flushes it. `closed` on a fatal error.
 pub fn (s &Session) write_from(ptr &u8, len int) int {
 	return C.vtls_write(s.sess, ptr, usize(len))
 }
@@ -296,6 +331,7 @@ pub fn (s &Session) ktls_abort() {
 
 // alpn returns the protocol negotiated via ALPN (e.g. 'http/1.1'), or '' if the
 // client offered none. Meaningful only after the handshake completes.
+// Allocates a V string.
 pub fn (s &Session) alpn() string {
 	p := C.vtls_get_alpn(s.sess)
 	if p == unsafe { nil } {
@@ -304,6 +340,10 @@ pub fn (s &Session) alpn() string {
 	return unsafe { cstring_to_vstring(p) }
 }
 
+// free ends the session and releases its memory. On a userspace session it
+// first sends a close_notify alert (best effort: the socket is non-blocking),
+// unless reset(-1) detached it; never on kTLS, where the kernel owns the
+// record framing. It does not close the fd: close it after. Call it once.
 pub fn (s &Session) free() {
 	C.vtls_session_free(s.sess)
 }
@@ -380,7 +420,8 @@ pub fn new_client(ca_file string, verify Verify) !&Config {
 // getaddrinfo reads as one (`10.0.0.5`, `::1`, `127.1`, `fe80::1%eth0`), is
 // never sent as SNI (RFC 6066 §3) and, under Verify.full, must match an
 // iPAddress SAN exactly (RFC 9525 §6.2; the zone is not part of it). Drive it
-// with handshake() like a server session.
+// with handshake() like a server session. none when the allocation or Mbed
+// TLS's setup fails.
 pub fn (c &Config) new_client_session(fd int, host string) ?Session {
 	s := C.vtls_client_session_new(c.ctx, fd, &char(host.str))
 	if s == unsafe { nil } {
@@ -394,7 +435,8 @@ pub fn (c &Config) new_client_session(fd int, host string) ?Session {
 // reset re-arms a client session for a new handshake to the same host on a
 // new socket, keeping its buffers (a reconnect allocates nothing). fd -1
 // detaches it from a socket about to be closed: nothing it does later can
-// reach that fd number once the kernel reuses it.
+// reach that fd number once the kernel reuses it. Client sessions only. false
+// when Mbed TLS failed to reset (free the session then).
 pub fn (s &Session) reset(fd int) bool {
 	return C.vtls_session_reset(s.sess, fd) == 0
 }
@@ -408,7 +450,8 @@ pub fn (s &Session) verify_failed() bool {
 }
 
 // handshake_error says why handshake() returned `closed`: the certificate
-// verification that failed, or the TLS error.
+// verification that failed, or the TLS error. Worded for a client session;
+// allocates a V string.
 pub fn (s &Session) handshake_error() string {
 	mut buf := [512]u8{}
 	C.vtls_handshake_error(s.sess, &char(&buf[0]), usize(buf.len))

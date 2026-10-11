@@ -18,19 +18,35 @@ module tls
 // the server module (worker dispatch, the TLS connection state machine) type-checks
 // and compiles regardless; only the C-backed bodies differ.
 
-// Handshake/read/write status (mirrors the C shim). Negative so they never
-// collide with a byte count from read/write.
-pub const want = -2 // would block on READ — retry on the next EPOLLIN
-pub const want_write = -3 // would block on WRITE — retry on the next EPOLLOUT
-pub const closed = -1 // fatal — close the connection
+// want is the status a Session call (handshake, read_into, write_from)
+// returns when it would block until the socket is readable: call it again on
+// the next readable edge (EPOLLIN), after mark_readable. Like want_write and
+// closed it is negative, so it never collides with a byte count; the values
+// mirror the C shim's VTLS_*.
+pub const want = -2
 
-// Default ALPN offer. Only `http/1.1` for now: advertising `h2` while the
-// server speaks only HTTP/1.1 would let an h2 client negotiate a protocol we
-// can't serve (RFC 7301 §3.2). When HTTP/2 lands, this becomes 'h2,http/1.1'
-// and the worker branches on Session.alpn().
+// want_write is the status a Session call returns when it would block until
+// the socket is writable: call it again, with the same arguments, on the next
+// writable edge (EPOLLOUT).
+pub const want_write = -3
+
+// closed is the status a Session call returns when the session is over: a
+// fatal TLS or socket error, or the peer's close (peer_closed tells them
+// apart). Free the session and close the connection.
+pub const closed = -1
+
+// default_alpn is the ALPN list every server config advertises until set_alpn
+// replaces it. Only `http/1.1` for now: advertising `h2` while the server
+// speaks only HTTP/1.1 would let an h2 client negotiate a protocol we can't
+// serve (RFC 7301 §3.2). When HTTP/2 lands, this becomes 'h2,http/1.1' and the
+// worker branches on Session.alpn().
 pub const default_alpn = 'http/1.1'
 
-// Config is a server-wide TLS configuration (certificate + key + SSL settings).
+// Config is a TLS configuration that sessions are created from: a server's
+// (certificate + key: new_self_signed, new_from_pem) or a client's (trusted
+// CAs: new_client). Workers may create sessions from one Config concurrently;
+// of its setters only set_ktls may run while they do. The memory is C-owned,
+// released by free().
 pub struct Config {
 	ctx voidptr
 }
@@ -65,7 +81,10 @@ pub enum Verify {
 
 // Session is a per-connection TLS session bound to a non-blocking fd: an
 // accepted one (Config.new_session) or a connected one (new_client_session).
-// The zero Session is no session at all (active() is false).
+// The zero Session is no session at all (active() is false). Its calls are
+// safe from several threads on distinct sessions, but one session is driven
+// by one thread at a time (the worker that owns its fd). The session does not
+// own the fd: free() it, then close the fd.
 pub struct Session {
 	sess voidptr
 }
