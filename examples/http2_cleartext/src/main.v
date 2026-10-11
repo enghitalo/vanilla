@@ -19,8 +19,10 @@ module main
 // `handle` the h1 path uses (a core.Handler is bytes-in/bytes-out — nothing
 // http1-specific about the contract), then re-frames the h1 response as
 // HEADERS + DATA with the http1_1.client response codec doing the parsing.
-// The translation allocates; that is the http2 bridge's cost, paid off the
-// h1 hot path (which is untouched).
+// The translation and the re-framing run in per-connection buffers that are
+// reused for every request, a parked stream included (BridgeState). The
+// http2 library's HPACK decoder still copies each request's header fields;
+// the h1 hot path is untouched either way.
 //
 // Async routes work over BOTH protocols (the issue #136 follow-up: .suspend
 // is legal for ConnHandlers): GET /slow parks on a timerfd. Served over h1
@@ -44,12 +46,12 @@ import http2
 import server
 import strconv
 
-const home_response = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 23\r\nConnection: keep-alive\r\n\r\nhello over one handler\n'.bytes()
+const home_response = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 23\r\nConnection: keep-alive\r\n\r\nhello over one handler\n'
 const not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 // 501: this worker/backend cannot take connections over (queue_takeover
 // returned false) — answering the preface with h1 bytes the client can see
 // beats leaving it to time out on a half-spoken protocol.
-const cannot_takeover_response = 'HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
+const cannot_takeover_response = 'HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
 const echo_head_prefix = 'HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: '
 const echo_head_suffix = '\r\nConnection: keep-alive\r\n\r\n'
 
@@ -112,7 +114,7 @@ fn handle(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event
 			conn: http2.new_server_conn()
 		}
 		if !core.queue_takeover(http2_takeover_conn, voidptr(bridge)) {
-			res << cannot_takeover_response
+			core.append_str(mut res, cannot_takeover_response)
 			return .close
 		}
 		// The engine keeps `bridge` reachable for the GC through the
@@ -137,7 +139,7 @@ fn handle(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event
 // is the bridge's capture loop (see serve_http2_request).
 fn app_route(hr request_parser.HttpRequest, mut res []u8, mut event_loop core.EventLoop) core.Step {
 	if slice_eq(hr.buffer, hr.method, get_method) && slice_eq(hr.buffer, hr.path, root_path) {
-		res << home_response
+		core.append_str(mut res, home_response)
 		return .done
 	}
 	if slice_eq(hr.buffer, hr.method, get_method) && slice_eq(hr.buffer, hr.path, slow_path) {
@@ -161,8 +163,18 @@ fn app_route(hr request_parser.HttpRequest, mut res []u8, mut event_loop core.Ev
 // allows one armed watch per parked connection).
 struct BridgeState {
 mut:
-	conn   &http2.ServerConn
-	parked bool
+	conn &http2.ServerConn
+	// The parked stream, if any. bridge_park parks at most one stream per
+	// connection, so its state lives here and the bridge itself is the watch
+	// payload: parking allocates nothing. While `parked`: which stream to
+	// answer, the app's continuation and payload, and the h1 response bytes
+	// accumulated so far (streamed across multi-hop suspends) in park_res, a
+	// buffer of its own because h1_res serves the next request in the burst.
+	parked         bool
+	park_stream_id u32
+	park_cont      core.WakeFn = unsafe { nil }
+	park_udata     voidptr
+	park_res       []u8
 	// Reused across bursts: consume() appends completed requests here, and we
 	// clear it each call instead of allocating a fresh slice per readable
 	// burst (which would leak under `-gc none`).
@@ -201,19 +213,6 @@ fn capture_register(mut el core.EventLoop, ext_fd int, interest core.WatchIntere
 	capture.cont = cont
 	capture.udata = udata
 	el.last_watched = ext_fd
-}
-
-// StreamWait carries a parked stream across the engine's park/resume hop:
-// which stream to answer, the app's continuation, and the h1 response bytes
-// accumulated so far (streamed across multi-hop suspends).
-@[heap]
-struct StreamWait {
-mut:
-	bridge    &BridgeState
-	stream_id u32
-	app_cont  core.WakeFn = unsafe { nil }
-	app_udata voidptr
-	h1_res    []u8
 }
 
 // http2_takeover_conn is the core.ConnHandler for a flipped connection: the
@@ -356,50 +355,52 @@ fn bridge_park(mut bridge BridgeState, stream_id u32, capture WatchCapture, mut 
 		conn.abort_stream(mut out, stream_id, .refused_stream)
 		return true
 	}
-	mut wait := &StreamWait{
-		bridge:    unsafe { &BridgeState(voidptr(&bridge)) }
-		stream_id: stream_id
-		app_cont:  capture.cont
-		app_udata: capture.udata
-	}
+	bridge.park_stream_id = stream_id
+	bridge.park_cont = capture.cont
+	bridge.park_udata = capture.udata
 	// The parked stream owns its partial response: bridge.h1_res is reused by
-	// the next request on this connection, so copy (not alias) it. Parks are
-	// the rare async case — this is the one allocation the async path keeps.
-	wait.h1_res << bridge.h1_res
+	// the next request on this connection, so copy (not alias) it, into the
+	// connection's park buffer (cleared, capacity kept).
+	bridge.park_res.clear()
+	if bridge.h1_res.len > 0 {
+		unsafe { bridge.park_res.push_many(bridge.h1_res.data, bridge.h1_res.len) }
+	}
 	bridge.parked = true
-	event_loop.watch_fd(capture.fd, capture.interest, bridge_wake, voidptr(wait))
+	event_loop.watch_fd(capture.fd, capture.interest, bridge_wake, voidptr(&bridge))
 	return true
 }
 
-// bridge_wake is the continuation the bridge arms for a parked stream: it
-// runs the app's continuation against the stream's PRIVATE h1 buffer (again
-// under a capture loop, so multi-hop suspends re-park cleanly), then
-// re-frames the finished h1 response for exactly that stream.
+// bridge_wake is the continuation the bridge arms for a parked stream (its
+// payload is the BridgeState): it runs the app's continuation against the
+// stream's PRIVATE h1 buffer, park_res (again under a capture loop, so
+// multi-hop suspends re-park cleanly), then re-frames the finished h1
+// response for exactly that stream.
 fn bridge_wake(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
-	mut wait := unsafe { &StreamWait(watch_payload) }
-	mut bridge := wait.bridge
+	mut bridge := unsafe { &BridgeState(watch_payload) }
 	mut capture := WatchCapture{}
 	mut probe_loop := core.EventLoop{
 		client_fd: event_loop.client_fd
 		reactor:   unsafe { voidptr(&capture) }
 		register:  capture_register
 	}
-	step := wait.app_cont(mut wait.h1_res, ready_fd, ready_fd_error, wait.app_udata, worker_state, mut
-		probe_loop)
+	step := bridge.park_cont(mut bridge.park_res, ready_fd, ready_fd_error, bridge.park_udata,
+		worker_state, mut probe_loop)
 	if step == .suspend {
 		if capture.fd < 0 || capture.cont == unsafe { nil } {
 			bridge.parked = false
-			http2.write_goaway(mut out, wait.stream_id, .internal_error)
+			http2.write_goaway(mut out, bridge.park_stream_id, .internal_error)
 			return .close
 		}
-		// Multi-hop park: re-arm with this same StreamWait, stay suspended.
-		wait.app_cont = capture.cont
-		wait.app_udata = capture.udata
-		event_loop.watch_fd(capture.fd, capture.interest, bridge_wake, voidptr(wait))
+		// Multi-hop park: the same stream stays parked, on the app's next fd.
+		bridge.park_cont = capture.cont
+		bridge.park_udata = capture.udata
+		event_loop.watch_fd(capture.fd, capture.interest, bridge_wake, watch_payload)
 		return .suspend
 	}
 	bridge.parked = false
-	if !frame_h1_response(mut bridge, wait.stream_id, wait.h1_res, mut out) {
+	// A local view of park_res avoids passing a bridge field alongside `mut bridge`.
+	res := bridge.park_res
+	if !frame_h1_response(mut bridge, bridge.park_stream_id, res, mut out) {
 		return .close
 	}
 	if step == .close {

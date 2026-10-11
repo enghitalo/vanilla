@@ -16,7 +16,7 @@ fn serve_h1(req string) (core.Step, string) {
 fn test_h1_routes() {
 	step, home := serve_h1('GET / HTTP/1.1\r\nHost: x\r\n\r\n')
 	assert step == .done
-	assert home == home_response.bytestr()
+	assert home == home_response
 	step2, echoed := serve_h1('POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nping')
 	assert step2 == .done
 	assert echoed.starts_with('HTTP/1.1 200 OK\r\n')
@@ -45,7 +45,7 @@ fn test_preface_without_capable_worker_is_501() {
 	// reports false and the preface must be answered with the visible 501.
 	step, res := serve_h1('PRI * HTTP/2.0\r\n\r\n')
 	assert step == .close
-	assert res == cannot_takeover_response.bytestr()
+	assert res == cannot_takeover_response
 }
 
 struct TestFrame {
@@ -233,8 +233,10 @@ fn test_bridge_parks_and_resumes_async_stream() ! {
 		assert consumed == input.len
 		assert step == .suspend
 		assert bridge.parked
+		assert bridge.park_stream_id == 1
 		assert engine_capture.fd >= 0 // the app's real timerfd, re-armed by the bridge
 		assert el.last_watched == engine_capture.fd
+		assert engine_capture.udata == voidptr(bridge) // the bridge is the watch payload
 		// Stream 3 answered immediately; stream 1 has nothing yet.
 		frames := split_frames(out)
 		mut saw_home := false
@@ -353,4 +355,68 @@ fn test_http2_partial_frame_consumes_nothing() {
 	assert consumed2 == whole.len
 	assert step2 == .done
 	assert split_frames(out2).len == 2 // HEADERS + DATA
+}
+
+// finish_slow stands in for an app continuation that completes a parked
+// response: it appends the rest of slow_response.
+fn finish_slow(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	core.append_str(mut out, 'slow done\n')
+	return .done
+}
+
+// park_and_resume parks stream 1 the way serve_http2_request does (the app
+// wrote `head`, then armed `app_watch`), and runs the continuation the bridge
+// armed on the engine loop `el`, as the engine would when the fd fires.
+fn park_and_resume(mut bridge BridgeState, head string, app_watch WatchCapture, mut el core.EventLoop, mut engine_capture WatchCapture, mut out []u8) {
+	bridge.h1_res.clear()
+	core.append_str(mut bridge.h1_res, head)
+	unsafe {
+		out.len = 0
+	}
+	bridge_park(mut bridge, 1, app_watch, mut out, mut el)
+	step := engine_capture.cont(mut out, engine_capture.fd, false, engine_capture.udata,
+		unsafe { nil }, mut el)
+	if step != .done || bridge.parked {
+		panic('the parked stream did not complete')
+	}
+}
+
+// Parking a stream and resuming it allocates nothing: the parked stream lives
+// in the BridgeState, its h1 bytes in the bridge's reused park buffer. (The
+// old hop allocated a StreamWait and a copy of its h1 bytes per parked
+// stream.) bridge_park and bridge_wake are driven directly, 20k times: the
+// burst path also runs the http2 library's HPACK decoder, which copies every
+// request's header fields.
+fn test_park_and_resume_allocate_nothing() {
+	$if gcboehm ? {
+		mut bridge := &BridgeState{
+			conn: http2.new_server_conn()
+		}
+		// What the app wrote before it suspended, and the watch it armed. The
+		// fd is never read: finish_slow answers without it.
+		head := slow_response.all_before('slow done')
+		app_watch := WatchCapture{
+			fd:   1 << 20
+			cont: finish_slow
+		}
+		mut engine_capture := WatchCapture{}
+		mut el := core.EventLoop{
+			reactor:  unsafe { voidptr(&engine_capture) }
+			register: capture_register
+		}
+		mut out := []u8{cap: 4096}
+		park_and_resume(mut bridge, head, app_watch, mut el, mut engine_capture, mut out) // warm-up
+		frames := split_frames(out)
+		assert frames.len == 1 // HEADERS only: stream 1 was never opened, so no DATA
+		assert frames[0].fh.type_ == .headers
+		assert frames[0].fh.stream_id == 1
+		assert bridge.park_res.bytestr() == slow_response
+		rounds := 20_000
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. rounds {
+			park_and_resume(mut bridge, head, app_watch, mut el, mut engine_capture, mut out)
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert grown < 4096, 'park + resume allocated ${grown} bytes over ${rounds} rounds'
+	}
 }

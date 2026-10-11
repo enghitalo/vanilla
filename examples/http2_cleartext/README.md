@@ -123,7 +123,10 @@ GOAWAY frame with `PROTOCOL_ERROR`, then the connection closes.
   capture `EventLoop` whose `capture_register` records the watch instead of
   arming it; `bridge_park` re-arms it on the real loop with `bridge_wake` as
   the continuation, and `bridge_wake` re-frames the finished response for the
-  stream that parked. Other streams keep being served meanwhile. One parked
+  stream that parked. The parked stream's state (its id, the app's
+  continuation and payload, the response so far in `park_res`) lives in the
+  connection's `BridgeState`, which is the watch payload: parking and resuming
+  allocate nothing. Other streams keep being served meanwhile. One parked
   stream per connection: a second one is refused with `RST_STREAM`
   (`REFUSED_STREAM`) so the client retries.
 - **Static parts are consts.** The HTTP/1.1 responses are `const`s; the echo
@@ -142,7 +145,7 @@ the HTTP/1.1 routes, the GOAWAY for a non-HTTP/1.x version, the 501 when no
 worker can take over, and the whole bridge driven as a bare `ConnHandler`
 (GET, POST with a body, a peer GOAWAY that keeps the connection serving, a
 stream that parks and resumes, a second parker refused with `RST_STREAM`, a
-partial frame). [server_end_to_end_test.v](src/server_end_to_end_test.v)
+partial frame, and that parking and resuming allocate nothing). [server_end_to_end_test.v](src/server_end_to_end_test.v)
 drives a real epoll server through `vtest`: the preface, requests and a PING
 on one connection, HTTP/1.1 on another connection to the same port, and
 `/slow` over both protocols, with `/` on another stream not waiting behind
