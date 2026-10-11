@@ -185,14 +185,15 @@ Two things that make the builder go further when a dynamic string is
 unavoidable:
 
 - `strings.Builder` **is** `[]u8` (`pub type Builder = []u8`), so you can hand
-  the builder's bytes to any `[]u8` API *mid-assembly* and keep appending —
-  [examples/auth](../examples/auth/src/main.v) builds `header.payload`, hmac-signs
-  the builder directly, then appends the signature: one buffer, zero
-  intermediate strings — and `return sb` satisfies a `[]u8` return type.
+  the builder's bytes to any `[]u8` API *mid-assembly* and keep appending, and
+  `return sb` satisfies a `[]u8` return type. The same trick works on `out`
+  itself, with no builder at all: [examples/auth](../examples/auth/src/main.v)
+  encodes the JWT's `header.payload` straight into `out`, HMAC-signs a `vbytes`
+  view of those bytes, then appends the signature.
 - **"Slow route" is not an excuse to concatenate.** A login route that pays
-  ~200 ms of argon2id still frames its response with `core.append_str`/`wi` and builds its
-  JWT in one builder. Rules stay simple by having no carve-outs; the only
-  place `${}` belongs is off-path diagnostics (below).
+  ~200 ms of argon2id still frames its response with `core.append_str`/`wi` and
+  writes its JWT straight into `out`. Rules stay simple by having no carve-outs;
+  the only place `${}` belongs is off-path diagnostics (below).
 
 Compare to the slow form — every `${}` here allocates:
 
@@ -248,8 +249,11 @@ valuable for latency/headroom — **not** raw req/s. Correct, cheap, paid once p
 >
 > **Worked example — auth.** [examples/auth](../examples/auth/src/main.v) applies the
 > same byte discipline where responses *can't* all be consts: argon2id login
-> (slow by design), JWT signed in a single builder, verification over
-> `vbytes`/`tos` views of the token, `core.append_str`/`wi` framing the one dynamic response.
+> (slow by design), the JWT encoded and signed in place in `out`, verification
+> over `vbytes` views of the token with a per-worker HMAC-SHA256 (`make_state`,
+> `sum_into` a stack array), `core.append_str`/`wi` framing the one dynamic
+> response. `/protected` and `/service` allocate nothing per request
+> (`test_hot_path_allocates_nothing`).
 
 ---
 
