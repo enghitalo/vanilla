@@ -1,6 +1,6 @@
 // vtest build: linux
 // End-to-end over a real socket (vtest, see docs/VTEST.md): the key comes from
-// the real `socket.peer_addr`, so a client sending a different forged
+// the real `socket.peer_ipv4`, so a client sending a different forged
 // X-Forwarded-For on every request still drains ONE bucket — its own.
 module main
 
@@ -38,5 +38,5 @@ fn test_e2e_real_peer_spoofed_xff_is_limited() ! {
 	}
 	// One bucket, keyed on the socket peer — not one per forged header.
 	assert limiter.buckets.len == 1
-	assert '127.0.0.1' in limiter.buckets
+	assert u32(0x7f000001) in limiter.buckets // 127.0.0.1
 }

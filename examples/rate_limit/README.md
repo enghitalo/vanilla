@@ -83,15 +83,19 @@ sleep 1; for i in $(seq 12); do curl -s -o /dev/null -w '%{http_code} ' localhos
   bucket up by `elapsed * rate` (capped at `capacity`), then spends a token.
   The clock is a parameter: `handle` passes the monotonic
   `time.sys_mono_now()`, the tests pass a fake one.
-- **The key is the socket peer.** `client_key` takes
-  `socket.peer_addr(client_fd)`. If the peer is not inside `trusted_cidrs`,
-  the header is ignored. If it is (your load balancer), the key is the
-  **right-most** `X-Forwarded-For` hop that is not one of your proxies:
-  proxies append, so only the left side is client-written. The hops are
-  scanned from the right in place and returned as a `tos` view; the map
-  clones the key on insert, so the view is never retained. An empty peer
-  (Windows, or a `getpeername` failure) becomes one shared `'unknown'` bucket.
-  This is the same rule as [examples/proxy_aware](../proxy_aware/).
+- **The key is the socket peer, as a number.** `client_key` takes
+  `socket.peer_ipv4(client_fd)`, the peer's IPv4 address as a `u32` (one
+  `getpeername` syscall, no allocation), and the buckets are a
+  `map[u32]Bucket`. If the peer is not inside `trusted_cidrs`, the header is
+  ignored. If it is (your load balancer), the key is the **right-most**
+  `X-Forwarded-For` hop that is not one of your proxies: proxies append, so
+  only the left side is client-written. The hops are scanned from the right
+  in place, and `parse_ipv4` turns each into a `u32`. A hop that is not an
+  IPv4 address (an IPv6 client, `unknown`) has no key, and everything left of
+  it is client-written, so the key is the proxy: such clients share its
+  bucket. A peer with no IPv4 address (a `getpeername` failure, a Unix-socket
+  listener) gets key `0`, one shared `'unknown'` bucket. This is the same rule
+  as [examples/proxy_aware](../proxy_aware/).
 - **`trusted_proxies` is empty by default**, so nothing is trusted until you
   list your own proxies as CIDRs (e.g. `'127.0.0.1/32'` for nginx on the same
   host). `parse_cidrs` turns them into masks once at init.
@@ -106,8 +110,8 @@ sleep 1; for i in $(seq 12); do curl -s -o /dev/null -w '%{http_code} ' localhos
   remaining count written by `wi` (`strconv.write_dec` into a stack scratch),
   and `response_200_tail`
   ([BEST_PRACTICES §3b](../../docs/BEST_PRACTICES.md#3b-dynamic-responses--append-parts-straight-into-out)).
-  `socket.peer_addr` is the deliberate exception to zero allocation: one
-  syscall and one small string per request.
+  A client that already has a bucket costs no allocation; only a new client's
+  bucket is an insert, bounded by `max_buckets`.
 
 ## Tests
 

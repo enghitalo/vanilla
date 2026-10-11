@@ -16,7 +16,7 @@ module main
 //   header: a client can send any value, a new value per request is a new
 //   bucket, and a limiter keyed on it never limits. Proxies APPEND to it, so
 //   its LEFT-MOST hop is whatever the client wrote. The key is therefore:
-//     - the socket peer IP (`socket.peer_addr(fd)`), unless that peer is a
+//     - the socket peer IP (`socket.peer_ipv4(fd)`), unless that peer is a
 //       proxy YOU run (`trusted_proxies`); then
 //     - the RIGHT-MOST `X-Forwarded-For` hop that is not one of your proxies —
 //       examples/proxy_aware's trust rule, copied here verbatim.
@@ -24,6 +24,11 @@ module main
 //   `X-Forwarded-For` is ignored until you list your own proxies. Trusting too
 //   much makes the limiter bypassable; trusting nothing behind a proxy makes
 //   every client share the proxy's bucket.
+//
+// THE KEY IS A NUMBER: the client's IPv4 address as a u32 (`map[u32]Bucket`).
+//   The peer comes from `socket.peer_ipv4(fd)` and XFF hops are parsed in
+//   place, so a request allocates nothing; only a NEW client's bucket is an
+//   insert, bounded by `max_buckets`.
 //
 // BOUNDED STATE: every new key is a map entry, so an unbounded table is a
 //   memory-exhaustion vector. A bucket that has refilled to capacity is
@@ -34,7 +39,7 @@ module main
 // CORRECT RESPONSE: 429 Too Many Requests + `Retry-After` + the
 //   `RateLimit-*` headers (draft standard) so clients can self-throttle.
 //
-// WORKS TODAY end to end: the core exposes `socket.peer_addr(fd)` for the
+// WORKS TODAY end to end: the core exposes `socket.peer_ipv4(fd)` for the
 // direct peer IP.
 import server
 import core
@@ -54,11 +59,11 @@ mut:
 struct Limiter {
 	rate        f64 // tokens added per second
 	capacity    f64 // max burst
-	max_buckets int = 100_000 // hard cap on tracked clients (~100 B each)
+	max_buckets int = 100_000 // hard cap on tracked clients (~30 B each)
 mut:
 	mu         &sync.Mutex = sync.new_mutex()
-	buckets    map[string]Bucket
-	next_sweep i64 // monotonic ns of the next idle sweep
+	buckets    map[u32]Bucket // keyed by client IPv4 (see client_key)
+	next_sweep i64            // monotonic ns of the next idle sweep
 }
 
 // allow refills the client's bucket based on elapsed time, then tries to spend
@@ -67,7 +72,7 @@ mut:
 // SOLUTION 4 — the clock is INJECTED (`now`, nanoseconds), not read inside.
 // Tests pass a fake clock and advance it deterministically: no sleeps, no
 // flakiness. main() passes `i64(time.sys_mono_now())`.
-fn (mut l Limiter) allow(client string, now i64) (bool, int) {
+fn (mut l Limiter) allow(client u32, now i64) (bool, int) {
 	l.mu.lock()
 	defer { l.mu.unlock() }
 	// Idle sweep, at most once per refill period (`capacity / rate` seconds,
@@ -120,7 +125,7 @@ fn math_min(a f64, b f64) f64 {
 // The 429 is FULLY static; the 200 only varies in `RateLimit-Remaining`, so it
 // splits into two consts around one decimal write. The body `{"ok":true}` is
 // fixed (11 bytes), which makes Content-Length a compile-time constant too.
-const response_429 = 'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nRateLimit-Limit: 10\r\nRateLimit-Remaining: 0\r\nContent-Length: 0\r\n\r\n'.bytes()
+const response_429 = 'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nRateLimit-Limit: 10\r\nRateLimit-Remaining: 0\r\nContent-Length: 0\r\n\r\n'
 const response_200_prefix = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nRateLimit-Remaining: '
 const response_200_tail = '\r\nContent-Length: 11\r\n\r\n{"ok":true}'
 
@@ -143,7 +148,7 @@ fn wi(mut out []u8, n i64) {
 const trusted_proxies = []string{}
 
 // Parsed ONCE at module init into (network, mask) pairs: per-request membership
-// is a parse + mask-and-compare, with zero substring allocations.
+// is a mask-and-compare on the u32 address.
 const trusted_cidrs = parse_cidrs(trusted_proxies)
 
 struct Cidr {
@@ -151,9 +156,9 @@ struct Cidr {
 	mask u32
 }
 
-// parse_ipv4 converts dotted-quad text to a host-order u32, or `none` when the
-// text is not a valid IPv4 address. A zero-allocation byte scan; rejection
-// doubles as hop validation — a non-IP token never matches a trusted network.
+// parse_ipv4 converts dotted-quad text to a host-order u32 (the form
+// socket.peer_ipv4 returns), or `none` when the text is not a valid IPv4
+// address. A zero-allocation byte scan; it runs per XFF hop on the hot path.
 @[direct_array_access]
 fn parse_ipv4(s string) ?u32 {
 	mut ip := u32(0)
@@ -207,42 +212,42 @@ fn parse_cidrs(list []string) []Cidr {
 	return out
 }
 
-// ip_in_cidrs — true when `ip` (dotted-quad text) falls inside any CIDR.
-// A non-IP `ip` (including '') is never trusted.
-fn ip_in_cidrs(ip string, cidrs []Cidr) bool {
-	addr := parse_ipv4(ip) or { return false }
+// ip_in_cidrs — true when `ip` falls inside any CIDR: a mask-and-compare.
+fn ip_in_cidrs(ip u32, cidrs []Cidr) bool {
 	for c in cidrs {
-		if (addr & c.mask) == c.net {
+		if (ip & c.mask) == c.net {
 			return true
 		}
 	}
 	return false
 }
 
-// client_key returns the identity to rate-limit on, over an INJECTED peer and
-// trust list (handle() passes `socket.peer_addr(fd)` and `trusted_cidrs`):
+// client_key returns the key to rate-limit on, over an INJECTED peer and
+// trust list (handle() passes `socket.peer_ipv4(fd)` and `trusted_cidrs`):
 //   1. peer NOT trusted: the peer itself. `X-Forwarded-For` is ignored — it is
 //      exactly what a spoofing client controls.
 //   2. peer trusted: the RIGHT-MOST `X-Forwarded-For` hop that is not a
 //      trusted proxy (everything right of it was appended by your proxies; the
 //      client can only pre-seed the left). All hops trusted: the left-most.
-//      No usable hop: the peer.
-//   3. '' peer — Windows (peer_addr returns '' by design) or getpeername
-//      failure: 'unknown', one shared bucket. Documented, not hidden.
-// `socket.peer_addr` is the DELIBERATE exception to zero-alloc: one
-// getpeername syscall + one small string per request.
+//      No usable hop: the peer. A hop that is not an IPv4 address (an IPv6
+//      client, `unknown`, garbage) has no u32 key, and every hop left of it
+//      is the client's to write, so the scan stops there and the key is the
+//      peer: such clients share the proxy's bucket, never a fresh one each.
+//   3. no peer address (none: getpeername failure, a UDS listener): key 0,
+//      one shared 'unknown' bucket (0.0.0.0 is never a TCP peer). Documented,
+//      not hidden.
 //
 // ZERO-COPY: the XFF value is scanned IN PLACE from the right by offsets
-// (comma split + OWS trim); a hop is an `unsafe tos` VIEW into req.buffer,
-// valid because it goes straight into allow() and the V map CLONES string
-// keys on insert (vlib/builtin/map.v) — nothing retains the view.
+// (comma split + OWS trim); each hop is an `unsafe tos` VIEW into the request
+// buffer that parse_ipv4 turns into the u32 key — nothing retains the view.
 @[direct_array_access]
-fn client_key(req request_parser.HttpRequest, peer string, trusted []Cidr) string {
-	if !ip_in_cidrs(peer, trusted) {
-		return if peer.len > 0 { peer } else { 'unknown' }
+fn client_key(req request_parser.HttpRequest, peer ?u32, trusted []Cidr) u32 {
+	p := peer or { return 0 }
+	if !ip_in_cidrs(p, trusted) {
+		return p
 	}
-	s := req.get_header_value_slice('X-Forwarded-For') or { return peer }
-	mut leftmost := '' // left-most valid hop, for the all-hops-trusted case
+	s := req.get_header_value_slice('X-Forwarded-For') or { return p }
+	mut leftmost := p // left-most hop, for the all-hops-trusted case
 	mut end := s.start + s.len // exclusive end of the hop being scanned
 	for i := s.start + s.len - 1; i >= s.start - 1; i-- {
 		// A comma at i — or the virtual one just before the value — closes the
@@ -259,7 +264,7 @@ fn client_key(req request_parser.HttpRequest, peer string, trusted []Cidr) strin
 			he--
 		}
 		if he > hs { // empty hops (",," / whitespace-only) are skipped
-			hop := unsafe { tos(&req.buffer[hs], he - hs) } // view into req.buffer
+			hop := parse_ipv4(unsafe { tos(&req.buffer[hs], he - hs) }) or { return p }
 			if !ip_in_cidrs(hop, trusted) {
 				return hop
 			}
@@ -267,7 +272,7 @@ fn client_key(req request_parser.HttpRequest, peer string, trusted []Cidr) strin
 		}
 		end = i
 	}
-	return if leftmost.len > 0 { leftmost } else { peer }
+	return leftmost
 }
 
 fn handle(req_buffer []u8, mut out []u8, client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop, mut limiter Limiter) core.Step {
@@ -275,14 +280,14 @@ fn handle(req_buffer []u8, mut out []u8, client_fd int, _worker_state voidptr, m
 		out << response.tiny_bad_request_response
 		return .close
 	}
-	key := client_key(req, socket.peer_addr(client_fd), trusted_cidrs)
+	key := client_key(req, socket.peer_ipv4(client_fd), trusted_cidrs)
 
 	// sys_mono_now: monotonic ns, no calendar conversion, immune to NTP jumps —
 	// exactly what elapsed-time refill needs (time.now() reads CLOCK_REALTIME
 	// and pays localtime_r per call).
 	allowed, remaining := limiter.allow(key, i64(time.sys_mono_now()))
 	if !allowed {
-		out << response_429
+		core.append_str(mut out, response_429)
 		return .done
 	}
 	core.append_str(mut out, response_200_prefix)
