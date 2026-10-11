@@ -19,29 +19,20 @@ fn (app App) handle_request(req_buffer []u8, mut out []u8, _client_fd int, _work
 		return .close
 	}
 
-	method := unsafe { tos(&req.buffer[req.method.start], req.method.len) }
-	path := unsafe { tos(&req.buffer[req.path.start], req.path.len) }
+	method := unsafe { tos(&req_buffer[req.method.start], req.method.len) }
+	path := unsafe { tos(&req_buffer[req.path.start], req.path.len) }
 
 	if method == 'GET' {
 		if path == '/' {
-			out << app.home_controller(req) or {
-				out << response.tiny_bad_request_response
-				return .close
-			}
+			app.home_controller(req, mut out)
 			return .done
 		} else if path.starts_with('/user/') {
-			out << app.get_user_controller(req) or {
-				out << response.tiny_bad_request_response
-				return .close
-			}
+			app.get_user_controller(req, mut out)
 			return .done
 		}
 	} else if method == 'POST' {
 		if path == '/user' {
-			out << app.create_user_controller(req) or {
-				out << response.tiny_bad_request_response
-				return .close
-			}
+			app.create_user_controller(req, mut out)
 			return .done
 		}
 	}

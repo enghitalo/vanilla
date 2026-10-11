@@ -69,10 +69,10 @@ method or path (`/users`, `/nope`) the canned 400, byte for byte as in
   would block that worker's whole event loop;
   [BEST_PRACTICES §5](../../docs/BEST_PRACTICES.md#5-side-effects-go-through-the-async-runtime--pools-off-the-hot-path)
   covers moving it off.
-- **The controllers are simple's.** `get_user_controller` reads the path from
-  the request, copies the id with `path[6..]` and builds the reply in a
-  `strings.Builder`; the router appends the returned bytes. For the
-  allocation-free form of the same routes, see [simple2](../simple2/).
+- **The controllers are simple's.** Each takes `mut out []u8` and appends
+  its response: `get_user_controller` reads the path from the request, takes
+  the id as a view of it (no copy) and frames the reply with
+  `core.append_str` plus `wi`. No route allocates per request.
   `get_users_controller` exists but no route calls it.
 
 ## Tests
@@ -82,7 +82,8 @@ v test examples/simple3/src
 ```
 
 [main_test.v](src/main_test.v) calls `App{}.handle_request` directly on four
-raw requests (home, user, create, an `INVALID` method).
+raw requests (home, user, create, an `INVALID` method) and checks that no
+route allocates.
 [server_end_to_end_test.v](src/server_end_to_end_test.v) sends the same four
 over real sockets with `vtest.drive`, wiring the handler through the same
 closure `main` uses. Both use `App{}` with no pool, which these routes never
@@ -91,7 +92,6 @@ touch.
 ## See also
 
 - [examples/simple](../simple/) — the free-function version
-- [examples/simple2](../simple2/) — the same routes, zero-copy and appending
-  straight into `out`
+- [examples/simple2](../simple2/) — the same routes, routed by byte offsets
 - [examples/hexagonal](../hexagonal/) — app structure with ports and adapters
 - [BEST_PRACTICES §6 — concurrency](../../docs/BEST_PRACTICES.md#6-concurrency-no-shared-mutable-state-without-protection)
