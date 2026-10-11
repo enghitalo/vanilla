@@ -83,6 +83,13 @@ fn main() {
 	}
 	b.measure('get_query_slice')
 
+	// 3b) Presence check for the last parameter (walks every element).
+	page := 'page'.bytes()
+	for _ in 0 .. iterations {
+		acc += int(req.has_query(page))
+	}
+	b.measure('has_query')
+
 	// 4) Request framing — the per-request cost framing adds to read_request.
 	// This worst-cases the no-body fast path: full header walk, CL/TE rejected.
 	for _ in 0 .. iterations {

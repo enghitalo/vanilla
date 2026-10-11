@@ -360,6 +360,58 @@ fn test_get_query_slice_special_characters() {
 	assert token_slice.to_string(req.buffer) == 'abc-123_xyz'
 }
 
+fn test_has_query() {
+	// target, key, has_query, get_query_slice (`none` when absent)
+	cases := [
+		['/a?debug', 'debug', 'true', 'none'],
+		['/a?debug=', 'debug', 'true', ''],
+		['/a?debug=1', 'debug', 'true', '1'],
+		['/a?debug&id=5', 'debug', 'true', 'none'],
+		['/a?debug&id=5', 'id', 'true', '5'],
+		['/a?id=5&debug', 'debug', 'true', 'none'],
+		['/a?id=5&debug&x=1', 'x', 'true', '1'],
+		['/a?debug&debug=2', 'debug', 'true', '2'],
+		['/a?&&debug&', 'debug', 'true', 'none'],
+		['/a?a=b=c', 'a', 'true', 'b=c'],
+		['/a?debugx=1', 'debug', 'false', 'none'],
+		['/a?debugx', 'debug', 'false', 'none'],
+		['/a?xdebug', 'debug', 'false', 'none'],
+		['/a?deb', 'debug', 'false', 'none'],
+		['/a?id=debug', 'debug', 'false', 'none'],
+		['/a?=debug', 'debug', 'false', 'none'],
+		['/a?', 'debug', 'false', 'none'],
+		['/a', 'debug', 'false', 'none'],
+		['/debug', 'debug', 'false', 'none'],
+		['/a?debug', '', 'false', 'none'],
+		['/a?=x', '', 'false', 'none'],
+	]
+	for c in cases {
+		buffer := 'GET ${c[0]} HTTP/1.1\r\nHost: example.com\r\n\r\n'.bytes()
+		req := decode_http_request(buffer) or { panic(err) }
+		key := c[1].bytes()
+		assert req.has_query(key) == (c[2] == 'true'), '${c[0]} ${c[1]}'
+		if s := req.get_query_slice(key) {
+			assert s.to_string(req.buffer) == c[3], '${c[0]} ${c[1]}'
+		} else {
+			assert c[3] == 'none', '${c[0]} ${c[1]}'
+		}
+	}
+}
+
+fn test_has_query_bare_key_at_buffer_end() {
+	// A hand-built request whose path ends the buffer with a bare key.
+	buffer := '/s?a=1&flag'.bytes()
+	req := HttpRequest{
+		buffer: buffer
+		path:   Slice{0, buffer.len}
+	}
+	assert req.has_query('flag'.bytes())
+	assert req.get_query_slice('flag'.bytes()) == none
+	assert req.has_query('a'.bytes())
+	assert !req.has_query('fla'.bytes())
+	assert !req.has_query('flagx'.bytes())
+}
+
 fn test_get_query_deprecated() {
 	buffer := 'GET /users?id=456 HTTP/1.1\r\nHost: example.com\r\n\r\n'.bytes()
 	req := decode_http_request(buffer) or { panic(err) }

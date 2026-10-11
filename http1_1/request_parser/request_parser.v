@@ -422,72 +422,69 @@ pub fn (req HttpRequest) validate_http1() ! {
 	}
 }
 
-// get_query_slice extracts a query parameter value as a Slice (ZERO ALLOCATIONS)
-// Example: GET /users?id=123&format=json
-//   get_query_slice('id'.bytes()) -> Slice pointing to "123"
-pub fn (req HttpRequest) get_query_slice(key []u8) ?Slice {
-	path_start := req.path.start
-	path_len := req.path.len
-
-	// An empty key would match a `?=x` element and then index key[0].
-	if key.len == 0 {
+// query_element finds the first element of path's query string named `key` and
+// returns what follows the name, up to the element's end: len 0 for a bare
+// `key` (counted only when bare_ok), otherwise its '=' and the value. Each
+// element is cut at its '&' first and its name compared in place: one memchr
+// per element. find_byte_idx, not a `!int`: an error() on not-found allocates
+// a MessageError, a per-request leak under `-gc none`.
+@[direct_array_access; inline]
+fn query_element(buf []u8, path Slice, key []u8, bare_ok bool) ?Slice {
+	// An empty key would match an element that starts with '=' (`?=x`).
+	if key.len == 0 || path.len == 0 {
 		return none
 	}
-	// Find '?' in path using memchr. find_byte_idx (no `!int` Result): an error()
-	// on not-found allocates a MessageError — a per-request leak under `-gc none`
-	// (query parsing runs on every request, several lookups each).
-	q_pos := find_byte_idx(&req.buffer[path_start], path_len, question_mark_u8)
+	q_pos := find_byte_idx(&buf[path.start], path.len, question_mark_u8)
 	if q_pos < 0 {
-		return none // No query string
+		return none
 	}
-
-	// Start of query string (after '?')
-	mut pos := path_start + q_pos + 1
-	path_end := path_start + path_len
-
-	// Parse query string: key1=val1&key2=val2
+	path_end := path.start + path.len
+	mut pos := path.start + q_pos + 1
 	for pos < path_end {
-		// Find '=' for this key
-		eq_pos := find_byte_idx(&req.buffer[pos], path_end - pos, equal_u8)
-		if eq_pos < 0 {
-			break // No '=' found, malformed query
-		}
-
-		key_len := eq_pos
-
-		// Check if key matches using memcmp
-		if key_len == key.len && unsafe { C.memcmp(&req.buffer[pos], &key[0], key.len) } == 0 {
-			// Found matching key, extract value
-			value_start := pos + eq_pos + 1
-			if value_start >= path_end {
+		amp := find_byte_idx(&buf[pos], path_end - pos, amperstand_u8)
+		end := if amp < 0 { path_end } else { pos + amp }
+		after := pos + key.len
+		if after <= end && unsafe { C.memcmp(&buf[pos], &key[0], key.len) } == 0 {
+			if after < end && buf[after] == equal_u8 {
 				return Slice{
-					start: value_start
+					start: after
+					len:   end - after
+				}
+			}
+			if after == end && bare_ok {
+				return Slice{
+					start: after
 					len:   0
 				}
 			}
-
-			// Find '&' or end of path using memchr
-			mut value_len := find_byte_idx(&req.buffer[value_start], path_end - value_start,
-				amperstand_u8)
-			if value_len < 0 {
-				value_len = path_end - value_start // last parameter, no '&'
-			}
-
-			return Slice{
-				start: value_start
-				len:   value_len
-			}
 		}
-
-		// Skip to next parameter (find '&')
-		amp_pos := find_byte_idx(&req.buffer[pos], path_end - pos, amperstand_u8)
-		if amp_pos < 0 {
-			break // Last parameter, no match
-		}
-		pos += amp_pos + 1
+		pos = end + 1
 	}
-
 	return none
+}
+
+// get_query_slice returns the value of the first query parameter named `key` as
+// a Slice into the request buffer, or none. Zero allocations. The value is raw
+// (not percent-decoded); `key` is matched byte for
+// byte against the raw names, and holds no '=' or '&'. A bare `?key` has no
+// value, so it is none here: has_query tells it from a missing key.
+// Example: GET /users?id=123&format=json
+//   get_query_slice('id'.bytes()) -> Slice pointing to "123"
+//   get_query_slice('format'.bytes()) -> "json"; `?q=` -> Slice{len: 0}
+pub fn (req HttpRequest) get_query_slice(key []u8) ?Slice {
+	v := query_element(req.buffer, req.path, key, false)?
+	return Slice{
+		start: v.start + 1
+		len:   v.len - 1
+	}
+}
+
+// has_query reports whether the query string names `key`, with a value or
+// without: true for `?debug`, `?debug=` and `?debug=1`. Zero allocations. Use
+// it for flags, which get_query_slice cannot see (it returns none for a bare
+// `?debug`, as for a missing key).
+pub fn (req HttpRequest) has_query(key []u8) bool {
+	return query_element(req.buffer, req.path, key, true) != none
 }
 
 // Deprecated: Use get_query_slice instead; it tells a missing key from an empty value.
