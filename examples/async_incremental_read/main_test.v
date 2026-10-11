@@ -2,9 +2,13 @@
 // main.v streams a popen(3) pipe through the epoll watch reactor (Linux only).
 module main
 
+import core
 import server
 import vtest
 import http1_1.response
+
+fn C.pipe(fds &i32) int
+fn C.write(fd int, buf voidptr, n usize) int
 
 const stream_req = 'GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
 
@@ -84,6 +88,55 @@ fn test_wx_writes_chunk_sizes() {
 		wx(mut out, n)
 		assert out.bytestr() == want, 'wx(${n})'
 	}
+}
+
+// record_register stands in for the backend's watch registration: it records
+// the fd the way the reactor does, and arms nothing.
+fn record_register(mut event_loop core.EventLoop, ext_fd int, interest core.WatchInterest, continuation core.WakeFn, watch_payload voidptr) {
+	event_loop.last_watched = ext_fd
+}
+
+// on_chunk, driven directly over a pipe: each wake frames what the pipe holds
+// as one chunk, after whatever `out` already has (out starts with no capacity,
+// so the first wake grows it); a 5000-byte write takes a full 4 KiB chunk and
+// then the rest; and a wake that finds nothing (EAGAIN) appends nothing and
+// re-arms.
+fn test_on_chunk_frames_what_the_pipe_holds() {
+	mut fds := [2]i32{}
+	assert C.pipe(unsafe { &fds[0] }) == 0
+	rfd := int(fds[0])
+	wfd := int(fds[1])
+	defer {
+		C.close(rfd)
+		C.close(wfd)
+	}
+	C.fcntl(rfd, C.F_SETFL, C.O_NONBLOCK)
+	mut event_loop := core.EventLoop{
+		register: record_register
+	}
+	mut out := []u8{}
+	out << `>`
+	line := 'line 1\n'
+	assert C.write(wfd, line.str, usize(line.len)) == line.len
+	step := on_chunk(mut out, rfd, false, unsafe { nil }, unsafe { nil }, mut event_loop)
+	assert step == .suspend
+	assert event_loop.last_watched == rfd
+	assert out.bytestr() == '>7\r\nline 1\n\r\n'
+	mut big := []u8{len: 5000}
+	for i in 0 .. big.len {
+		big[i] = u8(`a` + i % 26)
+	}
+	assert C.write(wfd, big.data, usize(big.len)) == big.len
+	on_chunk(mut out, rfd, false, unsafe { nil }, unsafe { nil }, mut event_loop)
+	on_chunk(mut out, rfd, false, unsafe { nil }, unsafe { nil }, mut event_loop)
+	want := '>7\r\nline 1\n\r\n' + '1000\r\n' + big[..4096].bytestr() + '\r\n' + '388\r\n' +
+		big[4096..].bytestr() + '\r\n'
+	assert out.bytestr() == want
+	event_loop.last_watched = -1
+	step2 := on_chunk(mut out, rfd, false, unsafe { nil }, unsafe { nil }, mut event_loop)
+	assert step2 == .suspend
+	assert event_loop.last_watched == rfd, 'EAGAIN must re-arm'
+	assert out.bytestr() == want, 'EAGAIN must append nothing'
 }
 
 // On the wire: every chunk must be well formed (its hex size matches its data),

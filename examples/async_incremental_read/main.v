@@ -39,6 +39,12 @@ const last_chunk = '0\r\n\r\n'
 
 const hex_digits = '0123456789abcdef'
 
+// read_max is the most one wake forwards as a chunk; size_line_max is the
+// room its chunk-size line takes at most (`1000\r\n`).
+const read_max = 4096
+
+const size_line_max = 6
+
 // route_is reports whether the request path, without its query string, is
 // `lit`. req.path includes the query, so the compare stops at the first `?`.
 // It compares bytes in place: the request is never copied.
@@ -98,13 +104,23 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
 // as one chunk and re-arm. Each chunk flushes on .suspend, so the client sees
 // output as the producer emits it.
 fn on_chunk(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
-	mut buf := [4096]u8{}
-	n := C.read(ready_fd, &buf[0], 4096)
+	// Read straight into out's spare capacity, leaving room for the chunk-size
+	// line in front, then slide the bytes down behind the line once their count
+	// is known: no scratch buffer to zero and copy on every wake.
+	if out.cap - out.len < size_line_max + read_max + 2 {
+		out.grow_cap(size_line_max + read_max + 2)
+	}
+	data := unsafe { &u8(out.data) + out.len + size_line_max }
+	n := C.read(ready_fd, data, read_max)
 	if n > 0 {
-		// HTTP chunk = <hex length>\r\n<bytes>\r\n
+		// HTTP chunk = <hex length>\r\n<bytes>\r\n. The capacity is reserved:
+		// the appends below never move out.data.
 		wx(mut out, n)
 		core.append_str(mut out, '\r\n')
-		unsafe { out.push_many(&buf[0], n) }
+		unsafe {
+			vmemmove(&u8(out.data) + out.len, data, n)
+			out.len += n
+		}
 		core.append_str(mut out, '\r\n')
 		event_loop.watch_fd(ready_fd, .readable, on_chunk, watch_payload)
 		return .suspend

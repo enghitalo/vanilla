@@ -68,10 +68,12 @@ the zero-size chunk:
   `event_loop.watch_fd(fd, .readable, on_chunk, fp)`, passing the `FILE*` as
   the `watch_payload` so the continuation can `pclose` it. It returns
   `.suspend`, which flushes the head. If `popen` fails it answers 404.
-- **One chunk per readiness.** `on_chunk` reads up to 4096 bytes into a stack
-  buffer. With data, it appends the size in hex (`wx`), CRLF, the bytes
-  (`push_many`) and CRLF, re-watches the same fd and returns `.suspend`: the
-  chunk goes out now, and the worker waits for the next line.
+- **One chunk per readiness.** `on_chunk` reserves room in `out` and reads up
+  to 4096 bytes straight into its spare capacity, leaving space for the
+  chunk-size line in front. With data, it appends the size in hex (`wx`) and
+  CRLF, slides the bytes down behind them, appends CRLF, re-watches the same
+  fd and returns `.suspend`: the chunk goes out now, and the worker waits for
+  the next line. No scratch buffer is zeroed and copied on every wake.
 - **End of stream.** A read of 0 is EOF: it appends `last_chunk`
   (`0\r\n\r\n`, RFC 9112 §7.1), `pclose`s the stream (which also closes the
   fd and reaps the child) and returns `.done`; the connection stays open for
@@ -87,7 +89,9 @@ the zero-size chunk:
 v test examples/async_incremental_read
 ```
 
-[main_test.v](main_test.v) checks `wx` against known chunk sizes, then drives
+[main_test.v](main_test.v) checks `wx` against known chunk sizes and drives
+`on_chunk` directly over a pipe (byte-exact chunks behind bytes already in
+`out`), then drives
 a live server through [vtest](../../docs/VTEST.md): the stream decodes
 strictly (every hex size matches its data) to the five lines, ends with the
 zero-size chunk, and the same keep-alive connection then answers a 404.
