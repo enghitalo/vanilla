@@ -2,16 +2,16 @@ module main
 
 // Controllers append response bytes STRAIGHT INTO the caller-owned `out`
 // buffer (docs/BEST_PRACTICES.md §3b) — no per-request strings.Builder, no
-// return-then-copy, no `.str()`, no manual frees. Static responses are consts
-// appended with `out <<`; the one dynamic response (`/user/<id>`) is framed
-// with `core.append_str` and the zero-alloc helper `wi` (strconv.write_dec
-// into a stack scratch).
+// return-then-copy, no `.str()`, no manual frees. Static responses are const
+// strings appended with `core.append_str`; the one dynamic response
+// (`/user/<id>`) is framed with `core.append_str` and the zero-alloc helper
+// `wi` (strconv.write_dec into a stack scratch).
 import strconv
 import core
 
-const http_ok_response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const http_ok_response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
-const http_created_response = 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const http_created_response = 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 // wi appends n's decimal digits into `out` — itoa into a stack scratch, then
 // append. No allocation, no `.str()`. A fixed-size array is zeroed on every
@@ -26,11 +26,11 @@ fn wi(mut out []u8, n i64) {
 }
 
 fn home_controller(mut out []u8) {
-	out << http_ok_response
+	core.append_str(mut out, http_ok_response)
 }
 
 fn get_users_controller(mut out []u8) {
-	out << http_ok_response
+	core.append_str(mut out, http_ok_response)
 }
 
 // get_user_controller echoes the id back as text/plain. `id` is a zero-copy
@@ -44,5 +44,5 @@ fn get_user_controller(id []u8, mut out []u8) {
 }
 
 fn create_user_controller(mut out []u8) {
-	out << http_created_response
+	core.append_str(mut out, http_created_response)
 }

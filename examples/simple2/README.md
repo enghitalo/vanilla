@@ -1,11 +1,10 @@
 # simple2 — the same routes, written to the byte discipline
 
-[examples/simple](../simple/) routes on `string` views and lets each
-controller return a freshly built `[]u8`. simple2 serves the same CRUD-shaped
-routes (plus `GET /users`) but follows the project's hot-path rules: the
-router compares bytes in place by offsets, the user id is a zero-copy view of
-the request buffer, and controllers append the response straight into the
-server's `out` buffer instead of returning one.
+[examples/simple](../simple/) routes on `string` views compared with `==`.
+simple2 serves the same CRUD-shaped routes (plus `GET /users`) with the
+router comparing bytes in place by offsets, and the user id as a zero-copy
+`[]u8` view of the request buffer. Both append the response straight into
+the server's `out` buffer and allocate nothing per request.
 
 Read it side by side with simple: same file split, same responses, and every
 difference is one of the patterns in
@@ -82,10 +81,12 @@ Connection: keep-alive
 | | simple | simple2 |
 |---|---|---|
 | method / path match | `tos` views compared with `==`, `starts_with` | `slice_eq` compares the request `Slice` against a literal, byte by byte |
-| the id | `path[6..]`, a new string, wrapped in `[id]` | `unsafe { (&req.buffer[i]).vbytes(n) }`, a view of the request bytes |
-| controller shape | `fn (...) ![]u8`, returns the response | `fn (..., mut out []u8)`, appends into `out` |
-| dynamic reply | `strings.Builder` + `.str()`, then copied into `out` | `core.append_str` for the literal parts, `wi` for `Content-Length` |
+| the id | `tos(path.str + 6, ...)`, a `string` view of the path | `unsafe { (&req.buffer[i]).vbytes(n) }`, a `[]u8` view of the request bytes |
 | `GET /user/` | 200 with an empty body | 400 (`req.path.len > prefix.len` requires an id byte) |
+
+The controllers are the same in both: `fn (..., mut out []u8)`, appending
+`const` strings with `core.append_str` and framing the one dynamic reply
+with `core.append_str` plus `wi` for `Content-Length`.
 
 ## How it works
 
@@ -96,8 +97,8 @@ Connection: keep-alive
 - **The id is a view.** `get_user_controller(id []u8, mut out)` receives a
   `vbytes` window over the request buffer. The response is built before the
   handler returns, so the view never outlives the buffer.
-- **Append, don't return.** Static replies are `const`s appended with
-  `out <<`; the one dynamic reply frames itself with `core.append_str` and
+- **Append, don't return.** Static replies are `const` strings appended with
+  `core.append_str`; the one dynamic reply frames itself with `core.append_str` and
   `wi`, which formats the integer with `strconv.write_dec` into a 24-byte
   stack scratch and pushes the digits
   ([BEST_PRACTICES §3b](../../docs/BEST_PRACTICES.md#3b-dynamic-responses--append-parts-straight-into-out)).
@@ -112,11 +113,12 @@ v test examples/simple2/src
 
 [main_test.v](src/main_test.v) calls `handle_request` directly: each route's
 exact bytes, the canned 400 for an unknown method, unknown GET and POST paths
-and the empty id, and `.close` plus the 400 for a truncated request head.
+and the empty id, `.close` plus the 400 for a truncated request head, and
+that no route allocates (a `gc_heap_usage()` delta over 20k rounds).
 
 ## See also
 
-- [examples/simple](../simple/) — the version this rewrites
+- [examples/simple](../simple/) — the same routes on `string` views
 - [examples/simple3](../simple3/) — simple's code with the handler on an
   `App` struct holding a SQLite pool
 - [examples/router](../router/) — the same in-place routing as a module, for

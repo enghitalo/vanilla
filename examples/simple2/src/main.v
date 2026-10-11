@@ -10,7 +10,8 @@ module main
 //     the request buffer. The response is built synchronously inside this call,
 //     so the view never outlives the buffer — never retain it past the handler.
 //   - Controllers append STRAIGHT INTO the caller-owned `out` buffer; static
-//     responses are consts appended with `out <<` (see controllers.v).
+//     responses are const strings appended with `core.append_str` (see
+//     controllers.v).
 import server
 import core
 import http1_1.request_parser
