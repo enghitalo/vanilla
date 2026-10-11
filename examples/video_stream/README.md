@@ -41,8 +41,32 @@ than sent shorter than its `Content-Length`.
 ```sh
 curl -i -H 'Range: bytes=0-99' http://localhost:3000/video
 # HTTP/1.1 206 Partial Content
-# Content-Range: bytes 0-99/52229
+# Content-Range: bytes 0-99/52228
 # Content-Length: 100
+```
+
+An end past the file stops at its last byte (RFC 9110 §14.1.2), so a client
+that fetches fixed-size chunks gets the tail of the file in its last one, not
+the whole file again; a suffix longer than the file takes all of it:
+
+```sh
+curl -i -H 'Range: bytes=52000-99999' http://localhost:3000/video
+# HTTP/1.1 206 Partial Content
+# Content-Range: bytes 52000-52227/52228
+# Content-Length: 228
+```
+
+A start at or past the end, or `bytes=-0`, cannot be satisfied: the answer is
+`416 Range Not Satisfiable` with the file's length and no body. A spec that is
+not one valid byte range (several ranges, an end before its start, a number
+that is not all digits, another unit) is ignored, and the whole file comes
+back as a 200.
+
+```sh
+curl -i -H 'Range: bytes=60000-' http://localhost:3000/video
+# HTTP/1.1 416 Range Not Satisfiable
+# Content-Range: bytes */52228
+# Content-Length: 0
 ```
 
 ## `/webcam` — live stream (push / MJPEG)

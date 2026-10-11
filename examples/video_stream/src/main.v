@@ -133,11 +133,14 @@ fn handle(req_buffer []u8, mut out []u8, client_fd int, _worker_state voidptr, m
 
 // serve_video answers a (possibly ranged) request for the video file at
 // `path`, reading only the bytes it returns, with pread(2) straight into `out`
-// after the header block (core.append_file_region). Range present -> 206 +
-// Content-Range, capped to video_chunk_max. No Range -> 200 with the full file
-// (browsers always send a Range, so this path is for simple clients / small
-// files). The views come from `req_buffer`, the handler's own parameter (a
-// view of `req.buffer` handed on to a callee moves `req` to the heap).
+// after the header block (core.append_file_region). A satisfiable Range ->
+// 206 + Content-Range, capped to video_chunk_max; an unsatisfiable one -> 416.
+// No Range, or one that is ignored -> 200 with the full file (browsers always
+// send a Range, so this path is for simple clients / small files). Only a GET
+// gets here (handle answers 405 to anything else), so Range is read for GET
+// alone, as RFC 9110 §14.2 defines it. The views come from `req_buffer`, the
+// handler's own parameter (a view of `req.buffer` handed on to a callee moves
+// `req` to the heap).
 //
 // The core's zero-copy alternative is core.queue_file (sendfile(2), used by
 // server.static_assets): the worker sends the region itself, but it needs an
@@ -166,7 +169,8 @@ fn serve_video(req request_parser.HttpRequest, req_buffer []u8, path string, mut
 		if rng.len > 0 {
 			// Zero-copy VIEW of the header value — parse_range scans it in place.
 			header := unsafe { (&req_buffer[rng.start]).vbytes(rng.len) }
-			if start, end_req := parse_range(header, size) {
+			spec, start, end_req := parse_range(header, size)
+			if spec == .satisfiable {
 				// Cap the chunk so memory stays bounded regardless of what was asked.
 				mut end := end_req
 				if end - start + 1 > video_chunk_max {
@@ -186,10 +190,20 @@ fn serve_video(req request_parser.HttpRequest, req_buffer []u8, path string, mut
 				append_body(mut out, fd, start, length, mark)
 				return
 			}
+			if spec == .unsatisfiable {
+				// 416, with the file's length in Content-Range (RFC 9110
+				// §15.5.17, §14.4) and no body.
+				core.append_str(mut out,
+					'HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */')
+				wi(mut out, size)
+				core.append_str(mut out, '\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n')
+				return
+			}
 		}
 	}
 
-	// No (valid) Range: full 200. Accept-Ranges tells the client it can seek.
+	// No Range, or one that is ignored: full 200. Accept-Ranges tells the
+	// client it can seek.
 	core.append_str(mut out,
 		'HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nContent-Length: ')
 	wi(mut out, size)
@@ -210,60 +224,102 @@ fn append_body(mut out []u8, fd int, off i64, length i64, mark int) {
 	}
 }
 
-// parse_range parses "bytes=START-END" into an inclusive, clamped (start, end).
-// Supports open-ended "bytes=START-" and suffix "bytes=-N" (last N bytes).
-// Pure offset scan over the header VIEW — no substr, no split(), no strings.
-fn parse_range(h []u8, size i64) ?(i64, i64) {
+// RangeSpec is what parse_range makes of a Range header value.
+enum RangeSpec {
+	ignore        // a Range the caller ignores: it serves the whole file (200)
+	satisfiable   // the inclusive window start..end, inside the file (206)
+	unsatisfiable // valid but unsatisfiable (RFC 9110 §14.1.2): the caller answers 416
+}
+
+// parse_range reads a Range header value through a byte VIEW: no substr, no
+// split(), no intermediate strings, no error() to box. It takes one byte
+// range, `bytes=FIRST-LAST`, `bytes=FIRST-` or `bytes=-SUFFIX`, each number
+// all digits (RFC 9110 §14.1.1). RFC 9110 §14.2 lets a server ignore a Range
+// header; §14.1.2 says which ones are unsatisfiable:
+//   - .ignore: anything else (a unit other than a lowercase `bytes`, a
+//     malformed spec, more than one range, a LAST below its FIRST), and a
+//     SUFFIX above 0 on an empty file: satisfiable, but it selects no byte
+//     a 206 could carry, and §14.2 lets a server ignore Range on an empty
+//     representation.
+//   - .unsatisfiable: a FIRST at or past the end of the file, so any FIRST on
+//     an empty file, or a SUFFIX of 0.
+//   - .satisfiable, start, end: the rest, with 0 <= start <= end < size. A
+//     LAST at or past the end of the file, or none, means up to the last
+//     byte, and a SUFFIX longer than the file means the whole file (both
+//     §14.1.2).
+@[direct_array_access]
+fn parse_range(h []u8, size i64) (RangeSpec, i64, i64) {
 	prefix := 'bytes='
-	if h.len <= prefix.len {
-		return none
+	if h.len < prefix.len {
+		return .ignore, 0, 0
 	}
 	for i in 0 .. prefix.len {
 		if h[i] != prefix[i] {
-			return none
+			return .ignore, 0, 0
 		}
 	}
-	// Exactly one '-' separates the two fields (RFC 9110 int-range/suffix-range).
+	// Exactly one '-' separates the two sides (split-free scan).
 	mut dash := -1
 	for i in prefix.len .. h.len {
-		if h[i] == u8(`-`) {
+		if h[i] == `-` {
 			if dash >= 0 {
-				return none
+				return .ignore, 0, 0
 			}
 			dash = i
 		}
 	}
 	if dash < 0 {
-		return none
+		return .ignore, 0, 0
 	}
 	mut start := i64(0)
 	mut end := size - 1
 	if dash == prefix.len {
-		n := dec_i64(h, dash + 1, h.len) // suffix: last N bytes
+		// suffix range "bytes=-N": the LAST N bytes
+		n := parse_dec(h, dash + 1, h.len)
+		if n < 0 || (n > 0 && size == 0) {
+			return .ignore, 0, 0
+		}
 		start = if n >= size { i64(0) } else { size - n }
 	} else {
-		start = dec_i64(h, prefix.len, dash)
-		if dash + 1 < h.len {
-			end = dec_i64(h, dash + 1, h.len)
+		start = parse_dec(h, prefix.len, dash)
+		if start < 0 {
+			return .ignore, 0, 0
+		}
+		if dash < h.len - 1 { // "bytes=N-M"; open-ended "bytes=N-" keeps end
+			last := parse_dec(h, dash + 1, h.len)
+			if last < 0 || last < start {
+				return .ignore, 0, 0
+			}
+			if last < end {
+				end = last
+			}
 		}
 	}
-	if start < 0 || end >= size || start > end {
-		return none
+	// start > end: a FIRST at or past the end of the file (end = -1 on an
+	// empty one), or a SUFFIX of 0.
+	if start > end {
+		return .unsatisfiable, 0, 0
 	}
-	return start, end
+	return .satisfiable, start, end
 }
 
-// dec_i64 parses the leading decimal digits of h[from..to] in place. No digits
-// yields 0 — the same accept/reject matrix as the substr+`.i64()` parser this
-// replaced (out-of-range values are caught by parse_range's final clamp check).
+// parse_dec parses h[from..to] as a decimal number: at least one byte, all of
+// them digits, else -1. RFC 9110 §14.1.2 tells a recipient to expect numbers
+// of any length without overflowing, so the value saturates at max_i64: a
+// huge number reads as larger than any file, never as a wrapped-around one.
 @[direct_array_access]
-fn dec_i64(h []u8, from int, to int) i64 {
+fn parse_dec(h []u8, from int, to int) i64 {
+	if from >= to {
+		return -1
+	}
 	mut v := i64(0)
-	for k in from .. to {
-		if h[k] < `0` || h[k] > `9` {
-			break
+	for i in from .. to {
+		c := h[i]
+		if c < `0` || c > `9` {
+			return -1
 		}
-		v = v * 10 + i64(h[k] - `0`)
+		d := i64(c - `0`)
+		v = if v > (max_i64 - d) / 10 { max_i64 } else { v * 10 + d }
 	}
 	return v
 }

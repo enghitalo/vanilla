@@ -135,44 +135,72 @@ fn test_snapshot_into_reuses_the_buffer() {
 
 // --- Range parsing ----------------------------------------------------------
 
+// range_of is parse_range as a string: `start-end` for a satisfiable range,
+// else the outcome's name.
+fn range_of(spec string, size i64) string {
+	kind, s, e := parse_range(spec.bytes(), size)
+	return if kind == .satisfiable { '${s}-${e}' } else { '${kind}' }
+}
+
 fn test_parse_range_explicit() {
-	start, end := parse_range('bytes=0-99'.bytes(), 1000) or { panic('should parse') }
-	assert start == 0
-	assert end == 99
+	assert range_of('bytes=0-99', 1000) == '0-99'
 }
 
 fn test_parse_range_open_ended() {
-	start, end := parse_range('bytes=500-'.bytes(), 1000) or { panic('should parse') }
-	assert start == 500
-	assert end == 999 // clamped to size-1
+	assert range_of('bytes=500-', 1000) == '500-999' // up to the last byte
 }
 
 fn test_parse_range_suffix_last_n() {
-	start, end := parse_range('bytes=-100'.bytes(), 1000) or { panic('should parse') }
-	assert start == 900 // last 100 bytes
-	assert end == 999
+	assert range_of('bytes=-100', 1000) == '900-999' // the last 100 bytes
 }
 
 fn test_parse_range_suffix_larger_than_file() {
-	start, end := parse_range('bytes=-5000'.bytes(), 1000) or { panic('should parse') }
-	assert start == 0 // suffix longer than the file clamps to the whole file
-	assert end == 999
+	// a suffix longer than the file is the whole file
+	assert range_of('bytes=-5000', 1000) == '0-999'
 }
 
-fn rejects(header string, size i64) bool {
-	if _, _ := parse_range(header.bytes(), size) {
-		return false // parsed -> not rejected
+// RFC 9110 §14.1.2: a LAST at or past the end of the file means its last byte
+// (#308: such a range was refused, so the whole file came back as a 200).
+fn test_parse_range_end_past_the_file_is_clamped() {
+	assert range_of('bytes=500-1000', 1000) == '500-999'
+	assert range_of('bytes=999-1000', 1000) == '999-999'
+	assert range_of('bytes=0-999999999', 1000) == '0-999'
+}
+
+// Unsatisfiable, the caller answers 416 (#308: refused for a 200): a FIRST at
+// or past the end of the file, so any FIRST on an empty file, or a SUFFIX of 0.
+fn test_parse_range_unsatisfiable() {
+	assert range_of('bytes=2000-3000', 1000) == 'unsatisfiable'
+	assert range_of('bytes=1000-', 1000) == 'unsatisfiable'
+	assert range_of('bytes=-0', 1000) == 'unsatisfiable'
+	assert range_of('bytes=0-', 0) == 'unsatisfiable'
+	assert range_of('bytes=0-0', 0) == 'unsatisfiable'
+	assert range_of('bytes=-0', 0) == 'unsatisfiable'
+}
+
+// Ignored, the caller serves the whole file: a LAST below its FIRST, another
+// unit, no spec, more than one range, no dash, a side that is not all digits
+// (before #308 its leading digits were read, so `bytes= 7-9` was served as
+// 0-9), and a SUFFIX above 0 on an empty file (no byte a 206 could carry).
+fn test_parse_range_ignores_invalid_specs() {
+	for spec in ['bytes=500-100', 'items=0-9', 'Bytes=0-9', 'bytes=', 'bytes=-', 'bytes=0-9-9',
+		'bytes=0-1,5-6', 'bytes=100', 'bytes= 7-9', 'bytes=5x-10', 'bytes=0-9x', 'bytes=-x'] {
+		assert range_of(spec, 1000) == 'ignore', spec
 	}
-	return true
+	assert range_of('bytes=-5', 0) == 'ignore'
 }
 
-fn test_parse_range_rejects_out_of_bounds() {
-	assert rejects('bytes=2000-3000', 1000) // beyond size
-	assert rejects('bytes=500-100', 1000) // start > end
-	assert rejects('items=0-9', 1000) // wrong unit
-	assert rejects('bytes=', 1000) // no spec at all
-	assert rejects('bytes=0-9-9', 1000) // two dashes (split len != 2)
-	assert rejects('bytes=100', 1000) // no dash
+// Numbers of any length (RFC 9110 §14.1.2) saturate instead of wrapping
+// (before #308, 2^64 wrapped around to offset 0).
+fn test_parse_range_saturates_huge_numbers() {
+	assert range_of('bytes=18446744073709551616-', 1000) == 'unsatisfiable'
+	assert range_of('bytes=0-18446744073709551615', 1000) == '0-999'
+	assert range_of('bytes=-18446744073709551616', 1000) == '0-999'
+	assert range_of('bytes=18446744073709551616-0', 1000) == 'ignore' // LAST < FIRST
+	assert parse_dec('9223372036854775807'.bytes(), 0, 19) == max_i64
+	assert parse_dec('9223372036854775808'.bytes(), 0, 19) == max_i64
+	assert parse_dec('922337203685477580'.bytes(), 0, 18) == 922337203685477580
+	assert parse_dec('12'.bytes(), 0, 0) == -1 // empty window
 }
 
 // --- serve_video reads only the bytes it returns -----------------------------
@@ -194,7 +222,44 @@ fn test_video_without_range_is_the_whole_file() {
 	}
 	whole := 'HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nContent-Length: 16\r\nConnection: keep-alive\r\n\r\n0123456789ABCDEF'
 	assert video(path, '') == whole
-	assert video(path, 'bytes=20-30') == whole // unusable range -> full 200
+	// A spec that is not one valid byte range is ignored -> full 200.
+	for rng in ['bytes=9-3', 'bytes=0-1,5-6', 'bytes= 7-9', 'items=0-4'] {
+		assert video(path, rng) == whole, rng
+	}
+}
+
+// An end past the file stops at its last byte (#308: the whole file came
+// back as a 200), and so does a suffix longer than the file.
+fn test_video_range_end_past_the_file_is_clamped() {
+	path := temp_file('clamp.bin', '0123456789ABCDEF')
+	defer {
+		os.rm(path) or {}
+	}
+	assert video(path, 'bytes=10-1000') == 'HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nContent-Range: bytes 10-15/16\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\nABCDEF'
+	for rng in ['bytes=0-15', 'bytes=0-99', 'bytes=-16', 'bytes=-100'] {
+		assert video(path, rng).ends_with('Content-Range: bytes 0-15/16\r\nContent-Length: 16\r\nConnection: keep-alive\r\n\r\n0123456789ABCDEF'), rng
+	}
+}
+
+// A range the file cannot satisfy gets 416 with the file's length and no
+// body; before #308 it got a 200 with the whole file, and a huge start
+// wrapped around to 0 for a 206 of all of it. On an empty file any start is
+// past the end, but a suffix is ignored (there is no byte for a 206 to
+// carry): the empty 200.
+fn test_video_unsatisfiable_range_416() {
+	path := temp_file('unsat.bin', '0123456789ABCDEF')
+	empty := temp_file('empty.bin', '')
+	defer {
+		os.rm(path) or {}
+		os.rm(empty) or {}
+	}
+	want := 'HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */16\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+	for rng in ['bytes=20-30', 'bytes=16-', 'bytes=-0', 'bytes=18446744073709551616-'] {
+		assert video(path, rng) == want, rng
+	}
+	assert video(empty, 'bytes=0-') == 'HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */0\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+	assert video(empty, 'bytes=-5') == video(empty, '')
+	assert video(empty, '') == 'HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 }
 
 // An open-ended range is answered with at most video_chunk_max bytes; the
@@ -211,6 +276,10 @@ fn test_video_chunk_is_capped() {
 	assert first.all_after('\r\n\r\n').len == video_chunk_max
 	next := video(path, 'bytes=${video_chunk_max}-')
 	assert next.ends_with('Content-Length: 4\r\nConnection: keep-alive\r\n\r\nTAIL')
+	// An end past the file is clamped, then capped like any other range.
+	clamped := video(path, 'bytes=0-99999999')
+	assert clamped.contains('Content-Range: bytes 0-${video_chunk_max - 1}/${size}\r\n')
+	assert clamped.all_after('\r\n\r\n').len == video_chunk_max
 }
 
 // A missing file, a directory and a FIFO are all "missing". A plain open()
@@ -232,9 +301,11 @@ fn test_video_not_a_regular_file_is_missing() {
 
 // Every route but /webcam (which registers a viewer and starts the capture
 // thread) runs 20k times through one reused `out`, as a worker would serve
-// them; the collector's lifetime allocation counter must not move. (Under
-// `-gc none`, vanilla's production build, the same allocation would be a
-// permanent leak.) Each /video request still opens and closes the file.
+// them, /video with every kind of Range answer (206, a clamped 206, 416, an
+// ignored Range, a saturated number); the collector's lifetime allocation
+// counter must not move. (Under `-gc none`, vanilla's production build, the
+// same allocation would be a permanent leak.) Each /video request still opens
+// and closes the file.
 fn test_serving_allocates_nothing() {
 	$if gcboehm ? {
 		path := temp_file('alloc.bin', 'x'.repeat(64 * 1024))
@@ -254,7 +325,11 @@ fn test_serving_allocates_nothing() {
 			'GET /video HTTP/1.1\r\nHost: x\r\nRange: bytes=1000-9999\r\n\r\n',
 			'GET /video HTTP/1.1\r\nHost: x\r\nRange: bytes=60000-\r\n\r\n',
 			'GET /video HTTP/1.1\r\nHost: x\r\nRange: bytes=-512\r\n\r\n',
+			'GET /video HTTP/1.1\r\nHost: x\r\nRange: bytes=60000-99999\r\n\r\n',
 			'GET /video HTTP/1.1\r\nHost: x\r\nRange: bytes=99999-\r\n\r\n',
+			'GET /video HTTP/1.1\r\nHost: x\r\nRange: bytes=-0\r\n\r\n',
+			'GET /video HTTP/1.1\r\nHost: x\r\nRange: bytes=0-1,5-6\r\n\r\n',
+			'GET /video HTTP/1.1\r\nHost: x\r\nRange: bytes=99999999999999999999999-\r\n\r\n',
 		].map(it.bytes())
 		mut reqs := []request_parser.HttpRequest{}
 		for r in ranges {
