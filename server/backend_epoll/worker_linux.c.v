@@ -624,6 +624,13 @@ fn process_events_tls(worker_id int, epoll_fd int, handler core.Handler, make_st
 	}
 }
 
+// run_epoll_backend is the Linux epoll backend behind Server.run (call that
+// instead): the calling thread accepts and hands each connection round-robin
+// to one epoll loop per worker thread (threads.len), plain HTTP or, with
+// tls_config, HTTPS. It prints the listening line and calls
+// after_server_start, then blocks for good: after Server.shutdown the
+// acceptor parks. It returns only if epoll_wait fails, or at once for a
+// negative socket_fd; exit(1) when the epoll or eventfd setup fails.
 pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () voidptr, on_worker_start core.WorkerStartFn, after_server_start core.AfterStartFn, port int, limits core.Limits, inflight []&core.Counter, active_conns &core.Counter, tls_config &tls.Config, mailboxes []voidptr, push_watermark int, mut threads []thread) {
 	if socket_fd < 0 {
 		return

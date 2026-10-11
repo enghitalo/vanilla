@@ -338,6 +338,9 @@ fn (mut st PlainState) tick() {
 	st.now = time.sys_mono_now()
 }
 
+// new_plain_state returns an empty PlainState, its tables at conn_table_min
+// fds (they grow by doubling as higher fds arrive): one per plain worker,
+// built on that worker's thread.
 pub fn new_plain_state() PlainState {
 	return PlainState{
 		conns:     []&ConnState{len: conn_table_min, init: unsafe { nil }}

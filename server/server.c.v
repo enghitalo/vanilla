@@ -19,23 +19,37 @@ const max_thread_pool_size = core.max_thread_pool_size
 // backend reads it too, and `core` is the leaf both sides depend on.
 pub type Limits = core.Limits
 
+// Server is a server with its listeners open: build it with new_server, serve
+// with run(), stop with shutdown(). Its fields are what new_server resolved
+// from the ServerConfig: build it only with new_server (the zero Server has
+// no listener).
 pub struct Server {
 pub:
-	port            int       = 3000
+	// port is the TCP port it listens on: the kernel's pick when
+	// ServerConfig.port was 0. Meaningless with unix_socket_path.
+	port int = 3000
+	// io_multiplexing is the backend run() drives (IOBackend).
 	io_multiplexing IOBackend = unsafe { IOBackend(0) }
-	socket_fd       int
-	limits          Limits
-	tls_config      &tls.Config = unsafe { nil } // nil ⇒ plain HTTP; set ⇒ HTTPS
+	// socket_fd is the listening socket: the only one, except on io_uring
+	// over TCP, where it is the first of listener_fds.
+	socket_fd int
+	// limits are the request and connection limits every worker enforces.
+	limits     Limits
+	tls_config &tls.Config = unsafe { nil } // nil ⇒ plain HTTP; set ⇒ HTTPS
 	// Non-empty ⇒ the listener is an AF_UNIX stream socket at this filesystem
 	// path (issue #122 §5) and `port` is meaningless. shutdown() uses it for
 	// the io_uring wake poke and to unlink the socket file.
 	unix_socket_path string
 pub mut:
-	threads []thread     = []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
+	// threads holds the worker threads run() spawns: its length is the
+	// worker count (ServerConfig.workers).
+	threads []thread = []thread{len: max_thread_pool_size, cap: max_thread_pool_size}
+	// handler is the request handler (ServerConfig.handler).
 	handler core.Handler = unsafe { nil }
 	// Optional per-worker state; see ServerConfig. make_state runs once per worker
 	// thread, its result reaches every handler call as the worker_state parameter.
-	make_state      fn () voidptr      = unsafe { nil }
+	make_state fn () voidptr = unsafe { nil }
+	// on_worker_start runs once per epoll worker (ServerConfig.on_worker_start).
 	on_worker_start core.WorkerStartFn = unsafe { nil }
 	// Runs ONCE on the main thread the instant the server is accepting (all
 	// listeners bound + workers spawned), right before run() blocks. See
@@ -60,22 +74,21 @@ pub mut:
 	draining &core.Counter = &core.Counter{}
 	// Server push (vanilla#230): one mailbox per epoll plain worker when
 	// ServerConfig.push_mailbox_slots > 0 (empty otherwise), opaque here and
-	// never freed (ConnHandles may outlive the server); and the pending-write
-	// bound of a pushed connection (0 = the default).
-	mailboxes      []voidptr
+	// never freed (ConnHandles may outlive the server).
+	mailboxes []voidptr
+	// push_watermark is the pending-write bound of a pushed connection
+	// (ServerConfig.push_watermark_bytes; 0 = the default, 1 MiB).
 	push_watermark int
 }
 
 // PushStats are the server's push counters, summed over its workers'
-// mailboxes (push_stats): posts enqueued, refused because a mailbox was full,
-// delivered to a wake fn, and dropped as stale (the connection was gone, or
-// no longer subscribed, when its worker took the post).
+// mailboxes (push_stats).
 pub struct PushStats {
 pub:
-	posted    u64
-	full      u64
-	delivered u64
-	stale     u64
+	posted    u64 // posts enqueued
+	full      u64 // posts refused because the mailbox was full
+	delivered u64 // posts delivered to a wake fn
+	stale     u64 // posts dropped: the connection was gone, or no longer subscribed, when its worker took them
 }
 
 // push_stats sums the push counters of every worker's mailbox (zero when the
@@ -178,16 +191,28 @@ pub fn (s Server) shutdown(grace_ms int) {
 	}
 }
 
+// Certificates is unused: nothing reads ServerConfig.certificates (#287).
+// Configure HTTPS with ServerConfig.tls_config instead, e.g.
+// `tls.new_from_pem(cert_pem, key_pem)!`.
 pub struct Certificates {
 pub:
-	cert_pem    []u8
-	key_pem     []u8
-	ca_cert_pem []u8
+	cert_pem    []u8 // PEM certificate (chain); ignored, see Certificates
+	key_pem     []u8 // PEM private key; ignored
+	ca_cert_pem []u8 // PEM CA certificate; ignored
 }
 
+// ServerConfig configures new_server. Only `handler` is required; every
+// other field has a working default: port 3000, the platform's backend, no
+// timeouts, one worker per CPU.
 pub struct ServerConfig {
 pub:
-	port            int       = 3000
+	// port is the TCP port to listen on. 0 lets the kernel pick a free one,
+	// which new_server reads back into Server.port. Ignored with
+	// unix_socket_path.
+	port int = 3000
+	// io_multiplexing selects the backend (IOBackend). The zero value is the
+	// platform's default: epoll on Linux, kqueue on macOS, IOCP on Windows.
+	// new_server errors for one the platform does not have.
 	io_multiplexing IOBackend = unsafe { IOBackend(0) }
 	// unix_socket_path, when set, makes the server listen on an AF_UNIX stream
 	// socket at this filesystem path INSTEAD of TCP (`port` is then ignored;
@@ -233,9 +258,17 @@ pub:
 	// closed (a subscriber that stopped reading). 0 = 1 MiB; at most
 	// core.max_pending_write_bytes (8 MiB).
 	push_watermark_bytes int
-	certificates         Certificates
-	limits               Limits
-	tls_config           &tls.Config = unsafe { nil } // set for HTTPS (e.g. tls.new_self_signed())
+	// certificates is ignored: nothing reads it, so setting it without
+	// tls_config serves plain HTTP (#287). Use tls_config.
+	certificates Certificates
+	// limits bounds request sizes, the connection count and the timeouts
+	// (core.Limits); the zero value arms no timeout.
+	limits Limits
+	// tls_config, when set, serves HTTPS (e.g. tls.new_self_signed()); the
+	// program must be built with `-d vanilla_tls`. The Linux epoll backend
+	// only: new_server rejects it on poll, IOCP and a unix socket, while
+	// io_uring and kqueue serve plain HTTP (#156).
+	tls_config &tls.Config = unsafe { nil }
 	// workers sets how many worker threads THIS server runs. 0 (default) =
 	// `VANILLA_WORKERS` env → `runtime.nr_cpus()` (the process-wide default). Set it
 	// PER server instance when co-hosting two servers in one process so their worker

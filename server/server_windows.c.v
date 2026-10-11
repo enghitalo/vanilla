@@ -46,9 +46,10 @@ import core
 import http1_1.request_parser
 import http1_1.response
 
-// Backend selection
+// IOBackend selects the event loop a Server runs on Windows
+// (ServerConfig.io_multiplexing): IOCP, the only one.
 pub enum IOBackend {
-	iocp = 0 // Windows only
+	iocp = 0 // a blocking acceptor + one completion port per worker
 }
 
 #include <winsock2.h>
@@ -731,6 +732,12 @@ fn win_accept_loop(socket_fd int, ports []voidptr, limits core.Limits, active_co
 	}
 }
 
+// run_iocp_backend is the Windows backend behind Server.run (call that
+// instead): the calling thread accepts and hands each connection round-robin
+// to one completion port per worker thread (threads.len). It prints the
+// listening line and calls after_server_start, then blocks until
+// Server.shutdown closes the listener, and returns once the workers are
+// joined. exit(1) when a completion port cannot be created.
 pub fn run_iocp_backend(srv Server, mut threads []thread) {
 	if srv.socket_fd < 0 {
 		return
@@ -800,12 +807,17 @@ fn run_selected_backend(srv Server, mut threads []thread) {
 	}
 }
 
+// run starts the IOCP workers and accepts on the calling thread: it prints
+// the listening line, calls after_server_start, then blocks until shutdown()
+// closes the listener, and returns once the workers are joined. exit(1) when
+// a completion port cannot be created.
 pub fn (mut srv Server) run() {
 	run_selected_backend(srv, mut srv.threads)
 }
 
-// iou_backend_available: io_uring is Linux-only, so it is never available here.
-// See the Linux definition (server_io_uring_linux.c.v) for the real probe.
+// iou_backend_available reports whether the io_uring backend can run in this
+// process: never here, io_uring is Linux-only. See the Linux definition
+// (server_io_uring_linux.c.v) for the real probe.
 pub fn iou_backend_available() bool {
 	return false
 }

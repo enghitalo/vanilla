@@ -6,9 +6,10 @@ import kqueue
 import socket
 import core
 
-// Backend selection
+// IOBackend selects the event loop a Server runs on macOS
+// (ServerConfig.io_multiplexing): kqueue, the only one.
 pub enum IOBackend {
-	kqueue = 0 // Darwin/macOS only
+	kqueue = 0 // an acceptor + one kqueue per worker
 }
 
 fn C.perror(s &char)
@@ -49,6 +50,12 @@ fn handle_accept_loop(socket_fd int, main_kq int, worker_kqs []int) {
 	}
 }
 
+// run_kqueue_backend is the macOS backend behind Server.run (call that
+// instead): the calling thread accepts and hands each connection round-robin
+// to one kqueue per worker thread (threads.len). It prints the listening line
+// and calls after_server_start, then blocks for good, even after
+// Server.shutdown. It returns at once, without reporting an error, when a
+// kqueue cannot be created (#298). No max_connections or timeouts yet (#154).
 pub fn run_kqueue_backend(socket_fd int, handler core.Handler, make_state fn () voidptr, after_server_start core.AfterStartFn, port int, limits Limits, inflight []&core.Counter, mut threads []thread) {
 	main_kq := kqueue.create_kqueue_fd()
 	if main_kq < 0 {
@@ -102,12 +109,18 @@ fn run_selected_backend(srv Server, mut threads []thread) {
 	}
 }
 
+// run starts the kqueue workers and serves on the calling thread: it prints
+// the listening line, calls after_server_start, then accepts, and does not
+// return after shutdown(): once shutdown() has drained, end the process with
+// exit() (see examples/graceful_shutdown). It returns at once, without
+// reporting an error, when a kqueue cannot be created (#298).
 pub fn (mut srv Server) run() {
 	run_selected_backend(srv, mut srv.threads)
 }
 
-// iou_backend_available: io_uring is Linux-only, so it is never available here.
-// See the Linux definition (server_io_uring_linux.c.v) for the real probe.
+// iou_backend_available reports whether the io_uring backend can run in this
+// process: never here, io_uring is Linux-only. See the Linux definition
+// (server_io_uring_linux.c.v) for the real probe.
 pub fn iou_backend_available() bool {
 	return false
 }
