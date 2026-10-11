@@ -139,12 +139,14 @@ const bad_request = 'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection
 
 const unavailable = 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
 
-// Static SSE frame pieces: allocated once, reused for every event.
+// Static SSE frame pieces. The heartbeat is sent as it is, so it stays a []u8;
+// the two halves of a `data:` event are appended into `out` with
+// core.append_str around the body.
 const keepalive_event = ': keepalive\n\n'.bytes()
 
-const data_prefix = 'data: '.bytes()
+const data_prefix = 'data: '
 
-const event_end = '\n\n'.bytes()
+const event_end = '\n\n'
 
 // slice_eq compares a request Slice against a literal IN PLACE by offsets —
 // no `.to_string()`, no `buf[a..b]` (V array slicing marks the source buffer
@@ -167,7 +169,12 @@ fn handle(req_buffer []u8, fd int, mut out []u8, mut clients Clients) core.Step 
 	$if windows {
 		clients.drop(fd) // a stream never sends a request: see Clients.add
 	}
-	req := request_parser.decode_http_request(req_buffer) or {
+	// decode_into, not decode_http_request: a malformed request would box an
+	// error() per request there.
+	mut req := request_parser.HttpRequest{
+		buffer: req_buffer
+	}
+	if !request_parser.decode_into(mut req) {
 		core.append_str(mut out, bad_request)
 		return .close
 	}
@@ -176,7 +183,7 @@ fn handle(req_buffer []u8, fd int, mut out []u8, mut clients Clients) core.Step 
 	//                core sends the headers and lets go of its fd (.close).
 	//                The broadcaster writes to it from now on, through the
 	//                registry's own descriptor.
-	if slice_eq(req.buffer, req.method, 'GET') && slice_eq(req.buffer, req.path, '/events') {
+	if slice_eq(req_buffer, req.method, 'GET') && slice_eq(req_buffer, req.path, '/events') {
 		if !clients.add(fd) {
 			core.append_str(mut out, unavailable)
 			return .close
@@ -189,22 +196,24 @@ fn handle(req_buffer []u8, fd int, mut out []u8, mut clients Clients) core.Step 
 	}
 
 	// POST /broadcast — fan a message out to every subscriber, right now.
-	if slice_eq(req.buffer, req.method, 'POST') && slice_eq(req.buffer, req.path, '/broadcast') {
-		// Frame `data: <body>\n\n` once, into ONE contiguous buffer. This single
-		// allocation is required: C.send() takes one buffer per call, so the
-		// frame must be contiguous. The body itself is never copied to a string —
-		// push_many reads it straight out of the request buffer, which is safe
-		// because broadcast() completes synchronously inside handle(), before
-		// the buffer is recycled. (This is the admin fan-out path, not the
-		// subscriber hot path; a shared scratch buffer would need locking across
-		// workers — rule 3 says don't.)
-		mut event := []u8{cap: data_prefix.len + req.body.len + event_end.len}
-		event << data_prefix
+	if slice_eq(req_buffer, req.method, 'POST') && slice_eq(req_buffer, req.path, '/broadcast') {
+		// Frame `data: <body>\n\n` once, contiguous, since C.send() takes one
+		// buffer per call: at the end of `out`, the worker's own write buffer,
+		// so it costs no allocation. broadcast() sends a view of it and keeps
+		// nothing (it completes synchronously, before anything else touches
+		// `out`), then `out` is rolled back to `mark` and the frame's bytes are
+		// overwritten by this request's response. The body is never copied to
+		// a string — push_many reads it straight out of the request buffer.
+		mark := out.len
+		core.append_str(mut out, data_prefix)
 		if req.body.len > 0 { // guard: &buf[start] is out of bounds on an empty slice
-			unsafe { event.push_many(&req.buffer[req.body.start], req.body.len) }
+			unsafe { out.push_many(&req_buffer[req.body.start], req.body.len) }
 		}
-		event << event_end // an empty body still yields the valid event `data: \n\n`
-		clients.broadcast(event)
+		core.append_str(mut out, event_end) // an empty body still yields the valid event `data: \n\n`
+		clients.broadcast(unsafe { (&out[mark]).vbytes(out.len - mark) })
+		unsafe {
+			out.len = mark
+		}
 		core.append_str(mut out, ok_response)
 		return .done
 	}

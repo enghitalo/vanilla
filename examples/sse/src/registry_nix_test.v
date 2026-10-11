@@ -97,3 +97,61 @@ fn test_recycled_fd_number_gets_no_events() {
 	C.close(b_srv)
 	C.close(b_cli)
 }
+
+// POST /broadcast frames its event in `out`, sends it to every subscriber and
+// rolls it back: the subscriber gets exactly the event, the poster exactly
+// the 200.
+fn test_broadcast_reaches_a_subscriber() {
+	mut clients := Clients{}
+	srv, cli := conn_pair()
+	subscribe(srv, mut clients)
+	mut out := []u8{}
+	step := handle('POST /broadcast HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello'.bytes(), -1, mut
+		out, mut clients)
+	assert step == .done
+	assert out.bytestr() == ok_response
+	assert pending(cli) == 'data: hello\n\n'
+	for fd in clients.snapshot() {
+		C.close(fd)
+	}
+	C.close(srv)
+	C.close(cli)
+}
+
+// A broadcast to a live subscriber allocates nothing either: 20k events go
+// out through one reused `out`, each drained from the client end into a
+// buffer allocated once.
+fn test_broadcast_to_a_subscriber_allocates_nothing() {
+	$if gcboehm ? {
+		mut clients := Clients{}
+		srv, cli := conn_pair()
+		subscribe(srv, mut clients)
+		req := 'POST /broadcast HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello'.bytes()
+		mut out := []u8{cap: 4096}
+		mut sink := []u8{len: 256}
+		rounds := 20_000
+		mut before := u64(0)
+		mut received := 0
+		for round in 0 .. rounds + 1 {
+			if round == 1 { // round 0 was the warm-up
+				before = gc_heap_usage().total_bytes
+			}
+			unsafe {
+				out.len = 0
+			}
+			handle(req, -1, mut out, mut clients)
+			if C.recv(cli, sink.data, sink.len, C.MSG_DONTWAIT) == 13 { // `data: hello\n\n`
+				received++
+			}
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert received == rounds + 1 // every event arrived whole
+		assert clients.snapshot().len == 1 // still subscribed: every send took the whole event
+		assert grown < 4096, 'broadcasting allocated ${grown} bytes over ${rounds} events'
+		for fd in clients.snapshot() {
+			C.close(fd)
+		}
+		C.close(srv)
+		C.close(cli)
+	}
+}
