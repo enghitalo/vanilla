@@ -5,10 +5,10 @@
 clock before doing more, and answers `504 Gateway Timeout` as soon as the
 budget is spent. A job that is too big is cut off instead of running away.
 
-This is the cooperative half of per-request time limits: one monotonic clock
-read per resume, no extra watch. It acts only when a step resumes. A step
-whose fd may never become ready (a hung upstream) needs the runtime's own
-deadline as well (see the last bullet below).
+This is the cooperative half of per-request time limits: one clock read
+(`time.ticks()`) per resume, no extra watch. It acts only when a step
+resumes. A step whose fd may never become ready (a hung upstream) needs the
+runtime's own deadline as well (see the last bullet below).
 
 ## Run
 
@@ -32,7 +32,7 @@ Content-Length: 32
 Connection: keep-alive
 
 completed within budget (~200ms)
-real	0m0.206s
+real	0m0.207s
 ```
 
 Ten steps would take about 500 ms, so the job is cut off at the first tick
@@ -61,7 +61,7 @@ real	0m0.356s
   high 48 bits, steps in the low 16, so `steps` is capped at `max_steps`,
   65535, far past what the budget allows): nothing is allocated per request.
   `handle` calls
-  `event_loop.watch_fd(tfd, .readable, tick, pack_job(time.ticks(), steps))`
+  `event_loop.watch_fd(tfd, .readable, tick, pack_job(time.ticks(), parse_steps(r)))`
   and returns `.suspend`; every resume gets the payload back, and the
   timerfd as `ready_fd`. The budget itself is the `budget_ms` const.
 - **Check, then work.** `tick` drains the timerfd's expiration count, then
@@ -96,13 +96,15 @@ v test examples/async_time_limit
 
 [main_test.v](main_test.v) unit-tests `parse_steps` (defaults, trailing junk,
 other parameters, the cap) and the payload round trip, checks that a whole
-job allocates nothing, and drives `tick` directly, with a pipe standing in for the
-timerfd and a start time far in the past: the 504's `Content-Length` matches
-its body for elapsed values from 3 to 11 digits, and the 200 is framed the
-same way. On a live server through [vtest](../../docs/VTEST.md), a 2-step job
-(200), a 10-step job (504, elapsed over the budget) and a 404 share one
-keep-alive connection, so a wrong length would misframe what follows; a
-malformed request gets the 400 and a closed connection.
+job allocates nothing, and drives `tick` directly, with a pipe standing in
+for the timerfd: a step with work left re-arms the same fd with the same
+start and one step fewer, and, with a start time far in the past, the 504's
+`Content-Length` matches its body for elapsed values from 3 to 11 digits,
+and the 200 is framed the same way. On a live server through
+[vtest](../../docs/VTEST.md), a 2-step job (200), a 10-step job (504,
+elapsed over the budget) and a 404 share one keep-alive connection, so a
+wrong length would misframe what follows; a malformed request gets the 400
+and a closed connection.
 
 ## See also
 

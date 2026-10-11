@@ -90,8 +90,9 @@ v test examples/async_incremental_read
 ```
 
 [main_test.v](main_test.v) checks `wx` against known chunk sizes and drives
-`on_chunk` directly over a pipe (byte-exact chunks behind bytes already in
-`out`), then drives
+`on_chunk` directly over a pipe: byte-exact chunks behind bytes already in
+`out`, a 5000-byte write split into a 4 KiB chunk and the rest, and a wake
+that finds nothing (`EAGAIN`) appending nothing and re-arming. It then drives
 a live server through [vtest](../../docs/VTEST.md): the stream decodes
 strictly (every hex size matches its data) to the five lines, ends with the
 zero-size chunk, and the same keep-alive connection then answers a 404.

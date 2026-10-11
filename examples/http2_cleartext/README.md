@@ -71,7 +71,7 @@ content-type: text/plain
 content-length: 10
 
 slow done
-time_total=0.030580
+time_total=0.031120
 ```
 
 The same routes over HTTP/1.1 on the same port:
@@ -145,11 +145,12 @@ the HTTP/1.1 routes, the GOAWAY for a non-HTTP/1.x version, the 501 when no
 worker can take over, and the whole bridge driven as a bare `ConnHandler`
 (GET, POST with a body, a peer GOAWAY that keeps the connection serving, a
 stream that parks and resumes, a second parker refused with `RST_STREAM`, a
-partial frame, and that parking and resuming allocate nothing). [server_end_to_end_test.v](src/server_end_to_end_test.v)
-drives a real epoll server through `vtest`: the preface, requests and a PING
-on one connection, HTTP/1.1 on another connection to the same port, and
-`/slow` over both protocols, with `/` on another stream not waiting behind
-the parked one.
+partial frame), and checks that parking and resuming a stream allocate
+nothing (`bridge_park` and `bridge_wake` driven directly, 20k times).
+[server_end_to_end_test.v](src/server_end_to_end_test.v) drives a real epoll
+server through `vtest`: the preface, requests and a PING on one connection,
+HTTP/1.1 on another connection to the same port, and `/slow` over both
+protocols, with `/` on another stream not waiting behind the parked one.
 
 CI also runs the [h2spec](https://github.com/summerwind/h2spec) conformance
 suite against this server

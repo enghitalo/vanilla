@@ -78,7 +78,7 @@ data: bye
 
 With a single worker (`VANILLA_WORKERS=1`), 200 concurrent streams
 (`seq 200 | xargs -P200 -I{} curl -sN localhost:8092/events -o /dev/null`)
-all finished in `real 0m5.182s`: the timers overlap.
+all finished in `real 0m5.117s`: the timers overlap.
 
 ## How it works
 
@@ -89,8 +89,9 @@ all finished in `real 0m5.182s`: the timers overlap.
   returning `.suspend`. The stream's only state is the number of events sent,
   and it rides in `watch_payload` itself, as an integer (0 here): no struct
   per stream, nothing to free. The timerfd is the continuation's `ready_fd`,
-  and the stream length is the `max_events` const. The headers are flushed with that first suspend, so
-  the client sees `200 text/event-stream` before any tick.
+  and the stream length is the `max_events` const. The headers are flushed
+  with that first suspend, so the client sees `200 text/event-stream` before
+  any tick.
 - **Append, flush, suspend.** `sse_tick` drains the timerfd and appends one
   chunk: the hex size (`wx`), then `data: tick N of M\n\n` built from consts
   and `wi` digits, then CRLF. The size is computed up front from the literal
@@ -117,10 +118,12 @@ v test examples/async_sse
 [main_test.v](main_test.v) checks `wx` (chunk sizes up to `7fffffff`) and
 drives `sse_tick` directly with a pipe standing in for the timerfd: five
 ticks produce five byte-exact chunks, the `bye` chunk and the terminator,
-re-arming on every tick but the last; two- and three-digit counters size
-their chunk correctly; and a whole stream allocates nothing. On a live server through [vtest](../../docs/VTEST.md)
-the stream ends where its framing says, the same connection then answers a
-404, and a malformed request gets the 400 and a closed connection.
+re-arming on every tick but the last, each carrying its count as the
+payload; a two-digit counter sizes its chunk correctly; and a whole stream
+(`handle` plus five ticks, 2000 times) allocates nothing. On a live server
+through [vtest](../../docs/VTEST.md) the stream ends where its framing says,
+the same connection then answers a 404, and a malformed request gets the 400
+and a closed connection.
 
 ## See also
 
