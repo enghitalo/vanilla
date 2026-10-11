@@ -112,7 +112,7 @@ pub enum WakeReason {
 //   event_loop   — this worker's event loop, for handlers that must wait (see
 //                  EventLoop): park with event_loop.watch_fd(...) + .suspend.
 //
-// Static routes append a precomputed `const ... .bytes()` and return .done;
+// Static routes append a `const` string with core.append_str and return .done;
 // dynamic routes append a const prefix, the Content-Length digits, '\r\n\r\n'
 // and the body. On a bad request, append the canned error response and return
 // .close. A handler that must wait on something (a DB socket, an upstream,

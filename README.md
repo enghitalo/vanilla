@@ -513,7 +513,8 @@ what the current pin buys and which workarounds it retires.
 - [x] **No zero-alloc integer formatter in the stdlib** — fixed:
   **`strconv.write_dec(n i64, mut buf []u8)`** and `write_dec_u(n u64, …)` write
   decimal digits into a caller-provided buffer with no allocation — use these instead
-  of `.str()` / `${}` on the response hot path.
+  of `.str()` / `${}` on the response hot path. They write at `buf[0]` (they don't
+  append): format into a stack scratch and append it, as `wi` does in the examples.
   ([vlang/v#27509](https://github.com/vlang/v/issues/27509))
 - [x] **`array.slice()` marked the source buffer on every call** — closed: V added a
   `.noslices` array flag, but `a[start..]` still marks by default, so vanilla keeps

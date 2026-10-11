@@ -53,7 +53,7 @@ not zeroing).
 
 | Attribute | Effect | Use for |
 |---|---|---|
-| `@[inline]` | force inline | tiny hot helpers (`find_byte`, `ascii_ci_eq`) |
+| `@[inline]` | force inline | tiny hot helpers (`find_byte_idx`, `ascii_ci_eq`) |
 | `@[direct_array_access]` | skip bounds checks in the fn | verified-safe index loops (parser) |
 | `@[manualfree]` | opt out of autofree | deterministic `defer { x.free() }` |
 | `@[heap]` | struct always heap-allocated | long-lived shared structs |
@@ -159,6 +159,13 @@ on V 0.5.2 `5516000` (2026-10-09), after the upstream fixes they led to.
   escapes"), whatever its type; the same call behind an ordinary method keeps it
   on the stack. veb_like matches in one method and calls handlers from another
   (`dispatch`), which is why its `Params` stays local (vlang/v#29801).
+- **A view into a struct's buffer that escapes moves the struct.**
+  `unsafe { tos(&req.buffer[i], n) }` handed to a function that returns it, or
+  to one returning `!T`/`?T`, moves `req` itself to the heap ("its address
+  escapes"): `memdup(&req, sizeof(request_parser__HttpRequest))` on every
+  request, in five examples until #279. The same view taken from the
+  handler's own `req_buffer` parameter (or from `buf := req.buffer`) keeps
+  `req` on the stack.
 - **Forwarding a `mut` parameter in a comptime call works** since
   vlang/v#29404: `app.$method(req, p, mut out)`.
 - **Methods are values** since vlang/v#29551: `App.one` and `T.$method` are
@@ -321,7 +328,7 @@ build** (`badd3466…`). Each entry notes what changed and what vanilla still do
   `!int` "not found" allocated per call. **Fixed:** builtin now exports
   `error_sentinel`, a cached allocation-free `IError`; `return error_sentinel` from a
   hot `!T` path is alloc-free (like `none` for `?T`). A `-1`/sentinel-returning twin
-  (`find_byte_idx` vs `find_byte`; `frame_request_length_lim_idx`) is still used where
+  (`find_byte_idx`, an int index instead of `!int`; `frame_request_length_lim_idx`) is still used where
   the **`Ok`-side** Result construction also matters — `error_sentinel` only removes
   the error-side box. ([vlang/v#27508](https://github.com/vlang/v/issues/27508))
 - **`int.str()` / `${}` allocate.** **Fixed:** the stdlib now has a `[]u8`-buffer

@@ -41,12 +41,15 @@ registry.
   into the request buffer, `unsafe { (&buf[start]).vbytes(len) }` for `[]u8`
   windows, `unsafe { tos(ptr, len) }` for read-only string params. Defer
   `.to_string()` / `.clone()` until the bytes must outlive the buffer; avoid
-  `buf[a..b]` (it marks the source buffer every call).
+  `buf[a..b]` (it marks the source buffer every call). Never slice `out`
+  itself: the mark makes the server's `clear()` drop its write buffer.
 - **Never concatenate (`+`) or interpolate (`${}`) in request-serving code** —
   not even on deliberately slow routes. Each one allocates (ints also pay
   `.str()`). Write static responses as `const` strings appended with
-  `core.append_str`, append parts straight into `out` (`core.append_str` +
-  `strconv.write_dec`), and a single
+  `core.append_str`, append parts straight into `out` (`core.append_str`, and
+  a local `wi` for integers: `strconv.write_dec` into a stack scratch, then
+  `push_many` — `write_dec` writes at `buf[0]`, it does not append; see
+  examples/simple2), and a single
   `strings.Builder` (`write_string` / `write_decimal` / `write_u8`) when a
   dynamic string is unavoidable. `${}` is fine in `eprintln`/`error()`
   diagnostics off the request path.

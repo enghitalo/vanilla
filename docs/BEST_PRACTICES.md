@@ -93,6 +93,21 @@ Reach for the bytes you already have before allocating new ones.
 **Don't**
 
 - Copy the whole body to inspect a few bytes.
+- Slice `out` (`out[start..]`), even to read back what you appended. The slice
+  marks the server's write buffer for good, and V's `array.clear()`, which the
+  server calls after every flush, then drops a marked buffer (`data = nil`,
+  `cap = 0`) instead of keeping its capacity: every later request regrows it,
+  and under `-gc none` each dropped block leaks. Pass `start` as an offset, take
+  `unsafe { (&out[start]).vbytes(out.len - start) }`, and roll back with
+  `unsafe { out.len = mark }`, never `out.trim(mark)`
+  ([examples/security_headers](../examples/security_headers/src/main.v)
+  splices headers in place this way).
+- Take a view as `&req.buffer[i]` when it leaves the handler (returned, or
+  passed to a function that returns it, or to one returning `!T`/`?T`): V then
+  moves the whole `HttpRequest` to the heap, a `memdup` on every request, even
+  on routes that never reach the view. Take it from the handler's own
+  `req_buffer` parameter (or `buf := req.buffer` first). `-warn-about-allocs`
+  reports it as "local moved to the heap: its address escapes".
 - Build intermediate `string`s in a loop — concatenation reallocates.
 - Build a lookup key with a slice expression like `route[8..]` — V `string.substr`
   does `malloc_noscan(len+1)` + `memcpy`, a fresh heap string **every request**
@@ -136,11 +151,21 @@ or passed to `C.send` — and for the library's public `[]u8` consts
 
 For responses with dynamic values, append the literal segments and the integers
 **directly into `out`** — no intermediate `strings.Builder`, no return-then-copy.
-`core.append_str` pushes a string's bytes; for integers, `strconv.write_dec` (or a
-small local `wi`, itoa into a stack scratch) writes the decimal digits.
+`core.append_str` pushes a string's bytes; for integers, a small local `wi`
+formats with `strconv.write_dec` into a stack scratch and appends the digits.
+(`write_dec(n, mut buf)` writes at `buf[0]` and returns the digit count: it
+does not append, so `strconv.write_dec(n, mut out)` would overwrite the start
+of the response.)
 
 ```v
-fn wi(mut out []u8, n i64) { /* itoa into a stack buffer, append digits */ }
+fn wi(mut out []u8, n i64) {
+    mut scratch := [24]u8{} // any i64; keep it small, a fixed array is zeroed per call
+    mut view := unsafe { (&scratch[0]).vbytes(scratch.len) }
+    written := strconv.write_dec(n, mut view)
+    if written > 0 {
+        unsafe { out.push_many(&scratch[0], written) }
+    }
+}
 
 fn write_json(mut out []u8, body string) {
     core.append_str(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ')
@@ -181,8 +206,8 @@ sb.write_string('Content-Length: ${body.len}\r\n')
 
 - Precompute fixed responses as `const`; reuse them.
 - Keep literal header text in plain string literals, not interpolated ones.
-- Format ints with `strconv.write_dec`/`write_dec_u` (zero-alloc, into your `[]u8`)
-  or `Builder.write_decimal`; `write_u8` (single bytes), `write_string` (literals).
+- Format ints with `wi` (`strconv.write_dec`/`write_dec_u` into a stack
+  scratch, then append) or `Builder.write_decimal`; `write_u8` (single bytes), `write_string` (literals).
 - Seed the builder with `header_overhead + body.len`.
 - Always send an accurate `Content-Length` (or `Transfer-Encoding: chunked`).
 - Set `Connection: keep-alive` unless you intend to close.
@@ -193,7 +218,7 @@ sb.write_string('Content-Length: ${body.len}\r\n')
 - Concatenate strings (`+`) or interpolate **anywhere in request-serving
   code** — even on a deliberately slow route. Every `'${a}.${b}'` is an
   allocation the builder/append patterns above do for free.
-- Call `.str()` / `int.str()` just to concatenate — `strconv.write_dec` avoids it.
+- Call `.str()` / `int.str()` just to concatenate — `wi` (`strconv.write_dec`) avoids it.
 - Forget the blank line (`\r\n\r\n`) between headers and body.
 - Compute the body twice (once for the length, once for the payload).
 
