@@ -14,8 +14,9 @@ module main
 //                  check in the role-gated controller)
 //   controllers.v  the router + controllers; each declares its own auth policy
 //
-// Invariant 2 (zero abstraction) holds: no middleware registry, no DI, no
-// dynamic dispatch. The handler contract stays bytes-in/bytes-out.
+// CONTRIBUTING.md rule 2 (keep abstraction to a minimum) holds: no middleware
+// registry, no DI, no dynamic dispatch. The handler contract stays
+// bytes-in/bytes-out.
 //
 // WORKS TODAY.
 import server

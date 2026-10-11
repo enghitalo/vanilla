@@ -404,8 +404,8 @@ pub fn (req HttpRequest) count_header(name string) int {
 // it after decode_http_request and map the returned error to 400 Bad Request.
 //
 // Kept separate from parsing on purpose: a parse-free fast responder pays
-// nothing, and servers that DO process requests stay strictly conformant
-// (Invariant 3). No new behavior is invented — only what the RFCs mandate.
+// nothing, and servers that DO process requests stay strictly conformant. No
+// new behavior is invented — only what the RFCs mandate.
 pub fn (req HttpRequest) validate_http1() ! {
 	// RFC 9112 §3.2: an HTTP/1.1 request MUST contain exactly one Host field;
 	// a server MUST respond 400 to a request that lacks Host or has more than one.

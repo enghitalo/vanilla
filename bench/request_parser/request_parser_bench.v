@@ -83,7 +83,7 @@ fn main() {
 	}
 	b.measure('get_query_slice')
 
-	// 4) Request framing — the per-request cost added to read_request in Phase 1.
+	// 4) Request framing — the per-request cost framing adds to read_request.
 	// This worst-cases the no-body fast path: full header walk, CL/TE rejected.
 	for _ in 0 .. iterations {
 		acc += request_parser.frame_request_length(raw_request) or { -1 }

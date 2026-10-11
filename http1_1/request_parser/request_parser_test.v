@@ -31,7 +31,7 @@ fn test_decode_http_request_valid_request() {
 	// A zero-header HTTP/1.0 request is valid SYNTAX (RFC 9112 §2.1) and must
 	// parse. Refusing to *serve* HTTP/1.0 is a server policy (respond 505 HTTP
 	// Version Not Supported, RFC 9110 §15.6.6) — never a parse error. The parser
-	// stays strict-but-not-inventive (Invariant 3).
+	// stays strict-but-not-inventive.
 	buffer := 'POST /api/resource HTTP/1.0\r\n\r\n'.bytes()
 	req := decode_http_request(buffer) or { panic('HTTP/1.0 zero-header should parse: ${err}') }
 	assert req.method.to_string(req.buffer) == 'POST'
@@ -376,7 +376,7 @@ fn test_get_query_deprecated_not_found() {
 	assert result.len == 0
 }
 
-// --- Phase 0: RFC conformance gates ---------------------------------------
+// --- RFC conformance gates ------------------------------------------------
 
 fn test_decode_zero_header_request() {
 	// RFC 9112 §2.1: zero field-lines is valid syntax. Must parse, not error.
@@ -459,7 +459,7 @@ fn test_validate_http1_cl_te_conflict() {
 	}
 }
 
-// --- Phase 1: request framing (pure, split-fuzz testable) ------------------
+// --- Request framing (pure, split-fuzz testable) ---------------------------
 
 fn test_frame_no_body() {
 	req := 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
@@ -908,7 +908,7 @@ fn test_frame_pipelined_returns_first() {
 	assert frame_request_length(two)! == first.len
 }
 
-// --- Phase 2: size limits (413 / 431) via frame_request_length_lim ----------
+// --- Size limits (413 / 431) via frame_request_length_lim -------------------
 
 fn test_frame_limit_body_413() {
 	// Content-Length over the limit must be rejected with status 413, BEFORE
@@ -966,7 +966,7 @@ fn test_frame_expected_total() {
 	assert frame_expected_total(nobody) == -1
 }
 
-// --- Phase 3: the no-Result hot-path twin frame_request_length_lim_idx --------
+// --- The no-Result hot-path twin frame_request_length_lim_idx -----------------
 // The drain loops call this directly to skip !int boxing. It must agree with the
 // Result wrapper: length >= 0 (complete), -1 (incomplete), or a frame_err_*
 // sentinel = the negated HTTP status (-413 / -431 / -400).

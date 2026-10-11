@@ -39,10 +39,11 @@ pub const status_100_continue_response = 'HTTP/1.1 100 Continue\r\n\r\n'.bytes()
 // Partial writes are now handled instead of silently dropped: `send` may accept
 // fewer bytes than offered, so we advance until everything is sent.
 //
-// REMAINDER (Phase 1b): true backpressure for a full socket buffer needs
-// EPOLLOUT + a per-fd pending-write queue. Until then, EAGAIN mid-response is
-// reported as an error (the caller closes the fd) rather than silently
-// truncating — loud beats wrong. Small responses (the hot path) send in one go.
+// REMAINDER (CHECKLIST.md #4, issue #154): true backpressure for a full socket
+// buffer needs a per-fd pending-write queue resumed when the socket turns
+// writable. Until then, EAGAIN mid-response is reported as an error (the caller
+// closes the fd) rather than silently truncating — loud beats wrong. Small
+// responses (the hot path) send in one go.
 pub fn send_response(fd int, buffer_ptr &u8, buffer_len int) ! {
 	mut total_sent := 0
 	for total_sent < buffer_len {

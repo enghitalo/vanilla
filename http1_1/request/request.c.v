@@ -6,8 +6,9 @@ import http1_1.request_parser
 
 fn C.recv(__fd int, __buf voidptr, __n usize, __flags int) int
 
-// Hard ceiling on a single request. Phase 2 makes this configurable per-server;
-// for now it's a backstop against unbounded memory growth from a hostile peer.
+// Hard ceiling on a single request: a backstop against unbounded memory growth
+// from a hostile peer. `read_request` does not take `core.Limits.max_request_bytes`
+// yet, so this const is the ceiling here.
 const max_request_bytes = 8 * 1024 * 1024
 
 // read_request reads one complete HTTP/1.1 message from the socket.
@@ -18,11 +19,12 @@ const max_request_bytes = 8 * 1024 * 1024
 // message is present yet — honoring Content-Length and Transfer-Encoding:
 // chunked. It drains until the message is framed or the socket reports EAGAIN.
 //
-// LIMITATIONS (tracked as Phase 1 remainders, see IMPLEMENTATION_PLAN.md):
-//   - No per-fd buffer across epoll edges: if a request is fragmented across
-//     network round-trips (EAGAIN mid-message), this returns an error instead
-//     of resuming on the next EPOLLIN. Fine for requests that arrive within one
-//     readiness burst (the common case, incl. keep-alive and small bodies).
+// LIMITATIONS (tracked in CHECKLIST.md #19, issue #154):
+//   - No per-fd buffer across readiness events: if a request is fragmented
+//     across network round-trips (EAGAIN mid-message), this returns an error
+//     instead of resuming on the next read event. Fine for requests that arrive
+//     within one readiness burst (the common case, incl. keep-alive and small
+//     bodies).
 //   - Pipelining: bytes beyond the first message are dropped (framer tells us
 //     where the first message ends; we trim to it).
 // max_header_bytes / max_body_bytes: 0 = unlimited (the configured `Limits`).
@@ -40,8 +42,8 @@ pub fn read_request(client_fd int, max_header_bytes int, max_body_bytes int) ![]
 	// throughput vs ~1% at cap:256 — so keep the per-request allocation small.
 	// (Note: `grow_cap` re-allocates via the SCAN variant, so requests that
 	// outgrow `cap` lose the noscan property — fine, they're off the hot path.)
-	// The principled zero-allocation fix is a per-worker reusable buffer
-	// (Invariant 2); see IMPLEMENTATION_PLAN.md.
+	// The zero-allocation fix is a reusable per-connection read buffer, as
+	// server/backend_poll has (CHECKLIST.md #19, issue #154).
 	mut buf := []u8{len: 0, cap: 256}
 
 	for {

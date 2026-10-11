@@ -3,9 +3,9 @@ module main
 // IP blocking (denylist) — reference design.
 //
 // Rejects requests from denied client IPs with 403 Forbidden, using the socket
-// peer address exposed by Phase 2 (`socket.peer_addr(fd)`). The handler keeps
-// the unified `core.Handler` contract — it just reads the client fd's peer
-// (client_fd) when it needs to decide.
+// peer address (`socket.peer_addr(fd)`). The handler keeps the unified
+// `core.Handler` contract — it just reads the client fd's peer (client_fd) when
+// it needs to decide.
 //
 // SECURITY / DESIGN notes:
 //   - Blocks by the SOCKET peer. Behind a proxy/CDN the peer IS the proxy, so
