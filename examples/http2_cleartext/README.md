@@ -139,8 +139,9 @@ GOAWAY frame with `PROTOCOL_ERROR`, then the connection closes.
 v -cc gcc test examples/http2_cleartext/src
 ```
 
-`-cc gcc` matters: under tcc the takeover is unavailable and the end-to-end
-test fails on the 501. [main_test.v](src/main_test.v) runs without sockets:
+`-cc gcc` matters: under tcc the takeover is unavailable (the preface gets
+a 501), so the end-to-end test skips itself and plain `v test` passes
+without exercising it. [main_test.v](src/main_test.v) runs without sockets:
 the HTTP/1.1 routes, the GOAWAY for a non-HTTP/1.x version, the 501 when no
 worker can take over, and the whole bridge driven as a bare `ConnHandler`
 (GET, POST with a body, a peer GOAWAY that keeps the connection serving, a

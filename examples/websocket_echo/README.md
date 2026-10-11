@@ -125,7 +125,8 @@ v -cc gcc test examples/websocket_echo/src
 ```
 
 `-cc gcc` matters: under tcc `queue_takeover` always returns false, so the
-end-to-end test gets a 501 and fails. [main_test.v](src/main_test.v) calls
+end-to-end test skips itself and plain `v test` passes without exercising
+it. [main_test.v](src/main_test.v) calls
 `handle` for the routes, the 400s for an incomplete handshake and the 501
 when no worker can take over, and `ws_echo_conn` with raw frames: the RFC
 "Hello" echo, two frames plus a partial tail in one burst, ping/pong, the

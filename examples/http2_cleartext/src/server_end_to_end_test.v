@@ -113,6 +113,12 @@ fn e2e_ping_ack() []u8 {
 }
 
 fn test_http2_cleartext_end_to_end() {
+	$if tinyc {
+		// tcc builds leave the takeover seam inert (core/takeover_slot.h), so
+		// the h2 preface gets a 501: nothing to drive end to end.
+		eprintln('[test] takeover is inert under tcc; skipping')
+		return
+	}
 	$if linux {
 		out := vtest.drive(server.ServerConfig{
 			io_multiplexing: .epoll

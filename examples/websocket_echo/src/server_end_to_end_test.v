@@ -69,6 +69,12 @@ const close_normal_frame = [u8(0x88), 0x02, 0x03, 0xe8]
 const close_protocol_frame = [u8(0x88), 0x02, 0x03, 0xea]
 
 fn test_websocket_echo_end_to_end() {
+	$if tinyc {
+		// tcc builds leave the takeover seam inert (core/takeover_slot.h), so
+		// the handshake gets a 501: nothing to drive end to end.
+		eprintln('[test] takeover is inert under tcc; skipping')
+		return
+	}
 	$if linux {
 		out := vtest.drive(server.ServerConfig{
 			io_multiplexing: .epoll
