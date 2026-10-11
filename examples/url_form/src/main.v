@@ -5,7 +5,7 @@ module main
 // The parser deliberately does NOT decode percent-escapes (it returns raw
 // bytes — the right default for a zero-copy core). But almost every real app
 // needs decoded values, so this is the canonical place to do it: at the edge of
-// the handler, explicitly, once.
+// the handler, explicitly, once, with request_parser.percent_decode_into.
 //
 // TWO PLACES ENCODING APPEARS:
 //   1. The URL/query:  /search?q=hello%20world&tag=c%2B%2B
@@ -49,44 +49,13 @@ const hex_lower = '0123456789abcdef'
 // The input is a zero-copy view; the RETURN is an owned string on purpose —
 // decoded bytes differ from the wire bytes and become map keys/values that
 // must outlive the request buffer (the justified copy, see header).
-// Malformed escapes (dangling `%`, non-hex) emit the literal `%` and move on.
-@[direct_array_access]
+// Malformed escapes (dangling `%`, non-hex) are kept as is. A handler that
+// only reads the value decodes into `out` or a per-worker scratch instead,
+// with no allocation.
 fn percent_decode(s []u8) string {
 	mut out := []u8{cap: s.len}
-	mut i := 0
-	for i < s.len {
-		c := s[i]
-		if c == `%` && i + 2 < s.len {
-			hi := hex_val(s[i + 1]) or {
-				out << c
-				i++
-				continue
-			}
-			lo := hex_val(s[i + 2]) or {
-				out << c
-				i++
-				continue
-			}
-			out << u8(hi * 16 + lo)
-			i += 3
-		} else if c == `+` {
-			out << ` ` // '+' means space in query / form encoding
-			i++
-		} else {
-			out << c
-			i++
-		}
-	}
+	request_parser.percent_decode_into(s, mut out, true)
 	return out.bytestr()
-}
-
-fn hex_val(c u8) ?int {
-	return match c {
-		`0`...`9` { int(c - `0`) }
-		`a`...`f` { int(c - `a` + 10) }
-		`A`...`F` { int(c - `A` + 10) }
-		else { none }
-	}
 }
 
 // view returns a zero-copy window into buf, or an empty slice for len == 0

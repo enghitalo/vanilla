@@ -126,21 +126,23 @@ concatenates, interpolates or allocates per request. The
 
 ## 🏗️ Foundation Improvements (ENABLES EVERYTHING)
 
-### 5. Query String Parsing — 🟡 PARTIAL
-- **Done:** `HttpRequest.get_query_slice(key []u8) ?Slice`
+### 5. Query String Parsing — ✅ RESOLVED
+- **Resolution:** `HttpRequest.get_query_slice(key []u8) ?Slice`
   (`http1_1/request_parser/request_parser.v`) returns a zero-copy `Slice` into
   the request buffer, with no `error()` on the not-found path
   (`find_byte_idx`); `has_query(key []u8) bool` also sees a bare flag
   (`?debug`), which `get_query_slice` returns as none. Both cut each element at
   its `&` and compare its name in place, one `memchr` per element.
   `get_query(key string)` is kept as a deprecated wrapper. Values are raw;
-  `examples/url_form/` percent-decodes them once at the edge.
+  `percent_decode_into(src, mut out, plus_as_space)` appends them decoded into
+  a buffer the caller reuses (no allocation once it has the room), and
+  `examples/url_form/` decodes with it once at the edge.
 - **Testing:** `request_parser_test.v` (single, multiple, last, missing key,
   no query, `?empty=`, an empty key, special characters, bare keys before,
-  between and after valued ones, name prefixes).
-- **Remains:** no percent-decoding helper in the library (an
-  `_into(mut out []u8)` form, so decoding allocates nothing).
-- **Priority:** 🟢 LOW
+  between and after valued ones, name prefixes; decoding: malformed and
+  truncated escapes, `+` both ways, decode-once, NUL/CR/LF, zero heap growth
+  over 20k calls).
+- **PRs:** #279 (empty key), #286 (`has_query`), PRNUM (`percent_decode_into`).
 
 ### 6. Add Standard HTTP Status Codes — ⚪ OBSOLETE
 - **Premise:** a library table of status-line consts
@@ -616,7 +618,7 @@ Open and partial items only.
 |----------|-------|-------|
 | 🔴 HIGH | 2 | #16 (#156: plaintext on io_uring/kqueue), #34 |
 | 🟡 MEDIUM | 7 | #4, #19, #23, #39, #40, #42, #44 |
-| 🟢 LOW | 2 | #5, #45 |
+| 🟢 LOW | 1 | #45 |
 
 ---
 
@@ -625,7 +627,7 @@ Open and partial items only.
 ### Phase 1: Foundation
 - [x] #1 - vmemcmp (obsolete)
 - [x] #2 - Dynamic routing
-- [ ] #5 - Query string parsing (flag keys, empty-key guard, percent-decode helper)
+- [x] #5 - Query string parsing
 - [x] #6 - HTTP status codes (obsolete)
 - [x] #8 - Header injection
 
@@ -672,13 +674,13 @@ Open and partial items only.
 
 ## 📈 Progress Tracking
 
-### Resolved: 26/37 (70%)
-- ✅ 22 done: #2, #3, #8, #10, #11, #15, #17, #18, #20, #21 (except kqueue),
-  #25, #27, #28, #29, #33, #35, #36, #37, #38, #41, #43, #46
+### Resolved: 27/37 (73%)
+- ✅ 23 done: #2, #3, #5, #8, #10, #11, #15, #17, #18, #20, #21 (except
+  kqueue), #25, #27, #28, #29, #33, #35, #36, #37, #38, #41, #43, #46
 - ⚪ 4 obsolete: #1, #6, #26, #32
 
-### Partial: 9/37 (24%)
-#5, #16, #19, #23, #39, #40, #42, #44, #45
+### Partial: 8/37 (22%)
+#16, #19, #23, #39, #40, #42, #44, #45
 
 ### Open: 2/37 (5%)
 #4, #34
@@ -714,7 +716,6 @@ Server push / close paths:
 
 For contributors wanting to learn:
 
-- **Beginner:** #5
 - **Intermediate:** #34, #40, #42
 - **Advanced:** #4/#19 (kqueue, #154), #16 (#156), #23
 
