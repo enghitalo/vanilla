@@ -67,7 +67,7 @@ assets := static_assets.new(static_assets.Config{
 
 Each representation (identity, `.br`, `.gz`) has its own strong ETag, a 304
 or 206 carries `Vary: Accept-Encoding` when the asset is negotiable (and the
-same `Cache-Control` as the 200), and 200, HEAD, 304 and 206 responses
+same `Cache-Control` as the 200), and 200, HEAD, 304, 206 and 416 responses
 allocate nothing per request (`respond_into` / `respond_req_into`;
 `respond_req_into` takes a request the handler already decoded).
 
@@ -86,7 +86,58 @@ size and mtime in seconds, in hex), so it stays the same across restarts and
 replicas. A Range request is answered from the identity representation, and
 its `If-None-Match` and `If-Range` are compared against the identity ETag (an
 `If-Range` that is not exactly that ETag, such as another tag, a weak tag or a
-date, gets the full 200 instead of the 206).
+date, gets the full 200 instead of the 206 or the 416).
+
+### Range requests
+
+A GET with a `Range` gets bytes of the identity representation, whatever
+`Accept-Encoding` says. An end past the file stops at its last byte (RFC 9110
+§14.1.2), and a suffix longer than the file takes all of it, so a client that
+fetches fixed-size chunks gets the tail of the file in its last one:
+
+```sh
+curl -i -r 10-1000 http://localhost:3000/app.3f5a9c.css
+```
+
+```
+HTTP/1.1 206 Partial Content
+Content-Type: text/css; charset=utf-8
+Content-Range: bytes 10-71/72
+Content-Length: 62
+Accept-Ranges: bytes
+ETag: "a82a292b7d229836"
+Cache-Control: public, max-age=31536000, immutable
+Connection: keep-alive
+
+r-scheme:light dark}#app{font:16px/1.5 system-ui;margin:2rem}
+```
+
+A range that cannot be satisfied (a start at or past the end, so any start on
+an empty file, or `bytes=-0`) gets a 416 carrying the file's length. It is
+decided after `If-None-Match`, so a cached copy that is still current gets its
+304 instead:
+
+```sh
+curl -i -r 500-600 http://localhost:3000/app.3f5a9c.css
+```
+
+```
+HTTP/1.1 416 Range Not Satisfiable
+Content-Range: bytes */72
+Content-Length: 0
+Connection: keep-alive
+
+```
+
+The 416 has no `ETag`, `Cache-Control` or `Vary`. A 416 is not heuristically
+cacheable, so without `Cache-Control` no cache stores it; with the asset's
+year-long one, a cache could store it under the method and URL alone and
+answer later requests that have no `Range` with it.
+
+A spec that is not one valid byte range (several ranges, an end before its
+start, a number that is not all digits, another unit) is ignored and the whole
+file comes back as a 200, and so is a suffix on an empty file. A HEAD ignores
+`Range` altogether: RFC 9110 §14.2 defines range handling for GET only.
 
 ### Memory: flat RAM, no per-request allocation (2026-06)
 
