@@ -34,6 +34,9 @@
 static int multishot_accept_works(struct io_uring *ring) {
     int works = -1;
     int cfd = -1;
+    int ret;
+    struct io_uring_sqe *sqe;
+    struct io_uring_cqe *cqe;
     struct sockaddr_in addr;
     socklen_t len = sizeof addr;
     memset(&addr, 0, sizeof addr);
@@ -53,19 +56,18 @@ static int multishot_accept_works(struct io_uring *ring) {
         goto out;
     }
     // io_uring_prep_multishot_accept needs liburing 2.2: set the flag by hand.
-    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    sqe = io_uring_get_sqe(ring);
     if (!sqe) {
         fputs("no free SQE\n", stderr);
         goto out;
     }
     io_uring_prep_rw(IORING_OP_ACCEPT, sqe, lfd, NULL, 0, 0);
     sqe->ioprio |= IORING_ACCEPT_MULTISHOT;
-    int ret = io_uring_submit(ring);
+    ret = io_uring_submit(ring);
     if (ret != 1) {
         fprintf(stderr, "io_uring_submit: %s\n", ret < 0 ? strerror(-ret) : "nothing submitted");
         goto out;
     }
-    struct io_uring_cqe *cqe;
     ret = io_uring_wait_cqe(ring, &cqe);
     if (ret < 0) {
         fprintf(stderr, "io_uring_wait_cqe: %s\n", strerror(-ret));

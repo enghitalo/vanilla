@@ -294,7 +294,9 @@ fn iou_resume_accept(worker &io_uring.Worker) {
 fn iou_arm_accept(worker &io_uring.Worker) {
 	if !io_uring.prepare_accept(&worker.ring, worker.socket_fd, worker.use_multishot) {
 		io_uring.submit(&worker.ring)
-		io_uring.prepare_accept(&worker.ring, worker.socket_fd, worker.use_multishot)
+		if !io_uring.prepare_accept(&worker.ring, worker.socket_fd, worker.use_multishot) {
+			eprintln('io_uring worker ${worker.cpu_id}: SQ full, the accept could not be re-armed; this worker takes no new connections')
+		}
 	}
 }
 
@@ -595,7 +597,7 @@ fn iou_sweep_timeouts(worker &io_uring.Worker, now u64) {
 // up on the main thread and driving it here would make every submit_and_wait
 // fail; doing it all here keeps the ring single-owner (and matches how every
 // thread-per-core io_uring server sets up).
-fn io_uring_worker_main(listener int, cpu_id int, ring_cap u32, handler core.Handler, make_state fn () voidptr, limits Limits, active_conns &core.Counter, inflight &core.Counter, draining &core.Counter) {
+fn io_uring_worker_main(listener int, cpu_id int, ring_cap u32, charged bool, handler core.Handler, make_state fn () voidptr, limits Limits, active_conns &core.Counter, inflight &core.Counter, draining &core.Counter) {
 	maybe_pin_worker(cpu_id)
 	mut worker := &io_uring.Worker{}
 	worker.cpu_id = cpu_id
@@ -617,7 +619,7 @@ fn io_uring_worker_main(listener int, cpu_id int, ring_cap u32, handler core.Han
 		tv_nsec: i64(socket.accept_pause % time.second)
 	}
 
-	ring_entries := iou_init_ring(&worker.ring, ring_cap) or {
+	ring_entries := iou_init_ring(&worker.ring, ring_cap, charged) or {
 		eprintln('Failed to initialize io_uring for worker ${cpu_id}: ${err.msg()}')
 		exit(1)
 	}
@@ -625,8 +627,8 @@ fn io_uring_worker_main(listener int, cpu_id int, ring_cap u32, handler core.Han
 		// Fell back below the size run_io_uring_backend picked (the user's other
 		// io_uring rings draw from the same RLIMIT_MEMLOCK budget). The
 		// connection pool is still sized for default_ring_entries, so under a
-		// burst the SQ can fill and accept re-arming can be skipped — surface it
-		// instead of silently degrading.
+		// burst the smaller SQ and CQ fill sooner — surface it instead of
+		// silently degrading.
 		eprintln('io_uring worker ${cpu_id}: using ${ring_entries} SQ entries (fell back from ${ring_cap})')
 	}
 	// Multishot accept needs kernel 5.19+; on older kernels stay single-shot
@@ -685,12 +687,14 @@ fn io_uring_worker_loop(worker &io_uring.Worker, mut env IouEnv, limits Limits, 
 	mut wait_ns := sweep_ns // time left until the next due scan
 
 	mut cqes := unsafe { [io_uring.drain_batch]&io_uring.Cqe{} }
-	// A completion queues at most a few SQEs (a recv and a send, an accept
-	// re-arm, a watch poll), and the SQ is flushed only between batches, so a
-	// batch is capped at a quarter of this ring's SQ: on a ring that fell back
-	// below 1024 entries a full drain_batch could fill the SQ.
+	// A completion usually queues a few SQEs at most (a recv and a send, an
+	// accept re-arm, a watch poll), and the SQ is flushed only between
+	// batches, so a batch is capped at a quarter of this ring's SQ: on a ring
+	// that fell back below 1024 entries a full drain_batch could fill the SQ.
+	// (One poll completion on a pipelined database connection resumes every
+	// client queued on it, which a batch limit cannot bound.)
 	batch := if ring_entries / 4 < u32(io_uring.drain_batch) {
-		ring_entries / 4
+		if ring_entries < 4 { u32(1) } else { ring_entries / 4 }
 	} else {
 		u32(io_uring.drain_batch)
 	}
@@ -711,6 +715,15 @@ fn io_uring_worker_loop(worker &io_uring.Worker, mut env IouEnv, limits Limits, 
 			if ret == -C.EINTR || ret == -C.ETIME {
 				// EINTR: retry. ETIME: no completion this interval — fall through
 				// to the (empty) drain and then the sweep.
+			} else if ret == -C.EBUSY || ret == -C.EAGAIN {
+				// The CQ, or the kernel's overflow backlog behind it, is full
+				// (EBUSY), or the kernel is short of request memory (EAGAIN):
+				// drain what is ready and try again.
+			} else if ret == -C.EBADR {
+				// The kernel dropped completions it could not keep (a full CQ
+				// and no memory for its overflow list); reported once per drop.
+				// The connections they belonged to may stall; the rest are fine.
+				eprintln('io_uring: the kernel dropped completions on a full CQ; some connections may stall')
 			} else {
 				C.perror(c'io_uring_submit_and_wait')
 				break
@@ -759,9 +772,10 @@ const iou_ring_ladder = [u32(io_uring.default_ring_entries), 8192, 4096, 2048, 1
 	io_uring.min_probe_ring_entries]
 
 // iou_ring_lock_bytes bounds the locked memory a ring of `entries` SQ entries
-// is charged: its SQE array (64 B per entry) and its CQ ring (a header plus two
-// 16 B CQEs per entry), each rounded up to whole pages, and to a power of two
-// pages on the kernels that allocate them that way. Each part is at most
+// is charged: its SQE array (64 B per entry) and its CQ ring (a header, two
+// 16 B CQEs per entry and, without IORING_SETUP_NO_SQARRAY, a 4 B SQ index per
+// entry), each rounded up to whole pages, and to a power of two pages on the
+// kernels that allocate them that way. Each part is at most
 // max(64 B * entries, one page), so the ring at most twice that.
 fn iou_ring_lock_bytes(entries u32, page u64) u64 {
 	part := u64(entries) * 64
@@ -821,8 +835,8 @@ fn iou_has_ipc_lock(status string, uid_map string) bool {
 }
 
 // iou_ring_entries_cap picks the SQ size every worker starts its ring at.
-// Where rings count against RLIMIT_MEMLOCK (iou_release_charges_rings, and no
-// CAP_IPC_LOCK), and a worker only walks down the ladder after a failure, the
+// Where rings count against RLIMIT_MEMLOCK (`charged`, iou_rings_charged), and
+// a worker only walks down the ladder after a failure, the
 // first workers would take full-size rings (up to 2 MiB each) and use the
 // budget up, and a later worker could not get even the smallest ring: the
 // process exited (a common default of 8 MiB holds four or five full-size
@@ -831,18 +845,26 @@ fn iou_has_ipc_lock(status string, uid_map string) bool {
 // closed ring's charge only some milliseconds after the close (and a previous
 // instance's only after it has exited), so a quick restart can still find
 // them counted. Not charged, or no limit (RLIM_INFINITY): full size.
-fn iou_ring_entries_cap(workers int) u32 {
+fn iou_ring_entries_cap(workers int, charged bool) u32 {
 	mut rl := C.rlimit{}
-	if C.getrlimit(C.RLIMIT_MEMLOCK, &rl) != 0 || rl.rlim_cur == u64(C.RLIM_INFINITY) {
-		return io_uring.default_ring_entries
-	}
-	if !iou_release_charges_rings(os.uname().release)
-		|| iou_has_ipc_lock(os.read_file('/proc/self/status') or { '' }, os.read_file('/proc/self/uid_map') or {
-			''
-		}) {
+	if !charged || C.getrlimit(C.RLIMIT_MEMLOCK, &rl) != 0
+		|| rl.rlim_cur == u64(C.RLIM_INFINITY) {
 		return io_uring.default_ring_entries
 	}
 	return iou_ring_entries_for(rl.rlim_cur / 2, workers, u64(os.page_size()))
+}
+
+// iou_rings_charged reports whether this process's rings count against
+// RLIMIT_MEMLOCK: a kernel that charges them (iou_release_charges_rings) and no
+// CAP_IPC_LOCK (iou_has_ipc_lock). A kernel built without user namespaces has
+// no /proc/self/uid_map: it is the initial namespace.
+fn iou_rings_charged() bool {
+	if !iou_release_charges_rings(os.uname().release) {
+		return false
+	}
+	status := os.read_file('/proc/self/status') or { '' }
+	uid_map := os.read_file('/proc/self/uid_map') or { '0 0 4294967295' }
+	return !iou_has_ipc_lock(status, uid_map)
 }
 
 // iou_init_ring sets the ring up at the largest ladder size no larger than
@@ -850,15 +872,15 @@ fn iou_ring_entries_cap(workers int) u32 {
 // a ring still comes up when the user's other rings hold part of
 // RLIMIT_MEMLOCK. At each size it tries SINGLE_ISSUER|DEFER_TASKRUN (kernel
 // 6.0+, the recommended setup), then SINGLE_ISSUER|COOP_TASKRUN (5.19+), then
-// plain flags. SQPOLL is intentionally never used. When even the smallest size
-// fails with ENOMEM, the whole walk is retried a few times, 20 ms apart: the
-// kernel returns a closed ring's charge some milliseconds after the close, so
-// iou_backend_available's probe rings, or a previous instance's, may still be
-// counted. Returns the negotiated SQ entry count; errors only if every
-// entry/flag combination fails.
-fn iou_init_ring(ring &io_uring.Ring, cap u32) !u32 {
+// plain flags. SQPOLL is intentionally never used. Where rings are `charged`
+// to RLIMIT_MEMLOCK and even the smallest size fails with ENOMEM, the whole
+// walk is retried a few times, 20 ms apart: the kernel returns a closed ring's
+// charge some milliseconds after the close, so iou_backend_available's probe
+// rings, or a previous instance's, may still be counted. Returns the
+// negotiated SQ entry count; errors only if every entry/flag combination fails.
+fn iou_init_ring(ring &io_uring.Ring, cap u32, charged bool) !u32 {
 	mut last := 0
-	for attempt in 0 .. 5 {
+	for attempt in 0 .. (if charged { 5 } else { 1 }) {
 		if attempt > 0 {
 			time.sleep(20 * time.millisecond)
 		}
@@ -883,7 +905,7 @@ fn iou_init_ring(ring &io_uring.Ring, cap u32) !u32 {
 			break
 		}
 	}
-	if last == -C.ENOMEM {
+	if last == -C.ENOMEM && charged {
 		return error('io_uring_setup failed for all ring entry/flag combinations (ENOMEM: ring memory counts against RLIMIT_MEMLOCK, raise `ulimit -l`)')
 	}
 	return error('io_uring_setup failed for all ring entry/flag combinations (${os.posix_get_error_msg(-last)})')
@@ -941,8 +963,10 @@ pub fn run_io_uring_backend(srv Server, mut threads []thread) {
 	// Worker count = the thread array new_server sized from config.workers (one
 	// SO_REUSEPORT listener was created per worker, so server.listener_fds.len matches).
 	num_workers := threads.len
-	// One ring size for every worker, from an even share of RLIMIT_MEMLOCK.
-	ring_cap := iou_ring_entries_cap(num_workers)
+	// One ring size for every worker, from an even share of RLIMIT_MEMLOCK
+	// where rings are charged to it.
+	charged := iou_rings_charged()
+	ring_cap := iou_ring_entries_cap(num_workers, charged)
 	if ring_cap < io_uring.default_ring_entries {
 		eprintln('io_uring: ${num_workers} rings of ${io_uring.default_ring_entries} SQ entries do not fit half of RLIMIT_MEMLOCK (`ulimit -l`); every worker starts at ${ring_cap} (fell back from ${io_uring.default_ring_entries})')
 	}
@@ -961,8 +985,8 @@ pub fn run_io_uring_backend(srv Server, mut threads []thread) {
 			eprintln('Failed to create listener for worker ${i}')
 			exit(1)
 		}
-		threads[i] = spawn io_uring_worker_main(listener, i, ring_cap, srv.handler, srv.make_state,
-			srv.limits, srv.active_conns, srv.inflight[i], srv.draining)
+		threads[i] = spawn io_uring_worker_main(listener, i, ring_cap, charged, srv.handler,
+			srv.make_state, srv.limits, srv.active_conns, srv.inflight[i], srv.draining)
 	}
 
 	if srv.unix_socket_path != '' {

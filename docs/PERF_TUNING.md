@@ -25,7 +25,7 @@ your own.
 | `GC_MARKERS` | online CPUs − 1 marker threads | a Boehm (default GC) build with fewer CPUs than the host has ([§1](#1-build-flags)) |
 | backend | `.epoll` | heavy connection churn: try `.io_uring`; TLS: epoll only ([§3](#3-choosing-a-backend)) |
 | `ulimit -n` | 1024 (systemd soft limit) | more than about a thousand open connections ([§4](#4-file-descriptors-and-connection-limits)) |
-| `ulimit -l` | system default (8 MiB on the test box) | io_uring rings below full size with more than a couple of workers (stderr says `fell back`; [§7](#7-io_uring-host-requirements)) |
+| `ulimit -l` | system default (8 MiB on the test box) | io_uring rings below full size on kernels that charge rings to it, with more than a couple of workers (stderr says `fell back`; [§7](#7-io_uring-host-requirements)) |
 | `Limits.max_connections` + timeouts | unlimited | any server facing the internet ([§4](#4-file-descriptors-and-connection-limits)) |
 | `net.core.somaxconn` | 4096 (Linux ≥ 5.4) | listen-queue overflows during connection bursts ([§5](#5-the-accept-queue-backlog-and-sysctls)) |
 | buffer sizes | 8 KiB read + 16 KiB write per connection | compile-time constants; see [§6](#6-memory-and-buffer-sizing) |
@@ -326,8 +326,8 @@ huge pages are `always`, RSS moves in 2 MiB steps with no allocation at all
   whose ring still cannot be set up at that size halves it, down to 256
   entries, and logs it (`io_uring worker N: using M SQ entries (fell back from
   C)`). If nothing works, the process prints `Failed to initialize io_uring
-  for worker N` (with a hint to raise `ulimit -l` on `ENOMEM`) and exits:
-  there is no automatic fallback to epoll (use
+  for worker N` (with a hint to raise `ulimit -l` on `ENOMEM`, where rings
+  are charged to it) and exits: there is no automatic fallback to epoll (use
   [`iou_backend_available()`](#3-choosing-a-backend)).
 - **Locked memory.** On kernels up to 5.11, and again from 6.14 (when the
   rings moved to io_uring's memory regions), ring memory counts against

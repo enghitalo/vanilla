@@ -41,7 +41,9 @@ pub const default_port = 8080
 // so completions never overflow even with one in-flight recv per connection.
 // A ring the server sizes down to fit RLIMIT_MEMLOCK (server's
 // iou_ring_entries_cap) has a smaller CQ: past it, completions wait in the
-// kernel's overflow list (IORING_FEAT_NODROP) until the ring drains.
+// kernel's overflow list (IORING_FEAT_NODROP) until the ring drains, as long as
+// the kernel can keep them (the server's worker loop drains and retries on
+// EBUSY, and reports EBADR, a dropped completion).
 pub const default_ring_entries = 16384
 
 // Derived constants
@@ -55,8 +57,9 @@ pub const write_buf_cap = 16 * 1024
 
 // How many CQE pointers to copy out of the ring per peek_batch call, at most:
 // the server's drain loop caps a batch at a quarter of the ring's SQ, and
-// submits queued SQEs between full batches, so the SQ never overflows no matter
-// how many completions are ready at once.
+// submits queued SQEs between full batches, so however many completions are
+// ready, the SQEs they queue fit (except a pipelined database poll, which
+// resumes every client queued on its connection).
 pub const drain_batch = 256
 
 // Operation types for user_data encoding
