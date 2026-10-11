@@ -24,7 +24,8 @@ fn C.vanilla_to_pending() bool
 // consumes complete protocol frames from `buf` (a view of the connection's
 // read buffer — copy anything that must outlive the call) and appends response
 // bytes to `out` (the same persistent, batch-flushed write buffer handlers
-// use). It returns how many bytes of `buf` it consumed plus the next Step:
+// use; core.queue_file returns false while it runs, so file bytes go there
+// too). It returns how many bytes of `buf` it consumed plus the next Step:
 //
 //   .done    — keep the connection open and wait for more bytes
 //   .suspend — park the connection on the fd just armed via

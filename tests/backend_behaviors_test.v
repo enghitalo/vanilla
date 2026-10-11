@@ -726,6 +726,11 @@ const bb_suspend_req = 'GET /suspend HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 const bb_short_req = 'GET /short HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 const bb_big_get_req = 'GET /big HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 const bb_parkfile_req = 'GET /parkfile HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+const bb_upgrade_req = 'GET /upgrade HTTP/1.1\r\nHost: x\r\nUpgrade: blob\r\nConnection: Upgrade\r\n\r\n'.bytes()
+const bb_switching = 'HTTP/1.1 101 Switching Protocols\r\nUpgrade: blob\r\nConnection: Upgrade\r\n\r\n'.bytes()
+// bb_conn_end ends every answer of bb_file_conn, with the region before it or
+// not, so a client can wait for it either way.
+const bb_conn_end = '|end'
 const bb_close_sep = '\r\nConnection: close\r\n\r\n'.bytes()
 
 // bb_target_is reports whether the request line's target is exactly `target`,
@@ -785,6 +790,16 @@ fn bb_file_cont(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload v
 	return .done
 }
 
+// bb_file_conn is the ConnHandler /upgrade hands its connection to, with the
+// BbFileRef as its takeover state: it answers every burst with the region,
+// handed off with bb_queue_region, then bb_conn_end.
+fn bb_file_conn(buf []u8, mut out []u8, client_fd int, takeover_state voidptr, worker_state voidptr, mut event_loop core.EventLoop) (int, core.Step) {
+	ref := unsafe { &BbFileRef(takeover_state) }
+	bb_queue_region(mut out, ref.file_fd, bb_file_off, bb_file_len, ref.accepted)
+	core.append_str(mut out, bb_conn_end)
+	return buf.len, core.Step.done
+}
+
 // bb_file_handler serves these routes over one borrowed file fd, counting
 // every hand-off queue_file accepts in `accepted`:
 //   /close    — headers, then the region handed off, .close
@@ -799,6 +814,7 @@ fn bb_file_cont(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload v
 //               off, which the file cannot fill
 //   /parkfile — parks on the client's own writability (the continuation runs
 //               on the worker's next pass), and bb_file_cont answers as /big
+//   /upgrade  — 101, and the connection goes to bb_file_conn
 //   other     — bb_ok_response, .done, nothing queued
 fn bb_file_handler(file_fd int, accepted &core.Counter) core.Handler {
 	ref := &BbFileRef{
@@ -809,6 +825,13 @@ fn bb_file_handler(file_fd int, accepted &core.Counter) core.Handler {
 		if bb_target_is(req, '/parkfile') {
 			event_loop.watch_fd(client_fd, .writable, bb_file_cont, voidptr(ref))
 			return .suspend
+		}
+		if bb_target_is(req, '/upgrade') {
+			if !core.queue_takeover(bb_file_conn, voidptr(ref)) {
+				return .close // not takeover-capable: the check fails on the missing 101
+			}
+			res << bb_switching
+			return .done
 		}
 		if bb_target_is(req, '/close') {
 			bb_file_head(mut res, bb_file_len, bb_close_sep)
@@ -1147,6 +1170,62 @@ fn check_queue_file_refused_in_continuation(backend server.IOBackend) ! {
 	// Refused whatever the compiler (under tcc the slot is inert anyway).
 	got := stdatomic.load_i64(&accepted.n)
 	assert got == 0, '${backend}: queue_file accepted ${got} hand-off(s) from a continuation'
+}
+
+// check_queue_file_refused_in_conn_handler: nothing takes the slot after a
+// ConnHandler either, so a region one queued would go out after the next
+// response on that worker, to another client. One worker, so both
+// connections below share its slot:
+//   1. GET /upgrade hands the connection to bb_file_conn, then a byte gets
+//      the region and bb_conn_end: queue_file must refuse the region, so
+//      the ConnHandler writes it itself.
+//   2. Once step 1 has its answer, GET / twice on a fresh connection:
+//      exactly two bb_ok_response. A region left queued by step 1 would
+//      follow the first.
+fn check_queue_file_refused_in_conn_handler(backend server.IOBackend) ! {
+	path, mut f := bb_file_fixture('queue_file_conn_handler')!
+	defer {
+		f.close()
+		os.rm(path) or {}
+	}
+	accepted := &core.Counter{}
+	mut h := vtest.start(server.ServerConfig{
+		io_multiplexing: backend
+		workers:         1
+		handler:         bb_file_handler(f.fd, accepted)
+	})!
+	defer {
+		h.stop()
+	}
+	mut want_upgraded := []u8{}
+	want_upgraded << bb_switching
+	want_upgraded << bb_file_data[bb_file_off..bb_file_off + bb_file_len].bytes()
+	want_upgraded << bb_conn_end.bytes()
+
+	upgraded := h.fire([
+		vtest.Script{
+			rounds: [
+				vtest.Round{
+					send:  bb_upgrade_req
+					until: vtest.count('101 Switching Protocols', 1)
+				},
+				vtest.Round{
+					send:  'x'.bytes()
+					until: vtest.count(bb_conn_end, 1)
+				},
+			]
+		},
+	])!
+	after := h.fire([bb_two_ok])!
+	u := upgraded.conns[0]
+	a := after.conns[0]
+	assert u.connect_err == '', u.connect_err
+	assert !u.unmet, '${backend}: the upgrade or the ConnHandler went unanswered: ${u.raw.bytestr()}'
+	assert a.connect_err == '', a.connect_err
+	assert a.raw == bb_concat(bb_ok_response, bb_ok_response), '${backend}: a region queued by a ConnHandler went out after the response to another connection: ${a.raw.bytestr()}'
+	got := stdatomic.load_i64(&accepted.n)
+	assert got == 0, '${backend}: queue_file accepted ${got} hand-off(s) from a ConnHandler'
+	assert u.raw == want_upgraded, '${backend}: the ConnHandler must write its region itself: ${u.raw.bytestr()}'
 }
 
 // check_queue_file_short_read: a queued region the file cannot fill (it
@@ -1718,6 +1797,17 @@ fn test_epoll_queue_file_before_streamed_head() ! {
 fn test_epoll_queue_file_refused_in_continuation() ! {
 	$if linux {
 		check_queue_file_refused_in_continuation(.epoll)!
+	}
+}
+
+// Takeover is inert under tcc (#173): run with gcc, as CI does.
+fn test_epoll_queue_file_refused_in_conn_handler() ! {
+	$if linux {
+		$if tinyc {
+			eprintln('[test] takeover is inert under tcc; skipping')
+			return
+		}
+		check_queue_file_refused_in_conn_handler(.epoll)!
 	}
 }
 
