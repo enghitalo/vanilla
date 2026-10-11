@@ -15,6 +15,7 @@ module main
 // concatenates; see main.v.)
 import core
 import http1_1.request_parser
+import http1_1.response
 import net
 
 const sec = i64(1_000_000_000) // 1s in nanoseconds
@@ -218,8 +219,9 @@ fn test_e2e_200_has_remaining_and_exact_framing() ! {
 		capacity: 10.0
 	}
 	resp := serve('GET / HTTP/1.1\r\nHost: x\r\n\r\n', mut l)!
-	// The whole response is deterministic: prefix + remaining(9) + tail.
-	assert resp == 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nRateLimit-Remaining: 9\r\nContent-Length: 11\r\n\r\n{"ok":true}'
+	// The whole response is deterministic: the limit is the capacity (10), and
+	// one token is spent (remaining 9).
+	assert resp == 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nRateLimit-Limit: 10\r\nRateLimit-Remaining: 9\r\nContent-Length: 11\r\n\r\n{"ok":true}'
 }
 
 fn test_e2e_capacity_exhaustion_returns_const_429() ! {
@@ -231,8 +233,8 @@ fn test_e2e_capacity_exhaustion_returns_const_429() ! {
 	assert serve(req, mut l)!.starts_with('HTTP/1.1 200')
 	assert serve(req, mut l)!.starts_with('HTTP/1.1 200')
 	denied := serve(req, mut l)!
-	assert denied == response_429 // exactly the const bytes
-	assert denied.contains('Retry-After: 1')
+	// exactly these bytes: the limit is this limiter's capacity, not a literal
+	assert denied == 'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nRateLimit-Limit: 2\r\nRateLimit-Remaining: 0\r\nContent-Length: 0\r\n\r\n'
 }
 
 fn test_e2e_spoofed_xff_does_not_bypass_the_limit() ! {
@@ -251,18 +253,20 @@ fn test_e2e_spoofed_xff_does_not_bypass_the_limit() ! {
 	assert l.buckets.len == 1
 }
 
-fn test_e2e_malformed_request_is_an_error() {
+fn test_e2e_malformed_request_gets_400_and_close() {
 	mut l := Limiter{
 		rate:     0.0
 		capacity: 1.0
 	}
-	// Malformed input must surface as a handler error, never a response.
-	if _ := serve('garbage', mut l) {
-		assert false, 'garbage bytes must not produce a response'
+	// Malformed input gets the canned 400 and `.close`, and spends no token.
+	for bad in ['garbage', 'GET / HT'] {
+		mut out := []u8{}
+		mut event_loop := core.EventLoop{}
+		step := handle(bad.bytes(), mut out, -1, unsafe { nil }, mut event_loop, mut l)
+		assert step == .close, bad
+		assert out == response.tiny_bad_request_response, bad
 	}
-	if _ := serve('GET / HT', mut l) {
-		assert false, 'truncated request line must not produce a response'
-	}
+	assert l.buckets.len == 0
 }
 
 // ---- the steady state allocates nothing ------------------------------------
@@ -319,7 +323,7 @@ fn test_rate_limit_allocates_nothing() ! {
 			keys += client_key(parsed, ip('10.0.0.5'), lb_cidrs)
 		}
 		grown := gc_heap_usage().total_bytes - before
-		assert out.bytestr() == response_429
+		assert out.bytestr() == 'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nRateLimit-Limit: 1\r\nRateLimit-Remaining: 0\r\nContent-Length: 0\r\n\r\n'
 		assert keys == u64(rounds) * ip('1.2.3.4')
 		assert grown < 4096, 'allocated ${grown} bytes over ${rounds * 3} calls'
 	}
