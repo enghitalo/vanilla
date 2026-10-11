@@ -32,12 +32,13 @@ const edge_port = 8096
 const resp_503 = 'HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n'
 const resp_404 = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n'
 const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'
-const failure_head = 'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nX-Upstream-Failure: '.bytes()
-const timeout_head = 'HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nX-Upstream-Failure: '.bytes()
-const crlf2 = '\r\n\r\n'.bytes()
+const failure_head = 'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nX-Upstream-Failure: '
+const timeout_head = 'HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nX-Upstream-Failure: '
+const crlf2 = '\r\n\r\n'
 const up_prefix = '/up/'
 const user_agent = 'vanilla-https-upstream/1'.bytes()
 const fill_prefix = '/fill/'
+const max_fill = 0x7fffffff
 
 // failure_names[int(f)] names an upstream.Failure in X-Upstream-Failure.
 const failure_names = ['none', 'invalid', 'dns', 'connect', 'tls_verify', 'tls', 'send', 'closed',
@@ -94,6 +95,25 @@ fn view(req []u8, s int, n int) string {
 	return if n > 0 { unsafe { tos(&req[s], n) } } else { '' }
 }
 
+// leading_int reads the decimal digits that start req[s..s + n], in place: 0
+// when there are none, saturating at max_fill (as string.int() does).
+@[direct_array_access]
+fn leading_int(req []u8, s int, n int) int {
+	mut v := 0
+	for i in s .. s + n {
+		c := req[i]
+		if c < `0` || c > `9` {
+			break
+		}
+		d := int(c - `0`)
+		if v > (max_fill - d) / 10 {
+			return max_fill
+		}
+		v = v * 10 + d
+	}
+	return v
+}
+
 fn edge(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut el core.EventLoop) core.Step {
 	// The request line, as views: METHOD SP target SP version.
 	sp1 := index_of(req, 0, ` `)
@@ -118,7 +138,7 @@ fn edge(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut el core
 			core.append_str(mut out, resp_404)
 			return .done
 		}
-		fill = view(req, sp1 + 1 + fill_prefix.len, slash - sp1 - 1 - fill_prefix.len).int()
+		fill = leading_int(req, sp1 + 1 + fill_prefix.len, slash - sp1 - 1 - fill_prefix.len)
 		up_start = slash
 	} else if !target.starts_with(up_prefix) {
 		core.append_str(mut out, resp_404)
@@ -194,7 +214,7 @@ fn on_upstream(mut out []u8, fd int, fd_err bool, payload voidptr, worker_state 
 		body := x.body_view()
 		core.append_str(mut out, 'Content-Length: ')
 		wi(mut out, body.len)
-		wb(mut out, crlf2)
+		core.append_str(mut out, crlf2)
 		wb(mut out, body)
 	}
 	x.release()
@@ -202,9 +222,13 @@ fn on_upstream(mut out []u8, fd int, fd_err bool, payload voidptr, worker_state 
 }
 
 fn failed(mut out []u8, f upstream.Failure) {
-	wb(mut out, if f == .timeout { timeout_head } else { failure_head })
+	if f == .timeout {
+		core.append_str(mut out, timeout_head)
+	} else {
+		core.append_str(mut out, failure_head)
+	}
 	core.append_str(mut out, failure_names[int(f)])
-	wb(mut out, crlf2)
+	core.append_str(mut out, crlf2)
 }
 
 fn index_of(b []u8, from int, c u8) int {

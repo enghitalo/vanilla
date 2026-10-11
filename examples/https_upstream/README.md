@@ -28,7 +28,7 @@ pay := upstream.Pool.new(upstream.Origin{ host: 'api.example.com' }, tls_cfg)!
 pay.start_maintenance(mut el)!
 
 // The handler: acquire (none = shed with 503), build, send, suspend.
-mut x := st.pay.acquire() or { out << resp_503; return .done }
+mut x := st.pay.acquire() or { core.append_str(mut out, resp_503); return .done }
 x.request('POST', '/v1/charges')
 x.header('Idempotency-Key', key)
 x.retryable(true) // safe to send twice: the key makes it so
@@ -38,7 +38,7 @@ if x.send(mut el, on_charge, unsafe { nil }) == .pending {
     return .suspend
 }
 x.release()
-out << resp_502
+core.append_str(mut out, resp_502)
 return .done
 
 // The continuation: advance until .ready or .failed, answer, release.

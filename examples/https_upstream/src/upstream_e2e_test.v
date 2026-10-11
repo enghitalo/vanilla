@@ -267,6 +267,27 @@ fn failure_of(resp string) string {
 	return resp.all_after('X-Upstream-Failure: ').all_before('\r\n')
 }
 
+// The <n> of /fill/<n>/ is read in place, with string.int()'s answers: the
+// leading digits, 0 without any, saturated at max_fill.
+fn test_fill_count_is_read_in_place() {
+	for s, want in {
+		'16':                   16
+		'0':                    0
+		'':                     0
+		'abc':                  0
+		'12x':                  12
+		'4194304':              4 << 20
+		'2147483647':           max_fill
+		'2147483648':           max_fill
+		'99999999999999999999': max_fill
+	} {
+		req := 'POST /fill/${s}/echo HTTP/1.1\r\n'.bytes()
+		start := 'POST /fill/'.len
+		assert leading_int(req, start, s.len) == want, s
+		assert leading_int(req, start, s.len) == s.int(), s
+	}
+}
+
 // Every response shape comes back with its exact status and decoded body:
 // Content-Length, chunked with a trailer, 100 Continue then 201, HEAD, 204, a
 // body delimited by the close (over TLS, after close_notify), and a POST body.
@@ -955,9 +976,9 @@ fn heap_bytes() i64 {
 }
 
 // No allocation per exchange: under -gc none (nothing is ever freed) the heap
-// after 200 warm-up calls and after 4000 more (Content-Length and chunked,
-// over TLS in a TLS build) grows by under 4096 B. The client is one keep-alive
-// connection reading into reused buffers.
+// after 200 warm-up calls and after 4000 more (Content-Length, chunked, and a
+// /fill/ upload, over TLS in a TLS build) grows by under 4096 B. The client is
+// one keep-alive connection reading into reused buffers.
 fn test_no_allocation_per_exchange() {
 	$if gcboehm ? {
 		return
@@ -980,12 +1001,13 @@ fn test_no_allocation_per_exchange() {
 	}
 	testkit.fd_wait_writable(fd, 1000)
 	reqs := ['GET /up/ok HTTP/1.1\r\nHost: edge\r\n\r\n'.bytes(),
-		'GET /up/chunked HTTP/1.1\r\nHost: edge\r\n\r\n'.bytes()]
+		'GET /up/chunked HTTP/1.1\r\nHost: edge\r\n\r\n'.bytes(),
+		'POST /fill/64/echo HTTP/1.1\r\nHost: edge\r\n\r\n'.bytes()]
 	mut acc := []u8{cap: 8192}
 	mut buf := []u8{len: 8192}
 	run := fn [fd, reqs] (n int, mut acc []u8, mut buf []u8) {
 		for i in 0 .. n {
-			req := reqs[i % 2]
+			req := reqs[i % reqs.len]
 			C.send(fd, req.data, usize(req.len), 0)
 			read_response(fd, mut acc, mut buf, 5000)
 			if client.status_code(acc) != 200 {
