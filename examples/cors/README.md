@@ -95,8 +95,8 @@ Content-Length: 11
   An empty `Origin` counts as absent.
 - **Consts around the one dynamic part.** Each response is a `const` head
   (`preflight_head`, `ok_cors_head`, appended with `core.append_str`), the
-  echoed origin, and a `const` tail (`preflight_tail`, `ok_cors_tail`, `[]u8`
-  appended with `out <<`). The fixed responses `resp_403` and
+  echoed origin, and a `const` tail (`preflight_tail`, `ok_cors_tail`), all
+  appended with `core.append_str`. The fixed responses `resp_403` and
   `resp_ok_plain` are whole consts. Nothing is concatenated or interpolated
   ([BEST_PRACTICES §3a](../../docs/BEST_PRACTICES.md#3a-static-responses--a-const-string-appended-with-coreappend_str)).
 - **Routing in place.** `slice_eq` compares the method `Slice` against
@@ -115,7 +115,8 @@ v test examples/cors/src
 the preflight for an allowed and a forbidden origin, the echoed origin and
 credentials header on simple requests, the plain response for a disallowed
 or missing origin, `Vary: Origin` on every variant, and the canned 400 with
-`.close` for a malformed request.
+`.close` for a malformed request, and that no variant allocates (a
+`gc_heap_usage()` delta over 20k rounds).
 
 ## See also
 

@@ -59,7 +59,7 @@ fn test_every_variant_carries_vary_origin() {
 	// EVERY variant — the plain one included, or a cache can serve the plain
 	// variant to an allowed origin (no Access-Control-Allow-Origin => blocked).
 	for c in [preflight_tail, ok_cors_tail, resp_ok_plain, resp_403] {
-		assert c.bytestr().contains('\r\nVary: Origin\r\n')
+		assert c.contains('\r\nVary: Origin\r\n')
 	}
 	for raw in [
 		'OPTIONS /api HTTP/1.1\r\nOrigin: http://localhost:5173\r\n\r\n', // 204 preflight
@@ -70,6 +70,43 @@ fn test_every_variant_carries_vary_origin() {
 	] {
 		out := serve(raw.bytes()).bytestr()
 		assert out.contains('\r\nVary: Origin\r\n'), out
+	}
+}
+
+// Every variant — allowed and refused preflights, simple requests with an
+// allowed, a refused or no Origin — runs 20k times through one reused buffer,
+// as a worker would serve them; the collector's lifetime allocation counter
+// must not move. (Under `-gc none`, vanilla's production build, an allocation
+// here would be a permanent leak.)
+fn test_requests_allocate_nothing() {
+	$if gcboehm ? {
+		reqs := [
+			'OPTIONS /api HTTP/1.1\r\nOrigin: http://localhost:5173\r\n\r\n',
+			'OPTIONS /api HTTP/1.1\r\nOrigin: https://evil.com\r\n\r\n',
+			'GET /api HTTP/1.1\r\nOrigin: https://app.example.com\r\n\r\n',
+			'GET /api HTTP/1.1\r\nOrigin: https://evil.com\r\n\r\n',
+			'GET /api HTTP/1.1\r\nHost: x\r\n\r\n',
+		].map(it.bytes())
+		mut out := []u8{cap: 4096}
+		mut event_loop := core.EventLoop{}
+		for r in reqs { // warm-up: `out` reaches its high-water mark
+			unsafe {
+				out.len = 0
+			}
+			handle(r, mut out, -1, unsafe { nil }, mut event_loop)
+		}
+		rounds := 20_000
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. rounds {
+			for r in reqs {
+				unsafe {
+					out.len = 0
+				}
+				handle(r, mut out, -1, unsafe { nil }, mut event_loop)
+			}
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert grown < 4096, 'allocated ${grown} bytes over ${rounds * reqs.len} requests'
 	}
 }
 
