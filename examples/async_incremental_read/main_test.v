@@ -1,18 +1,80 @@
 // vtest build: linux
-// main.v streams a popen(3) pipe through the epoll watch reactor (Linux only).
+// main.v streams a posix_spawn(3) pipe through the epoll watch reactor (Linux only).
 module main
 
 import core
+import os
 import server
+import strconv
+import time
 import vtest
 import http1_1.response
 
+#include <fcntl.h>
+#include <sys/resource.h>
+
 fn C.pipe(fds &i32) int
 fn C.write(fd int, buf voidptr, n usize) int
+fn C.fcntl(fd int, cmd int, arg int) int
+
+struct C.rlimit {
+mut:
+	rlim_cur u64
+	rlim_max u64
+}
+
+fn C.getrlimit(resource int, rlim &C.rlimit) int
+fn C.setrlimit(resource int, rlim &C.rlimit) int
 
 const stream_req = 'GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
 
 const missing_req = 'GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
+
+// Like main() for the server, have the kernel reap every producer the tests
+// start, from before the first one.
+fn testsuite_begin() {
+	ignore_sigchld()
+}
+
+// lowest_free_fd is the number the kernel gives the next new fd. The same
+// value before and after a failed spawn means it closed what it opened.
+fn lowest_free_fd() !int {
+	mut f := os.open('/dev/null')!
+	fd := f.fd
+	f.close()
+	return fd
+}
+
+// signal_mask returns the `name` mask (SigIgn, say) of a /proc/<pid>/status
+// text: bit n-1 stands for signal n.
+fn signal_mask(status string, name string) !u64 {
+	for line in status.split_into_lines() {
+		if line.starts_with(name + ':') {
+			return strconv.parse_uint(line.all_after(':').trim_space(), 16, 64)!
+		}
+	}
+	return error('no ${name} line in: ${status}')
+}
+
+// zombie_children lists the children of this process that exited and were
+// never reaped: the /proc/<pid>/stat entries in state Z whose ppid is this
+// process.
+fn zombie_children() []int {
+	me := os.getpid()
+	mut found := []int{}
+	for name in os.ls('/proc') or { []string{} } {
+		if name.len == 0 || !name[0].is_digit() {
+			continue
+		}
+		stat := os.read_file('/proc/${name}/stat') or { continue } // exited since ls
+		// `pid (comm) state ppid ...`, where comm may hold spaces and parens.
+		f := stat.all_after_last(')').fields()
+		if f.len > 1 && f[0] == 'Z' && f[1].int() == me {
+			found << name.int()
+		}
+	}
+	return found
+}
 
 // dechunk decodes a chunked body that starts at `start` (RFC 9112 §7.1),
 // strictly: every chunk-size line is hex digits + CRLF, and every chunk's data
@@ -94,6 +156,65 @@ fn test_wx_writes_chunk_sizes() {
 // the fd the way the reactor does, and arms nothing.
 fn record_register(mut event_loop core.EventLoop, ext_fd int, interest core.WatchInterest, continuation core.WakeFn, watch_payload voidptr) {
 	event_loop.last_watched = ext_fd
+}
+
+// A /stream whose producer cannot start gets 503 and parks nothing. The fd
+// limit is lowered to the next free fd number, so the producer's pipe cannot
+// be opened (EMFILE). It runs before the tests that start a server, whose
+// threads would otherwise share the limit.
+fn test_stream_answers_503_when_the_producer_cannot_start() ! {
+	mut saved := C.rlimit{}
+	assert C.getrlimit(C.RLIMIT_NOFILE, &saved) == 0
+	mut full := saved
+	full.rlim_cur = u64(lowest_free_fd()!)
+	assert C.setrlimit(C.RLIMIT_NOFILE, &full) == 0
+	mut event_loop := core.EventLoop{
+		register: record_register
+	}
+	mut out := []u8{}
+	step := handle(stream_req, mut out, -1, unsafe { nil }, mut event_loop)
+	C.setrlimit(C.RLIMIT_NOFILE, &saved)
+	assert step == .done
+	assert out.bytestr() == service_unavailable
+	assert event_loop.last_watched == -1, 'a failed spawn must watch nothing'
+}
+
+// A spawn that fails (no shell at that path) returns -1 and closes both ends
+// of the pipe it had opened.
+fn test_failed_spawn_leaves_no_fd_open() ! {
+	before := lowest_free_fd()!
+	assert C.spawn_producer(c'/nonexistent/sh', producer) == -1
+	assert lowest_free_fd()! == before
+}
+
+// The producer starts with SIGPIPE and SIGCHLD at their default actions,
+// though this process ignores both: SIGPIPE as new_server would (set by hand:
+// no server has started yet), SIGCHLD from testsuite_begin. The probe execs
+// grep in the shell's place, which keeps the shell's signal dispositions, to
+// print its own SigIgn mask down the pipe.
+fn test_producer_starts_with_default_sigpipe_and_sigchld() ! {
+	unsafe { C.signal(C.SIGPIPE, C.SIG_IGN) }
+	pipe_bit := u64(1) << (C.SIGPIPE - 1)
+	chld_bit := u64(1) << (C.SIGCHLD - 1)
+	ours := signal_mask(os.read_file('/proc/self/status')!, 'SigIgn')!
+	assert ours & pipe_bit != 0 && ours & chld_bit != 0, 'this process must ignore both'
+	fd := C.spawn_producer(c'/bin/sh', c'exec grep "^SigIgn:" /proc/self/status')
+	assert fd >= 0
+	C.fcntl(fd, C.F_SETFL, 0) // blocking: read up to EOF
+	mut got := []u8{}
+	mut buf := [256]u8{}
+	for {
+		n := C.read(fd, &buf[0], buf.len)
+		if n <= 0 {
+			break
+		}
+		unsafe { got.push_many(&buf[0], n) }
+	}
+	C.close(fd)
+	status := got.bytestr()
+	ign := signal_mask(status, 'SigIgn')!
+	assert ign & pipe_bit == 0, 'the producer ignores SIGPIPE: ${status}'
+	assert ign & chld_bit == 0, 'the producer ignores SIGCHLD: ${status}'
 }
 
 // on_chunk, driven directly over a pipe: each wake frames what the pipe holds
@@ -204,4 +325,35 @@ fn test_other_paths_get_404_and_bad_requests_close() ! {
 	assert bad.frames.len == 1
 	assert bad.frames[0] == response.tiny_bad_request_response
 	assert out.inflight_after == 0
+}
+
+// A client that disconnects mid-stream leaves no zombie (#292). The client
+// closes once the first line is in; at least 1.5 s later, when even a
+// producer that ran its whole 1 s loop has exited, no child of this process
+// may be a zombie (it ignores SIGCHLD, as main() does). Here the producer
+// does run that whole loop: it also holds a copy of the client's socket
+// (vtest's sockets are not close-on-exec, and client and server share this
+// process), so the close reaches the server only when the producer exits.
+fn test_a_client_leaving_mid_stream_leaves_no_zombie() ! {
+	out := vtest.drive(server.ServerConfig{
+		io_multiplexing: .epoll
+		handler:         handle
+	}, [
+		vtest.Script{
+			rounds: [
+				vtest.Round{
+					send:  stream_req
+					until: vtest.count('line 1\n', 1)
+				},
+			]
+		},
+	])!
+	c := out.conns[0]
+	assert c.connect_err == '', c.connect_err
+	assert !c.unmet, c.raw.bytestr()
+	assert out.inflight_after == 0
+	assert out.active_after == 0
+	time.sleep(1500 * time.millisecond)
+	zombies := zombie_children()
+	assert zombies.len == 0, 'zombie children: ${zombies}'
 }
