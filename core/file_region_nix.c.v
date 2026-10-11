@@ -6,11 +6,14 @@ module core
 // by handlers whose backend refused queue_file, so there is one copy of it.
 
 #include <unistd.h>
+#include "@VMODROOT/core/regular_file_nix.h"
 
 // pread(2) reads at an explicit offset and leaves the fd's own position alone,
 // so one shared fd is safe to read from many threads at once (the property
 // sendfile(2) with an explicit offset has too).
 fn C.pread(fd int, buf voidptr, count usize, offset i64) isize
+
+fn C.vanilla_regular_file_size(fd int) i64
 
 // append_file_region appends the bytes [off, off+length) of a borrowed file fd
 // to `buf` and returns how many it appended. It reads straight into `buf`'s
@@ -48,4 +51,15 @@ pub fn append_file_region(mut buf []u8, file_fd int, off i64, length i64) i64 {
 		}
 	}
 	return got
+}
+
+// regular_file_size returns the size of the regular file open on file_fd, or
+// -1 when fstat(2) fails or the fd is something else (a directory, a FIFO, a
+// device): the check a handler makes before it promises a Content-Length and
+// reads the file with append_file_region. The struct stat stays in C, so the
+// call allocates nothing on any platform (a stat struct a V function hands to
+// C.fstat is moved to the heap on macOS, docs/V_PERF_TOOLBOX.md).
+@[inline]
+pub fn regular_file_size(file_fd int) i64 {
+	return C.vanilla_regular_file_size(file_fd)
 }

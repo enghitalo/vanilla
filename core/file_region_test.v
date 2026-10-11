@@ -70,3 +70,31 @@ fn test_append_file_region_refusals_leave_the_bytes_unchanged() {
 		assert buf.cap < 1024
 	}
 }
+
+fn test_regular_file_size_is_the_size_of_a_regular_file_only() ! {
+	$if !windows {
+		path := fr_fixture('size')!
+		mut f := os.open(path)!
+		defer {
+			f.close()
+			os.rm(path) or {}
+		}
+		assert regular_file_size(f.fd) == fr_data.len
+		assert regular_file_size(-1) == -1 // not an open fd
+		mut dir := os.open(os.temp_dir())!
+		defer {
+			dir.close()
+		}
+		assert regular_file_size(dir.fd) == -1 // a directory
+		$if gcboehm ? {
+			before := gc_heap_usage().total_bytes
+			mut sum := i64(0)
+			for _ in 0 .. 20_000 {
+				sum += regular_file_size(f.fd)
+			}
+			grown := gc_heap_usage().total_bytes - before
+			assert sum == i64(20_000) * fr_data.len
+			assert grown < 4096, 'regular_file_size allocated ${grown} bytes over 20000 calls'
+		}
+	}
+}

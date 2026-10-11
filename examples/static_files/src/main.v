@@ -49,20 +49,11 @@ import server
 import core
 import http1_1.request_parser
 import http1_1.response
-import os
 import strconv
 import hash as wyhash
 
 #include <fcntl.h>
 #include <limits.h>
-#include <sys/stat.h>
-
-fn C.fstat(fd int, buf &C.stat) int
-
-// stat_words sizes the stack room fstat(2) writes its struct into: 256 bytes,
-// more than any platform's `struct stat` (144 on Linux x86_64 and macOS). A
-// test checks it.
-const stat_words = 32
 
 const web_root = './public'
 const index_path = '/index.html' // what a bare '/' serves
@@ -398,17 +389,11 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, m
 	defer {
 		C.close(fd)
 	}
-	// The struct lives in a bare fixed array, read through a pointer. A
-	// `C.stat{}` local handed to C.fstat is moved to the heap on every call
-	// where V declares C.stat with a fixed-array field (macOS: st_qspare); see
-	// docs/V_PERF_TOOLBOX.md.
-	mut stat_buf := [stat_words]u64{}
-	sb := unsafe { &C.stat(voidptr(&stat_buf[0])) }
-	if C.fstat(fd, sb) != 0 || sb.st_mode & os.s_ifmt != os.s_ifreg {
+	size := core.regular_file_size(fd)
+	if size < 0 {
 		core.append_str(mut out, resp_404)
 		return .done
 	}
-	size := i64(sb.st_size)
 	ctype := mime_type(unsafe { tos(&st.resolved[0], n) })
 
 	// Range request: serve 206 Partial Content (this is how seeking works).

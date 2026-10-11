@@ -163,11 +163,13 @@ on V 0.5.2 `5516000` (2026-10-09), after the upstream fixes they led to.
   reports the move ("local moved to the heap: its fixed array storage may
   escape"); vlang/v#29801 asks for summaries that follow such calls. A bare
   fixed-array local passed as `&a[0]` was never moved. A C call counts as
-  passing it on, and the struct's shape depends on the platform: `mut sb :=
-  C.stat{}` then `C.fstat(fd, &sb)` stays on the stack on Linux but is
-  `memdup`'d per call on macOS, whose `C.stat` ends in `st_qspare [2]i64`.
-  examples/static_files and examples/video_stream reserve a `[32]u64` and
-  read it as `&C.stat`.
+  passing it on, and what moves depends on the platform: `mut sb := C.stat{}`
+  then `C.fstat(fd, &sb)` stays on the stack on Linux, but on macOS (whose
+  `C.stat` ends in `st_qspare [2]i64`) it is `memdup`'d per call, and so is
+  a bare `[32]u64` whose address is cast to `&C.stat` for `C.fstat`. Keep
+  such a struct on the C side: `core.regular_file_size(fd)` runs fstat(2) in
+  a C inline and returns only the size. Check with `v -os macos -o x.c` and
+  grep the handler for `memdup`.
 - **An address passed straight into a comptime call escapes.** `&p` given to
   `app.$method(...)` inside the `$for` moves `p` to the heap ("its address
   escapes"), whatever its type; the same call behind an ordinary method keeps it

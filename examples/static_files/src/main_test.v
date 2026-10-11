@@ -345,12 +345,6 @@ fn test_malformed_request_errors() {
 
 // ---- the point of the design: serving allocates nothing ----------------------
 
-// fstat(2) writes this platform's struct stat into the stack array the
-// handler reserves for it: it must fit.
-fn test_stat_buffer_holds_struct_stat() {
-	assert sizeof(C.stat) <= stat_words * 8
-}
-
 // Every outcome — 200, 206, 304, HEAD, 404 for each refusal, 405, 400 — runs
 // 20k times through one worker State and one reused `out`, as a worker would
 // serve them; the collector's lifetime allocation counter must not move.
