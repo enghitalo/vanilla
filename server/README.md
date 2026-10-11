@@ -25,7 +25,7 @@ per-request allocation.
 |---|---|---|---|
 | Linux | `.epoll` *(default)* | one central acceptor → round-robins fds to per-worker epolls | `.suspend` watches, park deadlines, server push (subscriptions, mailbox), `make_state`, `on_worker_start`, TLS |
 | Linux | `.io_uring` | per-worker `SO_REUSEPORT` listener + multishot accept (kernel 5.19+) | `.suspend` watches (oneshot `IORING_OP_POLL_ADD`), `make_state` |
-| macOS | kqueue | per-worker | `.suspend` watches, `make_state` |
+| macOS | kqueue | one central acceptor → round-robins fds to per-worker kqueues | `.suspend` watches, `make_state` |
 | Windows | IOCP | one central acceptor → round-robins fds to per-worker IOCP ports | `.done`/`.close` only (`.suspend` closes), `make_state`, limits + timeouts |
 | any POSIX | `.poll` *(`-d vanilla_poll`)* | every worker polls the ONE shared listener (no SO_REUSEPORT assumed) | the QNX/VxWorks portability floor (`backend_poll/`): same request semantics, O(nfds), `.done`/`.close` only, never a default |
 
@@ -175,7 +175,9 @@ retries at once: [#154](https://github.com/enghitalo/vanilla/issues/154).)
 
 Raise the limit to fit the connections you expect, and set `max_connections`
 below it: a client over that cap gets a prompt close instead of a wait in the
-backlog.
+backlog. [../docs/PERF_TUNING.md](../docs/PERF_TUNING.md) covers raising it
+(shell, systemd, Docker), the listen backlog and `net.core.somaxconn`, and the
+per-connection memory that `max_connections` bounds.
 
 ## TLS
 
@@ -236,9 +238,13 @@ shared by the whole process:
 
 ## Performance
 
-Worker count = `VANILLA_WORKERS` env → `runtime.nr_cpus()` (set `VANILLA_WORKERS`
-inside a cpuset/CPU-capped container). The hot path is allocation-free (pooled
+Worker count = `ServerConfig.workers` → `VANILLA_WORKERS` env → `runtime.nr_cpus()`
+(set `VANILLA_WORKERS` under `taskset`, a cpuset or a CPU-capped container:
+`nr_cpus()` counts the host's online CPUs). The hot path is allocation-free (pooled
 per-connection buffers, zero-copy `buf_view` request windows, one batched send per
 readiness event). epoll ships `-prod -gc none`; io_uring ships `-prod` (default
-GC). See [../docs/V_PERF_TOOLBOX.md](../docs/V_PERF_TOOLBOX.md) and
+GC). For deployment (CPU split, `VANILLA_PIN_CPUS`, fd and locked-memory limits,
+backlog sysctls, buffer sizing, io_uring and kTLS host requirements) see
+[../docs/PERF_TUNING.md](../docs/PERF_TUNING.md); for handler code,
+[../docs/V_PERF_TOOLBOX.md](../docs/V_PERF_TOOLBOX.md) and
 [../docs/BEST_PRACTICES.md](../docs/BEST_PRACTICES.md).

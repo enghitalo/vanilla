@@ -429,7 +429,9 @@ wrk -H 'Connection: keep-alive' --connections 512 --threads 16 --duration 30s ht
 wrk -t16 -c512 -d30s -H "If-None-Match: c4ca4238a0b923820dcc509a6f75849b" http://localhost:3000/user/1
 ```
 
-See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark results on Apple M4.
+See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark results on Apple M4,
+and [docs/PERF_TUNING.md](docs/PERF_TUNING.md) for the worker count, CPU split,
+kernel limits and load-generator setup that decide what a run measures.
 
 ---
 
@@ -443,6 +445,7 @@ See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark 
 | [docs/V_PERF_TOOLBOX.md](docs/V_PERF_TOOLBOX.md) | V performance attributes, array flags, the C escape hatch, profiling allocations, and known gotchas |
 | [docs/LOCAL_IPC.md](docs/LOCAL_IPC.md) | HTTP over unix domain sockets: what loopback TCP costs, measured TCP-vs-UDS numbers, how `unix_socket_path` was built, peer credentials, fd passing, pitfalls |
 | [docs/PERF_GAP_ANALYSIS.md](docs/PERF_GAP_ANALYSIS.md) | Comparison against the fastest HTTP servers (tokio, io_uring C, Zig, Rust) and what was done to close the gaps |
+| [docs/PERF_TUNING.md](docs/PERF_TUNING.md) | Running a server fast: build flags, `VANILLA_WORKERS` and `taskset`, `ulimit -n`, the listen backlog and `somaxconn`, buffer sizing, io_uring and kTLS host requirements, measuring your own box |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Rules, raw-request testing with netcat/socat, benchmarking commands |
 | [CHECKLIST.md](CHECKLIST.md) | Full improvement backlog with phases, priorities, and progress tracking |
 
@@ -481,7 +484,7 @@ See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark 
 - [ ] API documentation (godoc-style, inline) — most public functions carry a doc comment; the gaps are mostly in `tls/` and `pg_async/`
 - [x] Architecture documentation — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (the module tree, each module's role, the grep-enforced dependency rule) and [server/README.md](server/README.md) (the engine, its backends, limits and TLS)
 - [ ] Security best-practices guide (injection, timing, header limits) — [docs/BEST_PRACTICES.md](docs/BEST_PRACTICES.md) §8 lists the defaults and points at the `auth`, `cors`, `csrf`, `rate_limit`, `request_limits` and `security_headers` examples; a dedicated guide is still open
-- [ ] Performance tuning guide — [docs/V_PERF_TOOLBOX.md](docs/V_PERF_TOOLBOX.md) covers `-gc none` vs the default GC; the operational side (`taskset` + `VANILLA_WORKERS`, `ulimit -n`, `net.core.somaxconn` and other kernel parameters) is still missing
+- [x] Performance tuning guide — [docs/PERF_TUNING.md](docs/PERF_TUNING.md) for operators (build flags, `VANILLA_WORKERS` + `taskset`, `ulimit -n`, `net.core.somaxconn` and other kernel parameters, buffer sizing, io_uring and kTLS requirements); [docs/V_PERF_TOOLBOX.md](docs/V_PERF_TOOLBOX.md) for `-gc none` vs the default GC and profiling
 - [x] Example READMEs for every `examples/` directory — each one says how to run it, shows real responses and links the code it explains
 - [x] Tests for every example ([#129](https://github.com/enghitalo/vanilla/issues/129)), all run in CI — the 51 examples on Linux, the 28 that run on macOS there too
 - [ ] Backend stress tests — connect storms, pipelined storms, slow readers with parked writes, large-upload drains, and fd exhaustion (`EMFILE`) at listen and at accept (`tests/accept_starved_test.v`, [#256](https://github.com/enghitalo/vanilla/issues/256)) are covered; a sustained high-concurrency soak is not

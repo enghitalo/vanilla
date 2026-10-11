@@ -588,14 +588,24 @@ concatenates, interpolates or allocates per request. The
   header and body limits, TLS hardening, rate limiting behind proxies, and how
   to report a vulnerability.
 
-### 45. Performance Tuning Guide — 🟡 PARTIAL
-- **Done:** [V_PERF_TOOLBOX](docs/V_PERF_TOOLBOX.md) (GC modes, profiling),
+### 45. Performance Tuning Guide — ✅ RESOLVED
+- **Resolution:** [docs/PERF_TUNING.md](docs/PERF_TUNING.md), the operator's
+  page: build flags (`-prod`, `-gc none`, `GC_MARKERS`, `-cc`), the worker
+  count (`VANILLA_WORKERS`, `taskset`, containers, `VANILLA_PIN_CPUS`),
+  choosing epoll or io_uring, `ulimit -n` and `max_connections`, the listen
+  backlog against `net.core.somaxconn` and the SYN sysctls, per-connection
+  buffer sizing, io_uring host requirements (kernel, `ulimit -l`, seccomp,
+  `VANILLA_NO_IOURING`), kTLS, NUMA and interrupts, and how to measure. Each
+  knob is checked against the code, and the measured numbers come from runs
+  cited on the page. Linked from `README.md` and `server/README.md`.
+  Code-level advice stays in [V_PERF_TOOLBOX](docs/V_PERF_TOOLBOX.md),
   [PERF_GAP_ANALYSIS](docs/PERF_GAP_ANALYSIS.md),
   [BEST_PRACTICES §10](docs/BEST_PRACTICES.md#10-benchmark-before-and-after-every-perf-change)
-  (benchmark methodology), [LOCAL_IPC](docs/LOCAL_IPC.md), `server/README.md`
-  (workers, `ulimit -n`).
-- **Remains:** one operational page: `taskset` + `VANILLA_WORKERS`,
-  `ulimit -n`, `net.core.somaxconn` and other sysctls, buffer sizing.
+  and [LOCAL_IPC](docs/LOCAL_IPC.md).
+- **Found while verifying:** [#290](https://github.com/enghitalo/vanilla/issues/290)
+  (`VANILLA_PIN_CPUS` pins to absolute CPU numbers and escapes a `taskset`
+  mask), [#296](https://github.com/enghitalo/vanilla/issues/296) (the epoll
+  pool keeps grown per-connection buffers for good; io_uring frees them).
 
 ### 46. Example Walkthroughs — ✅ RESOLVED
 - **Resolution:** all 51 example directories have a README, on one template
@@ -619,7 +629,7 @@ Open and partial items only.
 |----------|-------|-------|
 | 🔴 HIGH | 2 | #16 (#156: plaintext on io_uring/kqueue), #34 |
 | 🟡 MEDIUM | 7 | #4, #19, #23, #39, #40, #42, #44 |
-| 🟢 LOW | 1 | #45 |
+| 🟢 LOW | 0 | — |
 
 ---
 
@@ -668,20 +678,20 @@ Open and partial items only.
 - [ ] #42 - API docs (`tls/`, `server/`)
 - [x] #43 - Architecture doc
 - [ ] #44 - SECURITY.md
-- [ ] #45 - Performance tuning page
+- [x] #45 - Performance tuning page
 - [x] #46 - Example READMEs
 
 ---
 
 ## 📈 Progress Tracking
 
-### Resolved: 27/37 (73%)
-- ✅ 23 done: #2, #3, #5, #8, #10, #11, #15, #17, #18, #20, #21 (except
-  kqueue), #25, #27, #28, #29, #33, #35, #36, #37, #38, #41, #43, #46
+### Resolved: 28/37 (76%)
+- ✅ 24 done: #2, #3, #5, #8, #10, #11, #15, #17, #18, #20, #21 (except
+  kqueue), #25, #27, #28, #29, #33, #35, #36, #37, #38, #41, #43, #45, #46
 - ⚪ 4 obsolete: #1, #6, #26, #32
 
-### Partial: 8/37 (22%)
-#16, #19, #23, #39, #40, #42, #44, #45
+### Partial: 7/37 (19%)
+#16, #19, #23, #39, #40, #42, #44
 
 ### Open: 2/37 (5%)
 #4, #34
