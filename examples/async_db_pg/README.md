@@ -20,6 +20,7 @@ and the demo table. A throwaway one in Docker:
 docker run -d --rm --name vanilla-pg -e POSTGRES_USER=vanilla \
   -e POSTGRES_PASSWORD=secret -e POSTGRES_DB=vanilla \
   -p 127.0.0.1:55432:5432 postgres:16
+until docker exec vanilla-pg pg_isready -q -h 127.0.0.1 -U vanilla; do sleep 1; done
 docker exec vanilla-pg psql -U vanilla -d vanilla \
   -c "create table pg_async_demo (id int4 primary key, name text);" \
   -c "insert into pg_async_demo values (1,'alpha'),(2,'beta'),(3,'gamma');"
@@ -95,8 +96,10 @@ When every pooled connection of the worker is busy, `/db` answers
   `row.int4(0)` and `row.text(1)`, and releases the connection on every path.
 - **Rendering.** The JSON goes into the per-worker `st.body` scratch (length
   reset to 0, capacity kept), then into `out` behind a `Content-Length`
-  computed from it. `wb` appends a byte slice, `wi` formats an integer with
-  `strconv.write_dec` into a stack array: no `${}`, no `strings.Builder`
+  computed from it. The fixed pieces (`resp_json_head`, `resp_json_sep`,
+  `row_id_key`, `row_name_key`) are `const` strings appended with
+  `core.append_str`, `wb` appends the body slice, and `wi` formats an integer
+  with `strconv.write_dec` into a stack array: no `${}`, no `strings.Builder`
   ([BEST_PRACTICES §3b](../../docs/BEST_PRACTICES.md#3b-dynamic-responses--append-parts-straight-into-out)).
   `json_escape_into` escapes `"`, `\` and control characters, so a row value
   cannot break the document.

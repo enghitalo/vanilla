@@ -103,8 +103,13 @@ v test examples/date_header/src
 clock-dependent value: a refreshed line starts with `Date: `, ends with
 ` GMT\r\n` and is exactly 37 bytes; each `refresh` flips the active buffer;
 the response the handler composes contains the status line, the Date line
-and `Content-Length: 2`; and neither `respond` nor `refresh` allocates (a
-`gc_heap_usage()` delta over 20k calls each).
+and `Content-Length: 2`; and neither `respond` nor `refresh` allocates
+(`test_respond_allocates_nothing`, `test_refresh_allocates_nothing`: a
+`gc_heap_usage()` delta over 20k calls each). The 20k refreshes finish in
+under a millisecond, so they rarely cross a second boundary and mostly measure
+the flip; the digit rewrite itself is the `time.update_http_header` call that
+[efficient_date](../efficient_date/)'s allocation test forces on every other
+request.
 
 ## See also
 

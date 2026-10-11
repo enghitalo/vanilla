@@ -109,10 +109,12 @@ with that same 400 (there is no 404 here).
   array (libpq reads parameters as C strings) and binds them as `$1` with
   `exec_param`; the id is never spliced into SQL text.
 - **Responses appended into `out`.** The controllers take `mut out []u8`:
-  fixed responses are `const` strings appended with `core.append_str`, and
-  `append_rows_response` writes the head, then each row straight into `out`,
-  then splices the `Content-Length` digits in front of the body (one memmove
-  over it), with no `strings.Builder` and no return-then-copy
+  their fixed responses are `const` strings appended with `core.append_str`
+  (the 400 is `response.tiny_bad_request_response`, appended with `<<`), and
+  `append_rows_response` writes the head (`rows_head`, `rows_tail`), then each
+  row straight into `out`, then splices the `Content-Length` digits in between
+  (one memmove over the tail and body), with no `strings.Builder` and no
+  return-then-copy
   ([BEST_PRACTICES §1](../../docs/BEST_PRACTICES.md#1-handlers-append-into-the-connections-write-buffer-zero-alloc),
   [§3](../../docs/BEST_PRACTICES.md#3-avoid--interpolation-on-the-hot-path)).
   The body is still V's debug rendering of `pg.Row` (`row.str()`, one string
