@@ -26,12 +26,14 @@ fn run_v4l2(path string, mut v Viewers) int {
 	}
 	eprintln('[webcam] capturing via V4L2 in-process (no ffmpeg, zero-copy mmap)')
 	mut frames := 0
-	// ONE frame buffer + ONE header scratch, reused for every frame (grown to
-	// the high-water JPEG size instead of a fresh zeroed alloc per frame,
-	// BEST_PRACTICES §4). Reuse is safe: broadcast_frame completes synchronously
-	// below, before the buffer is refilled — this thread is the only writer.
+	// ONE frame buffer + ONE header scratch + ONE viewer snapshot, reused for
+	// every frame (grown to the high-water JPEG size / viewer count instead of
+	// a fresh alloc per frame, BEST_PRACTICES §4). Reuse is safe:
+	// broadcast_frame completes synchronously below, before the buffers are
+	// refilled — this thread is the only writer.
 	mut frame := []u8{cap: 256 * 1024}
 	mut scratch := []u8{cap: part_prefix.len + 32}
+	mut fds := []int{cap: 16}
 	for {
 		n := C.vcam_next(cam)
 		if n <= 0 {
@@ -46,7 +48,7 @@ fn run_v4l2(path string, mut v Viewers) int {
 			vmemcpy(frame.data, src, n)
 		}
 		C.vcam_done(cam)
-		v.broadcast_frame(frame, mut scratch)
+		v.broadcast_frame(frame, mut scratch, mut fds)
 		frames++
 	}
 	C.vcam_close(cam)

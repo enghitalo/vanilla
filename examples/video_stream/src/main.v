@@ -4,9 +4,10 @@ module main
 //
 //   GET /video   FILE stream, the PULL model: HTTP Range requests (206 Partial
 //                Content). This is how a browser <video> element seeks — it asks
-//                for byte ranges. We read ONLY the requested range from disk (a
-//                multi-GB file never sits in a []u8) and cap each chunk, so
-//                memory stays bounded no matter the file size.
+//                for byte ranges. We read ONLY the requested range from disk,
+//                with pread(2) straight into `out` (a multi-GB file never sits
+//                in a []u8), and cap each chunk, so memory stays bounded no
+//                matter the file size. POSIX (Linux, macOS).
 //
 //   GET /webcam  LIVE stream, the PUSH model: motion-JPEG over
 //                multipart/x-mixed-replace. One capture thread fans frames out to
@@ -23,11 +24,19 @@ module main
 //     straight into `out` via core.append_str/wi — no `+`, no `${}`, no builders.
 //   - Routing and the Range header are read IN PLACE as offsets/views into
 //     the request buffer — no `.to_string()`, no substr, no split.
+//   - The file is opened and fstat'ed per request, and the bytes a response
+//     carries are read into `out` by core.append_file_region: no os.File, no
+//     temporary []u8, no copy.
 import server
 import core
 import http1_1.request_parser
 import os
 import strconv
+
+#include <fcntl.h>
+#include <sys/stat.h>
+
+fn C.fstat(fd int, buf &C.stat) int
 
 const sample_video = 'sample.mp4'
 
@@ -40,7 +49,7 @@ const index_page = 'HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\
 // The multipart boundary text is INLINED here (consts are single literals —
 // never built with `+`/`${}`); a test pins that it matches `part_prefix` in
 // capture.v so the two can't drift.
-const mjpeg_headers = 'HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=vanillaframe\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n'.bytes()
+const mjpeg_headers = 'HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=vanillaframe\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n'
 
 const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 const method_not_allowed = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: GET\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
@@ -89,67 +98,85 @@ fn route_len(buf []u8, path request_parser.Slice) int {
 }
 
 fn handle(req_buffer []u8, mut out []u8, client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop, mut viewers Viewers) core.Step {
-	req := request_parser.decode_http_request(req_buffer) or {
+	// decode_into, not decode_http_request: a malformed request would box an
+	// error() per request there.
+	mut req := request_parser.HttpRequest{
+		buffer: req_buffer
+	}
+	if !request_parser.decode_into(mut req) {
 		core.append_str(mut out, bad_request)
 		return .done
 	}
-	if !slice_eq(req.buffer, req.method, 'GET') {
+	if !slice_eq(req_buffer, req.method, 'GET') {
 		core.append_str(mut out, method_not_allowed)
 		return .done
 	}
 	// Effective route = path with the query string stripped, as offsets.
 	route := request_parser.Slice{
 		start: req.path.start
-		len:   route_len(req.buffer, req.path)
+		len:   route_len(req_buffer, req.path)
 	}
 
-	if slice_eq(req.buffer, route, '/') {
+	if slice_eq(req_buffer, route, '/') {
 		core.append_str(mut out, index_page)
-	} else if slice_eq(req.buffer, route, '/webcam') {
+	} else if slice_eq(req_buffer, route, '/webcam') {
 		// Register the fd, start capture on the first viewer; the core sends
 		// these headers and keeps the connection open. The broadcaster (in
 		// capture.v) now owns the fd and pushes frames to it.
 		viewers.ensure_capture()
 		viewers.add(client_fd)
-		out << mjpeg_headers
-	} else if slice_eq(req.buffer, route, '/video') {
-		serve_video(req, mut out)
+		core.append_str(mut out, mjpeg_headers)
+	} else if slice_eq(req_buffer, route, '/video') {
+		serve_video(req, req_buffer, sample_video, mut out)
 	} else {
 		core.append_str(mut out, not_found)
 	}
 	return .done
 }
 
-// serve_video answers a (possibly ranged) request for the video file, reading
-// only the bytes it returns. Range present -> 206 + Content-Range, capped to
-// video_chunk_max. No Range -> 200 with the full file (browsers always send a
-// Range, so this path is for simple clients / small files).
+// serve_video answers a (possibly ranged) request for the video file at
+// `path`, reading only the bytes it returns, with pread(2) straight into `out`
+// after the header block (core.append_file_region). Range present -> 206 +
+// Content-Range, capped to video_chunk_max. No Range -> 200 with the full file
+// (browsers always send a Range, so this path is for simple clients / small
+// files). The views come from `req_buffer`, the handler's own parameter (a
+// view of `req.buffer` handed on to a callee moves `req` to the heap).
 //
-// The body allocation (`read_range`) is DISK I/O, not a discipline violation:
-// reading a file range must materialize bytes somewhere. The core's zero-copy
-// alternative is core.queue_file (sendfile(2), used by server.static_assets)
-// — not adopted here because this example teaches bounded-memory Range reads.
-fn serve_video(req request_parser.HttpRequest, mut out []u8) {
-	if !os.is_file(sample_video) {
+// The core's zero-copy alternative is core.queue_file (sendfile(2), used by
+// server.static_assets): the worker sends the region itself, but it needs an
+// fd that stays open for as long as the worker may send from it — not adopted
+// here, where the file is opened per request.
+fn serve_video(req request_parser.HttpRequest, req_buffer []u8, path string, mut out []u8) {
+	// O_NONBLOCK: a FIFO put in the file's place cannot block the worker in
+	// open() (on a regular file it changes nothing); fstat on the opened fd
+	// then refuses anything but a regular file.
+	fd := C.open(&char(path.str), C.O_RDONLY | C.O_NONBLOCK | C.O_CLOEXEC)
+	if fd < 0 {
 		core.append_str(mut out, video_missing)
 		return
 	}
-	size := i64(os.file_size(sample_video))
+	defer {
+		C.close(fd)
+	}
+	mut sb := C.stat{}
+	if C.fstat(fd, &sb) != 0 || sb.st_mode & os.s_ifmt != os.s_ifreg {
+		core.append_str(mut out, video_missing)
+		return
+	}
+	size := i64(sb.st_size)
+	mark := out.len
 
 	if rng := req.get_header_value_slice('Range') {
 		if rng.len > 0 {
 			// Zero-copy VIEW of the header value — parse_range scans it in place.
-			header := unsafe { (&req.buffer[rng.start]).vbytes(rng.len) }
+			header := unsafe { (&req_buffer[rng.start]).vbytes(rng.len) }
 			if start, end_req := parse_range(header, size) {
 				// Cap the chunk so memory stays bounded regardless of what was asked.
 				mut end := end_req
 				if end - start + 1 > video_chunk_max {
 					end = start + video_chunk_max - 1
 				}
-				data := read_range(sample_video, start, int(end - start + 1)) or {
-					core.append_str(mut out, not_found)
-					return
-				}
+				length := end - start + 1
 				core.append_str(mut out,
 					'HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nContent-Range: bytes ')
 				wi(mut out, start)
@@ -158,24 +185,33 @@ fn serve_video(req request_parser.HttpRequest, mut out []u8) {
 				core.append_str(mut out, '/')
 				wi(mut out, size)
 				core.append_str(mut out, '\r\nContent-Length: ')
-				wi(mut out, data.len)
+				wi(mut out, length)
 				core.append_str(mut out, '\r\nConnection: keep-alive\r\n\r\n')
-				out << data
+				append_body(mut out, fd, start, length, mark)
 				return
 			}
 		}
 	}
 
 	// No (valid) Range: full 200. Accept-Ranges tells the client it can seek.
-	data := read_range(sample_video, 0, int(size)) or {
-		core.append_str(mut out, not_found)
-		return
-	}
 	core.append_str(mut out,
 		'HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nContent-Length: ')
-	wi(mut out, data.len)
+	wi(mut out, size)
 	core.append_str(mut out, '\r\nConnection: keep-alive\r\n\r\n')
-	out << data
+	append_body(mut out, fd, 0, size, mark)
+}
+
+// append_body reads bytes [off, off+length) of the file into `out`, after the
+// header block that promised exactly `length` of them. A short read (the file
+// shrank under us, or a read error) cannot keep that promise: everything this
+// response appended, from `mark` on, is dropped for a 404.
+fn append_body(mut out []u8, fd int, off i64, length i64, mark int) {
+	if length > 0 && core.append_file_region(mut out, fd, off, length) != length {
+		unsafe {
+			out.len = mark
+		}
+		core.append_str(mut out, not_found)
+	}
 }
 
 // parse_range parses "bytes=START-END" into an inclusive, clamped (start, end).
@@ -236,21 +272,14 @@ fn dec_i64(h []u8, from int, to int) i64 {
 	return v
 }
 
-// read_range reads `length` bytes at `start` WITHOUT loading the whole file.
-fn read_range(path string, start i64, length int) ?[]u8 {
-	mut f := os.open(path) or { return none }
-	defer { f.close() }
-	data := f.read_bytes_at(length, u64(start))
-	return data
-}
-
 fn main() {
 	// Self-contained: synthesize a short sample.mp4 once if absent (needs
-	// ffmpeg). One-time init — the output filename is spelled out because
-	// consts/commands are single literals (keep it in sync with sample_video).
+	// ffmpeg). One-time init; an argument array, no shell (os.execute is
+	// deprecated, and -prod refuses it).
 	if !os.is_file(sample_video) {
 		eprintln('generating ${sample_video} (one-time, via ffmpeg)...')
-		os.execute('ffmpeg -loglevel error -y -f lavfi -i testsrc=size=640x480:rate=30:duration=8 -pix_fmt yuv420p sample.mp4')
+		os.exec(['ffmpeg', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i',
+			'testsrc=size=640x480:rate=30:duration=8', '-pix_fmt', 'yuv420p', sample_video])
 	}
 
 	mut viewers := &Viewers{}

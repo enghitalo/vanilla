@@ -18,16 +18,25 @@ v -prod run examples/video_stream/src
 The server synthesizes a short `sample.mp4` on first run (via ffmpeg) so it works
 out of the box. Drop in your own `sample.mp4` to stream a real file.
 
+It runs on Linux and macOS: the file route reads with `pread(2)`, and the
+webcam route needs V4L2, so it streams on Linux only.
+
 ## `/video` — file stream (pull / Range)
 
 This is how a `<video>` element plays and **seeks**: it sends
 `Range: bytes=START-END` and the server replies `206 Partial Content` with a
 `Content-Range`. Dragging the scrubber just issues a new range.
 
-Key property: we read **only the requested range** from disk
-(`read_bytes_at`) and **cap each chunk** (`video_chunk_max`, 2 MiB), so a
-multi-gigabyte file is never pulled into a `[]u8`. An open-ended
-`bytes=0-` is answered with a capped 206; the player asks for the next range.
+Key property: we read **only the requested range** from disk and **cap each
+chunk** (`video_chunk_max`, 2 MiB), so a multi-gigabyte file is never pulled
+into a `[]u8`. An open-ended `bytes=0-` is answered with a capped 206; the
+player asks for the next range.
+
+Each request opens and `fstat`s the file, then `core.append_file_region`
+reads the range with `pread(2)` straight into the connection's write buffer,
+after the headers: no `os.File`, no temporary `[]u8`, no copy. If the file
+shrinks before the read completes, the response is dropped for a 404 rather
+than sent shorter than its `Content-Length`.
 
 ```sh
 curl -i -H 'Range: bytes=0-99' http://localhost:3000/video

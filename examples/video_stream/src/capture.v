@@ -31,12 +31,14 @@ fn msg_nosignal() int {
 	return 0
 }
 
-// Per-frame framing: the constant pieces are single-literal consts, allocated
-// ONCE — never rebuilt per frame. Only the Content-Length digits vary; they are
-// written with wi() into a scratch buffer reused by the single capture thread.
-// The `vanillaframe` boundary must match the Content-Type sent to the client
-// (`mjpeg_headers` in main.v inlines it); a test pins the two so they can't drift.
-const part_prefix = '--vanillaframe\r\nContent-Type: image/jpeg\r\nContent-Length: '.bytes()
+// Per-frame framing: the constant pieces are single-literal consts — never
+// rebuilt per frame. Only the Content-Length digits vary; they are written
+// with wi() into a scratch buffer reused by the single capture thread, after
+// part_prefix (appended with core.append_str). part_trailer is sent as it is,
+// so it stays a []u8. The `vanillaframe` boundary must match the Content-Type
+// sent to the client (`mjpeg_headers` in main.v inlines it); a test pins the
+// two so they can't drift.
+const part_prefix = '--vanillaframe\r\nContent-Type: image/jpeg\r\nContent-Length: '
 const part_trailer = '\r\n'.bytes()
 
 // Viewers is the only shared state: the set of fds currently watching /webcam,
@@ -61,11 +63,17 @@ fn (mut v Viewers) drop(fd int) {
 	v.mu.unlock()
 }
 
-fn (mut v Viewers) snapshot() []int {
+// snapshot_into copies the viewer fds into `fds`, a buffer its caller owns and
+// reuses (the capture thread, once per frame): it grows to the most viewers
+// seen and then never allocates again, where `fds.keys()` built a new array
+// on every frame.
+fn (mut v Viewers) snapshot_into(mut fds []int) {
+	fds.clear()
 	v.mu.rlock()
-	fds := v.fds.keys()
+	for fd, _ in v.fds {
+		fds << fd
+	}
 	v.mu.runlock()
-	return fds
 }
 
 // ensure_capture spawns the single capture+broadcast thread exactly once, on the
@@ -91,17 +99,19 @@ fn capture_loop(mut v Viewers) {
 }
 
 // broadcast_frame writes one multipart part (headers + JPEG + CRLF) to every
-// viewer, dropping any that can't keep up or have disconnected. `scratch` is
-// the part-header buffer, OWNED by the single capture thread and reused across
-// frames (~30/s): const prefix + wi(jpeg.len) — zero allocations per frame.
-// It stays a caller-owned parameter ON PURPOSE: parking it in Viewers would
-// invite a second broadcaster to race the one writer. Do not move it.
-fn (mut v Viewers) broadcast_frame(jpeg []u8, mut scratch []u8) {
+// viewer, dropping any that can't keep up or have disconnected. `scratch` (the
+// part-header buffer) and `fds` (the viewer snapshot) are OWNED by the single
+// capture thread and reused across frames (~30/s): const prefix +
+// wi(jpeg.len), and snapshot_into — zero allocations per frame. They stay
+// caller-owned parameters ON PURPOSE: parking them in Viewers would invite a
+// second broadcaster to race the one writer. Do not move them.
+fn (mut v Viewers) broadcast_frame(jpeg []u8, mut scratch []u8, mut fds []int) {
 	scratch.clear() // len = 0, capacity kept — no realloc after the first frame
-	scratch << part_prefix
+	core.append_str(mut scratch, part_prefix)
 	wi(mut scratch, jpeg.len)
 	core.append_str(mut scratch, '\r\n\r\n')
-	for fd in v.snapshot() {
+	v.snapshot_into(mut fds)
+	for fd in fds {
 		if !send_all(fd, scratch) || !send_all(fd, jpeg) || !send_all(fd, part_trailer) {
 			v.drop(fd)
 		}
