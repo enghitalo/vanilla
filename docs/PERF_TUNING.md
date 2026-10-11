@@ -25,7 +25,7 @@ your own.
 | `GC_MARKERS` | online CPUs − 1 marker threads | a Boehm (default GC) build with fewer CPUs than the host has ([§1](#1-build-flags)) |
 | backend | `.epoll` | heavy connection churn: try `.io_uring`; TLS: epoll only ([§3](#3-choosing-a-backend)) |
 | `ulimit -n` | 1024 (systemd soft limit) | more than about a thousand open connections ([§4](#4-file-descriptors-and-connection-limits)) |
-| `ulimit -l` | system default (8 MiB on the test box) | io_uring with more than a couple of workers ([§7](#7-io_uring-host-requirements)) |
+| `ulimit -l` | system default (8 MiB on the test box) | io_uring rings below full size with more than a couple of workers (stderr says `fell back`; [§7](#7-io_uring-host-requirements)) |
 | `Limits.max_connections` + timeouts | unlimited | any server facing the internet ([§4](#4-file-descriptors-and-connection-limits)) |
 | `net.core.somaxconn` | 4096 (Linux ≥ 5.4) | listen-queue overflows during connection bursts ([§5](#5-the-accept-queue-backlog-and-sysctls)) |
 | buffer sizes | 8 KiB read + 16 KiB write per connection | compile-time constants; see [§6](#6-memory-and-buffer-sizing) |
@@ -294,9 +294,10 @@ Buffers grow past that size when a request or a response needs it:
 These sizes are compile-time constants, not configuration: changing them
 means editing the source (see the [table](#where-each-knob-lives)).
 
-**io_uring fixed cost per worker.** The ring is created with 16384 submission
-entries and twice as many completion entries: 1 MiB of 64-byte SQEs plus
-512 KiB of 16-byte CQEs. On top of that comes the 32768-slot connection
+**io_uring fixed cost per worker.** The ring is created with up to 16384
+submission entries (fewer under a tight locked-memory limit, [§7](#7-io_uring-host-requirements))
+and twice as many completion entries: at full size, 1 MiB of 64-byte SQEs
+plus 512 KiB of 16-byte CQEs. On top of that comes the 32768-slot connection
 table. Its buffers are allocated lazily, so idle slots cost only their struct.
 Measured at idle with a trivial handler (`-prod -gc none`, Linux 7.1):
 epoll used 2.9 MiB RSS with 2 workers and 3.1 MiB with 4; io_uring used
@@ -321,27 +322,46 @@ huge pages are `always`, RSS moves in 2 MiB steps with no allocation at all
   only slower. The check reads `uname -r`, so a backport that reports an older
   version also gets single-shot. Ring setup tries
   `SINGLE_ISSUER | DEFER_TASKRUN`, then `SINGLE_ISSUER | COOP_TASKRUN`, then no
-  flags, and halves the ring from 16384 down to 256 entries until one works.
-  A smaller ring is logged
-  (`io_uring worker N: using M SQ entries (fell back from 16384)`). If nothing
-  works, the process prints `Failed to initialize io_uring for worker N` and
-  exits: there is no automatic fallback to epoll (use
+  flags, at the ring size the locked-memory limit allows (next item). A worker
+  whose ring still cannot be set up at that size halves it, down to 256
+  entries, and logs it (`io_uring worker N: using M SQ entries (fell back from
+  C)`). If nothing works, the process prints `Failed to initialize io_uring
+  for worker N` (with a hint to raise `ulimit -l` on `ENOMEM`) and exits:
+  there is no automatic fallback to epoll (use
   [`iou_backend_available()`](#3-choosing-a-backend)).
-- **Locked memory.** Ring memory counts against `RLIMIT_MEMLOCK` (`ulimit -l`),
-  and the budget is **per user**: every io_uring process of that user draws
-  from it. A default ring is about 1.5 MiB (16384 SQEs of 64 bytes, 32768
-  CQEs of 16 bytes). Measured on Linux 7.1 (1 worker unless noted): at 4 MiB,
-  2 workers could not both start; at 2 MiB, one worker fell back to 512
-  entries; at 1 MiB, ring setup failed outright. At 8 MiB, results varied
-  from run to run while other io_uring processes of the same user were
-  running: 3 workers started with one ring at 512 entries, 4 workers failed,
-  and 5 then started. (The [liburing README](https://github.com/axboe/liburing/blob/master/README)
-  says kernels after 5.11 use the limit only for registered buffers; that
-  did not hold on this kernel.) Raise it for the service, with
+- **Locked memory.** On kernels up to 5.11, and again from 6.14 (when the
+  rings moved to io_uring's memory regions), ring memory counts against
+  `RLIMIT_MEMLOCK` (`ulimit -l`). 5.12 to 6.13 charge it to the memory cgroup
+  instead, as the [liburing README](https://github.com/axboe/liburing/blob/master/README)
+  says. The budget is **per user**: every io_uring process of that user draws
+  from it. A process with `CAP_IPC_LOCK` in the initial user namespace is
+  never charged; root without it is (Docker and Kubernetes drop it by
+  default, and a user namespace grants none that counts). A full-size ring
+  (16384 SQEs of 64 bytes, 32768 CQEs of 16 bytes) is charged up to 2 MiB;
+  measured on Linux 7.1, 1540 KiB at 16384 entries down to 28 KiB at 256.
+  Where rings are charged, the backend picks one ring size for every worker
+  before it spawns them: the largest that fits an even share of **half** the
+  limit, counting a ring as twice max(64 bytes per entry, one page). It logs
+  that once (`io_uring: 16 rings of 16384 SQ entries do not fit half of
+  RLIMIT_MEMLOCK (ulimit -l); every worker starts at 2048 (fell back from
+  16384)`). The other half is for the user's other rings and for rings the
+  kernel has not released yet: it returns a closed ring's charge some
+  milliseconds after the close, and a previous instance's after that
+  process has exited, so a quick restart can still find them counted. A ring
+  setup that fails with `ENOMEM` is also retried for about 100 ms. Measured
+  on Linux 7.1 with 16 CPUs at 8 MiB: 16 workers start at 2048 entries, 4 at
+  8192 and 64 at 512, back-to-back restarts and root in a user namespace
+  included. Without the cap the first workers took full-size rings and a
+  later one could not get even 256 entries, so 16 workers exited at startup.
+  Rings that the user's other processes hold still count: when they hold more
+  than half the limit, the last workers walk down to smaller rings, or fail.
+  Where rings are not charged, or under no limit (`RLIM_INFINITY`), every
+  ring is full size. Raise the limit for the service, with
   `LimitMEMLOCK=infinity` (systemd), `docker --ulimit memlock=-1`, or
-  `ulimit -l`, and watch stderr for `fell back`: a worker on a shrunken ring
-  still runs, but its submission queue can fill under a burst. Container
-  memory limits also apply to the rings.
+  `ulimit -l`, and watch stderr for `fell back`: a worker on a smaller ring
+  still runs, with smaller submission and completion queues (it drains
+  completions in batches of at most a quarter of its ring). Container memory
+  limits also apply to the rings.
 - **`kernel.io_uring_disabled`** (Linux 6.6+): `0` allows io_uring (the
   default); `1` limits it to privileged processes and members of
   `kernel.io_uring_group`; `2` disables it. Ring setup then fails with
