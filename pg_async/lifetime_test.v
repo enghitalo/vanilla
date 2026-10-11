@@ -90,11 +90,19 @@ fn test_lifetime_deadline_spreads_connections_opened_together() {
 		now) > now, 'a jitter past the lifetime still leaves some'
 }
 
-// A pool of 2 with a ~150 ms lifetime, served for over a second the way a
-// worker would (maintain() on the timer it asks for, exclusive and pipelined
-// queries in between): every connection is recycled several times, one at a
-// time, so acquire() always finds the other one; no query fails; each
-// recycle says Terminate and asks password_fn for a fresh credential.
+// A pool of 2 with a ~150 ms lifetime, served the way a worker would
+// (maintain() on the timer it asks for, exclusive and pipelined queries in
+// between) until each connection was recycled at least 4 times: one at a
+// time, so acquire() always finds the other one, and queries go through
+// during every recycle; the timer never sleeps past a deadline; no query
+// fails; each recycle says Terminate and asks password_fn for a fresh
+// credential.
+//
+// The loop counts recycles, not time: a re-dial takes a few maintain() ticks,
+// one per round of queries, so how many recycles fit in a fixed window
+// depends on how busy the machine is (1.2 s held about 16 on an idle
+// machine, 5 to 7 on loaded CI runners). The bound only catches recycling
+// that stopped.
 fn test_lifetime_recycles_without_failing_or_shedding_a_query() {
 	if !testkit.fake_pg_available() {
 		eprintln('pg_async: skipping lifetime tests (no python3)')
@@ -107,14 +115,31 @@ fn test_lifetime_recycles_without_failing_or_shedding_a_query() {
 	mut dials := &Dials{}
 	mut pool := PgPool.connect(lifetime_cfg(fake.port, mut dials, 150, 50), 2)!
 	assert dials.n == 2
+	mut recycled := [0, 0]
+	mut served := false // a query went through during the recycle in flight
 	mut queries := 0
 	mut next_tick := time.sys_mono_now()
 	sw := time.new_stopwatch()
-	for sw.elapsed().milliseconds() < 1200 {
-		if time.sys_mono_now() >= next_tick {
-			next_tick = time.sys_mono_now() + u64(pool.maintain()) * u64(time.millisecond)
+	for sw.elapsed().milliseconds() < 20_000 && (recycled[0] < 4 || recycled[1] < 4) {
+		now := time.sys_mono_now()
+		if now >= next_tick {
+			r := pool.recycling
+			wait := pool.maintain()
+			next_tick = now + u64(wait) * u64(time.millisecond)
+			if r >= 0 && pool.recycling < 0 {
+				assert served, 'no query went through while connection ${r} was recycled'
+				served = false
+				recycled[r]++
+			}
+			// The timer never sleeps past a deadline: it asks for a fast
+			// tick, or for one by the time each connection comes due.
+			for k in 0 .. 2 {
+				assert wait <= maintenance_busy_ms || k == pool.recycling
+					|| next_tick <= pool.conns[k].expires_at + u64(time.millisecond), 'the next tick comes after connection ${k} is due'
+			}
 		}
 		i := pool.acquire() or { panic('acquire() found no connection during a recycle') }
+		served = served || pool.recycling >= 0
 		mut c := pool.conn(i)
 		assert c.async_submit('select 1', []?[]u8{})
 		assert lt_int(lt_pump(mut c)!) == 1
@@ -128,17 +153,21 @@ fn test_lifetime_recycles_without_failing_or_shedding_a_query() {
 		queries += 3
 		time.sleep(2 * time.millisecond)
 	}
-	assert queries > 100
+	assert recycled[0] >= 4 && recycled[1] >= 4, 'recycled ${recycled[0]} and ${recycled[1]} times in ${sw.elapsed().milliseconds()} ms of 100-150 ms lifetimes'
 	// Let a recycle in flight finish, so close() finds both connections up.
 	for _ in 0 .. 1000 {
-		if pool.recycling < 0 {
+		r := pool.recycling
+		if r < 0 {
 			break
 		}
 		time.sleep(i64(pool.maintain()) * time.millisecond)
+		if pool.recycling < 0 {
+			recycled[r]++
+		}
 	}
 	assert pool.recycling < 0
 	total := fake.stat('authenticated')
-	assert total >= 2 + 8, 'only ${total - 2} recycles in 1.2 s of 100-150 ms lifetimes'
+	assert total == 2 + recycled[0] + recycled[1], 'one authentication per recycle'
 	assert dials.n == total, 'password_fn: once per connection'
 	pool.close()
 	// Every connection ended with a Terminate: each recycled one, then the
@@ -240,7 +269,8 @@ fn test_lifetime_drains_pipelined_queries_before_recycling() {
 
 // Against a live PostgreSQL (PGHOST; over TLS when PGSSLMODE asks): with a
 // 200 ms lifetime the pool's backends keep changing under a steady stream of
-// queries, and none of those queries fails.
+// queries, and none of those queries fails. As above, the loop runs until 6
+// backends have answered, not for a fixed time.
 fn test_live_lifetime_recycles_backends() {
 	host := os.getenv('PGHOST')
 	if host == '' {
@@ -272,7 +302,7 @@ fn test_live_lifetime_recycles_backends() {
 	mut pids := map[int]bool{}
 	mut next_tick := time.sys_mono_now()
 	sw := time.new_stopwatch()
-	for sw.elapsed().milliseconds() < 1500 {
+	for sw.elapsed().milliseconds() < 20_000 && pids.len < 6 {
 		if time.sys_mono_now() >= next_tick {
 			next_tick = time.sys_mono_now() + u64(pool.maintain()) * u64(time.millisecond)
 		}
@@ -283,6 +313,6 @@ fn test_live_lifetime_recycles_backends() {
 		pool.release(i)
 		time.sleep(5 * time.millisecond)
 	}
-	assert pids.len >= 6, 'only ${pids.len} backends in 1.5 s of 150-200 ms lifetimes'
+	assert pids.len >= 6, 'only ${pids.len} backends in ${sw.elapsed().milliseconds()} ms of 150-200 ms lifetimes'
 	assert dials.n >= pids.len
 }
