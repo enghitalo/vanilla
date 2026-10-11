@@ -5,12 +5,13 @@ import http1_1.request_parser
 import http1_1.response
 import net
 
-// SOLUTION: the trust rule is pure over an INJECTED peer — real_client_ip
-// takes the peer address explicitly, so every branch (trusted, untrusted,
-// unknown) is unit-testable. The live path feeds it `socket.peer_ipv4(fd)`,
-// the shipped core API; serve() below passes fd -1, which makes that real
-// call return none — driving the untrusted/'unknown' branch end to end — and
-// the loopback tests give it a real, trusted 127.0.0.1 peer.
+// SOLUTION: the trust rule is pure over an INJECTED peer — real_client_ip and
+// real_scheme take the peer address explicitly, so every branch (trusted,
+// untrusted, unknown) is unit-testable. The live path feeds them
+// `socket.peer_ipv4(fd)`, the shipped core API; serve() below passes fd -1,
+// which makes that real call return none — driving the untrusted/'unknown'
+// branch end to end — and the loopback tests give it a real, trusted
+// 127.0.0.1 peer.
 
 fn mkreq(s string) request_parser.HttpRequest {
 	return request_parser.decode_http_request(s.bytes()) or { panic(err) }
@@ -130,15 +131,63 @@ fn test_unknown_peer_is_untrusted() {
 	assert real_client_ip(req, none) == none
 }
 
+// ---- X-Forwarded-Proto: the same trust rule, and only two answers ---------
+
+fn test_scheme_from_trusted_peer() {
+	// Any case is accepted, and the answer is the lowercase literal: never
+	// the header bytes.
+	for value, want in {
+		'https': 'https'
+		'http':  'http'
+		'HTTPS': 'https'
+		'Https': 'https'
+		'hTtP':  'http'
+	} {
+		req := mkreq('GET / HTTP/1.1\r\nX-Forwarded-Proto: ${value}\r\n\r\n')
+		assert real_scheme(req, must_parse('10.0.0.5')) == want, value
+	}
+	// No header: the listener's own scheme.
+	req := mkreq('GET / HTTP/1.1\r\nHost: x\r\n\r\n')
+	assert real_scheme(req, must_parse('10.0.0.5')) == default_proto
+}
+
+// Anything but http/https, even from a trusted proxy, is the listener's own
+// scheme: a JSON-breaking value never reaches the response (#293).
+fn test_scheme_junk_from_trusted_peer_falls_back() {
+	for value in ['http","admin":true,"x":"y', 'ftp', 'https, http', 'httpss', 'htt', '', '<b>hi</b>',
+		'"https"'] {
+		req := mkreq('GET / HTTP/1.1\r\nX-Forwarded-Proto: ${value}\r\n\r\n')
+		assert real_scheme(req, must_parse('10.0.0.5')) == default_proto, value
+	}
+}
+
+// SECURITY invariant, as for XFF: from an untrusted or unknown peer the
+// header is ignored, a well-formed `https` included.
+fn test_scheme_from_untrusted_or_unknown_peer_is_ignored() {
+	for value in ['https', 'HTTPS', 'http","admin":true,"x":"y'] {
+		req := mkreq('GET / HTTP/1.1\r\nX-Forwarded-Proto: ${value}\r\n\r\n')
+		assert real_scheme(req, must_parse('203.0.113.7')) == default_proto, value
+		assert real_scheme(req, none) == default_proto, value
+	}
+}
+
 // ---- raw-request E2E through the real handler (fd -1 => no peer) -----------
 
 fn test_e2e_untrusted_peer_full_framing() ! {
 	// fd -1 drives the REAL socket.peer_ipv4 call: getpeername(-1) fails, so
-	// the peer is none -> untrusted 'unknown' -> the forged XFF is ignored.
-	// Exact-byte compare guards the computed Content-Length framing.
+	// the peer is none -> untrusted 'unknown' -> the forged XFF and XFP are
+	// ignored. Exact-byte compare guards the computed Content-Length framing.
 	req := 'GET / HTTP/1.1\r\nX-Forwarded-For: 1.2.3.4\r\nX-Forwarded-Proto: https\r\n\r\n'.bytes()
 	out := serve(req)!.bytestr()
-	body := '{"client_ip":"unknown","scheme":"https"}'
+	body := '{"client_ip":"unknown","scheme":"http"}'
+	assert out == 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${body.len}\r\n\r\n${body}'
+}
+
+// The issue's injection (#293) from an untrusted peer: no key is added.
+fn test_e2e_untrusted_peer_scheme_injection() ! {
+	req := 'GET / HTTP/1.1\r\nX-Forwarded-Proto: http","admin":true,"x":"y\r\n\r\n'.bytes()
+	out := serve(req)!.bytestr()
+	body := '{"client_ip":"unknown","scheme":"http"}'
 	assert out == 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${body.len}\r\n\r\n${body}'
 }
 
@@ -160,19 +209,24 @@ fn test_e2e_trusted_loopback_peer() ! {
 	defer { s.close() or {} }
 	fd := s.sock.handle
 	// 127.0.0.1/32 is a trusted proxy: its XFF is believed (right-most
-	// untrusted hop), and without one the peer itself is the client.
-	for req, ip in {
-		'GET / HTTP/1.1\r\nX-Forwarded-For: 6.6.6.6, 203.0.113.70\r\n\r\n': '203.0.113.70'
-		'GET / HTTP/1.1\r\nHost: x\r\n\r\n':                                '127.0.0.1'
+	// untrusted hop), and without one the peer itself is the client. Its XFP
+	// is believed as http/https only; the issue's two injections (#293) add
+	// no key: a junk scheme is the listener's own, a non-IPv4 hop the proxy.
+	for req, body in {
+		'GET / HTTP/1.1\r\nX-Forwarded-For: 6.6.6.6, 203.0.113.70\r\n\r\n':       '{"client_ip":"203.0.113.70","scheme":"http"}'
+		'GET / HTTP/1.1\r\nHost: x\r\n\r\n':                                      '{"client_ip":"127.0.0.1","scheme":"http"}'
+		'GET / HTTP/1.1\r\nX-Forwarded-Proto: HTTPS\r\n\r\n':                     '{"client_ip":"127.0.0.1","scheme":"https"}'
+		'GET / HTTP/1.1\r\nX-Forwarded-Proto: http","admin":true,"x":"y\r\n\r\n': '{"client_ip":"127.0.0.1","scheme":"http"}'
+		'GET / HTTP/1.1\r\nX-Forwarded-For: <b>hi</b>\r\n\r\n':                   '{"client_ip":"127.0.0.1","scheme":"http"}'
 	} {
-		body := '{"client_ip":"${ip}","scheme":"http"}'
-		assert serve_fd(req.bytes(), fd)!.bytestr() == 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${body.len}\r\n\r\n${body}'
+		assert serve_fd(req.bytes(), fd)!.bytestr() == 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${body.len}\r\n\r\n${body}', req
 	}
 }
 
-// Every outcome — a forwarded client, the trusted peer itself, an unknown
-// peer — runs 20k times through one reused buffer, as a worker serves them:
-// the collector's allocation counter must not move.
+// Every outcome — a forwarded client over https, the trusted peer itself, a
+// junk X-Forwarded-Proto, an unknown peer — runs 20k times through one reused
+// buffer, as a worker serves them: the collector's allocation counter must not
+// move.
 fn test_proxy_aware_allocates_nothing() ! {
 	$if gcboehm ? {
 		mut l := net.listen_tcp(.ip, '127.0.0.1:0')!
@@ -184,6 +238,7 @@ fn test_proxy_aware_allocates_nothing() ! {
 		fd := s.sock.handle
 		forwarded := 'GET / HTTP/1.1\r\nX-Forwarded-For: 6.6.6.6, 203.0.113.70, 10.0.0.1\r\nX-Forwarded-Proto: https\r\n\r\n'.bytes()
 		direct := 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+		injected := 'GET / HTTP/1.1\r\nX-Forwarded-Proto: http","admin":true,"x":"y\r\n\r\n'.bytes()
 		mut out := []u8{cap: 4096}
 		mut event_loop := core.EventLoop{}
 		handle(forwarded, mut out, fd, unsafe { nil }, mut event_loop) // warm-up
@@ -201,11 +256,15 @@ fn test_proxy_aware_allocates_nothing() ! {
 			unsafe {
 				out.len = 0
 			}
+			handle(injected, mut out, fd, unsafe { nil }, mut event_loop)
+			unsafe {
+				out.len = 0
+			}
 			handle(direct, mut out, -1, unsafe { nil }, mut event_loop)
 		}
 		grown := gc_heap_usage().total_bytes - before
 		assert out.bytestr().ends_with('{"client_ip":"unknown","scheme":"http"}')
-		assert grown < 4096, 'allocated ${grown} bytes over ${rounds * 3} requests'
+		assert grown < 4096, 'allocated ${grown} bytes over ${rounds * 4} requests'
 	}
 }
 

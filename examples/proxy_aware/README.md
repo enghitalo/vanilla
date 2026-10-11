@@ -5,12 +5,13 @@ the user's address arrives in `X-Forwarded-For`. That header is
 client-settable, so believing it blindly lets anyone forge their IP, slip past
 an IP allowlist or poison a rate limiter. The rule this example implements:
 
-1. Honor `X-Forwarded-For` **only** when the socket peer is in your list of
-   trusted proxy networks.
+1. Honor `X-Forwarded-For` and `X-Forwarded-Proto` **only** when the socket
+   peer is in your list of trusted proxy networks.
 2. Then take the **right-most** hop that is not one of your proxies. Proxies
    append to the header, so everything to the right was written by your own
    infrastructure; the client can only pre-seed the left.
-3. Otherwise ignore the header and use the socket peer.
+3. Otherwise ignore the headers and use the socket peer, and the listener's
+   own scheme.
 
 The handler answers with the address and scheme it settled on, as JSON.
 
@@ -68,12 +69,26 @@ curl -s localhost:3000/ -H 'X-Forwarded-For: 1.2.3.4, 203.0.113.7, 10.0.0.2' \
 If every hop is trusted (`X-Forwarded-For: 10.1.2.3, 172.20.0.9`), the
 left-most is the closest thing to a client: `{"client_ip":"10.1.2.3",...}`.
 
-From a peer that is **not** trusted the header is ignored. On Linux all of
-`127.0.0.0/8` is local, so binding curl to `127.0.0.2` makes an untrusted
+The scheme is believed only as `http` or `https` (any letter case), and the
+response carries one of those two words, never the header's bytes. A value
+that tries to break out of the JSON string is the listener's own scheme
+([#293](https://github.com/enghitalo/vanilla/issues/293)):
+
+```sh
+curl -s localhost:3000/ -H 'X-Forwarded-Proto: http","admin":true,"x":"y'
+```
+
+```
+{"client_ip":"127.0.0.1","scheme":"http"}
+```
+
+From a peer that is **not** trusted both headers are ignored. On Linux all
+of `127.0.0.0/8` is local, so binding curl to `127.0.0.2` makes an untrusted
 peer:
 
 ```sh
-curl -i --interface 127.0.0.2 localhost:3000/ -H 'X-Forwarded-For: 203.0.113.7'
+curl -i --interface 127.0.0.2 localhost:3000/ -H 'X-Forwarded-For: 203.0.113.7' \
+  -H 'X-Forwarded-Proto: https'
 ```
 
 ```
@@ -115,13 +130,15 @@ Content-Length: 41
   two values are appended, the address printed by `write_ipv4` (four `wi`
   calls), with no allocation
   ([BEST_PRACTICES §3b](../../docs/BEST_PRACTICES.md#3b-dynamic-responses--append-parts-straight-into-out)).
-- **`X-Forwarded-Proto` is echoed as sent**, from any peer, to show the read
-  (default `http`). It is client-settable like `X-Forwarded-For`: in
-  production gate it on the same peer trust, and never reflect either value
-  into a response without encoding it. Here it is not escaped, so
-  `-H 'X-Forwarded-Proto: http","admin":true,"x":"y'` adds keys to the JSON
-  ([#293](https://github.com/enghitalo/vanilla/issues/293)); `client_ip`
-  cannot be abused that way, since it is printed from the `u32`.
+- **`X-Forwarded-Proto` goes through the same trust rule.** `real_scheme`
+  takes the same injected peer and believes the header only from a trusted
+  one, and only as `http` or `https`, compared in place, case-insensitively
+  (`ci_eq`). It answers with one of those two literals, never the header's
+  bytes, so nothing the client writes reaches the JSON; anything else, and
+  any value from an untrusted or unknown peer, is the listener's own scheme,
+  `default_proto` (`http`). `client_ip` cannot be abused either: it is
+  printed from the `u32`, so a non-IPv4 hop such as
+  `X-Forwarded-For: <b>hi</b>` reports the proxy (`127.0.0.1` from curl).
 - [examples/rate_limit](../rate_limit/) copies this trust rule verbatim to
   key its buckets; there `trusted_proxies` starts empty.
 
@@ -136,12 +153,15 @@ CIDR membership at range edges, and `real_client_ip` with injected peers:
 right-most untrusted hop, all hops trusted, empty hops, whitespace-only
 header, a trusted peer without the header, a non-IPv4 client hop, an
 untrusted peer and the unknown peer, and `write_ipv4` against `ipv4_len`.
-Through `handle` (fd `-1`, so the peer is unknown, and a real loopback
-connection) it checks the exact response bytes, the default scheme, that a
-malformed request closes the connection (`handle` answers the canned 400 and
-returns `.close`), and that serving allocates nothing
-(`test_proxy_aware_allocates_nothing`, a `gc_heap_usage()` delta over 20k
-rounds).
+`real_scheme` gets the same peers: `http` and `https` in any case from a
+trusted one, junk values (the JSON injection among them) falling back to
+`http`, and every value ignored from an untrusted or unknown peer. Through
+`handle` (fd `-1`, so the peer is unknown, and a real loopback connection)
+it checks the exact response bytes, forged and injected headers included,
+the default scheme, that a malformed request closes the connection
+(`handle` answers the canned 400 and returns `.close`), and that serving
+allocates nothing (`test_proxy_aware_allocates_nothing`, a `gc_heap_usage()`
+delta over 20k rounds).
 
 ## See also
 

@@ -82,6 +82,22 @@ Connection: keep-alive
 
 ```
 
+So does `/\evil.com`: browsers treat `\` as `/` in http(s) URLs, so they
+would follow `Location: /\evil.com` to `//evil.com`
+([#293](https://github.com/enghitalo/vanilla/issues/293)):
+
+```sh
+curl -i -X POST 'localhost:3000/login?next=/\evil.com'
+```
+
+```
+HTTP/1.1 303 See Other
+Location: /
+Content-Length: 0
+Connection: keep-alive
+
+```
+
 `next=https://evil.com` and an empty `next=` also get `Location: /`; a POST
 with no `next` goes to `/dashboard`. `GET /login` (the form page) and every
 other path answer an empty `200 OK`.
@@ -102,13 +118,19 @@ other path answer an empty `200 OK`.
   The fallback targets are consts: `slash_bytes`, a byte array built once at
   startup, and `dashboard_target`, a string appended with `core.append_str`.
 - **The open-redirect guard.** `safe_next` accepts only a target that starts
-  with `/` and not `//`; anything else becomes `/`. The query value is not
+  with `/` and whose second byte cannot make a browser read it as
+  protocol-relative (`//host`, off-site); anything else becomes `/`. That
+  second byte may not be `/`, nor `\` (browsers treat it as `/` in http(s)
+  URLs), nor TAB, LF or CR (the URL parser removes them, so `/<TAB>/evil.com`
+  is `//evil.com` too; a raw TAB does reach the handler). Further in, those
+  bytes are part of the path: `/a\b` stays same-site. The query value is not
   percent-decoded, so `%2F%2Fevil.com` does not start with `/` and is
-  rejected as well. It is a minimal guard and it has a known gap: it lets
-  `/\evil.com` through, which browsers read as `//evil.com`. A real app
-  should match `next` against an allowlist of its own paths
+  rejected as well, and `/%5Cevil.com` is passed through: browsers do not
+  decode `%5C` in a `Location`, so it stays a same-site path. A real app
+  should still match `next` against an allowlist of its own paths
   ([BEST_PRACTICES §8](../../docs/BEST_PRACTICES.md#8-security-defaults)).
-  Header injection through `next` is stopped one layer down: a request head
+  Header injection through `next` is stopped one layer down: the
+  request-line parser ends the target at the first CR, and a request head
   with a bare LF is answered 400 by the server's framer before any handler
   runs.
 
@@ -119,10 +141,13 @@ v test examples/redirects/src
 ```
 
 [main_test.v](src/main_test.v) calls `handle` directly: `safe_next` on
-relative, protocol-relative, absolute and empty targets; the 301 with and
-without a query; the 308 on POST; the 303 with a good, off-site, empty and
-missing `next`; `GET /login` and unknown paths as 200; `.close` on a
-malformed request; and that no route allocates.
+relative, protocol-relative, absolute and empty targets, on a second byte
+that is `\`, TAB, LF or CR, and on same-site paths (`/`, `/a\b`,
+`/%5Cevil.com`); the 301 with and without a query; the 308 on POST; the 303
+with a good, off-site, backslash, raw-TAB, same-site, empty and missing
+`next`; that a raw LF or CR in `next` never reaches the `Location` (the
+framer refuses the LF, the CR gets the canned 400); `GET /login` and unknown
+paths as 200; `.close` on a malformed request; and that no route allocates.
 
 ## See also
 

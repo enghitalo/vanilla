@@ -27,9 +27,12 @@ module main
 //     write (and, with `${}`, an allocation) on every request it sends. Count
 //     denials, or log once per connection, if you need them.
 //   - The most efficient block is at CONNECTION time (drop on accept). That
-//     needs a core accept-hook; here we answer 403 per request at handler level.
+//     needs a core accept-hook; here the handler answers the first request
+//     with 403 and closes the connection.
 import server
 import core
+import http1_1.request_parser
+import http1_1.response
 import socket
 import sync
 
@@ -101,12 +104,26 @@ fn parse_ipv4(s string) ?u32 {
 const forbidden_response = 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
 const ok_response = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\nConnection: keep-alive\r\n\r\nallowed'
 
-fn handle(_req_buffer []u8, mut out []u8, client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop, mut blocklist Blocklist) core.Step {
+fn handle(req_buffer []u8, mut out []u8, client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop, mut blocklist Blocklist) core.Step {
+	// Deny before parsing: the decision needs only the connection, so a
+	// blocked peer costs no parse. .close, as the 403's `Connection: close`
+	// says: the server sends it and closes, and anything the peer pipelined
+	// behind it is never answered.
 	if ip := socket.peer_ipv4(client_fd) {
 		if blocklist.is_blocked(ip) {
 			core.append_str(mut out, forbidden_response)
-			return .done
+			return .close
 		}
+	}
+	// An allowed peer still sends a request, not just bytes: decode it before
+	// the 200. decode_into, not decode_http_request: a malformed request would
+	// box an error() per request there.
+	mut req := request_parser.HttpRequest{
+		buffer: req_buffer
+	}
+	if !request_parser.decode_into(mut req) {
+		out << response.tiny_bad_request_response
+		return .close
 	}
 	core.append_str(mut out, ok_response)
 	return .done

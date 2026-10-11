@@ -38,6 +38,20 @@ allowed
 A forged `X-Forwarded-For: 10.0.0.5` changes nothing: the decision uses the
 socket peer only.
 
+An allowed peer still has to send a request: bytes that do not parse get the
+canned 400, and the connection is closed.
+
+```sh
+printf 'garbage\r\n\r\n' | socat -t1 - TCP:localhost:3000
+```
+
+```
+HTTP/1.1 400 Bad Request
+Content-Length: 0
+Connection: close
+
+```
+
 To see the deny path from your own machine, add
 `blocklist.block('127.0.0.1')!` next to the other two in `main()` (`block`
 returns an error for text that is not IPv4, so the `!` is required) and rerun
@@ -47,11 +61,24 @@ returns an error for text that is not IPv4, so the `!` is required) and rerun
 HTTP/1.1 403 Forbidden
 Content-Length: 0
 Connection: close
+
 ```
 
-Despite that header, `handle` returns `.done`, not `.close`: the connection
-stays open, and a blocked peer that pipelines two requests gets two 403s on it
-([#293](https://github.com/enghitalo/vanilla/issues/293)).
+As that header says, `handle` returns `.close` after the 403: the server
+sends it and closes the connection, so a blocked peer that pipelines two
+requests gets one 403
+([#293](https://github.com/enghitalo/vanilla/issues/293)):
+
+```sh
+printf 'GET / HTTP/1.1\r\nHost: x\r\n\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n' | socat -t1 - TCP:localhost:3000
+```
+
+```
+HTTP/1.1 403 Forbidden
+Content-Length: 0
+Connection: close
+
+```
 
 Nothing is logged per denial: a blocked client could otherwise force a stderr
 write on every request it sends. Count denials, or log once per connection,
@@ -63,10 +90,13 @@ if you need them.
   the peer's IPv4 address as a `u32` (one `getpeername` syscall, no
   allocation), and checks it against the list. A peer with no IPv4 address
   (a Unix-socket listener; there use `socket.peer_cred`) is on no list: it is
-  allowed. It does not even parse the request: the decision needs only the
-  connection, so an allowed peer gets the 200 even for `garbage\r\n\r\n`.
-  Behind a proxy or CDN the peer is the proxy, so swap in the trusted-proxy
-  client IP from [examples/proxy_aware](../proxy_aware/).
+  allowed. Behind a proxy or CDN the peer is the proxy, so swap in the
+  trusted-proxy client IP from [examples/proxy_aware](../proxy_aware/).
+- **Deny first, then parse.** The decision needs only the connection, so a
+  blocked peer gets the 403 before its request is parsed, and `.close`. An
+  allowed peer's request is decoded with `request_parser.decode_into` (no
+  allocation, a malformed head included) before the 200; one that does not
+  parse gets the library's canned 400 and `.close`.
 - **IPv4 only.** The TCP listener binds `0.0.0.0`, so today every TCP peer
   has an IPv4 address and an IPv6 client cannot connect at all. On a
   dual-stack listener an IPv4-mapped peer (`::ffff:a.b.c.d`) would still be
@@ -94,9 +124,11 @@ v test examples/ip_block/src
 [main_test.v](src/main_test.v) covers the `block`/`unblock`/`is_blocked`
 round trip and the refusal of text that is not IPv4, allows a peer with no
 IPv4 address (fd `-1`), and drives `handle` over a real loopback connection:
-a listed `127.0.0.1` gets the 403, an unlisted one the 200, and neither
+a listed `127.0.0.1` gets the 403 and `.close`, an unlisted one the 200 and
+`.done`. A malformed request (`garbage\r\n\r\n`) gets the canned 400 and
+`.close` from an allowed peer, and the 403 from a listed one. None of it
 allocates (`test_ip_block_allocates_nothing`, a `gc_heap_usage()` delta over
-20k rounds of each).
+20k rounds of the 200, the 400 and the 403).
 
 ## See also
 
