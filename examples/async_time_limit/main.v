@@ -60,12 +60,22 @@ const max_steps = 0xffff
 
 // A job's state rides in watch_payload itself, so nothing is allocated per
 // request: the payload is an integer, not a pointer. The 64 bits hold
-//   bits 16..63: start, the time.ticks() of the request (ms since the epoch)
+//   bits 16..63: start, the now_ms() of the request (monotonic ms)
 //   bits  0..15: left, the work steps still to do (1..max_steps)
-// 48 signed bits of milliseconds reach about 4,400 years either side of 1970.
+// 48 signed bits of milliseconds hold about 4,400 years of uptime.
 // The timerfd is ready_fd, the fd the continuation wakes on.
 $if x32 {
 	$compile_error('async_time_limit packs its job state into a 64-bit watch_payload')
+}
+
+// now_ms is the monotonic clock in milliseconds (CLOCK_MONOTONIC, through
+// time.sys_mono_now). Unlike time.ticks(), which reads the wall clock, it
+// never steps: an NTP correction or `date -s` mid-job can neither make the
+// elapsed time negative (a Content-Length counted for 20 digits on a body
+// that carries "-5000") nor cut a job short with a spurious 504.
+@[inline]
+fn now_ms() i64 {
+	return i64(time.sys_mono_now() / 1_000_000)
 }
 
 // pack_job packs a job's start and steps left into a watch_payload.
@@ -159,7 +169,7 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
 	}
 	tfd := C.timerfd_create(C.CLOCK_MONOTONIC, 0)
 	arm_periodic(tfd, 50)
-	event_loop.watch_fd(tfd, .readable, tick, pack_job(time.ticks(), parse_steps(r)))
+	event_loop.watch_fd(tfd, .readable, tick, pack_job(now_ms(), parse_steps(r)))
 	return .suspend
 }
 
@@ -169,7 +179,7 @@ fn tick(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, 
 	mut tmp := [8]u8{}
 	C.read(ready_fd, &tmp[0], 8)
 	start, steps_left := unpack_job(watch_payload)
-	elapsed := time.ticks() - start
+	elapsed := now_ms() - start
 	if elapsed > budget_ms {
 		C.close(ready_fd)
 		core.append_str(mut out, resp_504_head)
