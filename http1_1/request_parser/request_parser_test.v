@@ -382,6 +382,9 @@ fn test_has_query() {
 		['/a?', 'debug', 'false', 'none'],
 		['/a', 'debug', 'false', 'none'],
 		['/debug', 'debug', 'false', 'none'],
+		['/a?a=b=c', 'a=b', 'false', 'none'],
+		['/a?a=b', 'a=b', 'false', 'none'],
+		['/a?a&b=1', 'a&b', 'false', 'none'],
 		['/a?debug', '', 'false', 'none'],
 		['/a?=x', '', 'false', 'none'],
 	]

@@ -445,6 +445,11 @@ fn query_element(buf []u8, path Slice, key []u8, bare_ok bool) ?Slice {
 		end := if amp < 0 { path_end } else { pos + amp }
 		after := pos + key.len
 		if after <= end && unsafe { C.memcmp(&buf[pos], &key[0], key.len) } == 0 {
+			// A key holding '=' would match a longer name's prefix (`a=b` in
+			// `?a=b=c`); one holding '&' never matches, elements are cut there.
+			if find_byte_idx(&key[0], key.len, equal_u8) >= 0 {
+				return none
+			}
 			if after < end && buf[after] == equal_u8 {
 				return Slice{
 					start: after
@@ -465,9 +470,9 @@ fn query_element(buf []u8, path Slice, key []u8, bare_ok bool) ?Slice {
 
 // get_query_slice returns the value of the first query parameter named `key` as
 // a Slice into the request buffer, or none. Zero allocations. The value is raw
-// (not percent-decoded); `key` is matched byte for
-// byte against the raw names, and holds no '=' or '&'. A bare `?key` has no
-// value, so it is none here: has_query tells it from a missing key.
+// (not percent-decoded), and `key` is matched byte for byte against the raw
+// names: a key holding '=' or '&' names nothing. A bare `?key` has no value,
+// so it is none here: has_query tells it from a missing key.
 // Example: GET /users?id=123&format=json
 //   get_query_slice('id'.bytes()) -> Slice pointing to "123"
 //   get_query_slice('format'.bytes()) -> "json"; `?q=` -> Slice{len: 0}
