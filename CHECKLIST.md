@@ -479,17 +479,24 @@ concatenates, interpolates or allocates per request. The
   [#2](https://github.com/enghitalo/vanilla/issues/2) lists further ideas
   (maintenance mode, GeoIP, multitenancy, feature flags, locale).
 
-### 36. Logging Example — 🟡 PARTIAL ([#15](https://github.com/enghitalo/vanilla/issues/15))
-- **Done:** `examples/middleware/src/access_log.v` (a buffered, zero-alloc
-  access log written to a file, flushed on shutdown) and
-  `examples/observability/` (one `key=value` line per request, `/healthz`,
-  `/readyz`, `/metrics`).
-- **Remains:** log rotation (reopen on `SIGHUP` or by size), a JSON line
-  format, shipping to an external collector (off the worker, through
-  `http1_1.upstream`), and a README for `examples/observability/`. Keep
-  [BEST_PRACTICES §5](docs/BEST_PRACTICES.md#5-side-effects-go-through-the-async-runtime--pools-off-the-hot-path):
-  each line is appended into a per-worker buffer (`core.append_str`,
-  `strconv.write_dec`), never written synchronously per request.
+### 36. Logging Example — ✅ RESOLVED ([#15](https://github.com/enghitalo/vanilla/issues/15))
+- **Resolution:** `examples/logging/` writes one JSON line per request into a
+  per-worker buffer (`core.append_str`, `wi`), with no syscall, no lock and no
+  allocation (`test_logging_allocates_nothing`). The worker's timerfd
+  (`on_worker_start`) drains the buffer between requests:
+  - one `write(2)` of many lines through the worker's own `O_APPEND`
+    descriptor;
+  - rotation by size (worker 0 renames) and reopen on `SIGHUP` (the
+    async-signal-safe handler bumps an atomic generation, and each worker
+    reopens on its own thread);
+  - NDJSON batches to a collector through a per-worker `http1_1.upstream`
+    pool, with a bounded queue, retry with a backoff, and every dropped line
+    counted (`/stats`).
+
+  `SIGTERM` gets a final flush. The example has a README, in-process tests and
+  e2e tests against a fake collector. `examples/observability/` has its
+  README; `examples/middleware/src/access_log.v` stays as the minimal
+  shared-`FILE*` version.
 
 ### 37. Security/Attack Protection Example — ✅ RESOLVED (as one example per concern)
 - **Resolution:** request size limits, slowloris and connection caps in
@@ -588,14 +595,14 @@ concatenates, interpolates or allocates per request. The
   `ulimit -n`, `net.core.somaxconn` and other sysctls, buffer sizing.
 
 ### 46. Example Walkthroughs — 🔴 OPEN
-- **Issue:** 13 of 50 example directories have a README (`conformance`,
-  `etag`, `hexagonal`, `https_upstream`, `json_api`, `mesh`, `middleware`,
-  `router`, `security_headers`, `spa_static_assets`, `sse`, `veb_like`,
-  `video_stream`).
+- **Issue:** 15 of 51 example directories have a README (`conformance`,
+  `etag`, `hexagonal`, `https_upstream`, `json_api`, `logging`, `mesh`,
+  `middleware`, `observability`, `router`, `security_headers`,
+  `spa_static_assets`, `sse`, `veb_like`, `video_stream`).
 - **Priority:** 🟡 MEDIUM
-- **Strategy:** most of the other 38 open `main.v` with a long explanatory
+- **Strategy:** most of the other 36 open `main.v` with a long explanatory
   comment that can seed the README; start with the security examples (#37),
-  `static_files`, `observability` and `request_limits`.
+  `static_files` and `request_limits`.
 
 ---
 
@@ -606,7 +613,7 @@ Open and partial items only.
 | Priority | Count | Items |
 |----------|-------|-------|
 | 🔴 HIGH | 2 | #16 (#156: plaintext on io_uring/kqueue), #34 |
-| 🟡 MEDIUM | 9 | #4, #19, #23, #36, #39, #40, #42, #44, #46 |
+| 🟡 MEDIUM | 8 | #4, #19, #23, #39, #40, #42, #44, #46 |
 | 🟢 LOW | 2 | #5, #45 |
 
 ---
@@ -629,7 +636,7 @@ Open and partial items only.
 ### Phase 3: Core Examples
 - [x] #33 - Static file server
 - [x] #35 - Middleware example
-- [ ] #36 - Logging example (rotation, JSON, shipping)
+- [x] #36 - Logging example (rotation, JSON, shipping)
 - [x] #37 - Security examples
 
 ### Phase 4: Protocol & Backend
@@ -663,13 +670,13 @@ Open and partial items only.
 
 ## 📈 Progress Tracking
 
-### Resolved: 24/37 (65%)
-- ✅ 20 done: #2, #3, #8, #10, #11, #15, #17, #18, #20, #21 (except kqueue),
-  #25, #27, #28, #29, #33, #35, #37, #38, #41, #43
+### Resolved: 25/37 (68%)
+- ✅ 21 done: #2, #3, #8, #10, #11, #15, #17, #18, #20, #21 (except kqueue),
+  #25, #27, #28, #29, #33, #35, #36, #37, #38, #41, #43
 - ⚪ 4 obsolete: #1, #6, #26, #32
 
-### Partial: 10/37 (27%)
-#5, #16, #19, #23, #36, #39, #40, #42, #44, #45
+### Partial: 9/37 (24%)
+#5, #16, #19, #23, #39, #40, #42, #44, #45
 
 ### Open: 3/37 (8%)
 #4, #34, #46
@@ -709,7 +716,7 @@ Docs:
 For contributors wanting to learn:
 
 - **Beginner:** #5, #46
-- **Intermediate:** #34, #36, #40, #42
+- **Intermediate:** #34, #40, #42
 - **Advanced:** #4/#19 (kqueue, #154), #16 (#156), #23
 
 ---
