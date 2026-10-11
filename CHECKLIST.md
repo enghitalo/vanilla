@@ -201,9 +201,9 @@ concatenates, interpolates or allocates per request. The
   epoll, before it binds anything; io_uring and kqueue used to accept it and
   serve plaintext ([#156](https://github.com/enghitalo/vanilla/issues/156)).
   Tested by `test_new_server_refuses_tls_where_it_is_not_served` in
-  `server/server_test.v`, on Linux and in a macOS job.
+  `server/server_test.v`, on Linux, Windows and in a macOS job.
 - **Remains:**
-  - TLS on IOCP ([#115](https://github.com/enghitalo/vanilla/issues/115)),
+  - TLS on io_uring and kqueue (refused for now), and on IOCP ([#115](https://github.com/enghitalo/vanilla/issues/115)),
     HTTP/2 over TLS + ALPN ([#142](https://github.com/enghitalo/vanilla/issues/142)),
     kTLS + `sendfile` for every static path ([#76](https://github.com/enghitalo/vanilla/issues/76)).
   - A TLS `.close` is one best-effort write ([#275](https://github.com/enghitalo/vanilla/issues/275)).
@@ -396,12 +396,13 @@ concatenates, interpolates or allocates per request. The
   `HTTPS_CERT` / `HTTPS_KEY` load a CA-issued PEM pair instead. The handler is
   plain HTTP (`http1_1/router`, const responses); `read_timeout_ms` bounds
   the handshake. Closes [#13](https://github.com/enghitalo/vanilla/issues/13).
-- **Testing:** `src/main_test.v` (the handler, any build: exact bytes, no
-  allocation, `load_tls` refusing half a pair) and `src/https_e2e_test.v`
-  (`-d vanilla_tls`, run by `.github/workflows/tls_backend.yml`): a client
-  that verifies the certificate against `cert.pem` on every loopback name,
-  keep-alive, a restart that keeps the identity, the `HTTPS_CERT`/`HTTPS_KEY`
-  path, and no plaintext answer on the HTTPS port.
+- **Testing:** `src/main_test.v` (the handler, any build: the answers'
+  bytes, no allocation, `load_tls` refusing half a pair) and
+  `src/https_e2e_test.v` (`-d vanilla_tls`, run by
+  `.github/workflows/tls_backend.yml`): a client that verifies the
+  certificate against `cert.pem` as localhost and 127.0.0.1, keep-alive, a
+  restart that keeps the identity, the `HTTPS_CERT`/`HTTPS_KEY` path, and a
+  plaintext request closed at once with no HTTP answer.
 
 ### 35. Middleware Example — ✅ RESOLVED
 - **Resolution:** `examples/middleware/` (handler chain, security-header

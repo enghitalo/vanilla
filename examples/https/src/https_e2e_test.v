@@ -69,11 +69,21 @@ fn temp_cert_dir(name string) string {
 	return os.join_path(os.temp_dir(), 'vanilla_https_${name}_${os.getpid()}')
 }
 
+// no_env_pem unsets HTTPS_CERT and HTTPS_KEY, so load_tls issues a
+// self-signed identity even in a shell that exported them (the README's
+// CA-issued setup).
+fn no_env_pem() {
+	os.unsetenv('HTTPS_CERT')
+	os.unsetenv('HTTPS_KEY')
+}
+
 // A self-signed identity (load_tls with no HTTPS_CERT/HTTPS_KEY) is written
 // to the cert dir, and a client that trusts its cert.pem verifies the server
-// as localhost, 127.0.0.1 and ::1. Requests on one keep-alive connection get
-// the handler's answers.
+// as localhost and as 127.0.0.1. Requests on one keep-alive connection get the
+// handler's answers. (The certificate names ::1 too, but the listener is
+// IPv4: socket.create_server_socket binds 0.0.0.0.)
 fn test_self_signed_identity_verifies_and_serves() ! {
+	no_env_pem()
 	dir := temp_cert_dir('self')
 	defer {
 		os.rmdir_all(dir) or {}
@@ -97,21 +107,15 @@ fn test_self_signed_identity_verifies_and_serves() ! {
 	nf_want := 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 	nf := exchange(mut c, 'GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n', nf_want.len)!
 	assert nf == nf_want
-	for host in ['127.0.0.1', '::1'] {
-		mut c2 := dial(host, h.port(), ca) or {
-			if host == '::1' && err.msg().contains('connect') {
-				continue // no IPv6 loopback on this host
-			}
-			return err
-		}
-		assert exchange(mut c2, 'GET / HTTP/1.1\r\nHost: x\r\n\r\n', want_hello.len)! == want_hello, host
-		c2.shutdown() or {}
-	}
+	mut c2 := dial('127.0.0.1', h.port(), ca)!
+	assert exchange(mut c2, 'GET / HTTP/1.1\r\nHost: x\r\n\r\n', want_hello.len)! == want_hello
+	c2.shutdown() or {}
 }
 
 // A restart loads the identity it persisted: the same certificate, so a
 // client that pinned cert.pem keeps working.
 fn test_restart_keeps_the_identity() ! {
+	no_env_pem()
 	dir := temp_cert_dir('restart')
 	defer {
 		os.rmdir_all(dir) or {}
@@ -156,8 +160,10 @@ fn test_pem_files_from_the_environment() ! {
 }
 
 // The HTTPS port never answers in plaintext: a cleartext request is a failed
-// handshake, and the connection closes with no HTTP response.
+// handshake, and the connection closes with no HTTP response (at once: not
+// at the 2 s read deadline, nor at the client's backstop).
 fn test_plaintext_request_gets_no_http_answer() ! {
+	no_env_pem()
 	dir := temp_cert_dir('plain')
 	defer {
 		os.rmdir_all(dir) or {}
@@ -171,15 +177,22 @@ fn test_plaintext_request_gets_no_http_answer() ! {
 		c.close() or {}
 	}
 	c.set_read_timeout(backstop)
+	sw := time.new_stopwatch()
 	c.write_string('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')!
 	mut acc := []u8{}
 	mut buf := []u8{len: 4096}
+	mut timed_out := false
 	for {
-		n := c.read(mut buf) or { break }
+		n := c.read(mut buf) or {
+			timed_out = err.code() == net.err_timed_out_code
+			break
+		}
 		if n <= 0 {
 			break
 		}
 		acc << buf[..n]
 	}
+	elapsed := sw.elapsed().milliseconds()
 	assert !acc.bytestr().contains('HTTP/1.1'), 'the HTTPS port answered in plaintext: ${acc.bytestr()}'
+	assert !timed_out && elapsed < 1000, 'the server must close a plaintext connection at once, took ${elapsed}ms (timed out: ${timed_out})'
 }

@@ -15,10 +15,10 @@ flag. Linux only: `new_server` refuses `tls_config` on any backend but epoll.
 v -d vanilla_tls run examples/https/src
 ```
 
-It listens on `:8443` ([main.v](src/main.v)). On the first run it issues a
-self-signed certificate for `localhost`, `127.0.0.1` and `::1` and writes it
-to `certs/` in the working directory (`cert.pem`, and `key.pem` with mode
-0600). Later runs load that identity again, so a client that trusts
+It listens on `:8443` ([main.v](src/main.v)), IPv4. On the first run it
+issues a self-signed certificate for `localhost`, `127.0.0.1` and `::1` and
+writes it to `certs/` in the working directory (`cert.pem`, and `key.pem` with
+mode 0600). Later runs load that identity again, so a client that trusts
 `certs/cert.pem` keeps working across restarts:
 
 ```sh
@@ -74,7 +74,9 @@ v -d vanilla_tls -prod run examples/https/src
 
 Setting only one of them is an error, not a fallback to a self-signed
 certificate. For a self-signed certificate valid for a real host, pass its
-names to `tls.new_self_signed(sans: ['DNS:example.com', 'IP:203.0.113.5'])`.
+names to `tls.new_self_signed(sans: ['DNS:example.com', 'IP:203.0.113.5'])`
+in `load_tls`, and delete `certs/` first: while its files exist they are
+loaded, and `sans` is ignored.
 
 ## How it works
 
@@ -98,9 +100,10 @@ names to `tls.new_self_signed(sans: ['DNS:example.com', 'IP:203.0.113.5'])`.
   and then `sendfile(2)` can stream file bodies without a userspace copy (see
   `static_assets`). Otherwise records stay in Mbed TLS, and the server logs
   the fallback once.
-- **Parallel crypto needs the right Mbed TLS build.** Distro packages are
-  built without `MBEDTLS_THREADING_C`, so the workers take turns in the crypto
-  library, and the server says so at startup.
+- **Parallel crypto needs the right Mbed TLS build.** Without
+  `MBEDTLS_THREADING_C` (the upstream default, and distro packages such as
+  Arch's) the workers take turns in the crypto library, and the server says
+  so at startup.
   [server/README.md](../../server/README.md#tls) shows how to build it with
   threading.
 
@@ -112,14 +115,15 @@ v -d vanilla_tls test examples/https/src
 ```
 
 [main_test.v](src/main_test.v) calls `route` directly and runs in any build:
-every route's exact bytes, appending after an earlier response, no
-allocation over 20k requests, and `load_tls` refusing a certificate without
-its key. [https_e2e_test.v](src/https_e2e_test.v) needs `-d vanilla_tls` on
-Linux and serves the example over TLS to a client that verifies the
-certificate against `cert.pem`, as `curl --cacert` does. It covers
-`localhost`, `127.0.0.1` and `::1`, keep-alive, a restart that keeps the
-identity, the `HTTPS_CERT`/`HTTPS_KEY` path, and a plaintext request that
-gets no HTTP answer.
+the exact bytes of the 200, HEAD and 404 answers, the 405's status line and
+`Allow`, appending after an earlier response, no allocation over 20k
+requests, and `load_tls` refusing a certificate without its key.
+[https_e2e_test.v](src/https_e2e_test.v) needs `-d vanilla_tls` on Linux and
+serves the example over TLS to a client that verifies the certificate
+against `cert.pem`, as `curl --cacert` does. It covers `localhost` and
+`127.0.0.1`, keep-alive, a restart that keeps the identity, the
+`HTTPS_CERT`/`HTTPS_KEY` path, and a plaintext request that is closed at once
+with no HTTP answer.
 
 ## See also
 
@@ -127,5 +131,3 @@ gets no HTTP answer.
   does, kTLS and the threading build
 - [examples/https_upstream](../https_upstream/): the client side, calling an
   HTTPS API from a handler
-- [examples/redirects](../redirects/): answering redirects, such as from a
-  plain-HTTP port to this one

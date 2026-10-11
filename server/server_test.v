@@ -89,7 +89,9 @@ fn test_new_server_ignores_sigpipe_only_when_default() ! {
 }
 
 // lowest_free_fd is the number the kernel gives the next new fd: the same
-// value before and after a refused new_server means it opened nothing.
+// value before and after a refused new_server means it opened nothing. POSIX
+// only in effect: a Windows socket is not a C file descriptor, so there the
+// check sees nothing.
 fn lowest_free_fd() !int {
 	mut f := os.open(os.executable())!
 	fd := f.fd

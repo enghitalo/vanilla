@@ -76,16 +76,28 @@ fn test_handler_allocates_nothing() {
 // way round) is a configuration mistake, not a reason to fall back to a
 // self-signed identity.
 fn test_load_tls_needs_both_cert_and_key() {
+	saved_cert := os.getenv_opt('HTTPS_CERT')
+	saved_key := os.getenv_opt('HTTPS_KEY')
 	os.setenv('HTTPS_CERT', '/nonexistent/cert.pem', true)
 	os.unsetenv('HTTPS_KEY')
 	defer {
-		os.unsetenv('HTTPS_CERT')
+		restore_env('HTTPS_CERT', saved_cert)
+		restore_env('HTTPS_KEY', saved_key)
 	}
 	load_tls('certs') or {
 		assert err.msg().contains('both HTTPS_CERT and HTTPS_KEY'), err.msg()
 		return
 	}
 	assert false, 'load_tls accepted HTTPS_CERT without HTTPS_KEY'
+}
+
+// restore_env puts back a variable the test changed: its old value, or unset.
+fn restore_env(name string, saved ?string) {
+	if v := saved {
+		os.setenv(name, v, true)
+	} else {
+		os.unsetenv(name)
+	}
 }
 
 // serve runs the handler on one request and returns what it appended.
