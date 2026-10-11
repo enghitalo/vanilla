@@ -67,9 +67,9 @@ plus one acceptor thread per server. An explicit `workers` wins over
   number of worker threads. On epoll that is one acceptor plus N event loops;
   on io_uring it is N shared-nothing rings, each with its own `SO_REUSEPORT`
   listener.
-- **The handlers build their replies per request.** `api_handler` and
-  `admin_handler` append a string literal's `.bytes()`, one allocation per
-  request. A `const` string appended with `core.append_str` avoids it
+- **The replies are `const`s.** `api_handler` and `admin_handler` append
+  `api_response` and `admin_response` with `core.append_str`: no allocation
+  per request
   ([BEST_PRACTICES §3a](../../docs/BEST_PRACTICES.md#3a-static-responses--a-const-string-appended-with-coreappend_str)).
 
 ## Tests
@@ -83,8 +83,8 @@ them: `new_server` sizes the per-worker arrays without spawning threads, so
 the checks are deterministic. Two epoll servers with `workers: 5` and
 `workers: 9` get pools of 5 and 9; `workers` unset falls back to
 `nr_cpus` (the test assumes `VANILLA_WORKERS` is not set); io_uring with
-`workers: 6` gets 6 threads and 6 listeners. The tests bind ports
-18181–18184.
+`workers: 6` gets 6 threads and 6 listeners. Both handlers are checked to
+allocate nothing. The tests bind ports 18181–18184.
 
 ## See also
 

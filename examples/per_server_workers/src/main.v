@@ -16,13 +16,19 @@ import server
 import core
 import runtime
 
+// Static responses are const strings, appended with core.append_str: no
+// per-request copy (docs/BEST_PRACTICES.md §3a).
+const api_response = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\nmain'
+
+const admin_response = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nadmin'
+
 fn api_handler(_req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
-	out << 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\nmain'.bytes()
+	core.append_str(mut out, api_response)
 	return .done
 }
 
 fn admin_handler(_req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
-	out << 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nadmin'.bytes()
+	core.append_str(mut out, admin_response)
 	return .done
 }
 

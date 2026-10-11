@@ -52,6 +52,34 @@ fn test_workers_zero_falls_back_to_default() {
 	}
 }
 
+// Both handlers append a const response: 20k requests through one reused
+// buffer must not move the collector's lifetime allocation counter.
+fn test_handlers_allocate_nothing() {
+	req := 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+	mut out := []u8{cap: 4096}
+	mut event_loop := core.EventLoop{}
+	api_handler(req, mut out, -1, unsafe { nil }, mut event_loop)
+	assert out.bytestr() == api_response
+	unsafe {
+		out.len = 0
+	}
+	admin_handler(req, mut out, -1, unsafe { nil }, mut event_loop)
+	assert out.bytestr() == admin_response
+	$if gcboehm ? {
+		rounds := 20_000
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. rounds {
+			unsafe {
+				out.len = 0
+			}
+			api_handler(req, mut out, -1, unsafe { nil }, mut event_loop)
+			admin_handler(req, mut out, -1, unsafe { nil }, mut event_loop)
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert grown < 4096, 'the handlers allocated ${grown} bytes over ${2 * rounds} requests'
+	}
+}
+
 // io_uring is shared-nothing: workers:N creates N SO_REUSEPORT listeners (one per
 // worker) in addition to sizing the thread array.
 fn test_workers_io_uring_one_listener_per_worker() {
