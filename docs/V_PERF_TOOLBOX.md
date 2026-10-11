@@ -110,6 +110,15 @@ Already used here for the per-worker epoll fd arrays
   `len > 0` before `&buf[start]`. Used across
   [examples/auth](../examples/auth/src/main.v) for password/API-key/bearer
   windows into the request buffer.
+- **`time.write_http_header` allocates** (and so does `push_to_http_header`,
+  which wraps it): its weekday comes from `time.day_of_week`, which builds the
+  array literal `[0, 3, 2, …]` on every call, ~128 B (V 0.5.2 e5f8d31, and
+  V master on 2026-10-11). A Date cache refreshed with it leaks that much per
+  refresh under `-gc none`. Refresh with `time.update_http_header(dst, len,
+  last_unix, now_unix)` instead: it rewrites only the digits that changed and
+  falls back to a whole write (with that allocation) on the first call and at
+  midnight ([examples/efficient_date](../examples/efficient_date/main.v),
+  [examples/date_header](../examples/date_header/src/main.v)).
 - `strings.Builder` **is** `[]u8` (`pub type Builder = []u8`): pass a builder
   mid-assembly to any `[]u8`-taking API (hash it, sign it) and keep appending;
   `return sb` satisfies a `[]u8` return. Saves the `.str()` copy when the

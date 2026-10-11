@@ -605,8 +605,9 @@ concatenates, interpolates or allocates per request. The
   [BEST_PRACTICES](docs/BEST_PRACTICES.md). Each command was run against the
   built server, and the PostgreSQL ones against a throwaway `postgres:16`.
   Bugs found while writing them: #292, #293, #294.
-- **Remains:** the examples #279 rewrites. Re-read each README once its
-  #279 commit lands: helper names, per-worker state and allocation claims.
+  The READMEs of the examples #279 rewrote were re-read against the new code
+  and corrected in the same commits: helper names, per-worker state and
+  allocation claims.
 
 ---
 
