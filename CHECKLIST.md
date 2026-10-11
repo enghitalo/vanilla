@@ -142,7 +142,7 @@ concatenates, interpolates or allocates per request. The
   between and after valued ones, name prefixes; decoding: malformed and
   truncated escapes, `+` both ways, decode-once, NUL/CR/LF, zero heap growth
   over 20k calls).
-- **PRs:** #279 (empty key), #286 (`has_query`), PRNUM (`percent_decode_into`).
+- **PRs:** #279 (empty key), #286 (`has_query`), #289 (`percent_decode_into`).
 
 ### 6. Add Standard HTTP Status Codes — ⚪ OBSOLETE
 - **Premise:** a library table of status-line consts
