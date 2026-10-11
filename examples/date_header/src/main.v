@@ -31,14 +31,15 @@ import sync.stdatomic
 const date_line_len = 37
 
 // The static frame every buffer starts from: only the 29 date bytes at offset 6
-// ever change (write_http_header rewrites exactly those), so the "Date: " prefix
+// ever change (update_http_header rewrites only those), so the "Date: " prefix
 // and trailing CRLF are seeded once and never touched on the refresh path.
 const line_template = 'Date: Xxx, 00 Xxx 0000 00:00:00 GMT\r\n'
 
 struct DateCache {
 mut:
 	bufs [2][date_line_len]u8
-	idx  u64 // active buffer index (0/1); read/written atomically
+	secs [2]i64 // unix second each buffer holds (0: the template); the ticker's alone
+	idx  u64    // active buffer index (0/1); read/written atomically
 }
 
 // seed lays down the static frame ("Date: " + placeholder + CRLF) in BOTH
@@ -51,23 +52,28 @@ fn (mut c DateCache) seed() {
 
 // refresh formats the current UTC time into the INACTIVE buffer, then publishes
 // it by flipping the atomic index. Called once per second by the ticker, so even
-// this off-hot-path work is cheap: `time.write_http_header` writes the 29-byte
-// RFC 9110 IMF-fixdate straight into the buffer at offset 6 (after "Date: "),
-// allocation-free — no format template to parse, no intermediate string.
+// this off-hot-path work is cheap: `time.update_http_header` rewrites, in place
+// at offset 6 (after "Date: "), only the digits of the RFC 9110 IMF-fixdate that
+// changed since that buffer's last refresh — no format template to parse, no
+// intermediate string, no allocation. Its first call per buffer, and the first
+// after midnight, writes the whole date with write_http_header, whose weekday
+// lookup (V's time.day_of_week) allocates a small array: once a day.
 fn (mut c DateCache) refresh() {
-	cur := stdatomic.load_u64(&c.idx)
-	next := 1 - cur
+	next := int(1 - stdatomic.load_u64(&c.idx))
+	now := time.unix_now()
 	unsafe {
-		time.utc().write_http_header(&c.bufs[int(next)][6], date_line_len - 6) or {}
+		time.update_http_header(&c.bufs[next][6], date_line_len - 6, c.secs[next], now) or {}
 	}
-	stdatomic.store_u64(&c.idx, next) // publish atomically
+	c.secs[next] = now
+	stdatomic.store_u64(&c.idx, u64(next)) // publish atomically
 }
 
-// date_line returns the current cached "Date: …\r\n" as a zero-copy slice. One
-// atomic load; no syscall, no formatting.
+// date_line returns the current cached "Date: …\r\n" as a zero-copy view of the
+// active buffer. One atomic load; no syscall, no formatting. (Not `bufs[i][..]`:
+// slicing a fixed array builds a new heap array on every call.)
 fn (c &DateCache) date_line() []u8 {
 	i := int(stdatomic.load_u64(&c.idx))
-	return c.bufs[i][..]
+	return unsafe { (&c.bufs[i][0]).vbytes(date_line_len) }
 }
 
 // The two STATIC halves of the response — everything except the Date line, which
@@ -77,6 +83,15 @@ const status_head = 'HTTP/1.1 200 OK\r\n'
 
 // Content-Length: 2 is the 'ok' body.
 const resp_tail = 'Content-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'
+
+// respond appends the whole response straight into the server-owned `out`: the
+// two static halves around the cached Date line (one atomic load, a zero-copy
+// view). No per-request allocation, no copy through an intermediate.
+fn respond(cache &DateCache, mut out []u8) {
+	core.append_str(mut out, status_head)
+	out << cache.date_line()
+	core.append_str(mut out, resp_tail)
+}
 
 fn main() {
 	mut cache := &DateCache{}
@@ -103,13 +118,7 @@ fn main() {
 		port:            3000
 		io_multiplexing: backend
 		handler:         fn [cache] (req_buffer []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
-			// Zero per-request allocation: append the two static halves and the
-			// pre-built cached Date line (one atomic load, zero-copy slice) straight
-			// into the server-owned `out` buffer — no per-request strings.Builder, no
-			// copy-through an intermediate.
-			core.append_str(mut out, status_head)
-			out << cache.date_line()
-			core.append_str(mut out, resp_tail)
+			respond(cache, mut out)
 			return .done
 		}
 	})!
