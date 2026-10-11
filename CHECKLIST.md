@@ -364,9 +364,9 @@ concatenates, interpolates or allocates per request. The
   `iou_*` in io_uring, `pl_*` in poll, `win_*` in IOCP, `tls_*` for HTTPS,
   `kq_*` in kqueue). The two caps every backend shares are one `core` const
   each: `core.default_max_request_bytes` (8 MiB, the request ceiling when
-  `Limits.max_request_bytes` is 0; also kqueue's `http1_1.request` reader and
-  the h2 body cap) and `core.max_pending_write_bytes` (8 MiB, the write-side
-  cap, which also bounds `push_watermark_bytes`).
+  `Limits.max_request_bytes` is 0; also the h2 body cap) and
+  `core.max_pending_write_bytes` (8 MiB, the write-side cap, which also bounds
+  `push_watermark_bytes`).
 - **Note:** kqueue's sizes are named, not changed; its backpressure is #154.
 
 ### 28. Remove Dead Code — ✅ RESOLVED

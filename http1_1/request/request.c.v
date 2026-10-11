@@ -1,16 +1,10 @@
 module request
 
-import core
 import http1_1.request_parser
 
 #include <errno.h>
 
 fn C.recv(__fd int, __buf voidptr, __n usize, __flags int) int
-
-// Hard ceiling on a single request: a backstop against unbounded memory growth
-// from a hostile peer. `read_request` does not take `core.Limits.max_request_bytes`
-// yet (kqueue, #154), so the engine's built-in default is the ceiling here.
-const max_request_bytes = core.default_max_request_bytes
 
 // read_request reads one complete HTTP/1.1 message from the socket.
 //
@@ -28,10 +22,13 @@ const max_request_bytes = core.default_max_request_bytes
 //     bodies).
 //   - Pipelining: bytes beyond the first message are dropped (framer tells us
 //     where the first message ends; we trim to it).
-// max_header_bytes / max_body_bytes: 0 = unlimited (the configured `Limits`).
+// max_header_bytes / max_body_bytes / max_request_bytes: 0 = unlimited. The
+// caller resolves its configured limits (and any default) before the call;
+// max_request_bytes is the ceiling on the buffered request (headers+body), the
+// backstop that keeps a hostile peer from growing the buffer without bound.
 // Over-limit / malformed errors carry an HTTP status in `.code()` (413/431/400);
 // connection-level errors carry no code (caller closes quietly).
-pub fn read_request(client_fd int, max_header_bytes int, max_body_bytes int) ![]u8 {
+pub fn read_request(client_fd int, max_header_bytes int, max_body_bytes int, max_request_bytes int) ![]u8 {
 	// recv straight into the buffer's spare capacity — no scratch buffer, no
 	// double copy.
 	//
@@ -73,7 +70,7 @@ pub fn read_request(client_fd int, max_header_bytes int, max_body_bytes int) ![]
 		}
 		// Configured body limit (if any) is enforced in the framer from
 		// Content-Length before buffering; this is the absolute backstop.
-		if buf.len > max_request_bytes {
+		if max_request_bytes > 0 && buf.len > max_request_bytes {
 			return error_with_code('request exceeds ${max_request_bytes} bytes', 413)
 		}
 
