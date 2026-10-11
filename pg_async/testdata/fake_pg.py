@@ -47,7 +47,12 @@ needs happen deterministically:
       are never answered (the connection stays open)
   --delay-ms MS                     every reply waits MS milliseconds (a slow
       query: a client can disconnect while its request is parked on it)
-  --conflicts N                     the first N insert/update statements (over
+  --pause-ms MS                     after every reply, read nothing for MS
+      milliseconds (a server busy elsewhere): what a client sends meanwhile
+      fills the socket, at once with a small --rcvbuf
+  --rcvbuf BYTES                    SO_RCVBUF of every connection (set on the
+      listening socket, so the TCP window is small from the handshake on)
+  --conflicts N                    the first N insert/update statements (over
       all connections) fail with ERROR 40001 serialization_failure, as a
       conflicting concurrent transaction makes them under SERIALIZABLE (and
       every optimistic-concurrency conflict on Aurora DSQL)
@@ -69,12 +74,17 @@ TLS, per run (--ssl; certificates from gen_test_ca.sh via --cert/--key):
       messages right before every query's reply (OpenSSL's
       SSL_new_session_ticket, through ctypes: the ssl module has no call for it)
 
+A message whose type byte no frontend message has ends the session with FATAL
+08P01 (invalid frontend message type), as in PostgreSQL, which reads the type
+before the length: bytes a client sent twice, or lost, show up there instead
+of as a hang on a length read from the middle of a message.
+
 --stats-file PATH keeps `key=value` counters (accepted, authenticated, queries
 — one per Sync —, statements — one per Bind —, rollbacks, conflicts,
 server_closes, ssl_requests, tls_handshakes, sni, tickets, cancel_requests,
-cancels_honored, cancels_ignored, cancelled, password_messages, terminates) up
-to date, so a test can assert on what the server saw. Every connection is
-logged to stderr.
+cancels_honored, cancels_ignored, cancelled, password_messages, terminates,
+protocol_errors) up to date, so a test can assert on what the server saw.
+Every connection is logged to stderr.
 
 It exits after --lifetime seconds, or within 0.2 s of its parent process
 exiting: a test that panics never runs its deferred stop(), and a fake left
@@ -165,12 +175,23 @@ def recv_exact(conn, n):
     return buf
 
 
-def read_typed(conn):
-    typ = recv_exact(conn, 1)
+def read_body(conn):
+    """A message's Int32 length, then the rest of it: the body."""
     ln = struct.unpack('!I', recv_exact(conn, 4))[0]
     if ln < 4:
         raise EOFError
-    return typ, recv_exact(conn, ln - 4)
+    return recv_exact(conn, ln - 4)
+
+
+def read_typed(conn):
+    typ = recv_exact(conn, 1)
+    return typ, read_body(conn)
+
+
+# The type bytes of protocol 3.0's frontend messages after the startup:
+# Bind, Close, CopyData/Done/Fail, Describe, Execute, Flush, FunctionCall,
+# Parse, the password/SASL responses, Query, Sync, Terminate.
+FRONTEND_TYPES = frozenset(b'BCdcfDEHFPpQSX')
 
 
 def cstr(b, pos):
@@ -489,7 +510,13 @@ def serve(conn, cid, settings, cancel_ev):
     stmts = []  # [sql, params] of the current group (up to Sync)
     sql = ''
     while True:
-        typ, body = read_typed(conn)
+        typ = recv_exact(conn, 1)
+        if typ[0] not in FRONTEND_TYPES:
+            bump('protocol_errors')
+            log(cid, f'invalid frontend message type {typ[0]}: closing')
+            conn.sendall(error_response('FATAL', '08P01', f'invalid frontend message type {typ[0]}'))
+            return
+        body = read_body(conn)
         if typ == b'X':
             bump('terminates')
             log(cid, 'Terminate')
@@ -536,6 +563,8 @@ def serve(conn, cid, settings, cancel_ev):
                 close_after_reply(conn, cid, reply)
                 return
             conn.sendall(reply)
+            if ARGS.pause_ms:
+                time.sleep(ARGS.pause_ms / 1000)
         # Describe / Execute / Flush need no answer of their own here: the
         # whole group is answered at its Sync.
 
@@ -585,6 +614,8 @@ def main():
     ap.add_argument('--hang-after', type=int, default=0)
     ap.add_argument('--conflicts', type=int, default=0)
     ap.add_argument('--delay-ms', type=int, default=0)
+    ap.add_argument('--pause-ms', type=int, default=0)
+    ap.add_argument('--rcvbuf', type=int, default=0)
     ap.add_argument('--lifetime', type=float, default=300.0, help='exit after this many seconds')
     ap.add_argument('--ssl', choices=('off', 'tls', 'garbage'), default='off')
     ap.add_argument('--require-ssl', action='store_true')
@@ -604,6 +635,9 @@ def main():
 
     srv = socket.socket()
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if ARGS.rcvbuf:
+        # Accepted connections inherit it, and the window scale follows it.
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, ARGS.rcvbuf)
     srv.bind(('127.0.0.1', 0))
     srv.listen(128)
     srv.settimeout(0.2)
