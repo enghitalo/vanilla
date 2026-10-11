@@ -55,16 +55,20 @@ real	0m0.356s
 ## How it works
 
 - **Per-request state in the payload.** `handle` creates a `CLOCK_MONOTONIC`
-  timerfd, arms it periodic at 50 ms (`arm_periodic`), and allocates one
-  `Job` (`tfd`, steps `left`, `start` from `time.ticks()`). It passes the
-  `Job` as the `watch_payload` of
-  `event_loop.watch_fd(tfd, .readable, tick, voidptr(job))` and returns
-  `.suspend`; every resume gets it back. The budget itself is the
-  `budget_ms` const.
+  timerfd and arms it periodic at 50 ms (`arm_periodic`). The job's state is
+  two numbers, `start` (`time.ticks()`, in ms) and the steps `left`, and
+  `pack_job` packs them into the 64-bit `watch_payload` itself (start in the
+  high 48 bits, steps in the low 16, so `steps` is capped at `max_steps`,
+  65535, far past what the budget allows): nothing is allocated per request.
+  `handle` calls
+  `event_loop.watch_fd(tfd, .readable, tick, pack_job(time.ticks(), steps))`
+  and returns `.suspend`; every resume gets the payload back, and the
+  timerfd as `ready_fd`. The budget itself is the `budget_ms` const.
 - **Check, then work.** `tick` drains the timerfd's expiration count, then
-  compares `time.ticks() - job.start` with `budget_ms`. Over budget: close the
-  timerfd, answer 504, `.done`. Otherwise it counts one step; on the last
-  one it closes the timerfd and answers 200; else it re-watches the same fd
+  unpacks the payload (`unpack_job`) and compares `time.ticks() - start` with
+  `budget_ms`. Over budget: close the timerfd, answer 504, `.done`.
+  Otherwise it counts one step; on the last one it closes the timerfd and
+  answers 200; else it re-watches the same fd with one step less packed in
   and returns `.suspend`. The request owns the timerfd: on a client
   disconnect mid-job the runtime closes it.
 - **Dynamic bodies, appended in parts.** Both replies carry the elapsed time.
@@ -91,7 +95,8 @@ v test examples/async_time_limit
 ```
 
 [main_test.v](main_test.v) unit-tests `parse_steps` (defaults, trailing junk,
-other parameters) and drives `tick` directly, with a pipe standing in for the
+other parameters, the cap) and the payload round trip, checks that a whole
+job allocates nothing, and drives `tick` directly, with a pipe standing in for the
 timerfd and a start time far in the past: the 504's `Content-Length` matches
 its body for elapsed values from 3 to 11 digits, and the 200 is framed the
 same way. On a live server through [vtest](../../docs/VTEST.md), a 2-step job
