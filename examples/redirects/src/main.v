@@ -42,10 +42,11 @@ const resp_301_old = 'HTTP/1.1 301 Moved Permanently\r\nLocation: /new\r\nConten
 const resp_308_api = 'HTTP/1.1 308 Permanent Redirect\r\nLocation: /api/v2/resource\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 const resp_200_empty = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
-// Byte keys/targets allocated ONCE at init — never `'lit'.bytes()` per request.
+// `[]u8` consts where a `[]u8` value is needed (get_query_slice's key,
+// safe_next's return), built ONCE at init — never `'lit'.bytes()` per request.
 const next_key = 'next'.bytes()
 const slash_bytes = '/'.bytes() // safe_next's reject target
-const dashboard_bytes = '/dashboard'.bytes() // default post-login landing page
+const dashboard_target = '/dashboard' // default post-login landing page
 
 // (BEST_PRACTICES §3b).
 // slice_eq compares a request Slice against a literal IN PLACE by offsets —
@@ -114,12 +115,15 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 			core.append_str(mut out, 'HTTP/1.1 303 See Other\r\nLocation: ')
 			if s := req.get_query_slice(next_key) {
 				if s.len > 0 {
-					out << safe_next(unsafe { (&req.buffer[s.start]).vbytes(s.len) })
+					// The view is taken from `req_buffer`, not `req.buffer`: a
+					// view of `req.buffer` returned through safe_next moves `req`
+					// to the heap, a copy on every request.
+					out << safe_next(unsafe { (&req_buffer[s.start]).vbytes(s.len) })
 				} else {
 					out << slash_bytes // empty `next=`: reject to '/'
 				}
 			} else {
-				out << dashboard_bytes // no `next`: default landing page
+				core.append_str(mut out, dashboard_target) // no `next`: default landing page
 			}
 			core.append_str(mut out, '\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n')
 			return .done

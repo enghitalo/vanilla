@@ -91,6 +91,46 @@ fn test_malformed_requests_error() {
 	assert caught
 }
 
+// Every route, the dynamic 303 included, runs 20k times through one reused
+// buffer, as a worker would serve them; the collector's lifetime allocation
+// counter must not move. (Under `-gc none`, vanilla's epoll build, an
+// allocation here would be a permanent leak.)
+fn test_handler_allocates_nothing() {
+	$if gcboehm ? {
+		reqs := [
+			'GET /old HTTP/1.1\r\nHost: x\r\n\r\n',
+			'GET /old?utm=1 HTTP/1.1\r\nHost: x\r\n\r\n',
+			'POST /login?next=/profile HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n',
+			'POST /login?next=//evil.com HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n',
+			'POST /login?next= HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n',
+			'POST /login HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n',
+			'GET /login HTTP/1.1\r\nHost: x\r\n\r\n',
+			'POST /api/v1/resource HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n',
+			'GET /nowhere HTTP/1.1\r\nHost: x\r\n\r\n',
+		].map(it.bytes())
+		mut out := []u8{cap: 4096}
+		mut event_loop := core.EventLoop{}
+		for r in reqs { // warm-up: `out` reaches its high-water mark
+			unsafe {
+				out.len = 0
+			}
+			handle(r, mut out, -1, unsafe { nil }, mut event_loop)
+		}
+		rounds := 20_000
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. rounds {
+			for r in reqs {
+				unsafe {
+					out.len = 0
+				}
+				handle(r, mut out, -1, unsafe { nil }, mut event_loop)
+			}
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert grown < 4096, 'the handler allocated ${grown} bytes over ${rounds * reqs.len} requests'
+	}
+}
+
 // serve adapts the raw-handler contract (writes into a caller-owned buffer) to
 // the return-a-buffer shape the assertions expect.
 fn serve(req []u8) ![]u8 {

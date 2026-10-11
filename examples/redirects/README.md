@@ -121,8 +121,8 @@ v test examples/redirects/src
 [main_test.v](src/main_test.v) calls `handle` directly: `safe_next` on
 relative, protocol-relative, absolute and empty targets; the 301 with and
 without a query; the 308 on POST; the 303 with a good, off-site, empty and
-missing `next`; `GET /login` and unknown paths as 200; and `.close` on a
-malformed request.
+missing `next`; `GET /login` and unknown paths as 200; `.close` on a
+malformed request; and that no route allocates.
 
 ## See also
 
