@@ -29,13 +29,13 @@ const resp_503 = 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConne
 
 const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'
 
-const resp_json_head = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '.bytes()
+const resp_json_head = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '
 
-const resp_json_sep = '\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const resp_json_sep = '\r\nConnection: keep-alive\r\n\r\n'
 
-const row_id_key = '{"id":'.bytes()
+const row_id_key = '{"id":'
 
-const row_name_key = ',"name":'.bytes()
+const row_name_key = ',"name":'
 
 // DbState is one worker's make_state value: its connection pool and a render
 // scratch for the JSON body, reused by every response on that worker.
@@ -179,17 +179,17 @@ fn on_db_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload vo
 			st.body << `,`
 		}
 		first = false
-		wb(mut st.body, row_id_key)
+		core.append_str(mut st.body, row_id_key)
 		wi(mut st.body, row.int4(0) or { -1 })
-		wb(mut st.body, row_name_key)
+		core.append_str(mut st.body, row_name_key)
 		json_escape_into(mut st.body, row.text(1) or { []u8{} })
 		st.body << `}`
 	}
 	st.body << `]`
 	st.pool.release(idx)
-	wb(mut out, resp_json_head)
+	core.append_str(mut out, resp_json_head)
 	wi(mut out, st.body.len)
-	wb(mut out, resp_json_sep)
+	core.append_str(mut out, resp_json_sep)
 	wb(mut out, st.body)
 	return .done
 }
