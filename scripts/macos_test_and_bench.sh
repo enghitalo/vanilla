@@ -192,7 +192,7 @@ if begin_example simple examples/simple/src; then
 	check simple "GET /" 200 "$BASE/"
 	check simple "GET /user/42" 200 "$BASE/user/42"
 	check simple "POST /user" 201 -X POST "$BASE/user"
-	check simple "GET /nope (fallback)" 400 "$BASE/nope"
+	check simple "GET /nope (404)" 404 "$BASE/nope"
 	end_example
 fi
 

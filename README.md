@@ -217,9 +217,9 @@ fn main() {
 | Directory | Description |
 |---|---|
 | `examples/tiny/` | Minimal "Hello, World!" — the benchmark target |
-| `examples/simple/` | Basic CRUD routing |
-| `examples/simple2/` | CRUD with helper utilities |
-| `examples/simple3/` | CRUD with a response builder |
+| `examples/simple/` | Basic CRUD routing on `string` views of the request |
+| `examples/simple2/` | The same routes routed by byte offsets in place, the id a zero-copy `[]u8` view |
+| `examples/simple3/` | simple's routes as methods on an `App` struct that holds shared resources (a SQLite pool) |
 | `examples/auth/` | Argon2id password hashing (RFC 9106), JWT with `exp` (HMAC-SHA256), API key auth |
 | `examples/chunked_streaming/` | Chunked transfer encoding |
 | `examples/compression/` | `Accept-Encoding` negotiation over precompressed brotli/zstd/gzip const responses |
