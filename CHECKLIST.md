@@ -10,8 +10,6 @@ Each item carries a status in its heading:
 - **✅ RESOLVED** — done; the entry says where it lives and what tests it.
 - **🟡 PARTIAL** — mostly done; the entry lists only what remains.
 - **🔴 OPEN** — not done yet.
-- **⚪ OBSOLETE** — the premise no longer applies (the code or the design moved
-  on); the entry says what replaced it.
 
 Open work links its GitHub issue. Code sketches follow
 [docs/BEST_PRACTICES.md](docs/BEST_PRACTICES.md): handlers are `core.Handler`s
@@ -38,14 +36,6 @@ concatenates, interpolates or allocates per request. The
 ---
 
 ## 🔴 Critical Bugs (MUST FIX)
-
-### 1. Undefined Function `vmemcmp` — ⚪ OBSOLETE
-- **Premise:** `vmemcmp` was never undefined: it is a V builtin
-  (`vlib/builtin/cfns_wrapper.c.v`), still used in `server/backend_poll`,
-  `server/backend_epoll` and `pg_async`.
-- **Today:** `http1_1/request_parser/request_parser.v` no longer calls it;
-  header lookup (`get_header_value_slice`) compares with `ascii_ci_eq`, and the
-  other byte compares use `C.memcmp`.
 
 ### 2. Dynamic Route Matching — ✅ RESOLVED
 - **Resolution:** routing moved from the example into two library modules,
@@ -143,17 +133,6 @@ concatenates, interpolates or allocates per request. The
   truncated escapes, `+` both ways, decode-once, NUL/CR/LF, zero heap growth
   over 20k calls).
 - **PRs:** #279 (empty key), #286 (`has_query`), #289 (`percent_decode_into`).
-
-### 6. Add Standard HTTP Status Codes — ⚪ OBSOLETE
-- **Premise:** a library table of status-line consts
-  (`'HTTP/1.1 200 OK\r\n'`) only makes sense if handlers concatenate the rest
-  of the response. They don't: [BEST_PRACTICES §3a](docs/BEST_PRACTICES.md#3a-static-responses--a-const-string-appended-with-coreappend_str)
-  has each app write its complete responses (status line + headers + body) as
-  `const` strings appended with `core.append_str`, and dynamic ones appended
-  part by part (§3b).
-- **Today:** `http1_1/response/response.c.v` holds the server's own complete
-  responses (100, 400, 408, 413, 431, 444); `http1_1/veb_like` has its 404,
-  405 and 501.
 
 ### 8. Header Injection Utility — ✅ RESOLVED (in the examples)
 - **Resolution:** header injection is a wrapper around the handler that
@@ -350,17 +329,6 @@ concatenates, interpolates or allocates per request. The
 - **Optional:** a coverage-guided fuzzer, and an ASan/UBSan CI job
   (`race_detector.yml` is TSan only).
 
-### 26. Consistent Error Handling — ⚪ OBSOLETE
-- **Premise:** "always `!`" would put an allocation on every hot-path failure.
-- **Today:** a deliberate two-style convention
-  ([BEST_PRACTICES §4](docs/BEST_PRACTICES.md#4-allocate-on-the-hot-path-with-intent),
-  [V_PERF_TOOLBOX](docs/V_PERF_TOOLBOX.md#v-allocation-gotchas-filed-upstream--all-fixed)):
-  hot paths return int sentinels (`frame_request_length_lim_idx` → -1 / -400 /
-  -413 / -431, `find_byte_idx`), with a `!` wrapper (`frame_request_length_lim`,
-  `error_with_code`) for callers off the hot path; `error()` with context
-  elsewhere. Tested by `test_frame_idx_error_sentinels` and
-  `test_frame_wrapper_codes_match_idx`.
-
 ### 27. Replace Magic Numbers with Constants — ✅ RESOLVED
 - **Resolution:** the tunables are `core.Limits` fields; each backend names its
   own sizes (`sm_*`, `read_buf_cap`, `write_buf_cap` in `server/backend_epoll`,
@@ -398,21 +366,6 @@ concatenates, interpolates or allocates per request. The
   h2c takeover state never freed under `-gc none`
   ([#269](https://github.com/enghitalo/vanilla/issues/269)); kqueue allocates
   per connection and per request (#154).
-
-### 32. Response Caching — ⚪ OBSOLETE (as designed)
-- **Premise:** a process-wide `map` behind a `sync.Mutex` on the hot path goes
-  against [BEST_PRACTICES §6](docs/BEST_PRACTICES.md#6-concurrency-no-shared-mutable-state-without-protection)
-  (shared-nothing, lock-free workers).
-- **Covered by:** `const` complete responses (§3a); `static_assets/` (a
-  build-once, lock-free asset server with precomputed responses, ETag, 304 and
-  206, bodies optionally in RAM, snapshots published atomically with
-  `follow_disk`; PRs #73, #80, #81, #180); `examples/etag/` (dynamic
-  `If-None-Match` → 304); the cached `Date` line (`examples/date_header`,
-  `examples/efficient_date`).
-- **If a TTL cache for dynamic responses is ever needed:** keep it per worker
-  (built in `make_state`, reached through `worker_state`), so lookups take no
-  lock. The cache example request is
-  [#3](https://github.com/enghitalo/vanilla/issues/3).
 
 ---
 
@@ -667,10 +620,8 @@ Open and partial items only.
 ## 🎯 Implementation Roadmap
 
 ### Phase 1: Foundation
-- [x] #1 - vmemcmp (obsolete)
 - [x] #2 - Dynamic routing
 - [x] #5 - Query string parsing
-- [x] #6 - HTTP status codes (obsolete)
 - [x] #8 - Header injection
 
 ### Phase 2: TLS/HTTPS
@@ -695,11 +646,9 @@ Open and partial items only.
 
 ### Phase 5: Quality & Testing
 - [x] #25 - Bounds checking
-- [x] #26 - Error handling (obsolete)
 - [x] #27 - Magic numbers
 - [x] #28 - Dead code
 - [x] #29 - Response buffers
-- [x] #32 - Response caching (obsolete)
 - [x] #38 - Parser tests
 - [ ] #39 - Soak test
 - [ ] #40 - Consistent example tests (#130)
@@ -716,16 +665,14 @@ Open and partial items only.
 
 ## 📈 Progress Tracking
 
-### Resolved: 29/37 (78%)
-- ✅ 25 done: #2, #3, #5, #8, #10, #11, #15, #17, #18, #20, #21 (except
-  kqueue), #25, #27, #28, #29, #33, #35, #36, #37, #38, #41, #42, #43, #45,
-  #46
-- ⚪ 4 obsolete: #1, #6, #26, #32
+### Resolved: 25/33 (76%)
+#2, #3, #5, #8, #10, #11, #15, #17, #18, #20, #21 (except kqueue), #25, #27,
+#28, #29, #33, #35, #36, #37, #38, #41, #42, #43, #45, #46
 
-### Partial: 6/37 (16%)
+### Partial: 6/33 (18%)
 #16, #19, #23, #39, #40, #44
 
-### Open: 2/37 (5%)
+### Open: 2/33 (6%)
 #4, #34
 
 ---
