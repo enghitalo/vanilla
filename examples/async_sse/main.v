@@ -6,8 +6,7 @@ module main
 // continuation that wrote bytes before returning `.suspend` has them flushed
 // immediately (not buffered until `.done`), the client receives each event the
 // instant it is produced. The single worker keeps serving everyone else between
-// ticks, so thousands of open streams cost ~one timerfd + a small struct each,
-// not a thread each.
+// ticks, so thousands of open streams cost one timerfd each, not a thread each.
 //
 // This stream is finite (5 ticks, then "bye"), so the client must be able to
 // see where it ends. Each event goes out as one HTTP chunk
@@ -35,14 +34,8 @@ fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
 fn C.read(fd int, buf voidptr, count usize) int
 
-// Stream is the per-connection cursor, carried across ticks via watch_payload — ONE
-// heap allocation for the whole stream, freed when it ends (not per event).
-struct Stream {
-mut:
-	tfd  int // the periodic timerfd this stream is parked on
-	sent int // events emitted so far
-	max  int // end the stream after this many
-}
+// max_events ends the stream after this many ticks.
+const max_events = 5
 
 const sse_headers = 'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n'
 
@@ -126,44 +119,42 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
 	}
 	tfd := C.timerfd_create(C.CLOCK_MONOTONIC, 0)
 	arm_periodic(tfd, 1000) // one event per second
-	st := &Stream{
-		tfd:  tfd
-		sent: 0
-		max:  5
-	}
 	// Headers go out NOW: async_serve flushes the write buffer after the initial
 	// .suspend, so the client sees `200 text/event-stream` before any tick.
 	core.append_str(mut out, sse_headers)
-	event_loop.watch_fd(tfd, .readable, sse_tick, voidptr(st))
+	// The stream's only state is the number of events sent, carried in
+	// watch_payload itself (none yet): nothing is allocated per stream.
+	event_loop.watch_fd(tfd, .readable, sse_tick, unsafe { nil })
 	return .suspend
 }
 
 // sse_tick fires once per timer expiry: emit one event and re-arm. The appended
 // bytes are flushed on .suspend (the streaming primitive), so each event ships
-// immediately instead of waiting for the stream to finish.
+// immediately instead of waiting for the stream to finish. watch_payload is the
+// number of events sent so far (an integer, not a pointer), and ready_fd is the
+// stream's timerfd.
 fn sse_tick(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
 	C.read(ready_fd, &tmp[0], 8) // drain the timerfd expiry count
-	mut st := unsafe { &Stream(watch_payload) }
-	st.sent++
+	sent := int(usize(watch_payload)) + 1
 	// One chunk: `<size in hex>\r\n<event>\r\n`. The size is the literal parts
 	// plus the digits of the two counters.
-	size := tick_head.len + strconv.dec_digits(u64(st.sent)) + tick_of.len +
-		strconv.dec_digits(u64(st.max)) + event_end.len
+	size := tick_head.len + strconv.dec_digits(u64(sent)) + tick_of.len +
+		strconv.dec_digits(u64(max_events)) + event_end.len
 	wx(mut out, size)
 	core.append_str(mut out, '\r\n')
 	core.append_str(mut out, tick_head)
-	wi(mut out, st.sent)
+	wi(mut out, sent)
 	core.append_str(mut out, tick_of)
-	wi(mut out, st.max)
+	wi(mut out, max_events)
 	core.append_str(mut out, event_end)
 	core.append_str(mut out, '\r\n')
-	if st.sent >= st.max {
+	if sent >= max_events {
 		core.append_str(mut out, bye_and_end)
-		C.close(st.tfd) // request owns the timerfd; closing it removes it from epoll
+		C.close(ready_fd) // request owns the timerfd; closing it removes it from epoll
 		return .done // the body is complete; the connection stays open
 	}
-	event_loop.watch_fd(st.tfd, .readable, sse_tick, watch_payload) // keep streaming
+	event_loop.watch_fd(ready_fd, .readable, sse_tick, voidptr(usize(sent))) // keep streaming
 	return .suspend
 }
 

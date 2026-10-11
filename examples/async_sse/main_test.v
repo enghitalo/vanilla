@@ -25,10 +25,21 @@ const events_req = 'GET /events HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
 
 const missing_req = 'GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
 
+// Armed is the watch a test loop records: record_register finds it through
+// EventLoop.reactor, which the test loop never hands to a real reactor.
+struct Armed {
+mut:
+	fd      int = -1
+	payload voidptr
+}
+
 // record_register stands in for the backend's watch registration: it records
-// the fd the way the reactor does, and arms nothing.
+// the fd the way the reactor does, plus the payload, and arms nothing.
 fn record_register(mut event_loop core.EventLoop, ext_fd int, interest core.WatchInterest, continuation core.WakeFn, watch_payload voidptr) {
 	event_loop.last_watched = ext_fd
+	mut armed := unsafe { &Armed(event_loop.reactor) }
+	armed.fd = ext_fd
+	armed.payload = watch_payload
 }
 
 // dechunk decodes a chunked body that starts at `start` (RFC 9112 §7.1),
@@ -118,59 +129,106 @@ fn test_sse_tick_frames_each_event_as_a_chunk_and_ends_the_body() {
 	assert rc == 0
 	rfd := int(fds[0])
 	wfd := int(fds[1])
-	st := &Stream{
-		tfd: rfd
-		max: 5
-	}
+	mut armed := Armed{}
 	mut event_loop := core.EventLoop{
+		reactor:  unsafe { voidptr(&armed) }
 		register: record_register
 	}
 	mut out := []u8{}
 	expiry := u64(1)
+	mut payload := unsafe { nil } // what handle arms: no event sent yet
 	for tick in 1 .. 6 {
 		written := C.write(wfd, &expiry, 8) // what a timerfd expiry reads as
 		assert written == 8
 		event_loop.last_watched = -1
-		step := sse_tick(mut out, rfd, false, voidptr(st), unsafe { nil }, mut event_loop)
+		step := sse_tick(mut out, rfd, false, payload, unsafe { nil }, mut event_loop)
 		if tick < 5 {
 			assert step == .suspend, 'tick ${tick}'
 			assert event_loop.last_watched == rfd, 'tick ${tick} must re-arm its timer'
+			assert usize(armed.payload) == usize(tick), 'tick ${tick} must carry its count'
+			payload = armed.payload
 		} else {
 			assert step == .done, 'the last tick ends the request'
 			assert event_loop.last_watched == -1, 'the last tick must not re-arm'
 		}
 	}
-	C.close(wfd) // sse_tick already closed rfd (st.tfd) on the last tick
+	C.close(wfd) // sse_tick already closed rfd (its ready_fd) on the last tick
 	assert out.bytestr() == want_chunks
 	body, end := dechunk(out, 0) or { panic('the body does not end: ${out.bytestr()}') }
 	assert body == want_events
 	assert end == out.len
 }
 
+// The chunk size counts the counter's digits: a count past max_events (which
+// handle never arms) still frames its chunk, then ends the stream.
 fn test_sse_tick_sizes_multi_digit_counters() {
 	mut fds := [2]i32{}
 	rc := C.pipe(unsafe { &fds[0] })
 	assert rc == 0
 	defer {
-		C.close(int(fds[0]))
-		C.close(int(fds[1]))
+		C.close(int(fds[1])) // sse_tick closes fds[0], its ready_fd, as it ends
 	}
-	st := &Stream{
-		tfd:  int(fds[0])
-		sent: 9
-		max:  120
-	}
+	mut armed := Armed{}
 	mut event_loop := core.EventLoop{
+		reactor:  unsafe { voidptr(&armed) }
 		register: record_register
 	}
 	mut out := []u8{}
 	expiry := u64(1)
 	written := C.write(int(fds[1]), &expiry, 8)
 	assert written == 8
-	step := sse_tick(mut out, int(fds[0]), false, voidptr(st), unsafe { nil }, mut event_loop)
-	assert step == .suspend
-	// `data: tick 10 of 120\n\n` is 22 = 0x16 bytes.
-	assert out.bytestr() == '16\r\ndata: tick 10 of 120\n\n\r\n'
+	step := sse_tick(mut out, int(fds[0]), false, voidptr(usize(9)), unsafe { nil }, mut
+		event_loop)
+	assert step == .done
+	// `data: tick 10 of 5\n\n` is 20 = 0x14 bytes.
+	assert out.bytestr() == '14\r\ndata: tick 10 of 5\n\n\r\n' + bye_and_end
+}
+
+// stream runs one whole /events stream in process: handle's head, then
+// max_events ticks of sse_tick over a pipe that stands in for the timerfd.
+fn stream(mut out []u8, mut event_loop core.EventLoop, mut armed Armed) {
+	unsafe {
+		out.len = 0
+	}
+	handle(events_req, mut out, -1, unsafe { nil }, mut event_loop)
+	C.close(armed.fd) // handle armed a real timerfd; a pipe ticks instead
+	mut fds := [2]i32{}
+	C.pipe(unsafe { &fds[0] })
+	expiry := u64(1)
+	mut payload := armed.payload
+	for _ in 0 .. max_events {
+		C.write(int(fds[1]), &expiry, 8)
+		unsafe {
+			out.len = 0
+		}
+		sse_tick(mut out, int(fds[0]), false, payload, unsafe { nil }, mut event_loop)
+		payload = armed.payload
+	}
+	C.close(int(fds[1])) // the last tick closed fds[0]
+}
+
+// A stream allocates nothing: 2000 of them through one reused buffer must not
+// move the collector's lifetime allocation counter. (The old per-stream state
+// was a heap struct that nothing freed: under -gc none, vanilla's production
+// build, a leak per stream.)
+fn test_stream_allocates_nothing() {
+	$if gcboehm ? {
+		mut out := []u8{cap: 4096}
+		mut armed := Armed{}
+		mut event_loop := core.EventLoop{
+			reactor:  unsafe { voidptr(&armed) }
+			register: record_register
+		}
+		stream(mut out, mut event_loop, mut armed) // warm-up
+		assert out.bytestr().ends_with(bye_and_end)
+		rounds := 2000
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. rounds {
+			stream(mut out, mut event_loop, mut armed)
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert grown < 4096, 'the stream allocated ${grown} bytes over ${rounds} streams'
+	}
 }
 
 // On the wire: the stream must end where the chunked framing says it does, and

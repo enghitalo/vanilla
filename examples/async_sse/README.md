@@ -5,8 +5,8 @@ periodic `timerfd` drives the stream: each time it fires, the continuation
 appends one event and re-arms. Bytes a continuation appends before returning
 `.suspend` are flushed right away, not held until `.done`, so the client gets
 each event the moment it is produced. Between ticks the worker serves
-everyone else; an open stream costs a timerfd and a small struct, not a
-thread.
+everyone else; an open stream costs a timerfd, not a thread, and nothing is
+allocated for it.
 
 The stream is finite, so the client must see where it ends: each event is one
 HTTP chunk (`Transfer-Encoding: chunked`) and a zero-size chunk ends the body
@@ -83,24 +83,27 @@ all finished in `real 0m5.182s`: the timers overlap.
 ## How it works
 
 - **Headers first, then park.** `handle` creates a `CLOCK_MONOTONIC`
-  timerfd armed periodic at 1 s (`arm_periodic`), allocates one `Stream`
-  (`tfd`, `sent`, `max: 5`) for the whole stream, appends the `sse_headers`
+  timerfd armed periodic at 1 s (`arm_periodic`), appends the `sse_headers`
   const and calls
-  `event_loop.watch_fd(tfd, .readable, sse_tick, voidptr(st))` before
-  returning `.suspend`. The headers are flushed with that first suspend, so
+  `event_loop.watch_fd(tfd, .readable, sse_tick, unsafe { nil })` before
+  returning `.suspend`. The stream's only state is the number of events sent,
+  and it rides in `watch_payload` itself, as an integer (0 here): no struct
+  per stream, nothing to free. The timerfd is the continuation's `ready_fd`,
+  and the stream length is the `max_events` const. The headers are flushed with that first suspend, so
   the client sees `200 text/event-stream` before any tick.
 - **Append, flush, suspend.** `sse_tick` drains the timerfd and appends one
   chunk: the hex size (`wx`), then `data: tick N of M\n\n` built from consts
   and `wi` digits, then CRLF. The size is computed up front from the literal
   parts' lengths plus `strconv.dec_digits` of the two counters. It re-watches
-  the same fd and returns `.suspend`, which flushes the chunk.
+  the same fd with the new count as the payload and returns `.suspend`,
+  which flushes the chunk.
 - **End the body, keep the connection.** On the last tick it appends
   `bye_and_end` (the `bye` chunk and the zero-size chunk in one const),
   closes the timerfd (the request owns it) and returns `.done`. Without the
   chunked framing the body would be close-delimited, and on a keep-alive
   connection the client would wait forever.
 - **Disconnects.** If the client goes away mid-stream, the runtime closes the
-  request-owned timerfd; the `Stream` is left to the GC.
+  request-owned timerfd; there is nothing else to release.
 - No `${}` anywhere on the path: the event text is consts plus `wi`/`wx`
   appends into `out`
   ([BEST_PRACTICES §3b](../../docs/BEST_PRACTICES.md#3b-dynamic-responses--append-parts-straight-into-out)).
@@ -115,7 +118,7 @@ v test examples/async_sse
 drives `sse_tick` directly with a pipe standing in for the timerfd: five
 ticks produce five byte-exact chunks, the `bye` chunk and the terminator,
 re-arming on every tick but the last; two- and three-digit counters size
-their chunk correctly. On a live server through [vtest](../../docs/VTEST.md)
+their chunk correctly; and a whole stream allocates nothing. On a live server through [vtest](../../docs/VTEST.md)
 the stream ends where its framing says, the same connection then answers a
 404, and a malformed request gets the 400 and a closed connection.
 
