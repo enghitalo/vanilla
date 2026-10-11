@@ -2,6 +2,7 @@ module main
 
 import core
 import http1_1.request_parser
+import http1_1.response
 import net
 
 // SOLUTION: the trust rule is pure over an INJECTED peer — real_client_ip
@@ -208,9 +209,14 @@ fn test_proxy_aware_allocates_nothing() ! {
 	}
 }
 
-fn test_malformed_request_errors() {
-	// Malformed input must surface as a handler error, never a response.
-	if _ := serve('garbage'.bytes()) {
-		assert false, 'garbage request must not produce a response'
+fn test_malformed_request_gets_400_and_close() {
+	// Malformed input gets the canned 400 and `.close` (serve() would report
+	// the close as an error, so drive handle directly to see the bytes).
+	for bad in ['garbage', 'GET / HT'] {
+		mut out := []u8{}
+		mut event_loop := core.EventLoop{}
+		step := handle(bad.bytes(), mut out, -1, unsafe { nil }, mut event_loop)
+		assert step == .close, bad
+		assert out == response.tiny_bad_request_response, bad
 	}
 }

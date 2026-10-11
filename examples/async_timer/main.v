@@ -2,10 +2,10 @@ module main
 
 // Async-runtime example (no database needed): the smallest consumer of the
 // opt-in `watch(fd)+continuation` primitive. `/delay?ms=N` PARKS the request on
-// a `timerfd` and replies "delayed" when it fires — the single worker keeps
-// serving other connections meanwhile, so N concurrent /delay requests overlap
-// instead of serializing. N defaults to 200 and is capped at 10 s. Every other
-// path replies immediately.
+// a `timerfd` and replies "delayed" when it fires — its worker keeps serving
+// other connections meanwhile, so N concurrent /delay requests overlap instead
+// of serializing, even on one worker (VANILLA_WORKERS=1). N defaults to 200
+// and is capped at 10 s. Every other path replies immediately.
 //
 // Run:   v run examples/async_timer/
 // Try:   curl 'http://localhost:8091/delay?ms=300'

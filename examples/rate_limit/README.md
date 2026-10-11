@@ -28,6 +28,7 @@ curl -i localhost:3000/
 ```
 HTTP/1.1 200 OK
 Content-Type: application/json
+RateLimit-Limit: 20
 RateLimit-Remaining: 19
 Content-Length: 11
 
@@ -51,14 +52,13 @@ curl -i localhost:3000/
 ```
 HTTP/1.1 429 Too Many Requests
 Retry-After: 1
-RateLimit-Limit: 10
+RateLimit-Limit: 20
 RateLimit-Remaining: 0
 Content-Length: 0
 ```
 
-`RateLimit-Limit: 10` is a literal in `response_429` while the burst is 20,
-and the 200 carries no `RateLimit-Limit` at all
-([#294](https://github.com/enghitalo/vanilla/issues/294)).
+`RateLimit-Limit` is the bucket's capacity, the burst a client can spend at
+once; `RateLimit-Remaining` is what is left of it.
 
 Forging `X-Forwarded-For` does not buy a fresh bucket, because the peer
 (`127.0.0.1`) is not a trusted proxy:
@@ -114,9 +114,10 @@ sleep 1; for i in $(seq 12); do curl -s -o /dev/null -w '%{http_code} ' localhos
 - **One limiter for all workers.** The handler is a closure over a single
   `&Limiter`, so its map is guarded by a `sync.Mutex`
   ([BEST_PRACTICES §6](../../docs/BEST_PRACTICES.md#6-concurrency-no-shared-mutable-state-without-protection)).
-- **Responses.** The 429 is a `const`; the 200 is `response_200_prefix`, the
-  remaining count written by `wi` (`strconv.write_dec` into a stack scratch),
-  and `response_200_tail`
+- **Responses.** Both are consts around decimal writes: the limit, written
+  from the limiter's own `capacity` so it cannot drift from the configured
+  burst, and on the 200 the remaining count. `wi` writes each one
+  (`strconv.write_dec` into a stack scratch)
   ([BEST_PRACTICES §3b](../../docs/BEST_PRACTICES.md#3b-dynamic-responses--append-parts-straight-into-out)).
   A client that already has a bucket costs no allocation; only a new client's
   bucket is an insert, bounded by `max_buckets`.
@@ -133,11 +134,12 @@ drops full buckets and never changes a decision, that the table cap fails
 closed, and the identity rules (empty default trust list, `X-Forwarded-For`
 ignored from untrusted peers, right-most untrusted hop behind a trusted proxy,
 a non-IPv4 client hop keyed on the proxy, edge cases); `handle` is fed raw
-requests for the exact 200 framing, the const 429 and the `.close` on a
-malformed request. `test_rate_limit_allocates_nothing` checks that a client
-that already has a bucket, allowed or denied, keyed on a real loopback peer,
-and the trusted-proxy hop scan allocate nothing (a `gc_heap_usage()` delta
-over 20k rounds).
+requests for the exact 200 and 429 bytes (the limit is the capacity of the
+limiter under test) and the canned 400 with `.close` on a malformed request.
+`test_rate_limit_allocates_nothing` checks that a client that already has a
+bucket, allowed or denied, keyed on a real loopback peer, and the
+trusted-proxy hop scan allocate nothing (a `gc_heap_usage()` delta over 20k
+rounds).
 [server_end_to_end_test.v](src/server_end_to_end_test.v) (Linux)
 sends ten requests with a different forged header each over a real socket:
 three pass, seven get 429, and only one bucket (`127.0.0.1`) exists.

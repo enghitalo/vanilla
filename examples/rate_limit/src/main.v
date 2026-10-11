@@ -122,11 +122,17 @@ fn math_min(a f64, b f64) f64 {
 }
 
 // ---- responses (consts — the hot path appends, never builds) ----------------
-// The 429 is FULLY static; the 200 only varies in `RateLimit-Remaining`, so it
-// splits into two consts around one decimal write. The body `{"ok":true}` is
-// fixed (11 bytes), which makes Content-Length a compile-time constant too.
-const response_429 = 'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nRateLimit-Limit: 10\r\nRateLimit-Remaining: 0\r\nContent-Length: 0\r\n\r\n'
-const response_200_prefix = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nRateLimit-Remaining: '
+// Both responses carry `RateLimit-Limit`, the bucket's capacity (the burst a
+// client can spend at once), and `RateLimit-Remaining`. The limit is written
+// from the Limiter's own `capacity`, so it cannot drift from the configured
+// burst; the 200's remaining count is the only other varying part. Each
+// response is consts around those decimal writes. The 429 has no body and the
+// 200's body `{"ok":true}` is fixed (11 bytes), so both Content-Lengths are
+// constants.
+const response_429_head = 'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nRateLimit-Limit: '
+const response_429_tail = '\r\nRateLimit-Remaining: 0\r\nContent-Length: 0\r\n\r\n'
+const response_200_head = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nRateLimit-Limit: '
+const response_200_mid = '\r\nRateLimit-Remaining: '
 const response_200_tail = '\r\nContent-Length: 11\r\n\r\n{"ok":true}'
 
 // wi appends n's decimal digits into `out` — itoa into a stack scratch, then
@@ -286,11 +292,18 @@ fn handle(req_buffer []u8, mut out []u8, client_fd int, _worker_state voidptr, m
 	// exactly what elapsed-time refill needs (time.now() reads CLOCK_REALTIME
 	// and pays localtime_r per call).
 	allowed, remaining := limiter.allow(key, i64(time.sys_mono_now()))
+	// capacity is set once at construction and never written after, so it is
+	// read here without the limiter's lock.
+	limit := i64(limiter.capacity)
 	if !allowed {
-		core.append_str(mut out, response_429)
+		core.append_str(mut out, response_429_head)
+		wi(mut out, limit)
+		core.append_str(mut out, response_429_tail)
 		return .done
 	}
-	core.append_str(mut out, response_200_prefix)
+	core.append_str(mut out, response_200_head)
+	wi(mut out, limit)
+	core.append_str(mut out, response_200_mid)
 	wi(mut out, remaining)
 	core.append_str(mut out, response_200_tail)
 	return .done

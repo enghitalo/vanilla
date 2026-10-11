@@ -14,9 +14,10 @@ module main
 // Run:   v run examples/efficient_date/
 // Try:   curl -i http://localhost:8096/        # note the Date header
 //
-// A background timerfd could refresh the cache proactively instead of lazily,
-// but that needs a worker-start hook for a watch not tied to any request — a
-// noted async-runtime follow-up. Lazy refresh is simpler and just as cheap.
+// A timerfd on each worker's loop could refresh the cache proactively instead
+// of lazily: ServerConfig.on_worker_start arms one per worker, and
+// examples/async_date_timerfd does exactly that. Lazy refresh needs no timer
+// at all and is just as cheap.
 import server
 import core
 import time

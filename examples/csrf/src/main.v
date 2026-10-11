@@ -6,14 +6,16 @@ module main
 // a state-changing request to your site, riding on the victim's cookies. The
 // defense is to require a secret the attacker's site cannot read or guess.
 //
-// TWO STANDARD PATTERNS (both shown):
+// TWO LAYERS (both used here):
 //   1. SameSite cookies — the first line of defense (see cookies_sessions).
 //      `SameSite=Lax/Strict` stops the cookie from being sent on cross-site
 //      POSTs at all. Necessary but pair it with a token for defense in depth.
-//   2. Double-submit / synchronizer token — issue a random CSRF token, deliver
-//      it in BOTH a cookie and the page; state-changing requests must echo it
-//      in a header/form field. The attacker's site can't read the cookie (same-
-//      origin policy), so it can't forge the matching header.
+//   2. Double-submit token — `GET /form` issues a random CSRF token in a
+//      cookie (the response body is empty); state-changing requests must echo
+//      it in the `X-CSRF-Token` header, which same-origin JS copies from the
+//      cookie. The attacker's site can't read the cookie (same-origin policy),
+//      so it can't forge the matching header. (The synchronizer-token pattern
+//      keeps the token server-side, in the session, instead; not shown here.)
 //
 // RULES:
 //   - Only enforce on UNSAFE methods (POST/PUT/PATCH/DELETE). GET/HEAD must be
@@ -49,8 +51,7 @@ const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\
 
 // GET /form response = const head + 64 hex token bytes + const tail. The token
 // cookie is readable by same-origin JS (to copy into the request header), so
-// NOT HttpOnly for the double-submit variant; the synchronizer variant keeps
-// it server-side instead.
+// it is NOT HttpOnly: double-submit needs the page's script to read it.
 const form_head = 'HTTP/1.1 200 OK\r\nSet-Cookie: csrf='
 const form_tail = '; Secure; SameSite=Strict; Path=/\r\nContent-Type: text/html\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 

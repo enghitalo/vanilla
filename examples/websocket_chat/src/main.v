@@ -22,7 +22,9 @@ module main
 // generation: a message posted to a member who has just left is dropped on
 // its worker, never delivered to the connection that reuses the fd number.
 //
-// Run:   v run examples/websocket_chat/src
+// Run:   v -prod run examples/websocket_chat/src
+//        (-prod: a tcc build, V's default without it, leaves the takeover
+//        inert and /chat answers 501)
 // Try:   two websocket clients (websocat ws://localhost:3000/chat?name=ana and
 //        ws://localhost:3000/chat?name=bo), then type in either.
 import core
