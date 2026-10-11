@@ -230,6 +230,12 @@ fn test_video_not_a_regular_file_is_missing() {
 
 // --- the point of the design: serving allocates nothing ----------------------
 
+// fstat(2) writes this platform's struct stat into the stack array the
+// handler reserves for it: it must fit.
+fn test_stat_buffer_holds_struct_stat() {
+	assert sizeof(C.stat) <= stat_words * 8
+}
+
 // Every route but /webcam (which registers a viewer and starts the capture
 // thread) runs 20k times through one reused `out`, as a worker would serve
 // them; the collector's lifetime allocation counter must not move. (Under

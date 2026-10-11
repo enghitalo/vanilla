@@ -38,6 +38,11 @@ import strconv
 
 fn C.fstat(fd int, buf &C.stat) int
 
+// stat_words sizes the stack room fstat(2) writes its struct into: 256 bytes,
+// more than any platform's `struct stat` (144 on Linux x86_64 and macOS). A
+// test checks it.
+const stat_words = 32
+
 const sample_video = 'sample.mp4'
 
 // Cap each 206 chunk so a Range request can never pull an unbounded slice into
@@ -158,8 +163,13 @@ fn serve_video(req request_parser.HttpRequest, req_buffer []u8, path string, mut
 	defer {
 		C.close(fd)
 	}
-	mut sb := C.stat{}
-	if C.fstat(fd, &sb) != 0 || sb.st_mode & os.s_ifmt != os.s_ifreg {
+	// The struct lives in a bare fixed array, read through a pointer. A
+	// `C.stat{}` local handed to C.fstat is moved to the heap on every call
+	// where V declares C.stat with a fixed-array field (macOS: st_qspare); see
+	// docs/V_PERF_TOOLBOX.md.
+	mut stat_buf := [stat_words]u64{}
+	sb := unsafe { &C.stat(voidptr(&stat_buf[0])) }
+	if C.fstat(fd, sb) != 0 || sb.st_mode & os.s_ifmt != os.s_ifreg {
 		core.append_str(mut out, video_missing)
 		return
 	}
