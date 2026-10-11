@@ -258,7 +258,7 @@ fn main() {
 | `examples/async_db_pg/` | PostgreSQL queries via async handler |
 | `examples/pg_transactions/` | An atomic PostgreSQL transaction in one round trip (`async_submit_batch`), run again on a serialization failure (40001) as `pg_async.TxRetry` decides |
 | `examples/async_timer/` | Async per-request timer |
-| `examples/io_uring_demo/` | Backend selection through `ServerConfig.io_multiplexing` (runs epoll as shipped; set `.io_uring` on Linux) |
+| `examples/io_uring_demo/` | Backend selection through `ServerConfig.io_multiplexing`: io_uring on Linux where the process can use it, epoll otherwise |
 
 ---
 

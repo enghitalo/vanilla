@@ -4,11 +4,10 @@ A hello-world server whose point is the `io_multiplexing` field of
 `server.ServerConfig`: the handler is the same on every backend, and the
 backend (epoll, io_uring, kqueue, IOCP) is a single config value.
 
-**As written it does not run on io_uring.** [main.v](src/main.v) passes
-`unsafe { server.IOBackend(0) }`, the first value of the per-OS enum: `epoll`
-on Linux, `kqueue` on macOS. That is also why it builds and runs everywhere
-(CI runs it on macOS too). To try io_uring, change that line to
-`io_multiplexing: .io_uring` (Linux only), as shown below.
+On Linux it runs on **io_uring** when this process can use it, and falls
+back to epoll when it cannot (`pick_backend` in [main.v](src/main.v)).
+Elsewhere it uses the platform's only backend: kqueue on macOS, IOCP on
+Windows.
 
 ## Run
 
@@ -32,25 +31,55 @@ Connection: keep-alive
 Hello, World!
 ```
 
-**On io_uring.** With `io_multiplexing: .io_uring` the startup line says so
-and the replies are byte-identical:
+The startup lines say which backend serves it. On a 16-CPU machine running
+Linux 7.1 with the common 8 MiB locked-memory limit (`ulimit -l` 8192), after
+the listeners' `[socket]` lines:
 
 ```
+io_uring: 16 rings of 16384 SQ entries do not fit half of RLIMIT_MEMLOCK (`ulimit -l`); every worker starts at 2048 (fell back from 16384)
 listening on http://localhost:3000/ (io_uring)
 ```
 
-The backend needs a kernel with io_uring that is not disabled
-(`/proc/sys/kernel/io_uring_disabled` is `0`) or blocked by a seccomp policy
-(GitHub's hosted runners deny `io_uring_setup`). Each worker owns a ring, and
-rings count against the locked-memory limit (`ulimit -l`): here, with 16
-workers and an 8 MiB limit, one worker failed `io_uring_setup` and the
-process exited. `VANILLA_WORKERS=4` ran cleanly. No liburing is needed: the
-backend makes the raw `io_uring_setup` / `io_uring_enter` syscalls.
+Each worker owns a ring. On kernels that charge ring memory to
+`RLIMIT_MEMLOCK`, a budget per user (up to 5.11, and from 6.14), the backend
+sizes every ring from an even share of half the limit, so that the workers'
+own rings fit, smaller when the limit is tight; 5.12 to 6.13 give every
+worker a full-size ring. Raise the limit (`ulimit -l unlimited`,
+`LimitMEMLOCK=infinity`) for full-size rings everywhere; see
+[PERF_TUNING §7](../../docs/PERF_TUNING.md#7-io_uring-host-requirements).
 
-[probe.c](probe.c) is a separate C check against liburing (`gcc probe.c
--luring`). It reports whether the kernel supports `IORING_OP_ACCEPT`, though
-it prints that as "multishot accept supported": the flag it tests,
-`IO_URING_OP_SUPPORTED`, means the opcode is supported at all, not multishot.
+Where io_uring is unavailable (a kernel without it,
+`kernel.io_uring_disabled`, a seccomp policy that denies `io_uring_setup`
+such as Docker's default or GitHub's hosted runners, or
+`VANILLA_NO_IOURING=1`) the same command serves on epoll, with the same
+bytes:
+
+```
+io_uring is not available to this process; serving on epoll
+listening on http://localhost:3000/
+```
+
+No liburing is needed: the backend makes the raw `io_uring_setup` /
+`io_uring_enter` syscalls.
+
+[probe.c](probe.c) is a separate check, against liburing 2.0 or newer, of what
+the kernel offers the backend:
+
+```sh
+gcc -o probe examples/io_uring_demo/probe.c -luring && ./probe
+```
+
+```
+io_uring: available
+IORING_OP_ACCEPT: supported
+multishot accept: works
+```
+
+The probe's op table has no bit for multishot accept
+(`IO_URING_OP_SUPPORTED` only says the accept opcode exists), so it connects
+to a loopback listener, arms a multishot accept on it and reads the
+completion: a kernel older than 5.19 rejects it with `EINVAL`. The backend
+itself decides by kernel release.
 
 ## How it works
 
@@ -59,6 +88,13 @@ it prints that as "multishot accept supported": the flag it tests,
   appends do not change. On io_uring each worker runs its own ring with its
   own `SO_REUSEPORT` listener; on epoll one acceptor feeds the worker loops
   (see [examples/per_server_workers](../per_server_workers/)).
+- **Pick io_uring only where it runs.** `pick_backend` asks
+  `server.iou_backend_available()`, which sets up one small ring per worker
+  the server will spawn (and closes them), so a host that refuses io_uring,
+  or cannot fit even the smallest rings, serves on epoll instead. It is a
+  check, not a reservation: rings the user's other processes take between
+  the check and the workers' setup still count. `VANILLA_NO_IOURING` forces
+  the epoll path.
 - **The reply is a `const`.** `handle_request` appends `hello_response`, a
   `const` string, with `core.append_str`: no allocation per request, the same
   pattern as [examples/tiny](../tiny/)
