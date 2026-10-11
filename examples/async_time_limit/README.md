@@ -5,8 +5,8 @@
 clock before doing more, and answers `504 Gateway Timeout` as soon as the
 budget is spent. A job that is too big is cut off instead of running away.
 
-This is the cooperative half of per-request time limits: one clock read
-(`time.ticks()`) per resume, no extra watch. It acts only when a step
+This is the cooperative half of per-request time limits: one monotonic clock
+read (`now_ms()`) per resume, no extra watch. It acts only when a step
 resumes. A step whose fd may never become ready (a hung upstream) needs the
 runtime's own deadline as well (see the last bullet below).
 
@@ -56,21 +56,27 @@ real	0m0.356s
 
 - **Per-request state in the payload.** `handle` creates a `CLOCK_MONOTONIC`
   timerfd and arms it periodic at 50 ms (`arm_periodic`). The job's state is
-  two numbers, `start` (`time.ticks()`, in ms) and the steps `left`, and
+  two numbers, `start` (`now_ms()`, in ms) and the steps `left`, and
   `pack_job` packs them into the 64-bit `watch_payload` itself (start in the
   high 48 bits, steps in the low 16, so `steps` is capped at `max_steps`,
   65535, far past what the budget allows): nothing is allocated per request.
   `handle` calls
-  `event_loop.watch_fd(tfd, .readable, tick, pack_job(time.ticks(), parse_steps(r)))`
+  `event_loop.watch_fd(tfd, .readable, tick, pack_job(now_ms(), parse_steps(r)))`
   and returns `.suspend`; every resume gets the payload back, and the
   timerfd as `ready_fd`. The budget itself is the `budget_ms` const.
 - **Check, then work.** `tick` drains the timerfd's expiration count, then
-  unpacks the payload (`unpack_job`) and compares `time.ticks() - start` with
+  unpacks the payload (`unpack_job`) and compares `now_ms() - start` with
   `budget_ms`. Over budget: close the timerfd, answer 504, `.done`.
   Otherwise it counts one step; on the last one it closes the timerfd and
   answers 200; else it re-watches the same fd with one step less packed in
   and returns `.suspend`. The request owns the timerfd: on a client
   disconnect mid-job the runtime closes it.
+- **A monotonic clock.** `now_ms()` reads `CLOCK_MONOTONIC` through
+  `time.sys_mono_now()`. `time.ticks()` would read the wall clock
+  (`gettimeofday`), which an NTP correction or `date -s` can step mid-job:
+  backwards, elapsed goes negative and the 200 counts 20 digits for `-4800`
+  in its `Content-Length`, so the client waits for bytes that never come;
+  forwards, a short job gets a spurious 504.
 - **Dynamic bodies, appended in parts.** Both replies carry the elapsed time.
   `tick` computes the `Content-Length` up front from the literal parts'
   lengths plus `strconv.dec_digits` of each number, then appends the const
@@ -95,7 +101,8 @@ v test examples/async_time_limit
 ```
 
 [main_test.v](main_test.v) unit-tests `parse_steps` (defaults, trailing junk,
-other parameters, the cap) and the payload round trip, checks that a whole
+other parameters, the cap) and the payload round trip, checks that the job
+clock is monotonic, not the wall clock, and that a whole
 job allocates nothing, and drives `tick` directly, with a pipe standing in
 for the timerfd: a step with work left re-arms the same fd with the same
 start and one step fewer, and, with a start time far in the past, the 504's

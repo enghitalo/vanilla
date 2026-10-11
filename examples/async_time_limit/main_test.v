@@ -77,10 +77,10 @@ fn test_parse_steps_reads_the_query() {
 	assert steps_of('/job?steps=99999999999999999999999') == max_steps
 }
 
-// The job state rides in the payload: start keeps its sign and its value for
-// thousands of years either side of 1970, and steps keep all 16 bits.
+// The job state rides in the payload: start keeps its sign and its value
+// across the whole signed 48-bit range, and steps keep all 16 bits.
 fn test_job_payload_round_trips() {
-	now := time.ticks()
+	now := now_ms()
 	for start in [now, now - 12_345_678_901, now + 1, i64(0), i64(-1), -now, (i64(1) << 47) - 1,
 		-(i64(1) << 47)] {
 		for left in [1, 2, 10, max_steps] {
@@ -88,6 +88,21 @@ fn test_job_payload_round_trips() {
 			assert s == start, 'start ${start} (left ${left})'
 			assert l == left, 'left ${left} (start ${start})'
 		}
+	}
+}
+
+// tick measures elapsed time on the monotonic clock, not the wall clock: a
+// wall-clock step mid-job (NTP, `date -s`) must neither make elapsed negative
+// nor cut the job short. CLOCK_MONOTONIC counts from boot, nowhere near the
+// epoch-based time.ticks(), so a regression back to the wall clock fails the
+// first assert.
+fn test_the_job_clock_is_monotonic() {
+	assert now_ms() < time.ticks() / 2, 'now_ms() reads the wall clock'
+	mut prev := now_ms()
+	for _ in 0 .. 1000 {
+		now := now_ms()
+		assert now >= prev
+		prev = now
 	}
 }
 
@@ -104,7 +119,7 @@ fn test_tick_rearms_with_one_step_less() {
 	expiry := u64(1)
 	written := C.write(int(fds[1]), &expiry, 8)
 	assert written == 8
-	start := time.ticks()
+	start := now_ms()
 	mut armed := Armed{}
 	mut event_loop := core.EventLoop{
 		reactor:  unsafe { voidptr(&armed) }
@@ -134,7 +149,7 @@ fn test_tick_frames_the_504_for_any_elapsed_width() {
 			register: record_register
 		}
 		mut out := []u8{}
-		step := tick(mut out, int(fds[0]), false, pack_job(time.ticks() - ago, 10), unsafe { nil }, mut
+		step := tick(mut out, int(fds[0]), false, pack_job(now_ms() - ago, 10), unsafe { nil }, mut
 			event_loop)
 		C.close(int(fds[1])) // tick closed fds[0], its ready_fd
 		assert step == .done
@@ -156,7 +171,7 @@ fn test_tick_frames_the_200_when_the_work_is_done() {
 		register: record_register
 	}
 	mut out := []u8{}
-	step := tick(mut out, int(fds[0]), false, pack_job(time.ticks() - 42, 1), unsafe { nil }, mut
+	step := tick(mut out, int(fds[0]), false, pack_job(now_ms() - 42, 1), unsafe { nil }, mut
 		event_loop)
 	C.close(int(fds[1])) // tick closed fds[0], its ready_fd
 	assert step == .done
