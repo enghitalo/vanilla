@@ -59,16 +59,16 @@ log always agree on it:
 - `METHOD SP PATH` is the request line's prefix, found with two `memchr`
   calls. The log line is assembled around it in a stack buffer, with the
   numbers written by `strconv.write_dec`, without parsing the headers.
-- The `/metrics` body is built in a small buffer, then framed with
-  `core.append_str` and `wi`. That buffer is the example's one allocation, on
-  the scrape route only, because the body must exist before its
-  `Content-Length` is known. The counters are copied under the mutex and
-  formatted outside it.
+- The `/metrics` response goes straight into `out`, with no body buffer: the
+  counters are copied under the mutex, the `Content-Length` is the literals'
+  lengths plus the counters' digit counts (`strconv.dec_digits`), and the
+  body is then written from the same copy, outside the lock. A request
+  allocates nothing (`test_serving_allocates_nothing`).
 
 ## Trade-offs, and where to go next
 
-- **One `println` per request** is a synchronous write to stdout on the
-  request path. That is fine for a demo, or when stdout is a pipe to a log
+- **One `print` per request** (one `write`, newline included) is a
+  synchronous write to stdout on the request path. That is fine for a demo, or when stdout is a pipe to a log
   agent. [`examples/logging`](../logging) shows the production shape: JSON
   lines in a per-worker buffer, written by the worker's timer, with rotation,
   `SIGHUP` and shipping to a collector.
@@ -81,7 +81,7 @@ log always agree on it:
 `src/main_test.v` sends raw requests through the whole `observed()` wrapper,
 with no socket (BEST_PRACTICES §9). It covers the status read-back and its
 bounds, the counts by class, the exposition format and its
-`Content-Length`, the health routes, a malformed request (`400`, counted
+`Content-Length`, that serving allocates nothing, the health routes, a malformed request (`400`, counted
 `4xx`) and a failing handler (`500`, counted `5xx`).
 
 ```sh

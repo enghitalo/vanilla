@@ -22,15 +22,19 @@ module main
 // of the request line up to the 2nd space (two memchr calls, headers never
 // scanned), copied into a stack buffer around the formatted numbers. That
 // example also shows the next step (batched fwrite, no syscall per request);
-// here one println per request keeps the demo portable and simple.
+// here one write per request keeps the demo portable and simple.
 //
 // BYTE DISCIPLINE (docs/BEST_PRACTICES.md §2/§3, docs/V_PERF_TOOLBOX.md):
+// no allocation per request.
 //   - Handlers APPEND into `out` (§1) — no return-a-buffer, no copy.
 //   - Fixed responses are `const` strings appended with `core.append_str`.
 //   - Routing compares the path IN PLACE by offsets (`slice_eq`) — no
 //     `.to_string()`, no match-on-string.
-//   - The /metrics body is framed with `core.append_str`/`wi`/`wu` (append_str + write_dec
-//     into a stack scratch) — zero `${}` in request-serving code.
+//   - The /metrics response goes straight into `out`: its Content-Length is
+//     the literals' lengths plus the counters' digit counts, computed from
+//     the same snapshot the body is then written from, with
+//     `core.append_str`/`wu` (append_str + write_dec into a stack scratch) —
+//     no body buffer, zero `${}` in request-serving code.
 //   - The wrapper reads the status straight from the three digit bytes already
 //     in `out` — no slice expression, no `.bytestr()`, no re-parse.
 //
@@ -69,26 +73,58 @@ fn (mut m Metrics) record(status int) {
 	m.mu.unlock()
 }
 
-// prometheus_body appends the text exposition into `body`: literal metric
-// names + counters written with `wu` — zero `${}`, zero intermediate strings.
-// Counters are snapshotted under the mutex so one scrape sees a consistent
-// set, and the formatting happens outside the critical section.
-fn (mut m Metrics) prometheus_body(mut body []u8) {
+// Counters is one snapshot of the registry, taken under its mutex: one scrape
+// sees a consistent set, and the Content-Length computed from it agrees with
+// the body written from it. The formatting happens outside the critical
+// section.
+struct Counters {
+	requests_total u64
+	status_2xx     u64
+	status_4xx     u64
+	status_5xx     u64
+}
+
+fn (mut m Metrics) snapshot() Counters {
 	m.mu.lock()
-	requests_total := m.requests_total
-	s2 := m.status_2xx
-	s4 := m.status_4xx
-	s5 := m.status_5xx
+	c := Counters{
+		requests_total: m.requests_total
+		status_2xx:     m.status_2xx
+		status_4xx:     m.status_4xx
+		status_5xx:     m.status_5xx
+	}
 	m.mu.unlock()
-	core.append_str(mut body, 'http_requests_total ')
-	wu(mut body, requests_total)
-	core.append_str(mut body, '\nhttp_responses_total{class="2xx"} ')
-	wu(mut body, s2)
-	core.append_str(mut body, '\nhttp_responses_total{class="4xx"} ')
-	wu(mut body, s4)
-	core.append_str(mut body, '\nhttp_responses_total{class="5xx"} ')
-	wu(mut body, s5)
-	core.append_str(mut body, '\n')
+	return c
+}
+
+// The literal parts of the exposition, in order; each counter follows its own.
+const metric_total = 'http_requests_total '
+const metric_2xx = '\nhttp_responses_total{class="2xx"} '
+const metric_4xx = '\nhttp_responses_total{class="4xx"} '
+const metric_5xx = '\nhttp_responses_total{class="5xx"} '
+const metric_end = '\n'
+
+// exposition_len is the byte length of what write_exposition appends for `c`:
+// the literals plus each counter's digit count (strconv.dec_digits, the count
+// write_dec_u writes). The Content-Length goes out first, and the body is
+// written once, straight into `out`.
+fn (c Counters) exposition_len() int {
+	return metric_total.len + strconv.dec_digits(c.requests_total) + metric_2xx.len +
+		strconv.dec_digits(c.status_2xx) + metric_4xx.len + strconv.dec_digits(c.status_4xx) +
+		metric_5xx.len + strconv.dec_digits(c.status_5xx) + metric_end.len
+}
+
+// write_exposition appends the Prometheus text exposition: literal metric
+// names + counters written with `wu` — zero `${}`, zero intermediate strings.
+fn (c Counters) write_exposition(mut out []u8) {
+	core.append_str(mut out, metric_total)
+	wu(mut out, c.requests_total)
+	core.append_str(mut out, metric_2xx)
+	wu(mut out, c.status_2xx)
+	core.append_str(mut out, metric_4xx)
+	wu(mut out, c.status_4xx)
+	core.append_str(mut out, metric_5xx)
+	wu(mut out, c.status_5xx)
+	core.append_str(mut out, metric_end)
 }
 
 // ---- static responses (consts — the handler appends, never builds) ----------
@@ -144,15 +180,20 @@ fn slice_eq(buf []u8, s request_parser.Slice, lit string) bool {
 // the wrapper records the 400 it reads from `out`. The `!` is for the SERVER's
 // failures (a dependency down, a bug), which the wrapper answers with 500.
 fn app(req_buffer []u8, mut m Metrics, mut out []u8) !core.Step {
-	req := request_parser.decode_http_request(req_buffer) or {
+	// decode_into, not decode_http_request: a malformed request would box an
+	// error() per request there.
+	mut req := request_parser.HttpRequest{
+		buffer: req_buffer
+	}
+	if !request_parser.decode_into(mut req) {
 		out << response.tiny_bad_request_response
 		return .close
 	}
-	if slice_eq(req.buffer, req.path, '/healthz') {
+	if slice_eq(req_buffer, req.path, '/healthz') {
 		core.append_str(mut out, resp_healthz)
 		return .done
 	}
-	if slice_eq(req.buffer, req.path, '/readyz') {
+	if slice_eq(req_buffer, req.path, '/readyz') {
 		// Check dependencies here (db ping, etc). Fail -> 503. The not-ready
 		// branch is dead in this demo but it IS the point of /readyz — and as
 		// a const it costs nothing.
@@ -164,16 +205,15 @@ fn app(req_buffer []u8, mut m Metrics, mut out []u8) !core.Step {
 		core.append_str(mut out, resp_not_ready_503)
 		return .done
 	}
-	if slice_eq(req.buffer, req.path, '/metrics') {
-		// The one small allocation in this example, on the SCRAPE route only:
-		// the body must exist before its Content-Length is known. Prometheus
-		// polls every 15-60s — this never runs per client request.
-		mut body := []u8{cap: 160}
-		m.prometheus_body(mut body)
+	if slice_eq(req_buffer, req.path, '/metrics') {
+		// Snapshot first: the Content-Length is computed from the same counters
+		// the body is then written from, so the two agree, and the body goes
+		// straight into `out` — no buffer to build it in first.
+		c := m.snapshot()
 		core.append_str(mut out, metrics_head)
-		wi(mut out, i64(body.len))
+		wi(mut out, c.exposition_len())
 		core.append_str(mut out, '\r\n\r\n')
-		out << body
+		c.write_exposition(mut out)
 		return .done
 	}
 	// Unknown path: this demo answers an empty 200 (kept from day one — a real
@@ -198,13 +238,15 @@ fn status_of(resp []u8, start int) int {
 		11] - `0`)
 }
 
-// log_line assembles 'level=info method=M path=P status=NNN dur_us=N' in a
-// stack buffer and emits it with ONE println. "METHOD SP PATH" comes from two
-// memchr calls over the request-line prefix — no full parse, no heap. The
-// `tos` view over the stack buffer is read-only and MUST NOT escape: println
-// copies the bytes to fd 1 synchronously, then the frame dies. Silently skips
-// a malformed request line or a pathologically long request-target (logging
-// must never break a response).
+// log_line assembles 'level=info method=M path=P status=NNN dur_us=N\n' in a
+// stack buffer and emits it with ONE print: one write, newline included, where
+// println writes the line and its '\n' separately (two writes, which another
+// worker's line can land between). "METHOD SP PATH" comes from two memchr
+// calls over the request-line prefix — no full parse, no heap. The `tos` view
+// over the stack buffer is read-only and MUST NOT escape: print copies the
+// bytes to fd 1 synchronously, then the frame dies. Silently skips a malformed
+// request line or a pathologically long request-target (logging must never
+// break a response).
 @[direct_array_access]
 fn log_line(req_buffer []u8, status int, dur_us i64) {
 	if req_buffer.len < 4 {
@@ -229,9 +271,10 @@ fn log_line(req_buffer []u8, status int, dur_us i64) {
 		path_len := int(&u8(sp2) - &req_buffer[after_method])
 
 		mut line := [512]u8{}
-		// worst case: 4 literals (40 B) + method + path + 3 status digits +
-		// up to 20 for a 64-bit duration — bounded before any write.
-		if method_len + path_len + 64 > line.len {
+		// worst case: 4 literals (40 B) + method + path + the status (3 digits;
+		// up to 5 when its bytes are no digits) + up to 20 for a 64-bit
+		// duration + '\n' — bounded before any write.
+		if method_len + path_len + 66 > line.len {
 			return
 		}
 		mut n := 0
@@ -261,8 +304,10 @@ fn log_line(req_buffer []u8, status int, dur_us i64) {
 		if written > 0 {
 			n += written
 		}
-		// One structured line per request.
-		println(tos(&line[0], n))
+		line[n] = `\n`
+		n++
+		// One structured line per request, in one write.
+		print(tos(&line[0], n))
 	}
 }
 
@@ -282,7 +327,11 @@ fn observed(next fn (req []u8, mut out []u8) !core.Step, mut m Metrics) core.Han
 			// `${}` is sanctioned off the hot path (BEST_PRACTICES §3):
 			// error diagnostics, not request serving.
 			eprintln('level=error err=${err}')
-			out.trim(start_len)
+			// Roll back by length, never out.trim(): trim reallocates `out`,
+			// the connection's write buffer, once it was ever sliced.
+			unsafe {
+				out.len = start_len
+			}
 			core.append_str(mut out, resp_internal_error_500)
 			core.Step.close
 		}
