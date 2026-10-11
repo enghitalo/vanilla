@@ -265,12 +265,13 @@ pipelining are family-agnostic. What changed:
    accepted on the listener by its local address, which for UDS means
    "AF_UNIX and bound to a path" instead of "same TCP port".
 5. **Family guards in [`socket/socket_tcp.c.v`](../socket/socket_tcp.c.v)**:
-   `peer_addr` returns `''` when `sin_family != AF_INET` — without the guard a
-   UDS peer would decode as `"0.0.0.0"` and silently collapse every client
-   into one bucket in `examples/rate_limit` and `examples/ip_block` (`''` =
-   "unknown" is those examples' documented handling of a failed
-   `getpeername`). `local_port` returns `-1` the same way. The UDS-native
-   replacement for IP identity is `socket.peer_cred` (§6).
+   `peer_ipv4` returns `none` (and `peer_addr` `''`) unless the family is
+   `AF_INET` or an IPv4-mapped `AF_INET6` — without the guard a UDS peer would
+   decode as `0.0.0.0` and silently collapse every client into one bucket in
+   `examples/rate_limit` and `examples/ip_block` (`none` = "unknown" is those
+   examples' documented handling of a failed `getpeername`). `local_port`
+   returns `-1` the same way. The UDS-native replacement for IP identity is
+   `socket.peer_cred` (§6).
 6. **Lifecycle**: `Server.shutdown` unlinks the socket file after the drain;
    the unlink-before-bind (item 1) covers non-graceful exits. `bind()` creates
    the file as `0777 & ~umask` and there is no `unix_socket_mode` option:
@@ -352,7 +353,7 @@ zero round trips, and strictly stronger than "it came from 127.0.0.1" (which
 every uid on the box can say). This is how D-Bus, journald and Docker
 authenticate. Kernel ≥ 6.5 adds `SO_PEERPIDFD` for a race-free process handle.
 vanilla exposes it as `socket.peer_cred(fd) ?PeerCred` — `SO_PEERCRED` on
-Linux, `getpeereid` + `LOCAL_PEERPID` on macOS — the sibling of `peer_addr`:
+Linux, `getpeereid` + `LOCAL_PEERPID` on macOS — the sibling of `peer_ipv4`:
 one `getsockopt` when a handler asks, `none` on a TCP socket
 ([`socket/peer_cred_linux.c.v`](../socket/peer_cred_linux.c.v)).
 
@@ -418,9 +419,9 @@ would be a natural `ServerConfig.listener_fd` follow-up.
 - **Megabyte-sized single writes**: raise `SO_SNDBUF` or chunk the writes
   (UDS ignores `SO_RCVBUF`; defaults come from `net.core.wmem_default`, not
   TCP's autotuned buffers — see §2; buffer-sized chunked streaming is fine).
-- **`peer_addr`-keyed logic** (rate limiting, IP blocks) must treat `''` as
-  "unknown transport" and use `socket.peer_cred` on UDS instead (§5 item 5,
-  §6).
+- **`peer_ipv4`-keyed logic** (rate limiting, IP blocks) must treat `none`
+  as "unknown transport" and use `socket.peer_cred` on UDS instead (§5 item
+  5, §6).
 - **Portability**: macOS/BSD — first-class (kqueue identical; `sun_path` 104;
   no abstract namespace; creds via `getpeereid`/`LOCAL_PEERCRED`, which
   `socket.peer_cred` wraps). Windows ≥ 10 1803 —

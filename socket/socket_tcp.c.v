@@ -174,10 +174,10 @@ pub fn accept_client(server_fd int) int {
 	}
 }
 
-// peer_addr returns the remote IPv4 address of a connected socket (e.g.
-// "203.0.113.7"), or '' on error. Call it from a handler only when you need the
-// client IP (rate limiting, proxy trust) — it costs one getpeername syscall and
-// nothing otherwise, keeping the `fn ([]u8, int)` handler contract intact.
+// peer_addr returns the remote IPv4 address of a connected socket as text (e.g.
+// "203.0.113.7"), or '' on error. It ALLOCATES that string on every call, so it
+// does not belong on a request-serving path: handlers use peer_ipv4, which
+// returns the same address as a u32 and allocates nothing.
 pub fn peer_addr(fd int) string {
 	// One body for every platform: ws2_32 exports getpeername and inet_ntop
 	// with the same shapes the unix headers declare.
@@ -196,6 +196,48 @@ pub fn peer_addr(fd int) string {
 		return ''
 	}
 	return unsafe { cstring_to_vstring(&char(&buf[0])) }
+}
+
+// peer_ipv4 returns the remote IPv4 address of a connected socket as a
+// host-order u32 (127.0.0.1 is 0x7f000001), or none when the peer has no IPv4
+// address: a getpeername failure, an AF_UNIX peer, or a plain IPv6 peer. An
+// IPv4-mapped IPv6 peer (::ffff:a.b.c.d, how a dual-stack listener sees an
+// IPv4 client) yields its IPv4 address. Call it from a handler only when you
+// need the client IP (rate limiting, IP blocks, proxy trust): one getpeername
+// syscall, no allocation, and the handler contract stays intact.
+//
+// One body for every platform: the IPv4 address sits at byte 4 of a
+// sockaddr_in and the IPv6 one at byte 8 of a sockaddr_in6 on Linux, macOS and
+// Windows alike, and the family is read through the C struct, which knows
+// where each platform keeps it.
+@[direct_array_access]
+pub fn peer_ipv4(fd int) ?u32 {
+	// Room for a sockaddr_in6 (28 bytes), 8-byte aligned. A longer address
+	// (AF_UNIX) comes back truncated, or as an error on Windows: either way it
+	// is not IPv4.
+	mut a := [4]u64{}
+	mut l := u32(sizeof(a))
+	if C.getpeername(fd, voidptr(&a[0]), &l) != 0 {
+		return none
+	}
+	family := int(unsafe { &C.sockaddr_in(voidptr(&a[0])) }.sin_family)
+	b := unsafe { &u8(&a[0]) }
+	mut at := 4 // sockaddr_in.sin_addr
+	// One unsafe block, not `unsafe { x } != y`: V emits that comparison
+	// without parentheses around x.
+	unsafe {
+		if family == C.AF_INET6 {
+			// sin6_addr at byte 8 is ::ffff:a.b.c.d only as ten zero bytes,
+			// two 0xff, then the IPv4 address.
+			if a[1] != 0 || b[16] != 0 || b[17] != 0 || b[18] != 0xff || b[19] != 0xff {
+				return none
+			}
+			at = 20
+		} else if family != C.AF_INET {
+			return none
+		}
+		return u32(b[at]) << 24 | u32(b[at + 1]) << 16 | u32(b[at + 2]) << 8 | u32(b[at + 3])
+	}
 }
 
 // shutdown_write half-closes a socket (SHUT_WR / SD_SEND = 1 on every platform):

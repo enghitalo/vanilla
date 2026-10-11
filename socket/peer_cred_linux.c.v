@@ -6,7 +6,7 @@ module socket
 // claims. The trust model this completes: filesystem permissions on the
 // socket path decide WHO MAY CONNECT; peer_cred tells the handler WHO EACH
 // CONNECTION IS (per-uid authorization, audit, rate limits by caller).
-// Sits next to peer_addr, same contract: call it from a handler only when
+// Sits next to peer_ipv4, same contract: call it from a handler only when
 // identity is needed — one getsockopt syscall, nothing otherwise.
 
 // struct ucred is glibc's __USE_GNU surface.
