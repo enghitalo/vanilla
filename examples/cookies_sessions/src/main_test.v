@@ -2,6 +2,7 @@ module main
 
 import core
 import http1_1.response
+import time
 
 // Pure logic tests + raw-request E2E (BEST_PRACTICES §9). The cookie scanner
 // and the session store are pure/in-memory, so the parsing rules, the session
@@ -41,23 +42,62 @@ fn test_cookie_value_parsing() {
 
 fn test_session_roundtrip() {
 	mut s := Store{}
-	id := s.create('user-7')
-	sess := s.get(id) or { panic('session should exist') }
+	id := s.create('user-7', 0) or { panic('store should have room') }
+	sess := s.get(id, 0) or { panic('session should exist') }
 	assert sess.user_id == 'user-7'
 	assert sess.csrf_token.len == 64 // a per-session CSRF token is minted too
 }
 
 fn test_unknown_session_is_none() {
 	mut s := Store{}
-	assert s.get('does-not-exist') == none
+	assert s.get('does-not-exist', 0) == none
 }
 
 fn test_session_ids_unguessable() {
 	mut s := Store{}
-	a := s.create('u')
-	b := s.create('u')
+	a := s.create('u', 0) or { panic('store should have room') }
+	b := s.create('u', 0) or { panic('store should have room') }
 	assert a.len == 64 // CSPRNG, 32 bytes hex
 	assert a != b // never collide / never sequential
+}
+
+// The server enforces the lifetime itself — Max-Age is only a client hint.
+fn test_session_expires_server_side() {
+	mut s := Store{}
+	id := s.create('u', 0) or { panic('store should have room') }
+	assert s.get(id, session_ttl_ns - 1) != none
+	assert s.get(id, session_ttl_ns) == none
+}
+
+// The lazy sweep in create() reclaims expired sessions, at most once per
+// sweep_every_ns.
+fn test_sweep_reclaims_expired_sessions() {
+	mut s := Store{}
+	old := s.create('u', 0) or { panic('store should have room') }
+	// Inside the sweep window nothing is walked, even past old's expiry.
+	s.next_sweep = session_ttl_ns + sweep_every_ns
+	s.create('u', session_ttl_ns) or { panic('store should have room') }
+	assert s.sessions.len == 2
+	// Once the window opens, the next create drops the expired entry.
+	s.create('u', s.next_sweep) or { panic('store should have room') }
+	assert s.sessions.len == 2
+	assert old !in s.sessions
+}
+
+// A full store fails CLOSED for new logins and never evicts a live session;
+// room reappears once a sweep reclaims expired entries.
+fn test_store_is_capped() {
+	mut s := Store{
+		max_sessions: 2
+	}
+	a := s.create('u', 0) or { panic('store should have room') }
+	b := s.create('u', 0) or { panic('store should have room') }
+	assert s.create('u', 1) == none
+	assert s.get(a, 1) != none
+	assert s.get(b, 1) != none
+	assert s.sessions.len == 2
+	s.create('u', session_ttl_ns) or { panic('sweep should have freed room') }
+	assert s.sessions.len == 1
 }
 
 // serve adapts the unified handler contract (writes into a caller-owned
@@ -72,13 +112,14 @@ fn serve(mut store Store, req string) string {
 fn test_login_me_logout_flow() {
 	mut s := Store{}
 	// /login mints a session and sets the cookie with ALL security attributes.
-	login := serve(mut s, 'GET /login HTTP/1.1\r\nHost: x\r\n\r\n')
+	login := serve(mut s, 'POST /login HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n')
 	assert login.contains('200 OK')
 	assert login.contains('HttpOnly')
 	assert login.contains('Secure')
 	assert login.contains('SameSite=Lax')
 	assert login.contains('Path=/')
 	assert login.contains('Max-Age=86400')
+	assert session_ttl_s == 86400 // cookie lifetime == server-side lifetime
 	assert login.contains('Content-Length: 0')
 	sid := login.all_after('Set-Cookie: sid=').all_before(';')
 	assert sid.len == 64 // CSPRNG id, 32 bytes hex
@@ -91,16 +132,46 @@ fn test_login_me_logout_flow() {
 	// sid found even when it is not the first cookie pair.
 	me2 := serve(mut s, 'GET /me HTTP/1.1\r\nHost: x\r\nCookie: theme=dark; sid=${sid}\r\n\r\n')
 	assert me2.contains('200 OK')
-	// /logout expires the cookie.
-	logout := serve(mut s, 'GET /logout HTTP/1.1\r\nHost: x\r\n\r\n')
+	// /logout deletes the server-side session AND expires the cookie.
+	logout := serve(mut s, 'GET /logout HTTP/1.1\r\nHost: x\r\nCookie: sid=${sid}\r\n\r\n')
 	assert logout.contains('200 OK')
 	assert logout.contains('Set-Cookie: sid=;')
 	assert logout.contains('Max-Age=0')
+	assert s.sessions.len == 0
+	// A replayed cookie is dead after logout.
+	assert serve(mut s, 'GET /me HTTP/1.1\r\nHost: x\r\nCookie: sid=${sid}\r\n\r\n').contains('401')
+	// Logout without a session still clears the cookie (idempotent).
+	assert serve(mut s, 'GET /logout HTTP/1.1\r\nHost: x\r\n\r\n').contains('Max-Age=0')
+}
+
+// /login changes server state: any method but POST is refused and mints
+// nothing, so crawlers, prefetchers and `<img src>` cannot create sessions.
+fn test_login_requires_post() {
+	mut s := Store{}
+	for method in ['GET', 'HEAD', 'PUT'] {
+		r := serve(mut s, '${method} /login HTTP/1.1\r\nHost: x\r\n\r\n')
+		assert r.starts_with('HTTP/1.1 405 ')
+		assert r.contains('Allow: POST\r\n')
+		assert !r.contains('Set-Cookie')
+	}
+	assert s.sessions.len == 0
+}
+
+// A full store answers new logins with 503 + Retry-After and no cookie.
+fn test_login_when_store_full() {
+	mut s := Store{
+		max_sessions: 0
+	}
+	r := serve(mut s, 'POST /login HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n')
+	assert r.starts_with('HTTP/1.1 503 ')
+	assert r.contains('Retry-After: ${sweep_every_s}\r\n')
+	assert !r.contains('Set-Cookie')
+	assert s.sessions.len == 0
 }
 
 fn test_me_rejects_missing_or_bogus_cookie() {
 	mut s := Store{}
-	sid := s.create('user-42')
+	sid := s.create('user-42', i64(time.sys_mono_now())) or { panic('store should have room') }
 	// no Cookie header at all
 	assert serve(mut s, 'GET /me HTTP/1.1\r\nHost: x\r\n\r\n').contains('401')
 	// cookie present but not a live session id

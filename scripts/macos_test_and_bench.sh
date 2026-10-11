@@ -244,10 +244,12 @@ fi
 # --- cookies_sessions ---
 if begin_example cookies_sessions examples/cookies_sessions/src; then
 	JAR="$WORK/cookies.txt"; rm -f "$JAR"
-	check cookies_sessions "GET /login (set cookie)" 200 -c "$JAR" "$BASE/login"
+	check cookies_sessions "GET /login (POST only)" 405 "$BASE/login"
+	check cookies_sessions "POST /login (set cookie)" 200 -X POST -c "$JAR" "$BASE/login"
 	check cookies_sessions "GET /me (with sid)" 200 -b "$JAR" "$BASE/me"
 	check cookies_sessions "GET /me (no cookie)" 401 "$BASE/me"
 	check cookies_sessions "GET /logout" 200 -b "$JAR" "$BASE/logout"
+	check cookies_sessions "GET /me (sid after logout)" 401 -b "$JAR" "$BASE/me"
 	end_example
 fi
 

@@ -18,6 +18,20 @@ module main
 // bytes; crypto.rand + encoding.hex are stdlib. The only shared state is the
 // session store (a mutex-guarded map here; Redis/db in production).
 //
+// THIS IS NOT AUTHENTICATION: `store.create('user-42')` stands in for a real
+// credential check (see examples/auth). A server must never mint sessions for
+// unauthenticated requests — /login is POST-only so that, behind that check,
+// crawlers, prefetchers and `<img src>` cannot create them either.
+//
+// BOUNDED STATE: every session is a map entry, so an unbounded store is a
+//   memory-exhaustion vector (#280). Each session carries a server-side expiry
+//   from the SAME constant as the cookie's Max-Age (the cookie's lifetime is
+//   only a client-side hint): get() treats an expired entry as absent, a lazy
+//   sweep inside create() drops them, /logout deletes its entry, and
+//   `max_sessions` caps the table on top, failing CLOSED (503) for new logins
+//   while it is full — never evicting a live user's session to make room. The
+//   cap bounds memory; it is not a rate limiter (pair with examples/rate_limit).
+//
 // BYTE DISCIPLINE (docs/BEST_PRACTICES.md §2/§3):
 //   - The Cookie header is scanned IN PLACE by offsets (cookie_value) — no
 //     split(), no map[string]string, no substr copies per request.
@@ -26,7 +40,8 @@ module main
 //   - Static responses are consts; /login and /me frame their one dynamic part
 //     with core.append_str/wi straight into `out` — no `${}`, no `+`, no body string.
 //   - The only per-request-path allocations left are Store.create's owned
-//     strings, and those run per LOGIN, not per request (see new_token).
+//     strings: one session per successful POST /login, bounded by
+//     `max_sessions` (see new_token).
 import server
 import core
 import http1_1.request_parser
@@ -35,41 +50,93 @@ import sync
 import crypto.rand
 import encoding.hex
 import strconv
+import time
+
+// Session lifetime: ONE constant feeds both the server-side expiry and the
+// cookie's Max-Age (resp_login_suffix), so the two can never drift.
+const session_ttl_s = 86400
+const session_ttl_ns = i64(session_ttl_s) * 1_000_000_000
+// Expired sessions are swept at most this often; a full store also answers
+// `Retry-After` with it, since a sweep is the earliest room can appear.
+const sweep_every_s = 60
+const sweep_every_ns = i64(sweep_every_s) * 1_000_000_000
 
 struct Session {
 	user_id    string
 	csrf_token string
+	expires_ns i64 // monotonic ns; past this the session is gone
 }
 
 struct Store {
+	max_sessions int = 100_000 // hard cap (~0.5 KB resident each, measured)
 mut:
-	mu       &sync.RwMutex = sync.new_rwmutex()
-	sessions map[string]Session
+	mu         &sync.RwMutex = sync.new_rwmutex()
+	sessions   map[string]Session
+	next_sweep i64 // monotonic ns of the next expiry sweep
 }
 
-// create mints a session keyed by a fresh CSPRNG id. The id and token are
-// OWNED strings on purpose: they live in the store beyond this request, so a
-// view into the request buffer could never back them (use-after-free). This
-// allocates — acceptably: it runs once per login, not per request.
-fn (mut s Store) create(user_id string) string {
-	id := new_token()
+// create mints a session keyed by a fresh CSPRNG id, or returns none when the
+// store is full. The id and token are OWNED strings on purpose: they live in
+// the store beyond this request, so a view into the request buffer could never
+// back them (use-after-free). This allocates — once per successful login.
+//
+// The clock is INJECTED (`now`, monotonic ns — handle() passes
+// `time.sys_mono_now()`), so tests drive expiry without sleeping.
+fn (mut s Store) create(user_id string, now i64) ?string {
 	s.mu.lock()
+	defer { s.mu.unlock() }
+	// Expiry sweep, at most once per sweep_every_ns: its O(n) walk runs under
+	// the write lock create() already holds, amortized over every login in
+	// that window — no extra thread, no cost on the /me read path.
+	if now >= s.next_sweep {
+		s.sweep(now)
+		s.next_sweep = now + sweep_every_ns
+	}
+	if s.sessions.len >= s.max_sessions {
+		// Full: fail CLOSED until a sweep frees room. Evicting live sessions
+		// instead would let an anonymous flood log real users out.
+		return none
+	}
+	id := new_token()
 	s.sessions[id] = Session{
 		user_id:    user_id
 		csrf_token: new_token()
+		expires_ns: now + session_ttl_ns
 	}
-	s.mu.unlock()
 	return id
 }
 
-// get looks a session up by id. The caller may pass a `tos` VIEW into the
-// request buffer: a map lookup only hashes/compares the key bytes and never
-// retains the key (static_assets uses the same pattern for
+// get looks a session up by id; an expired one is absent. The caller may pass
+// a `tos` VIEW into the request buffer: a map lookup only hashes/compares the
+// key bytes and never retains the key (static_assets uses the same pattern for
 // zero-alloc routing), so the view never escapes.
-fn (mut s Store) get(id string) ?Session {
+fn (mut s Store) get(id string, now i64) ?Session {
 	s.mu.rlock()
 	defer { s.mu.runlock() }
-	return s.sessions[id] or { return none }
+	sess := s.sessions[id] or { return none }
+	if now >= sess.expires_ns {
+		return none // the sweep reclaims it; a read lock cannot delete
+	}
+	return sess
+}
+
+// delete drops a session (logout). Like get(), it takes a `tos` view: map
+// delete only hashes/compares the key and never retains it.
+fn (mut s Store) delete(id string) {
+	s.mu.lock()
+	s.sessions.delete(id)
+	s.mu.unlock()
+}
+
+// sweep drops every expired session. Caller holds the write lock. Deleting
+// inside the loop is safe: V's map iteration tolerates it (as in
+// examples/rate_limit's sweep).
+fn (mut s Store) sweep(now i64) {
+	for id, sess in s.sessions {
+		if now >= sess.expires_ns {
+			s.sessions.delete(id)
+		}
+	}
 }
 
 // CSPRNG token — 32 bytes of entropy, hex-encoded. Never a predictable value.
@@ -136,13 +203,20 @@ fn cookie_value(buf []u8, start int, len int, name string) (int, int) {
 // ---- static responses (consts — the handler appends, never builds) ---------
 const resp_401 = 'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n'
 const resp_404 = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n'
+// /login changes server state, so it is POST-only (RFC 9110 §15.5.6: 405 must
+// list the allowed methods).
+const resp_405 = 'HTTP/1.1 405 Method Not Allowed\r\nAllow: POST\r\nContent-Length: 0\r\n\r\n'
+// Store full (max_sessions): new logins fail closed until a sweep frees room.
+// The `${}` here and in resp_login_suffix runs ONCE at const init, never per
+// request.
+const resp_503 = 'HTTP/1.1 503 Service Unavailable\r\nRetry-After: ${sweep_every_s}\r\nContent-Length: 0\r\n\r\n'
 // /logout is FULLY static — expiring the cookie is the same bytes every time,
 // so the complete response is one const (BEST_PRACTICES §3a).
 const resp_logout = 'HTTP/1.1 200 OK\r\nSet-Cookie: sid=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0\r\nContent-Length: 0\r\n\r\n'
 // /login is const-around-dynamic: everything except the 64-hex sid is literal.
 // Set-Cookie precedes Content-Length, so the length header stays a literal 0.
 const resp_login_prefix = 'HTTP/1.1 200 OK\r\nSet-Cookie: sid='
-const resp_login_suffix = '; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400\r\nContent-Length: 0\r\n\r\n'
+const resp_login_suffix = '; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${session_ttl_s}\r\nContent-Length: 0\r\n\r\n'
 const resp_me_prefix = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '
 
 // ---- zero-alloc append helpers (BEST_PRACTICES §3b) -------------------------
@@ -175,6 +249,19 @@ fn slice_eq(buf []u8, s request_parser.Slice, lit string) bool {
 	return true
 }
 
+// session_id returns the request's `sid` cookie as a zero-copy `tos` VIEW into
+// the request buffer, or none when the header or the cookie is absent/empty.
+// The view is only valid while the buffer is: pass it to lookups that never
+// retain the key (Store.get / Store.delete), never store it.
+fn session_id(req request_parser.HttpRequest) ?string {
+	c := req.get_header_value_slice('Cookie') or { return none }
+	vstart, vlen := cookie_value(req.buffer, c.start, c.len, 'sid')
+	if vlen <= 0 { // absent or empty sid — also guards &buf[vstart] below
+		return none
+	}
+	return unsafe { tos(&req.buffer[vstart], vlen) }
+}
+
 fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop, mut store Store) core.Step {
 	req := request_parser.decode_http_request(req_buffer) or {
 		out << response.tiny_bad_request_response
@@ -182,27 +269,29 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 	}
 
 	if slice_eq(req.buffer, req.path, '/login') {
-		// (Authenticate first — see examples/auth.) Then mint a session.
-		sid := store.create('user-42')
+		if !slice_eq(req.buffer, req.method, 'POST') {
+			core.append_str(mut out, resp_405)
+			return .done
+		}
+		// (Authenticate first — see examples/auth; answer 401 on failure.)
+		// Only then mint a session.
+		sid := store.create('user-42', i64(time.sys_mono_now())) or {
+			core.append_str(mut out, resp_503)
+			return .done
+		}
 		// Note ALL the security attributes on the Set-Cookie: two consts with
 		// the sid appended between them — the only dynamic bytes in the reply.
 		core.append_str(mut out, resp_login_prefix)
 		core.append_str(mut out, sid)
 		core.append_str(mut out, resp_login_suffix)
 	} else if slice_eq(req.buffer, req.path, '/me') {
-		c := req.get_header_value_slice('Cookie') or {
-			core.append_str(mut out, resp_401)
-			return .done
-		}
-		vstart, vlen := cookie_value(req.buffer, c.start, c.len, 'sid')
-		if vlen <= 0 { // absent or empty sid — also guards &buf[vstart] below
-			core.append_str(mut out, resp_401)
-			return .done
-		}
 		// Zero-copy lookup key: a string VIEW into the request buffer. Only
 		// valid because get() never retains it — see the Store.get comment.
-		sid := unsafe { tos(&req.buffer[vstart], vlen) }
-		sess := store.get(sid) or {
+		sid := session_id(req) or {
+			core.append_str(mut out, resp_401)
+			return .done
+		}
+		sess := store.get(sid, i64(time.sys_mono_now())) or {
 			core.append_str(mut out, resp_401)
 			return .done
 		}
@@ -214,8 +303,12 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 		core.append_str(mut out, sess.user_id)
 		core.append_str(mut out, '"}')
 	} else if slice_eq(req.buffer, req.path, '/logout') {
-		// Expire the cookie (Max-Age=0). A real impl also deletes the
-		// server-side session — the cookie alone is just the client half.
+		// Delete the server-side session, then expire the cookie (Max-Age=0)
+		// — the cookie alone is just the client half. A logout without a live
+		// session still clears the cookie: logout is idempotent.
+		if sid := session_id(req) {
+			store.delete(sid)
+		}
 		core.append_str(mut out, resp_logout)
 	} else {
 		core.append_str(mut out, resp_404)
@@ -240,6 +333,6 @@ fn main() {
 			return handle(req_buffer, mut out, client_fd, worker_state, mut event_loop, mut store)
 		}
 	})!
-	println('Cookies/sessions demo on http://localhost:3000/  (/login, /me, /logout)')
+	println('Cookies/sessions demo on http://localhost:3000/  (POST /login, /me, /logout)')
 	srv.run()
 }
