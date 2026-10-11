@@ -258,7 +258,7 @@ fn main() {
 | `examples/async_db_pg/` | PostgreSQL queries via async handler |
 | `examples/pg_transactions/` | An atomic PostgreSQL transaction in one round trip (`async_submit_batch`), run again on a serialization failure (40001) as `pg_async.TxRetry` decides |
 | `examples/async_timer/` | Async per-request timer |
-| `examples/io_uring_demo/` | io_uring backend demonstration (Linux) |
+| `examples/io_uring_demo/` | Backend selection through `ServerConfig.io_multiplexing` (runs epoll as shipped; set `.io_uring` on Linux) |
 
 ---
 
@@ -482,7 +482,7 @@ See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark 
 - [x] Architecture documentation — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (the module tree, each module's role, the grep-enforced dependency rule) and [server/README.md](server/README.md) (the engine, its backends, limits and TLS)
 - [ ] Security best-practices guide (injection, timing, header limits) — [docs/BEST_PRACTICES.md](docs/BEST_PRACTICES.md) §8 lists the defaults and points at the `auth`, `cors`, `csrf`, `rate_limit`, `request_limits` and `security_headers` examples; a dedicated guide is still open
 - [ ] Performance tuning guide — [docs/V_PERF_TOOLBOX.md](docs/V_PERF_TOOLBOX.md) covers `-gc none` vs the default GC; the operational side (`taskset` + `VANILLA_WORKERS`, `ulimit -n`, `net.core.somaxconn` and other kernel parameters) is still missing
-- [ ] Example READMEs for every `examples/` directory — 15 of 51 have one
+- [x] Example READMEs for every `examples/` directory — each one says how to run it, shows real responses and links the code it explains
 - [x] Tests for every example ([#129](https://github.com/enghitalo/vanilla/issues/129)), all run in CI — the 51 examples on Linux, the 28 that run on macOS there too
 - [ ] Backend stress tests — connect storms, pipelined storms, slow readers with parked writes, large-upload drains, and fd exhaustion (`EMFILE`) at listen and at accept (`tests/accept_starved_test.v`, [#256](https://github.com/enghitalo/vanilla/issues/256)) are covered; a sustained high-concurrency soak is not
 - [x] Request-parser edge-case tests — split-point fuzzing over every prefix of a request, malformed and ambiguous framing (`tests/framing_ambiguity_test.v`), chunked trailers (`tests/chunked_trailer_test.v`), requests split across TCP segments (`tests/backend_behaviors_test.v`), plus the h1spec/Http11Probe CI gates

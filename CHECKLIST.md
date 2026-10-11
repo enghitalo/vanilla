@@ -507,7 +507,7 @@ concatenates, interpolates or allocates per request. The
   SQL with an injection regression test in `database` (#193, PR #211); input
   validation in `url_form` and `json_api`; header injection refused by
   `http1_1/client` and `http1_1/upstream`.
-- **Remains:** none of these directories has a README (#46).
+- Every one of these directories has a README (#46).
 
 ---
 
@@ -594,15 +594,16 @@ concatenates, interpolates or allocates per request. The
 - **Remains:** one operational page: `taskset` + `VANILLA_WORKERS`,
   `ulimit -n`, `net.core.somaxconn` and other sysctls, buffer sizing.
 
-### 46. Example Walkthroughs — 🔴 OPEN
-- **Issue:** 15 of 51 example directories have a README (`conformance`,
-  `etag`, `hexagonal`, `https_upstream`, `json_api`, `logging`, `mesh`,
-  `middleware`, `observability`, `router`, `security_headers`,
-  `spa_static_assets`, `sse`, `veb_like`, `video_stream`).
-- **Priority:** 🟡 MEDIUM
-- **Strategy:** most of the other 36 open `main.v` with a long explanatory
-  comment that can seed the README; start with the security examples (#37),
-  `static_files` and `request_limits`.
+### 46. Example Walkthroughs — ✅ RESOLVED
+- **Resolution:** all 51 example directories have a README, on one template
+  (see `examples/tiny/README.md`): what the example shows and why, the run
+  command, every endpoint with a curl call and the real response it got, the
+  design points as they appear in the code, the test command and links into
+  [BEST_PRACTICES](docs/BEST_PRACTICES.md). Each command was run against the
+  built server, and the PostgreSQL ones against a throwaway `postgres:16`.
+  Bugs found while writing them: #292, #293, #294.
+- **Remains:** the examples #279 rewrites. Re-read each README once its
+  #279 commit lands: helper names, per-worker state and allocation claims.
 
 ---
 
@@ -613,7 +614,7 @@ Open and partial items only.
 | Priority | Count | Items |
 |----------|-------|-------|
 | 🔴 HIGH | 2 | #16 (#156: plaintext on io_uring/kqueue), #34 |
-| 🟡 MEDIUM | 8 | #4, #19, #23, #39, #40, #42, #44, #46 |
+| 🟡 MEDIUM | 7 | #4, #19, #23, #39, #40, #42, #44 |
 | 🟢 LOW | 2 | #5, #45 |
 
 ---
@@ -664,22 +665,22 @@ Open and partial items only.
 - [x] #43 - Architecture doc
 - [ ] #44 - SECURITY.md
 - [ ] #45 - Performance tuning page
-- [ ] #46 - Example READMEs
+- [x] #46 - Example READMEs
 
 ---
 
 ## 📈 Progress Tracking
 
-### Resolved: 25/37 (68%)
-- ✅ 21 done: #2, #3, #8, #10, #11, #15, #17, #18, #20, #21 (except kqueue),
-  #25, #27, #28, #29, #33, #35, #36, #37, #38, #41, #43
+### Resolved: 26/37 (70%)
+- ✅ 22 done: #2, #3, #8, #10, #11, #15, #17, #18, #20, #21 (except kqueue),
+  #25, #27, #28, #29, #33, #35, #36, #37, #38, #41, #43, #46
 - ⚪ 4 obsolete: #1, #6, #26, #32
 
 ### Partial: 9/37 (24%)
 #5, #16, #19, #23, #39, #40, #42, #44, #45
 
-### Open: 3/37 (8%)
-#4, #34, #46
+### Open: 2/37 (5%)
+#4, #34
 
 ---
 
@@ -696,9 +697,6 @@ TLS:
 
 Server push / close paths:
   #23 (outbound queue) ← #270, #271, #272, #275
-
-Docs:
-  #46 (example READMEs) ← #37's examples first
 ```
 
 ---
@@ -715,7 +713,7 @@ Docs:
 
 For contributors wanting to learn:
 
-- **Beginner:** #5, #46
+- **Beginner:** #5
 - **Intermediate:** #34, #40, #42
 - **Advanced:** #4/#19 (kqueue, #154), #16 (#156), #23
 
