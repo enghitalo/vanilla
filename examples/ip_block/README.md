@@ -1,7 +1,7 @@
 # ip_block — deny listed client addresses with 403
 
 A denylist of IP addresses checked on every request against the connection's
-**socket peer** (`socket.peer_addr(client_fd)`), never against a header the
+**socket peer** (`socket.peer_ipv4(client_fd)`), never against a header the
 client can write. A listed address gets `403 Forbidden`; everyone else gets
 the resource.
 
@@ -47,19 +47,24 @@ Content-Length: 0
 Connection: close
 ```
 
-and the server logs `[ip-block] denied 127.0.0.1` on stderr.
+Nothing is logged per denial: a blocked client could otherwise force a stderr
+write on every request it sends. Count denials, or log once per connection,
+if you need them.
 
 ## How it works
 
-- **The peer, not a header.** `handle` takes `socket.peer_addr(client_fd)`
-  (one `getpeername` syscall and one small string per request) and checks it
-  against the list. It does not even parse the request: the decision needs
-  only the connection. Behind a proxy or CDN the peer is the proxy, so swap in
-  the trusted-proxy client IP from [examples/proxy_aware](../proxy_aware/).
-- **One shared, read-mostly list.** `Blocklist` is a `map[string]bool`
-  behind a `sync.RwMutex`: `is_blocked` takes the read lock, so workers check
-  in parallel; `block` and `unblock` take the write lock and can run at any
-  time, from any thread
+- **The peer, not a header.** `handle` takes `socket.peer_ipv4(client_fd)`,
+  the peer's IPv4 address as a `u32` (one `getpeername` syscall, no
+  allocation), and checks it against the list. A peer with no IPv4 address
+  (a Unix-socket listener; there use `socket.peer_cred`) is on no list: it is
+  allowed. It does not even parse the request: the decision needs only the
+  connection. Behind a proxy or CDN the peer is the proxy, so swap in the
+  trusted-proxy client IP from [examples/proxy_aware](../proxy_aware/).
+- **One shared, read-mostly list.** `Blocklist` is a `map[u32]bool` behind a
+  `sync.RwMutex`. `block` and `unblock` take dotted-quad text, parse it once
+  (`parse_ipv4`) and refuse what is not IPv4. `is_blocked` takes the read
+  lock, so workers check in parallel; `block` and `unblock` take the write
+  lock and can run at any time, from any thread
   ([BEST_PRACTICES §6](../../docs/BEST_PRACTICES.md#6-concurrency-no-shared-mutable-state-without-protection)).
   The handler reaches it as a closure capture in `main()`.
 - **Const responses.** `forbidden_response` and `ok_response` are `const`
@@ -75,9 +80,10 @@ v test examples/ip_block/src
 ```
 
 [main_test.v](src/main_test.v) covers the `block`/`unblock`/`is_blocked`
-round trip and drives `handle` with fd `-1` (whose peer is `''`): unlisted it
-gets the 200, and with `''` blocked it gets the 403. The real peer address is
-exercised with curl as above.
+round trip and the refusal of text that is not IPv4, allows a peer with no
+IPv4 address (fd `-1`), and drives `handle` over a real loopback connection:
+a listed `127.0.0.1` gets the 403, an unlisted one the 200, and neither
+allocates.
 
 ## See also
 
