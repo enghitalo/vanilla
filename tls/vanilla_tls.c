@@ -107,6 +107,14 @@ typedef struct {
     int closed;      // a recv saw EOF (1) or failed (2): reported once the read-ahead is empty
     int defer_send;  // vtls_write is encrypting under the crypto lock: hold the send
     int deferred;    // ...and a record is encrypted and waiting to be sent
+    // 1 while a record vtls_write encrypted but could not send whole waits
+    // inside Mbed TLS for the caller's retry; 2 once its last byte is out,
+    // maybe sent from inside another call (see vtls_write).
+    int wpend;
+    // A client read stopped at a TLS 1.3 NewSessionTicket that Mbed TLS
+    // processes only once its pending output is out (it answered
+    // WANT_WRITE): the next read or write goes through the handshake path.
+    int parked;
     int bio_want;    // the receive callback answered WANT_READ in this Mbed TLS call
     int peer_closed; // the peer ended the session: EOF or close_notify (vtls_peer_closed)
     int close_notify; // ...with a close_notify alert, not a bare EOF (vtls_peer_close_notify)
@@ -519,7 +527,13 @@ static int vtls_bio_send(void *ctx, const unsigned char *buf, size_t len) {
     do {
         r = send(fd, buf, len, MSG_NOSIGNAL);
     } while (r < 0 && errno == EINTR);
-    if (r >= 0) return (int)r;
+    if (r >= 0) {
+        // Mbed TLS asks for all its pending output at once: when all of it
+        // went, a record vtls_write left pending is out, whichever call
+        // flushed it.
+        if (s->wpend == 1 && (size_t)r == len) s->wpend = 2;
+        return (int)r;
+    }
     if (errno == EAGAIN || errno == EWOULDBLOCK) return MBEDTLS_ERR_SSL_WANT_WRITE;
     if (errno == EPIPE || errno == ECONNRESET) return MBEDTLS_ERR_NET_CONN_RESET;
     return MBEDTLS_ERR_NET_SEND_FAILED;
@@ -627,6 +641,7 @@ int vtls_read(void *sess, unsigned char *buf, size_t len) {
         ret = mbedtls_ssl_read(&s->ssl, buf, len);
         VTLS_UNLOCK();
     } while (vtls_retry(s, ret) && ++n < VTLS_RETRIES);
+    s->parked = ret == MBEDTLS_ERR_SSL_WANT_WRITE;
     if (ret > 0) return ret;
     if (ret == 0 || ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) { // closed
         // mbedtls_ssl_read answers 0 for a transport EOF without close_notify,
@@ -645,15 +660,34 @@ int vtls_peer_close_notify(void *sess) { return ((vtls_session *)sess)->close_no
 int vtls_write(void *sess, const unsigned char *buf, size_t len) {
     vtls_session *s = (vtls_session *)sess;
     int ret;
-    do {
+    for (;;) {
+        if (s->wpend == 2) {
+            // The record a WANT_WRITE left pending went out from inside
+            // another call. Mbed TLS processes a TLS 1.3 NewSessionTicket
+            // through its handshake path, which first flushes pending output:
+            // a read that meets one sends the record, and so does the write
+            // below that finishes one a read left parked. This call is the
+            // retry with the same length that Mbed TLS asked for, so it
+            // reports the record's bytes sent, as Mbed TLS does once it has
+            // flushed a record itself: called on, Mbed TLS would find nothing
+            // pending and encrypt the same bytes into a second record (#237).
+            s->wpend = 0;
+            ret = mbedtls_ssl_get_max_out_record_payload(&s->ssl);
+            return ret > 0 && (size_t)ret < len ? ret : (int)len;
+        }
         // A client's write first finishes a NewSessionTicket a read left
-        // parked (see vtls_retry); write on past it.
+        // parked (see vtls_retry); write on past it. Encrypt under the lock,
+        // send after it, unless a read left one parked: processing it is
+        // crypto, and a deferred send would stop the handshake path at its
+        // flush, to be finished by the unlocked call below.
         VTLS_LOCK();
-        s->defer_send = VTLS_SERIALIZED; // encrypt under the lock, send after it
+        s->defer_send = VTLS_SERIALIZED && !s->parked;
         ret = mbedtls_ssl_write(&s->ssl, buf, len);
         s->defer_send = 0;
         VTLS_UNLOCK();
-    } while (ret == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET);
+        if (ret != MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) break;
+        s->parked = 0;
+    }
     if (s->deferred) {
         // The record is encrypted and pending in mbedTLS (it saw WANT_WRITE).
         // Called again with the same arguments, as its API requires, it only
@@ -668,12 +702,19 @@ int vtls_write(void *sess, const unsigned char *buf, size_t len) {
         //     mbedtls_ssl_get_record_expansion...
         //   - ...which reads PSA's key store only for a CBC suite: the
         //     version is pinned to TLS 1.3 (setup, and client_setup), whose
-        //     suites are all AEAD.
+        //     suites are all AEAD;
+        //   - no NewSessionTicket is parked, else the call would process it
+        //     (the handshake path): the call above does not defer then.
         // Change any of these and this call needs the lock too.
         s->deferred = 0;
         ret = mbedtls_ssl_write(&s->ssl, buf, len);
     }
-    if (ret >= 0) return ret;
+    if (ret >= 0) {
+        s->wpend = 0;
+        s->parked = 0;
+        return ret;
+    }
+    if (ret == MBEDTLS_ERR_SSL_WANT_WRITE) s->wpend = 1;
     return map_ret(ret);
 }
 
@@ -752,6 +793,8 @@ static void client_rearm(vtls_session *s, int fd) {
     s->last_err = 0;
     s->defer_send = 0;
     s->deferred = 0;
+    s->wpend = 0;
+    s->parked = 0;
     s->ra_off = 0;
     s->ra_len = 0;
 }

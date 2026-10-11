@@ -323,6 +323,133 @@ fn test_tls_session_tickets_mid_query() {
 	assert f.fake.stat('tickets') == 2 * 13
 }
 
+// ticket_fixture is a fake server for vanilla#237: two TLS 1.3 tickets ahead
+// of every reply, then 500 ms of reading nothing, through a small receive
+// window.
+fn ticket_fixture(certs string) !TlsFixture {
+	return tls_fixture(certs, server_args(certs, 'server', ['--tickets-per-query', '2', '--pause-ms',
+		'500', '--rcvbuf', '4096']))
+}
+
+// ticket_pad is query B's parameter, 48 KB (three records and a bit), in
+// digits: no frontend message type, so a byte the server gets twice shows up
+// at the next type byte.
+fn ticket_pad() []u8 {
+	mut pad := []u8{len: 48 * 1024}
+	for i in 0 .. pad.len {
+		pad[i] = u8(`0` + i % 10)
+	}
+	return pad
+}
+
+// record_pending_behind_tickets pipelines A (`select 1`) and B (`pad` echoed)
+// on `c`, so that the tickets and the reply to A wait in the socket while a
+// record of B is pending inside Mbed TLS: the server reads nothing after
+// answering A, and the small socket buffers fill.
+fn record_pending_behind_tickets(mut c PgConn, pad []u8) ! {
+	c.set_nonblocking()!
+	small := i32(4096)
+	C.setsockopt(i32(c.fd), C.SOL_SOCKET, C.SO_SNDBUF, &small, sizeof(small))
+	assert c.async_submit('select 1', []?[]u8{})
+	assert c.async_flush()!
+	assert C.pg_async_wait(c.fd, C.POLLIN, 5000) > 0 // the tickets and the reply to A
+	assert c.async_submit(r'select $1::text', [?[]u8(pad)])
+	assert !c.async_flush()!, 'B should not fit the socket while the server reads nothing'
+	assert c.tls_wlen > 0
+}
+
+// finish_a_and_b pumps `c` as a continuation would (flush what is pending,
+// read, wait for what the connection waits for) until A and B are answered.
+// B's answer must be `pad`, byte for byte: a record sent twice shifts B's
+// messages, and the fake answers the first invalid type byte with FATAL
+// 08P01, as PostgreSQL does.
+fn finish_a_and_b(mut c PgConn, pad []u8) ! {
+	mut results := []Result{}
+	deadline := time.sys_mono_now() + 10 * u64(time.second)
+	for results.len < 2 && time.sys_mono_now() < deadline {
+		if c.async_wants_write() {
+			c.async_flush()!
+		}
+		poll := c.async_on_readable()!
+		if poll.ready {
+			results << poll.result
+			continue
+		}
+		C.pg_async_wait(c.fd, if c.async_wants_write() { C.POLLOUT } else { C.POLLIN }, 10)
+	}
+	assert results.len == 2, 'the pipelined queries did not complete'
+	assert int_of(results[0]) == 1
+	mut it := results[1].rows()
+	row := it.next() or { panic('expected a row') }
+	assert row.text(0)! == pad
+	assert !c.is_broken()
+}
+
+// A TLS 1.3 NewSessionTicket read while a query record of ours is pending
+// inside Mbed TLS (vanilla#237). Mbed TLS takes a ticket through its
+// handshake path, which first flushes pending output, so the read sends the
+// record; the retry with the same length that Mbed TLS asked for must then
+// report it sent, not encrypt its bytes a second time.
+fn test_tls_ticket_read_while_a_query_record_is_pending() ! {
+	certs := tls_ready() or { return }
+	defer {
+		os.rmdir_all(certs) or {}
+	}
+	mut f := ticket_fixture(certs)!
+	defer {
+		f.stop()
+	}
+	mut c := PgConn.connect(f.cfg(.verify_full, 'localhost'))!
+	defer {
+		c.close()
+	}
+	pad := ticket_pad()
+	record_pending_behind_tickets(mut c, pad)!
+	finish_a_and_b(mut c, pad)!
+	assert f.fake.stat('protocol_errors') == 0
+	assert f.fake.stat('tickets') == 4
+}
+
+// The write side of vanilla#237. A read that meets a ticket while the socket
+// cannot take the record pending ahead of it leaves the ticket parked and
+// reports want_write. A write that comes first (close() sends a Terminate, for
+// one) finishes the ticket: it sends the record and processes the ticket, and
+// must then report the record sent, not write on into a second copy (with
+// MBEDTLS_THREADING_C) or fail the connection after processing the ticket
+// outside the shim's crypto lock (without it).
+fn test_tls_write_after_a_read_parked_a_ticket() ! {
+	certs := tls_ready() or { return }
+	defer {
+		os.rmdir_all(certs) or {}
+	}
+	mut f := ticket_fixture(certs)!
+	defer {
+		f.stop()
+	}
+	mut c := PgConn.connect(f.cfg(.verify_full, 'localhost'))!
+	defer {
+		c.close()
+	}
+	pad := ticket_pad()
+	record_pending_behind_tickets(mut c, pad)!
+	assert !c.async_on_readable()!.ready
+	assert c.tls_read_blocked, 'the read should stop at the ticket'
+	deadline := time.sys_mono_now() + 10 * u64(time.second)
+	for {
+		assert time.sys_mono_now() < deadline, 'the pending record never went out'
+		C.pg_async_wait(c.fd, C.POLLOUT, 100)
+		n := c.send_some(unsafe { &u8(c.send_buf.data) + c.send_off }, c.send_len - c.send_off)
+		if n > 0 {
+			c.send_off += n
+			break
+		}
+		assert n == io_again, 'the write failed: ${c.io_error('send')}'
+	}
+	finish_a_and_b(mut c, pad)!
+	assert f.fake.stat('protocol_errors') == 0
+	assert f.fake.stat('tickets') == 4
+}
+
 // 20000 rows (~300 KB) arrive as many TLS records: async_on_readable must
 // drain the TLS layer, not stop at the first record.
 fn test_tls_large_result_spans_many_records() {

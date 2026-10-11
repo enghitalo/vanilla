@@ -297,7 +297,9 @@ pub fn (s &Session) mark_readable() {
 // many it took: one record at most (16 KiB), so loop until all is sent.
 // `want_write` (or `want`): the record is encrypted and pending inside Mbed
 // TLS, so call again with the SAME `ptr` and `len` once the socket is ready,
-// which only flushes it. `closed` on a fatal error.
+// which only flushes it. A read_into in between may send it (Mbed TLS flushes
+// before it processes a TLS 1.3 session ticket); the call then reports it
+// sent and sends nothing. `closed` on a fatal error.
 pub fn (s &Session) write_from(ptr &u8, len int) int {
 	return C.vtls_write(s.sess, ptr, usize(len))
 }

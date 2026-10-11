@@ -83,6 +83,8 @@ fn (mut c PgConn) tls_send(p &u8, len int) int {
 	// A record Mbed TLS encrypted but could not send whole stays in Mbed TLS,
 	// which must be called again with the same length — not the (maybe
 	// longer) pending tail, or it would count bytes it never encrypted as sent.
+	// A read meanwhile may send the record (a TLS 1.3 ticket makes Mbed TLS
+	// flush first): the retry then reports it sent (tls/, vanilla#237).
 	l := if c.tls_wlen > 0 { c.tls_wlen } else { len }
 	n := c.tls.write_from(p, l)
 	if n >= 0 {

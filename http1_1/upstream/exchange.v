@@ -383,8 +383,8 @@ fn (mut x Exchange) answer_waiting(failed bool) bool {
 	if x.sess.active() {
 		// Never read through the session while a record of ours is pending
 		// (tls_wlen): a TLS 1.3 ticket read now would flush that record from
-		// inside the read, and the same-length retry that must follow would
-		// then encrypt the bytes a second time. Once the send failed nothing
+		// inside the read, and with the socket full the read stops at the
+		// ticket, short of the answer behind it. Once the send failed nothing
 		// more is written, so the read is safe. Ciphertext may also sit in
 		// the session's read-ahead already, so a raw peek decides nothing.
 		if failed || x.tls_wlen == 0 {
