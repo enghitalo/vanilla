@@ -42,17 +42,26 @@ split-fuzz test over every prefix of a framed request
 
 ## Notes on purity & byte discipline
 
-- `parse_multipart` scans the raw body bytes by offsets; every `Part` field is
-  a zero-copy view into the request buffer (`tos` / `vbytes`). The views must
-  not outlive the request — here the response is built synchronously, so
-  nothing retains them.
+- `PartIter` scans the raw body bytes by offsets and yields one part at a
+  time, so no array of parts is built; every `Part` field is a zero-copy view
+  into the request buffer (`tos` / `vbytes`). The views must not outlive the
+  request — here the response is built synchronously, so nothing retains
+  them.
 - Header lookup is case-insensitive (RFC 9110 §5.1): `Content-Type`,
   `content-type` and `CONTENT-TYPE` all match — the core folds ASCII case in
   place. The `boundary=` parameter name is matched case-insensitively too
   (RFC 2045).
-- Static responses (the 404 and the 400 family) are consts built once at init;
-  dynamic responses are framed straight into `out` with zero-alloc append
-  helpers — no `${}`, no `+` anywhere.
-- One deliberate copy remains: `json.decode` is cJSON-backed and measures its
-  input with `strlen`, so it needs a real NUL-terminated string — a view into
-  the request buffer would over-read past the body.
+- Static responses (the 404 and the 400 family) are const strings appended
+  with `core.append_str`. Dynamic bodies are encoded straight into `out`
+  (`json2.encode_append`, `core.append_str`), then `frame_body` puts the
+  status line and the exact `Content-Length` in front of them, in place — no
+  `${}`, no `+`, no builder anywhere.
+- The JSON body reaches `json2` as a `tos` view of the request buffer: `json2`
+  reads only the view's length and returns every decoded string as its own
+  copy. Its token array lives in per-worker state (`make_state`) and is reused
+  by `decode_reuse`, so it is not allocated per request.
+- What still allocates is `json2`'s own, on `POST /users`: each decode (the
+  `name` and `email` it returns are owned strings, plus a little bookkeeping)
+  and its formatting of the `id` number into a small string (under 100 bytes
+  per request, down from about 2.4 KiB). `POST /upload` and
+  every static answer allocate nothing; the tests count both.

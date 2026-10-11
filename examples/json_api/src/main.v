@@ -19,21 +19,28 @@ module main
 // BYTE DISCIPLINE (docs/BEST_PRACTICES.md §2/§3, docs/V_PERF_TOOLBOX.md):
 //   - Routing compares method/path bytes IN PLACE by offsets (slice_eq) — no
 //     `.to_string()` on the hot path.
-//   - Static responses are consts appended with `out <<`; dynamic responses
-//     are framed straight into `out` with core.append_str/wi — no `${}`, no `+`.
-//   - Multipart parts are VIEWS into the request buffer (tos/vbytes): parsing
-//     allocates nothing per part, and CRLF is matched as numeric bytes (13/10).
-//     The views must not outlive `req.buffer` — safe here because the response
-//     is built synchronously in the same call.
-//   - ONE deliberate copy remains: `json.decode` is cJSON-backed and reads its
-//     input through strlen — see create_user_json.
+//   - Static responses are const strings appended with core.append_str.
+//     Dynamic bodies are encoded straight into `out` (json2.encode_append),
+//     then frame_body puts the head with the exact Content-Length in front of
+//     them, in place — no `${}`, no `+`, no body string, no builder.
+//   - The JSON body reaches json2 as a `tos` VIEW of the request buffer: json2
+//     is length-bounded and copies every string it decodes, so nothing it
+//     returns points into the buffer. Its token array is reused per worker
+//     (decode_reuse + make_state), not allocated per request.
+//   - Multipart parts are VIEWS into the request buffer (tos/vbytes), walked
+//     one at a time by PartIter: no array of parts per request, and CRLF is
+//     matched as numeric bytes (13/10). The views must not outlive the request
+//     buffer — safe here because the response is built synchronously in the
+//     same call.
+//   - What still allocates on /users is json2's own: every decode (the
+//     strings it returns are owned copies, by design, plus a little
+//     bookkeeping) and its formatting of the `id` number.
 import server
 import core
 import http1_1.request_parser
 import http1_1.response
 import json2
 import strconv
-import strings
 
 // ----- domain types ---------------------------------------------------------
 
@@ -48,34 +55,41 @@ struct CreatedUser {
 	email string
 }
 
-// ----- static responses (consts — built once, appended per request) ----------
-
-// frame_static builds one COMPLETE response at init (the consts below).
-// Interpolation-free even here: the builder writes the length as a decimal.
-fn frame_static(status_line string, body string) []u8 {
-	mut sb := strings.new_builder(96 + body.len)
-	sb.write_string('HTTP/1.1 ')
-	sb.write_string(status_line)
-	sb.write_string('\r\nContent-Type: application/json\r\nContent-Length: ')
-	sb.write_decimal(body.len)
-	sb.write_string('\r\nConnection: keep-alive\r\n\r\n')
-	sb.write_string(body)
-	return sb
-}
+// ----- static responses (const strings, appended with core.append_str) -------
+// Each Content-Length is its body's length; test_static_responses_are_framed
+// checks every one, so keep them in sync when a body changes.
 
 // 404 is the honest status for an unmatched route (this used to be a 400).
-const resp_404 = frame_static('404 Not Found', '{"error":"not found"}')
+const resp_404 = 'HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: 21\r\nConnection: keep-alive\r\n\r\n{"error":"not found"}'
 // Decode error detail stays server-side (BEST_PRACTICES §8) — clients get a
 // generic, fully static 400.
-const resp_400_invalid_json = frame_static('400 Bad Request', '{"error":"invalid JSON"}')
-const resp_400_missing_fields = frame_static('400 Bad Request',
-	'{"error":"name and email are required"}')
-const resp_400_no_content_type = frame_static('400 Bad Request', '{"error":"missing Content-Type"}')
-const resp_400_no_boundary = frame_static('400 Bad Request',
-	'{"error":"missing multipart boundary"}')
+const resp_400_invalid_json = 'HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 24\r\nConnection: keep-alive\r\n\r\n{"error":"invalid JSON"}'
+const resp_400_missing_fields = 'HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 39\r\nConnection: keep-alive\r\n\r\n{"error":"name and email are required"}'
+const resp_400_no_content_type = 'HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 32\r\nConnection: keep-alive\r\n\r\n{"error":"missing Content-Type"}'
+const resp_400_no_boundary = 'HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 38\r\nConnection: keep-alive\r\n\r\n{"error":"missing multipart boundary"}'
+
+// Heads of the dynamic responses: frame_body writes `head`, the body's length,
+// then `head_tail` in front of the body.
+const head_201 = 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: '
+const head_200 = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '
+const head_tail = '\r\nConnection: keep-alive\r\n\r\n'
 
 const cr = u8(13) // numeric, never `\r` in byte comparisons (V rune-literal footgun)
 const lf = u8(10)
+
+// ----- per-worker state ---------------------------------------------------------
+
+// State is one worker's reusable decode storage: make_state runs once per
+// worker thread, so no lock. json2.decode_reuse keeps its token array here
+// between requests instead of allocating and freeing one per request.
+struct State {
+mut:
+	decode json2.DecodeBuffer
+}
+
+fn make_state() voidptr {
+	return &State{}
+}
 
 // ----- zero-alloc append helpers (BEST_PRACTICES §3b) -------------------------
 
@@ -90,20 +104,56 @@ fn wi(mut out []u8, n i64) {
 	}
 }
 
+// frame_body puts `head`, the body's decimal length and `tail` in front of the
+// body the caller appended at out[mark..], in place: the body is already
+// written, so the Content-Length is exact. Grow `out` by the head's size,
+// shift the body right, copy the head into the gap (the in-place splice of
+// examples/security_headers). No padded length, no scratch buffer, and no
+// allocation once `out` has reached its high-water mark. Never slice `out`:
+// that would make the server drop its write buffer.
+fn frame_body(mut out []u8, mark int, head string, tail string) {
+	body_len := out.len - mark
+	mut digits := [24]u8{}
+	mut view := unsafe { (&digits[0]).vbytes(digits.len) }
+	n := strconv.write_dec(i64(body_len), mut view)
+	gap := head.len + n + tail.len
+	unsafe {
+		out.grow_len(gap)
+		p := &u8(out.data) + mark
+		vmemmove(p + gap, p, body_len)
+		vmemcpy(p, head.str, head.len)
+		vmemcpy(p + head.len, &digits[0], n)
+		vmemcpy(p + head.len + n, tail.str, tail.len)
+	}
+}
+
 // ----- JSON endpoint: POST /users ---------------------------------------------
 
-fn create_user_json(req request_parser.HttpRequest, mut out []u8) {
-	// DELIBERATE COPY — a string API genuinely requires it: json.decode is
-	// cJSON-backed (vlib's json_parse hands `s.str` to C.cJSON_Parse, which
-	// measures its input with strlen). A `tos` view into the request buffer is
-	// not NUL-terminated at the body's end and would over-read past it.
-	body := req.body.to_string(req.buffer)
-	input := json2.decode[CreateUser](body) or {
-		out << resp_400_invalid_json
+// decode_user decodes the body with the worker's reusable token storage, or
+// with a one-off decode when the handler runs without make_state (the unit
+// tests call handle() with a nil worker_state).
+fn decode_user(body string, worker_state voidptr) !CreateUser {
+	if worker_state == unsafe { nil } {
+		return json2.decode[CreateUser](body)
+	}
+	mut st := unsafe { &State(worker_state) }
+	return json2.decode_reuse[CreateUser](body, mut st.decode)
+}
+
+fn create_user_json(req request_parser.HttpRequest, mut out []u8, worker_state voidptr) {
+	// A `tos` VIEW of the body: json2 reads only the view's length and copies
+	// every string it decodes, so the view does not outlive this call. Taken
+	// from a local copy of the buffer header, not `&req.buffer[...]`: a view of
+	// a field of `req` that flows into a `!` call makes V move `req` to the
+	// heap on every request.
+	buf := req.buffer
+	body := if req.body.len > 0 { unsafe { tos(&buf[req.body.start], req.body.len) } } else { '' }
+	input := decode_user(body, worker_state) or {
+		core.append_str(mut out, resp_400_invalid_json)
 		return
 	}
 	if input.name == '' || input.email == '' {
-		out << resp_400_missing_fields
+		core.append_str(mut out, resp_400_missing_fields)
 		return
 	}
 	created := CreatedUser{
@@ -111,21 +161,19 @@ fn create_user_json(req request_parser.HttpRequest, mut out []u8) {
 		name:  input.name
 		email: input.email
 	}
-	// json.encode escapes the user-controlled strings (§8 — never reflect raw
-	// input); core.append_str/wi frame it straight into `out` — no intermediate response
-	// buffer, no `${}`.
-	payload := json2.encode(created, escape_unicode: true)
-	core.append_str(mut out, 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: ')
-	wi(mut out, payload.len)
-	core.append_str(mut out, '\r\nConnection: keep-alive\r\n\r\n')
-	core.append_str(mut out, payload)
+	// json2 escapes the user-controlled strings (§8 — never reflect raw input)
+	// and encodes straight into `out`; frame_body then puts the head in front.
+	mark := out.len
+	json2.encode_append(created, mut out, escape_unicode: true)
+	frame_body(mut out, mark, head_201, head_tail)
 }
 
 // ----- multipart endpoint: POST /upload ---------------------------------------
 //
 // Zero copy: the body is scanned by OFFSETS and every Part field is a view into
 // the request buffer (`tos` for the attribute strings, `vbytes` for content).
-// The views MUST NOT outlive req.buffer — here the summary response is built
+// PartIter yields the parts one at a time, so no array of parts is built. The
+// views MUST NOT outlive req.buffer — here the summary response is built
 // synchronously in the same handler call, so nothing retains them.
 
 struct Part {
@@ -268,45 +316,55 @@ fn scan_part(body []u8, start int, end int) ?Part {
 	}
 }
 
-// parse_multipart splits a multipart/form-data body into its parts — in place,
-// zero copies. `boundary` is the bare token (no leading `--`); each delimiter
-// line is `--` + boundary (next_delim). The preamble before the first delimiter
-// and the closing `--boundary--` are skipped per the RFC 2046 structure.
-@[direct_array_access]
-fn parse_multipart(body []u8, boundary []u8) []Part {
-	mut parts := []Part{}
-	if boundary.len == 0 {
-		return parts
+// PartIter splits a multipart/form-data body into its parts — in place, zero
+// copies, one part per `next()`, so `for p in parts_of(body, boundary)` walks
+// them without building an array. `boundary` is the bare token (no leading
+// `--`); each delimiter line is `--` + boundary (next_delim). The preamble
+// before the first delimiter and the closing `--boundary--` are skipped per
+// the RFC 2046 structure.
+struct PartIter {
+	body     []u8
+	boundary []u8
+mut:
+	pos int // offset of the next delimiter; -1 once the body is exhausted
+}
+
+fn parts_of(body []u8, boundary []u8) PartIter {
+	return PartIter{
+		body:     body
+		boundary: boundary
+		pos:      if boundary.len == 0 { -1 } else { next_delim(body, 0, boundary) }
 	}
-	dlen := 2 + boundary.len
-	mut pos := next_delim(body, 0, boundary)
-	for pos >= 0 {
-		mut start := pos + dlen
+}
+
+@[direct_array_access]
+fn (mut it PartIter) next() ?Part {
+	dlen := 2 + it.boundary.len
+	for it.pos >= 0 {
+		mut start := it.pos + dlen
 		// `--` right after the boundary is the closing delimiter — done.
-		if start + 2 <= body.len && body[start] == `-` && body[start + 1] == `-` {
+		if start + 2 <= it.body.len && it.body[start] == `-` && it.body[start + 1] == `-` {
+			it.pos = -1
 			break
 		}
 		// Skip the CRLF that ends the delimiter line.
-		if start + 2 <= body.len && body[start] == cr && body[start + 1] == lf {
+		if start + 2 <= it.body.len && it.body[start] == cr && it.body[start + 1] == lf {
 			start += 2
 		}
-		next := next_delim(body, start, boundary)
-		mut end := if next >= 0 { next } else { body.len }
+		next := next_delim(it.body, start, it.boundary)
+		mut end := if next >= 0 { next } else { it.body.len }
 		// The CRLF before the next delimiter belongs to the delimiter.
-		if end - start >= 2 && body[end - 2] == cr && body[end - 1] == lf {
+		if end - start >= 2 && it.body[end - 2] == cr && it.body[end - 1] == lf {
 			end -= 2
 		}
+		it.pos = next // -1 when this was the last part
 		if end > start {
-			if p := scan_part(body, start, end) {
-				parts << p
+			if p := scan_part(it.body, start, end) {
+				return p
 			}
 		}
-		if next < 0 {
-			break
-		}
-		pos = next
 	}
-	return parts
+	return none
 }
 
 // boundary_range scans the Content-Type VALUE (by offsets, in place) for the
@@ -340,49 +398,47 @@ fn boundary_range(buf []u8, start int, len int) (int, int) {
 
 fn upload(req request_parser.HttpRequest, mut out []u8) {
 	ct := req.get_header_value_slice('Content-Type') or {
-		out << resp_400_no_content_type
+		core.append_str(mut out, resp_400_no_content_type)
 		return
 	}
-	b_start, b_len := boundary_range(req.buffer, ct.start, ct.len)
+	buf := req.buffer // views come from this local, not `&req.buffer[...]` (see create_user_json)
+	b_start, b_len := boundary_range(buf, ct.start, ct.len)
 	if b_len <= 0 {
-		out << resp_400_no_boundary
+		core.append_str(mut out, resp_400_no_boundary)
 		return
 	}
-	boundary := unsafe { (&req.buffer[b_start]).vbytes(b_len) } // view
-	mut parts := []Part{}
-	if req.body.len > 0 {
-		body := unsafe { (&req.buffer[req.body.start]).vbytes(req.body.len) } // view
-		parts = parse_multipart(body, boundary)
+	boundary := unsafe { (&buf[b_start]).vbytes(b_len) } // view
+	body := if req.body.len > 0 {
+		unsafe { (&buf[req.body.start]).vbytes(req.body.len) } // view
+	} else {
+		[]u8{} // len 0 / cap 0 — alloc-free
 	}
-	// The summary must be sized before the headers can be written, so it is
-	// assembled in ONE builder. json.encode escapes the two user-controlled
-	// strings (§8 — hand-rolled escaping would be an injection risk); it is
-	// length-safe on view strings (json_ascii_string iterates by len).
-	// Everything else is write_string/write_decimal — no `${}`, no `+`, no join.
-	mut summary := strings.new_builder(32 + parts.len * 64)
-	summary.write_string('{"received":[')
+	// The summary is written straight into `out`, then framed in place.
+	// json2.encode_append escapes the two user-controlled strings (§8 —
+	// hand-rolled escaping would be an injection risk); it is length-safe on
+	// view strings (it iterates by len). Everything else is append_str/wi — no
+	// `${}`, no `+`, no builder.
+	mark := out.len
+	core.append_str(mut out, '{"received":[')
 	mut first := true
-	for p in parts {
+	for p in parts_of(body, boundary) {
 		if p.filename.len == 0 {
 			continue
 		}
 		if !first {
-			summary.write_u8(`,`)
+			out << `,`
 		}
 		first = false
-		summary.write_string('{"field":')
-		summary.write_string(json2.encode(p.name, escape_unicode: true))
-		summary.write_string(',"filename":')
-		summary.write_string(json2.encode(p.filename, escape_unicode: true))
-		summary.write_string(',"size":')
-		summary.write_decimal(p.content.len)
-		summary.write_u8(`}`)
+		core.append_str(mut out, '{"field":')
+		json2.encode_append(p.name, mut out, escape_unicode: true)
+		core.append_str(mut out, ',"filename":')
+		json2.encode_append(p.filename, mut out, escape_unicode: true)
+		core.append_str(mut out, ',"size":')
+		wi(mut out, p.content.len)
+		out << `}`
 	}
-	summary.write_string(']}')
-	core.append_str(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ')
-	wi(mut out, summary.len)
-	core.append_str(mut out, '\r\nConnection: keep-alive\r\n\r\n')
-	out << summary // Builder IS []u8 — appended directly, never re-stringified
+	core.append_str(mut out, ']}')
+	frame_body(mut out, mark, head_200, head_tail)
 }
 
 // ----- routing -----------------------------------------------------------------
@@ -406,23 +462,28 @@ fn slice_eq(buf []u8, s request_parser.Slice, lit string) bool {
 
 // Sub-handlers take `mut out` and append directly — nothing is returned just
 // to be copied again (no return-then-copy).
-fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
-	req := request_parser.decode_http_request(req_buffer) or {
+fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
+	// decode_into, not decode_http_request: a malformed request would box an
+	// error() per request there.
+	mut req := request_parser.HttpRequest{
+		buffer: req_buffer
+	}
+	if !request_parser.decode_into(mut req) {
 		out << response.tiny_bad_request_response
 		return .close
 	}
 
-	if slice_eq(req.buffer, req.method, 'POST') {
-		if slice_eq(req.buffer, req.path, '/users') {
-			create_user_json(req, mut out)
+	if slice_eq(req_buffer, req.method, 'POST') {
+		if slice_eq(req_buffer, req.path, '/users') {
+			create_user_json(req, mut out, worker_state)
 			return .done
 		}
-		if slice_eq(req.buffer, req.path, '/upload') {
+		if slice_eq(req_buffer, req.path, '/upload') {
 			upload(req, mut out)
 			return .done
 		}
 	}
-	out << resp_404
+	core.append_str(mut out, resp_404)
 	return .done
 }
 
@@ -439,6 +500,7 @@ fn main() {
 		port:            3000
 		io_multiplexing: backend
 		handler:         handle
+		make_state:      make_state
 	})!
 	println('JSON API on http://localhost:3000/  (POST /users, POST /upload)')
 	srv.run()
