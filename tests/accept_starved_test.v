@@ -11,15 +11,12 @@
 //      fails accept4() with EMFILE before it looks at the backlog, so the next
 //      accept fails with nothing pending;
 //   2. a client waits in the backlog that the server can't accept.
-// Then it frees an fd, and the waiting client must be served. On io_uring and
-// poll it also shuts the server down during a pause, which must not re-arm an
-// accept or spin.
+// Then it frees an fd, and the waiting client must be served. Last, it shuts
+// the server down during a pause, which must not re-arm an accept or spin.
 //
 // The limit is lowered BEFORE new_server: io_uring copies RLIMIT_NOFILE into
 // each accept SQE when it prepares it, so a limit lowered later would not
-// reach the accept already armed. The epoll check runs last: shutting an epoll
-// server down can leave its acceptor spinning on EBADF (#163), which would
-// spoil a later check's CPU reading.
+// reach the accept already armed.
 import server
 import core
 import sync.stdatomic
@@ -161,17 +158,14 @@ fn check_accept_pauses_when_out_of_fds(backend server.IOBackend) ! {
 	assert reply_b == as_ok, '${backend}: the waiting client was not served once an fd was free: ${reply_b}'
 
 	// 3. Shut down while paused (client C waits, as B did): the pause must end
-	// without re-arming an accept or spinning. Not on epoll, whose acceptor
-	// can spin on EBADF after any shutdown (#163).
-	if backend != .epoll {
-		C.close(fillers.pop())
-		clients << as_dial(h.port())!
-		cpu_paused := cpu_us_while_idle(200)
-		assert cpu_paused < 40_000, '${backend}: spun on EMFILE with client C waiting: ${cpu_paused} us of CPU in 200 ms'
-		h.stop()
-		cpu_stopped := cpu_us_while_idle(300)
-		assert cpu_stopped < 60_000, '${backend}: spun after a shutdown during an accept pause: ${cpu_stopped} us of CPU in 300 ms'
-	}
+	// without re-arming an accept or spinning.
+	C.close(fillers.pop())
+	clients << as_dial(h.port())!
+	cpu_paused := cpu_us_while_idle(200)
+	assert cpu_paused < 40_000, '${backend}: spun on EMFILE with client C waiting: ${cpu_paused} us of CPU in 200 ms'
+	h.stop()
+	cpu_stopped := cpu_us_while_idle(300)
+	assert cpu_stopped < 60_000, '${backend}: spun after a shutdown during an accept pause: ${cpu_stopped} us of CPU in 300 ms'
 }
 
 fn test_iouring_accept_pauses_when_out_of_fds() ! {

@@ -16,6 +16,7 @@ import time
 fn C.perror(s &char)
 fn C.eventfd(initval u32, flags int) int
 fn C.sleep(seconds u32) u32
+fn C.pause() int
 fn C.close(fd int) int
 // mask is a cpu_set_t* in <sched.h>; we hand it a raw u64 word array, so keep
 // the binding untyped rather than model cpu_set_t (whose header typedef would
@@ -81,6 +82,15 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 			continue
 		}
 
+		// A live listener never reports EPOLLHUP or EPOLLERR. Once it is shut
+		// down (Server.shutdown), it reports EPOLLHUP on every wait: a TCP
+		// listener stops listening, and an AF_UNIX one also reports EPOLLIN
+		// while accept() fails with EAGAIN. Waiting again would spin until the
+		// close takes it out of this epoll set (#163): stop.
+		if event.events & (u32(C.EPOLLHUP) | u32(C.EPOLLERR)) != 0 {
+			stop_accepting(main_epoll_fd)
+		}
+
 		if event.events & u32(C.EPOLLIN) != 0 {
 			$if verbose ? {
 				eprintln('[epoll] EPOLLIN event on listening socket')
@@ -109,6 +119,12 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 						next_log = socket.note_accept_pause(err, next_log)
 						time.sleep(socket.accept_pause)
 						break
+					}
+					if socket.listener_gone(err) {
+						// Closed after epoll_wait returned (Server.shutdown closes
+						// it from another thread): the number is free, or already
+						// names another file. Stop.
+						stop_accepting(main_epoll_fd)
 					}
 					eprintln(@LOCATION)
 					C.perror(c'Accept failed')
@@ -170,6 +186,19 @@ fn handle_accept_loop(socket_fd int, main_epoll_fd int, epoll_fds []int, limits 
 				}
 			}
 		}
+	}
+}
+
+// stop_accepting ends the accept loop once the listener is gone. run() still
+// blocks, as it always has: the documented way out is Server.shutdown() and
+// then exit() from another thread, and run() returning on the main thread
+// would end the process before that drain. So it closes the acceptor's epoll
+// fd and parks the thread, with no wake-ups.
+@[noreturn]
+fn stop_accepting(main_epoll_fd int) {
+	socket.close_socket(main_epoll_fd)
+	for {
+		C.pause()
 	}
 }
 

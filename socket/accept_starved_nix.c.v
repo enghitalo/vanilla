@@ -40,6 +40,20 @@ pub fn accept_starved(err int) bool {
 	return err == C.EMFILE || err == C.ENFILE || err == C.ENOBUFS || err == C.ENOMEM
 }
 
+// listener_gone reports whether accept() failed because the listener itself
+// is gone: its number was closed (EBADF), or names a file that is not a
+// socket (ENOTSOCK) or a socket that is not listening (EINVAL: a TCP listener
+// that was shut down, or whatever reused the number). A live listener never
+// fails this way, so no retry can succeed: the acceptor stops instead.
+// Server.shutdown() closes the listener from another thread, so an acceptor
+// woken just before can call accept() after the close, and retrying at once
+// spun it at full CPU for the rest of the process (#163). Only the error path
+// calls this.
+@[inline]
+pub fn listener_gone(err int) bool {
+	return err == C.EBADF || err == C.ENOTSOCK || err == C.EINVAL
+}
+
 // note_accept_pause tells why an acceptor stopped accepting, at most once
 // every 10 s. `next_log` is that acceptor's own rate-limit state (start it at
 // 0); store the value returned in its place.

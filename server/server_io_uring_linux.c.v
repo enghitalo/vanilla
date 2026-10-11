@@ -254,6 +254,11 @@ fn handle_io_uring_accept(worker &io_uring.Worker, cqe &io_uring.Cqe, limits Lim
 		if io_uring.prepare_timeout(&worker.ring, &worker.accept_pause_ts, resume) {
 			return
 		}
+	} else if socket.listener_gone(-res) {
+		// The listener was shut down or closed. Server.shutdown() also sets
+		// the draining flag below, but whoever did it, a new accept would fail
+		// the same way at once: re-arming it would spin this worker (#163).
+		return
 	}
 	// Graceful shutdown: once Server.shutdown() has set the draining flag (and
 	// shut the listener, which is what completed this accept with an error), do
