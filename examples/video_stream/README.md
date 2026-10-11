@@ -27,10 +27,13 @@ This is how a `<video>` element plays and **seeks**: it sends
 `Range: bytes=START-END` and the server replies `206 Partial Content` with a
 `Content-Range`. Dragging the scrubber just issues a new range.
 
-Key property: we read **only the requested range** from disk and **cap each
-chunk** (`video_chunk_max`, 2 MiB), so a multi-gigabyte file is never pulled
-into a `[]u8`. An open-ended `bytes=0-` is answered with a capped 206; the
-player asks for the next range.
+Key property: a satisfiable range reads **only its bytes** from disk, and
+each chunk is **capped** (`video_chunk_max`, 2 MiB), so seeking through a
+multi-gigabyte file never pulls it into a `[]u8`. An open-ended `bytes=0-` is
+answered with a capped 206; the player asks for the next range. A request
+without a `Range`, or whose `Range` is ignored (below), gets the whole file,
+read into the write buffer in full: that path is for simple clients and small
+files.
 
 Each request opens and `fstat`s the file, then `core.append_file_region`
 reads the range with `pread(2)` straight into the connection's write buffer,
@@ -60,7 +63,8 @@ A start at or past the end, or `bytes=-0`, cannot be satisfied: the answer is
 `416 Range Not Satisfiable` with the file's length and no body. A spec that is
 not one valid byte range (several ranges, an end before its start, a number
 that is not all digits, another unit) is ignored, and the whole file comes
-back as a 200.
+back as a 200. So is any `Range` sent with an `If-Range`: the route sends no
+`ETag` or `Last-Modified`, so no `If-Range` can match (RFC 9110 §13.1.5).
 
 ```sh
 curl -i -H 'Range: bytes=60000-' http://localhost:3000/video

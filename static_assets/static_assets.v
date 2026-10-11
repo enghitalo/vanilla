@@ -27,11 +27,11 @@ module static_assets
 // of one version of its file: the complete precomputed HTTP response for it
 // (status line + headers, plus the body when the body is kept in RAM), its
 // strong ETag (one per representation) and its precomputed 304. A snapshot is
-// never modified after it is published, so `respond()` is a lock-free read
-// shared across all worker threads and every response path, 200, HEAD, 304,
-// 206 and 416, appends precomputed or computed-in-place bytes with zero
-// allocation. `respond()` is a pure function of the request bytes —
-// socket-free and E2E-testable exactly like the rest of vanilla.
+// never modified after it is published, so serving is a lock-free read shared
+// across all worker threads. respond_into() appends every response (200,
+// HEAD, 304, 206, 416) with zero allocation; respond() builds a 206, a 416 or
+// a disk-backed body into a new buffer. `respond()` is a pure function of the
+// request bytes — socket-free and E2E-testable like the rest of vanilla.
 //
 // FOLLOWING THE DISK (`Config.follow_disk`, off by default): a representation
 // re-checks its file with one stat(2) per `revalidate_ms` window, made by the
@@ -516,13 +516,14 @@ fn (s &AssetServer) decide(asset &Asset, req &request_parser.HttpRequest, head b
 	buf := req.buffer
 	// A Range is always a range of the identity bytes, so a GET whose Range
 	// applies selects the identity representation: If-None-Match, which RFC
-	// 9110 §13.2.2 evaluates before Range, is compared against its ETag, and
-	// the encoded representations are neither negotiated nor stat'ed. A Range
-	// applies when it is one valid byte range (parse_range_slice) and its
-	// If-Range, if any, matches the identity ETag; otherwise it is ignored and
-	// the full response is served. An applied Range that is unsatisfiable
-	// gets a 416. Only a GET reads Range (RFC 9110 §14.2): a HEAD is answered
-	// as if it had none.
+	// 9110 §13.2.2 evaluates before Range, is compared against its ETag alone,
+	// and the encoded representations are neither negotiated nor stat'ed. A
+	// current identity copy gets its 304; a client whose current copy is the
+	// br or gzip one gets the 206 or the 416. A Range applies when it is one
+	// valid byte range (parse_range_slice) and its If-Range, if any, matches
+	// the identity ETag; otherwise it is ignored and the full response is
+	// served. An applied Range that is unsatisfiable gets a 416. Only a GET
+	// reads Range (RFC 9110 §14.2): a HEAD is answered as if it had none.
 	if !head {
 		if rng := req.get_header_value_slice('Range') {
 			isnap := asset.reps[slot_identity].current()
@@ -1113,11 +1114,13 @@ fn etag_matches_slice(buf []u8, sl request_parser.Slice, etag string) bool {
 	return false
 }
 
-// if_range_allows reports whether a satisfiable Range may be served as a 206:
-// the request has no If-Range, or its If-Range is `etag` (the identity ETag)
-// exactly. RFC 9110 §13.1.5: entity tags are compared strongly, so a weak
-// `W/` tag never matches, and neither does an HTTP-date (it would be compared
-// with a Last-Modified this module never sends). Byte-level, no allocation.
+// if_range_allows reports whether a valid Range applies, answered with a 206,
+// or with a 416 when it is unsatisfiable: the request has no If-Range, or its
+// If-Range is `etag` (the identity ETag) exactly. Otherwise the Range is
+// ignored and the full response is served. RFC 9110 §13.1.5: entity tags are
+// compared strongly, so a weak `W/` tag never matches, and neither does an
+// HTTP-date (it would be compared with a Last-Modified this module never
+// sends). Byte-level, no allocation.
 @[direct_array_access]
 fn if_range_allows(req &request_parser.HttpRequest, etag string) bool {
 	sl := req.get_header_value_slice('If-Range') or { return true }

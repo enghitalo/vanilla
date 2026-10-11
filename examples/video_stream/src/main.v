@@ -4,10 +4,12 @@ module main
 //
 //   GET /video   FILE stream, the PULL model: HTTP Range requests (206 Partial
 //                Content). This is how a browser <video> element seeks — it asks
-//                for byte ranges. We read ONLY the requested range from disk,
-//                with pread(2) straight into `out` (a multi-GB file never sits
-//                in a []u8), and cap each chunk, so memory stays bounded no
-//                matter the file size. POSIX (Linux, macOS).
+//                for byte ranges. A satisfiable Range reads ONLY its bytes from
+//                disk, with pread(2) straight into `out`, capped at
+//                video_chunk_max, so it costs bounded memory whatever the file
+//                size. A request without a Range, or whose Range is ignored,
+//                gets the whole file, read into `out` in full: that path is for
+//                simple clients and small files. POSIX (Linux, macOS).
 //
 //   GET /webcam  LIVE stream, the PUSH model: motion-JPEG over
 //                multipart/x-mixed-replace. One capture thread fans frames out to
@@ -136,11 +138,13 @@ fn handle(req_buffer []u8, mut out []u8, client_fd int, _worker_state voidptr, m
 // after the header block (core.append_file_region). A satisfiable Range ->
 // 206 + Content-Range, capped to video_chunk_max; an unsatisfiable one -> 416.
 // No Range, or one that is ignored -> 200 with the full file (browsers always
-// send a Range, so this path is for simple clients / small files). Only a GET
-// gets here (handle answers 405 to anything else), so Range is read for GET
-// alone, as RFC 9110 §14.2 defines it. The views come from `req_buffer`, the
-// handler's own parameter (a view of `req.buffer` handed on to a callee moves
-// `req` to the heap).
+// send a Range, so this path is for simple clients / small files). A Range
+// sent with an If-Range is ignored: this route sends no validator (no ETag, no
+// Last-Modified), so RFC 9110 §13.1.5 evaluates every If-Range as false. Only
+// a GET gets here (handle answers 405 to anything else), so Range is read for
+// GET alone, as RFC 9110 §14.2 defines it. The views come from `req_buffer`,
+// the handler's own parameter (a view of `req.buffer` handed on to a callee
+// moves `req` to the heap).
 //
 // The core's zero-copy alternative is core.queue_file (sendfile(2), used by
 // server.static_assets): the worker sends the region itself, but it needs an
@@ -166,7 +170,8 @@ fn serve_video(req request_parser.HttpRequest, req_buffer []u8, path string, mut
 	mark := out.len
 
 	if rng := req.get_header_value_slice('Range') {
-		if rng.len > 0 {
+		// An If-Range can never be true here (see above): its Range is ignored.
+		if rng.len > 0 && req.get_header_value_slice('If-Range') == none {
 			// Zero-copy VIEW of the header value — parse_range scans it in place.
 			header := unsafe { (&req_buffer[rng.start]).vbytes(rng.len) }
 			spec, start, end_req := parse_range(header, size)

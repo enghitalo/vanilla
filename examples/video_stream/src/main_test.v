@@ -25,11 +25,16 @@ fn route(method string, target string) string {
 // video runs serve_video for `path` (sample_video is CWD-relative, and a test
 // must not write one into the repo), with an optional Range header.
 fn video(path string, range string) string {
-	mut head := 'GET /video HTTP/1.1\r\nHost: localhost\r\n'
-	if range != '' {
-		head += 'Range: ${range}\r\n'
+	if range == '' {
+		return video_with(path, '')
 	}
-	buf := (head + '\r\n').bytes()
+	return video_with(path, 'Range: ${range}\r\n')
+}
+
+// video_with runs serve_video for `path` with `headers`: header lines, each
+// ending in CRLF.
+fn video_with(path string, headers string) string {
+	buf := ('GET /video HTTP/1.1\r\nHost: localhost\r\n' + headers + '\r\n').bytes()
 	mut req := request_parser.HttpRequest{
 		buffer: buf
 	}
@@ -262,6 +267,30 @@ fn test_video_unsatisfiable_range_416() {
 	assert video(empty, '') == 'HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 }
 
+// The route sends no validator (no ETag, no Last-Modified), so an If-Range
+// can never be true and its Range MUST be ignored (RFC 9110 §13.1.5): the
+// whole file as a 200, whatever the Range asks for and whatever the If-Range
+// says. The same Range without an If-Range gets its 206 or 416, and an
+// If-Range without a Range changes nothing.
+fn test_video_if_range_ignores_the_range() {
+	path := temp_file('if_range.bin', '0123456789ABCDEF')
+	defer {
+		os.rm(path) or {}
+	}
+	whole := video(path, '')
+	assert whole.starts_with('HTTP/1.1 200 OK\r\n')
+	assert video(path, 'bytes=4-8').starts_with('HTTP/1.1 206 Partial Content\r\n')
+	assert video(path, 'bytes=20-30').starts_with('HTTP/1.1 416 Range Not Satisfiable\r\n')
+	for tag in ['"0123456789abcdef"', 'W/"0123456789abcdef"', 'Wed, 21 Oct 2015 07:28:00 GMT',
+		'*', ''] {
+		for rng in ['bytes=4-8', 'bytes=10-1000', 'bytes=-3', 'bytes=20-30', 'bytes=-0'] {
+			assert video_with(path, 'Range: ${rng}\r\nIf-Range: ${tag}\r\n') == whole, '${rng} | ${tag}'
+			assert video_with(path, 'If-Range: ${tag}\r\nRange: ${rng}\r\n') == whole, '${tag} | ${rng}'
+		}
+		assert video_with(path, 'If-Range: ${tag}\r\n') == whole, tag
+	}
+}
+
 // An open-ended range is answered with at most video_chunk_max bytes; the
 // player asks for the next range.
 fn test_video_chunk_is_capped() {
@@ -302,10 +331,10 @@ fn test_video_not_a_regular_file_is_missing() {
 // Every route but /webcam (which registers a viewer and starts the capture
 // thread) runs 20k times through one reused `out`, as a worker would serve
 // them, /video with every kind of Range answer (206, a clamped 206, 416, an
-// ignored Range, a saturated number); the collector's lifetime allocation
-// counter must not move. (Under `-gc none`, vanilla's production build, the
-// same allocation would be a permanent leak.) Each /video request still opens
-// and closes the file.
+// ignored Range, one ignored for its If-Range, a saturated number); the
+// collector's lifetime allocation counter must not move. (Under `-gc none`,
+// vanilla's production build, the same allocation would be a permanent leak.)
+// Each /video request still opens and closes the file.
 fn test_serving_allocates_nothing() {
 	$if gcboehm ? {
 		path := temp_file('alloc.bin', 'x'.repeat(64 * 1024))
@@ -329,6 +358,7 @@ fn test_serving_allocates_nothing() {
 			'GET /video HTTP/1.1\r\nHost: x\r\nRange: bytes=99999-\r\n\r\n',
 			'GET /video HTTP/1.1\r\nHost: x\r\nRange: bytes=-0\r\n\r\n',
 			'GET /video HTTP/1.1\r\nHost: x\r\nRange: bytes=0-1,5-6\r\n\r\n',
+			'GET /video HTTP/1.1\r\nHost: x\r\nRange: bytes=1000-9999\r\nIf-Range: "x"\r\n\r\n',
 			'GET /video HTTP/1.1\r\nHost: x\r\nRange: bytes=99999999999999999999999-\r\n\r\n',
 		].map(it.bytes())
 		mut reqs := []request_parser.HttpRequest{}

@@ -113,9 +113,7 @@ r-scheme:light dark}#app{font:16px/1.5 system-ui;margin:2rem}
 ```
 
 A range that cannot be satisfied (a start at or past the end, so any start on
-an empty file, or `bytes=-0`) gets a 416 carrying the file's length. It is
-decided after `If-None-Match`, so a cached copy that is still current gets its
-304 instead:
+an empty file, or `bytes=-0`) gets a 416 carrying the file's length:
 
 ```sh
 curl -i -r 500-600 http://localhost:3000/app.3f5a9c.css
@@ -128,6 +126,11 @@ Content-Length: 0
 Connection: keep-alive
 
 ```
+
+The 416 and the 206 are decided after `If-None-Match`, which a Range request
+compares with the identity ETag alone: a current identity copy gets its 304
+instead, while a client whose current copy is the `.br` or `.gz` one gets the
+206 or the 416.
 
 The 416 has no `ETag`, `Cache-Control` or `Vary`. A 416 is not heuristically
 cacheable, so without `Cache-Control` no cache stores it; with the asset's

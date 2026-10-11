@@ -491,10 +491,11 @@ fn test_range_unsatisfiable_disk_backed_and_appended() {
 	assert out.bytestr() == earlier + want
 }
 
-// Range is evaluated after If-None-Match (RFC 9110 §13.2.2), against the
-// identity ETag as for a 206: a cached copy that is still current gets its
-// 304, even when the range would get a 416. An If-Range that is not the
-// identity ETag ignores the Range, unsatisfiable or not (§13.1.5).
+// Range is evaluated after If-None-Match (RFC 9110 §13.2.2), which is
+// compared with the identity ETag alone, as for a 206: a current identity
+// copy gets its 304, even when the range would get a 416, and a current br
+// copy does not. An If-Range that is not the identity ETag ignores the Range,
+// unsatisfiable or not (§13.1.5).
 fn test_range_unsatisfiable_with_preconditions() {
 	s := server()
 	e_id := s.etag_for('app.abc123.js')!
@@ -1386,6 +1387,19 @@ fn test_follow_sendfile_handoff() {
 }
 
 // --- no allocation per request -----------------------------------------------
+//
+// Each request is served on its own: a warm-up, then alloc_rounds times while
+// the GC's lifetime allocation counter is watched (it stays 0 on -gc none and
+// -race builds). It must grow by less than alloc_budget, so a path that leaks
+// even one byte per request fails, whichever path it is.
+
+const alloc_rounds = 2000
+const alloc_budget = u64(1024)
+
+// shown names a request in a failure message: its lines, CRLF made visible.
+fn shown(r []u8) string {
+	return r.bytestr().trim_space().replace('\r\n', ' | ')
+}
 
 fn test_respond_into_does_not_allocate() {
 	s := server()
@@ -1412,18 +1426,19 @@ fn test_respond_into_does_not_allocate() {
 		req('GET /nope.9f3a1c.wasm HTTP/1.1'),
 	]
 	mut out := []u8{cap: 2 * big_size}
-	// Warm up, then count what the GC hands out (0 on -gc none / -race builds).
 	for r in reqs {
-		out.clear()
-		s.respond_into(r, mut out)!
+		for _ in 0 .. 3 {
+			out.clear()
+			s.respond_into(r, mut out)!
+		}
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. alloc_rounds {
+			out.clear()
+			s.respond_into(r, mut out)!
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert grown < alloc_budget, 'respond_into allocated ${grown} bytes over ${alloc_rounds} of: ${shown(r)}'
 	}
-	before := gc_heap_usage().total_bytes
-	for i in 0 .. 10_000 {
-		out.clear()
-		s.respond_into(reqs[i % reqs.len], mut out)!
-	}
-	grown := gc_heap_usage().total_bytes - before
-	assert grown < 16 * 1024, 'respond_into allocated ${grown} bytes over 10k requests'
 }
 
 fn test_respond_does_not_allocate_for_in_memory_replies() {
@@ -1445,15 +1460,17 @@ fn test_respond_does_not_allocate_for_in_memory_replies() {
 		req('GET /nope.9f3a1c.wasm HTTP/1.1'),
 		req('POST / HTTP/1.1'),
 	]
-	mut total := 0
 	for r in reqs {
-		total += s.respond(r)!.len
+		mut total := 0
+		for _ in 0 .. 3 {
+			total += s.respond(r)!.len
+		}
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. alloc_rounds {
+			total += s.respond(r)!.len
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert total > 0
+		assert grown < alloc_budget, 'respond allocated ${grown} bytes over ${alloc_rounds} of: ${shown(r)}'
 	}
-	before := gc_heap_usage().total_bytes
-	for i in 0 .. 10_000 {
-		total += s.respond(reqs[i % reqs.len])!.len
-	}
-	grown := gc_heap_usage().total_bytes - before
-	assert total > 0
-	assert grown < 16 * 1024, 'respond allocated ${grown} bytes over 10k requests'
 }
