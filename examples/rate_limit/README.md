@@ -56,6 +56,10 @@ RateLimit-Remaining: 0
 Content-Length: 0
 ```
 
+`RateLimit-Limit: 10` is a literal in `response_429` while the burst is 20,
+and the 200 carries no `RateLimit-Limit` at all
+([#294](https://github.com/enghitalo/vanilla/issues/294)).
+
 Forging `X-Forwarded-For` does not buy a fresh bucket, because the peer
 (`127.0.0.1`) is not a trusted proxy:
 
@@ -67,7 +71,8 @@ for i in $(seq 5); do curl -s -o /dev/null -w '%{http_code} ' -H "X-Forwarded-Fo
 429 429 429 429 429
 ```
 
-After one second about ten tokens are back:
+A token refills every 100 ms, so a slow loop can see one `200` there; after
+one second about ten tokens are back:
 
 ```sh
 sleep 1; for i in $(seq 12); do curl -s -o /dev/null -w '%{http_code} ' localhost:3000/; done; echo
@@ -94,8 +99,11 @@ sleep 1; for i in $(seq 12); do curl -s -o /dev/null -w '%{http_code} ' localhos
   IPv4 address (an IPv6 client, `unknown`) has no key, and everything left of
   it is client-written, so the key is the proxy: such clients share its
   bucket. A peer with no IPv4 address (a `getpeername` failure, a Unix-socket
-  listener) gets key `0`, one shared `'unknown'` bucket. This is the same rule
-  as [examples/proxy_aware](../proxy_aware/).
+  listener) gets key `0`, one shared `'unknown'` bucket. The TCP listener
+  binds `0.0.0.0`, so today every TCP peer has an IPv4 key; on a dual-stack
+  listener every native IPv6 client would share that key-`0` bucket, and one
+  of them could drain it for all. This is the same rule as
+  [examples/proxy_aware](../proxy_aware/).
 - **`trusted_proxies` is empty by default**, so nothing is trusted until you
   list your own proxies as CIDRs (e.g. `'127.0.0.1/32'` for nginx on the same
   host). `parse_cidrs` turns them into masks once at init.
@@ -124,8 +132,13 @@ then deny, exact refill, per-client isolation), checks that the sweep only
 drops full buckets and never changes a decision, that the table cap fails
 closed, and the identity rules (empty default trust list, `X-Forwarded-For`
 ignored from untrusted peers, right-most untrusted hop behind a trusted proxy,
-edge cases); `handle` is fed raw requests for the exact 200 framing and the
-const 429. [server_end_to_end_test.v](src/server_end_to_end_test.v) (Linux)
+a non-IPv4 client hop keyed on the proxy, edge cases); `handle` is fed raw
+requests for the exact 200 framing, the const 429 and the `.close` on a
+malformed request. `test_rate_limit_allocates_nothing` checks that a client
+that already has a bucket, allowed or denied, keyed on a real loopback peer,
+and the trusted-proxy hop scan allocate nothing (a `gc_heap_usage()` delta
+over 20k rounds).
+[server_end_to_end_test.v](src/server_end_to_end_test.v) (Linux)
 sends ten requests with a different forged header each over a real socket:
 three pass, seven get 429, and only one bucket (`127.0.0.1`) exists.
 

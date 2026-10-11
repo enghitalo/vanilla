@@ -1,6 +1,6 @@
 # ip_block — deny listed client addresses with 403
 
-A denylist of IP addresses checked on every request against the connection's
+A denylist of IPv4 addresses checked on every request against the connection's
 **socket peer** (`socket.peer_ipv4(client_fd)`), never against a header the
 client can write. A listed address gets `403 Forbidden`; everyone else gets
 the resource.
@@ -39,13 +39,19 @@ A forged `X-Forwarded-For: 10.0.0.5` changes nothing: the decision uses the
 socket peer only.
 
 To see the deny path from your own machine, add
-`blocklist.block('127.0.0.1')` next to the other two in `main()` and rerun:
+`blocklist.block('127.0.0.1')!` next to the other two in `main()` (`block`
+returns an error for text that is not IPv4, so the `!` is required) and rerun
+`curl -i localhost:3000/`:
 
 ```
 HTTP/1.1 403 Forbidden
 Content-Length: 0
 Connection: close
 ```
+
+Despite that header, `handle` returns `.done`, not `.close`: the connection
+stays open, and a blocked peer that pipelines two requests gets two 403s on it
+([#293](https://github.com/enghitalo/vanilla/issues/293)).
 
 Nothing is logged per denial: a blocked client could otherwise force a stderr
 write on every request it sends. Count denials, or log once per connection,
@@ -58,8 +64,14 @@ if you need them.
   allocation), and checks it against the list. A peer with no IPv4 address
   (a Unix-socket listener; there use `socket.peer_cred`) is on no list: it is
   allowed. It does not even parse the request: the decision needs only the
-  connection. Behind a proxy or CDN the peer is the proxy, so swap in the
-  trusted-proxy client IP from [examples/proxy_aware](../proxy_aware/).
+  connection, so an allowed peer gets the 200 even for `garbage\r\n\r\n`.
+  Behind a proxy or CDN the peer is the proxy, so swap in the trusted-proxy
+  client IP from [examples/proxy_aware](../proxy_aware/).
+- **IPv4 only.** The TCP listener binds `0.0.0.0`, so today every TCP peer
+  has an IPv4 address and an IPv6 client cannot connect at all. On a
+  dual-stack listener an IPv4-mapped peer (`::ffff:a.b.c.d`) would still be
+  checked by its IPv4 address, but a native IPv6 peer has no `u32`: it would
+  be allowed, since the list cannot hold an IPv6 address.
 - **One shared, read-mostly list.** `Blocklist` is a `map[u32]bool` behind a
   `sync.RwMutex`. `block` and `unblock` take dotted-quad text, parse it once
   (`parse_ipv4`) and refuse what is not IPv4. `is_blocked` takes the read
@@ -83,7 +95,8 @@ v test examples/ip_block/src
 round trip and the refusal of text that is not IPv4, allows a peer with no
 IPv4 address (fd `-1`), and drives `handle` over a real loopback connection:
 a listed `127.0.0.1` gets the 403, an unlisted one the 200, and neither
-allocates.
+allocates (`test_ip_block_allocates_nothing`, a `gc_heap_usage()` delta over
+20k rounds of each).
 
 ## See also
 

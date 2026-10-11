@@ -88,8 +88,9 @@ Content-Length: 41
 
 - **The peer comes from the socket.** `handle` calls
   `socket.peer_ipv4(client_fd)`, the peer's IPv4 address as a `u32` (one
-  `getpeername` syscall, no allocation), and passes it to `real_client_ip`. That function takes the peer as a parameter, so the
-  tests drive every branch with injected peers.
+  `getpeername` syscall, no allocation), and passes it to `real_client_ip`.
+  That function takes the peer as a parameter, so the tests drive every
+  branch with injected peers.
 - **CIDRs parsed once.** `parse_cidrs` turns `trusted_proxies` into
   pre-masked `Cidr` pairs at module init; per request, `ip_in_cidrs` is a
   mask-and-compare on the `u32`. Real masking gets ranges
@@ -105,7 +106,9 @@ Content-Length: 41
   client, `unknown`) cannot be reported, and every hop left of it is
   client-written, so the answer is the proxy itself. A peer with no IPv4
   address (a `getpeername` failure, a Unix-socket listener) is untrusted and
-  reported as `unknown`.
+  reported as `unknown`. The TCP listener binds `0.0.0.0`, so today every TCP
+  peer is IPv4; on a dual-stack listener a native IPv6 peer would be
+  `unknown` too, and an IPv6 proxy could never be trusted.
 - **Framed once, straight into `out`.** Content-Length is `body_overhead`
   plus the lengths of the two dynamic fields (`ipv4_len` for the address),
   written by `wi`; then the `body_pre`/`body_mid`/`body_tail` consts and the
@@ -115,7 +118,10 @@ Content-Length: 41
 - **`X-Forwarded-Proto` is echoed as sent**, from any peer, to show the read
   (default `http`). It is client-settable like `X-Forwarded-For`: in
   production gate it on the same peer trust, and never reflect either value
-  into a response without encoding it.
+  into a response without encoding it. Here it is not escaped, so
+  `-H 'X-Forwarded-Proto: http","admin":true,"x":"y'` adds keys to the JSON
+  ([#293](https://github.com/enghitalo/vanilla/issues/293)); `client_ip`
+  cannot be abused that way, since it is printed from the `u32`.
 - [examples/rate_limit](../rate_limit/) copies this trust rule verbatim to
   key its buckets; there `trusted_proxies` starts empty.
 
@@ -132,7 +138,10 @@ header, a trusted peer without the header, a non-IPv4 client hop, an
 untrusted peer and the unknown peer, and `write_ipv4` against `ipv4_len`.
 Through `handle` (fd `-1`, so the peer is unknown, and a real loopback
 connection) it checks the exact response bytes, the default scheme, that a
-malformed request gets no response, and that serving allocates nothing.
+malformed request closes the connection (`handle` answers the canned 400 and
+returns `.close`), and that serving allocates nothing
+(`test_proxy_aware_allocates_nothing`, a `gc_heap_usage()` delta over 20k
+rounds).
 
 ## See also
 
