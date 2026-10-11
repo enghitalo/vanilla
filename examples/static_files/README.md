@@ -150,13 +150,16 @@ v test examples/static_files/src
 ```
 
 [main_test.v](src/main_test.v) builds a throwaway `public/` + `public2/`
-fixture in a temp dir (with symlinks pointing in and out of the root) and
-calls `handle` directly. It covers `parse_range` (normal, suffix,
-open-ended, rejected specs), `mime_type`, traversal (`..`, the `public2`
-sibling, an escaping symlink, unresolvable paths and symlink loops), and
-raw-request cases: index, query strip, HEAD, 404, 405, 206, fallback to 200,
-the ETag → 304 round trip, the canned 400 on garbage, and that serving
-allocates nothing (a `gc_heap_usage()` delta over 20k rounds of requests).
+fixture in a temp dir (with symlinks pointing in and out of the root, a
+directory, a FIFO and an empty file) and calls `handle` directly. It covers
+`parse_range` (normal, suffix, open-ended, rejected specs), `mime_type`,
+traversal (`..`, the `public2` sibling, an escaping symlink, unresolvable
+paths and symlink loops, a NUL, an over-long path), and raw-request cases:
+index, query strip, HEAD, 404 (also for the directory, the FIFO and a path
+ending in `/`), 405, 206 (a window from the middle too, and HEAD), fallback
+to 200, the ETag → 304 round trip, a response already in `out` left intact,
+the canned 400 on garbage, and that serving allocates nothing (a
+`gc_heap_usage()` delta over 20k rounds of requests).
 
 ## See also
 

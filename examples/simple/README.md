@@ -8,18 +8,17 @@ with the router in [main.v](src/main.v) and the controllers in
 
 It is written the straightforward way, to read easily: the router compares
 `string` views of the request with `==`, and each controller appends its
-response straight into `out`. It still allocates nothing per request. The
-next two examples change one thing each: [simple2](../simple2/) routes by
-byte offsets instead of building string views, and [simple3](../simple3/)
-keeps this code but hangs the handler on an `App` struct that owns shared
-resources.
+response straight into `out`. No route allocates. The next two examples
+change one thing each: [simple2](../simple2/) routes by byte offsets instead
+of building string views, and [simple3](../simple3/) keeps this code but
+hangs the handler on an `App` struct that owns shared resources.
 
 ## File layout
 
 | File | Role |
 |---|---|
 | [src/main.v](src/main.v) | `handle_request` (the router) and `main` (server config) |
-| [src/controllers.v](src/controllers.v) | one function per route, each returning the full response |
+| [src/controllers.v](src/controllers.v) | one function per route, each appending the full response into `out` |
 | `dockerfile`, `docker-compose.yml` | container recipe (not exercised by the tests; the compose file's `PORT` variable is not read, the port is fixed in code) |
 
 ## Run
@@ -72,11 +71,14 @@ The id is everything after `/user/`, query included: `/user/7?x=1` echoes
 
 - **One handler is the router.** `handle_request` decodes the request with
   `request_parser.decode_http_request` (a malformed one gets
-  `response.tiny_bad_request_response` and `.close`), takes the method and
-  path as `tos` views of the handler's `req_buffer` (no copy), and branches
-  with `==` and `starts_with`. The views come from `req_buffer`, not
-  `req.buffer`: a view of `req.buffer` that reaches a callee makes V copy the
-  whole request struct to the heap on every request.
+  `response.tiny_bad_request_response` and `.close`; its boxed `error()` is
+  the one allocation left, on a connection about to close), takes the method
+  and path as `tos` views of the handler's `req_buffer` (no copy), and
+  branches with `==` and `starts_with`. The views come from `req_buffer`, not
+  `req.buffer`: a view of `req.buffer` handed to a function that returns it
+  (or returns `!T`/`?T`) makes V copy the whole request struct to the heap on
+  every request
+  ([V_PERF_TOOLBOX](../../docs/V_PERF_TOOLBOX.md#comptime-escape-and-allocation-checks-v-5516000)).
 - **Controllers append the whole response.** Each takes `mut out []u8`:
   `home_controller` and `create_user_controller` append `const` strings with
   `core.append_str`, and `get_user_controller` gets the id as a view of the

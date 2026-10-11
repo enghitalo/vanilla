@@ -20,7 +20,7 @@ see [examples/async_db_pg](../async_db_pg/) and
 | File | Role |
 |---|---|
 | [src/main.v](src/main.v) | `App`, `App.handle_request` (the router), `main` (pool + server) |
-| [src/controllers.v](src/controllers.v) | the controllers, as `App` methods returning the full response |
+| [src/controllers.v](src/controllers.v) | the controllers, as `App` methods appending the full response into `out` |
 
 ## Run
 

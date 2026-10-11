@@ -74,7 +74,7 @@ not parsed as a form: `{}`.
   byte and `+` into a space, writing into `out` itself; the JSON escapes are
   then made in place. The decoded pairs are used once, within the call, so
   they never exist as strings, in a map or in a builder: a request allocates
-  nothing
+  nothing (`test_requests_allocate_nothing`)
   ([BEST_PRACTICES §2](../../docs/BEST_PRACTICES.md#2-stay-zero-copy-work-with-slices-not-copies)).
   A handler that must keep a value decodes it into an owned buffer with the
   same helper.

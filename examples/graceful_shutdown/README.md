@@ -35,6 +35,8 @@ Then stop it with `kill -TERM <pid>` (or Ctrl-C). Measured with the binary
 built from this folder, an idle keep-alive connection open, and SIGTERM:
 
 ```
+[socket] SO_REUSEPORT enabled for load balancing
+[socket] Binding to 0.0.0.0:3000
 Graceful-shutdown demo on http://localhost:3000/  (send SIGTERM to drain & exit)
 listening on http://localhost:3000/
 signal received: stop accepting, draining (2s), exiting...

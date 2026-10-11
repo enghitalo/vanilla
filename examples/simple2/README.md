@@ -4,7 +4,9 @@
 simple2 serves the same CRUD-shaped routes (plus `GET /users`) with the
 router comparing bytes in place by offsets, and the user id as a zero-copy
 `[]u8` view of the request buffer. Both append the response straight into
-the server's `out` buffer and allocate nothing per request.
+the server's `out` buffer and allocate nothing on any route (only a
+malformed head, which closes the connection, still boxes an `error()` in
+`decode_http_request`).
 
 Read it side by side with simple: same file split, same responses, and every
 difference is one of the patterns in

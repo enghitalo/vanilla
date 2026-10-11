@@ -99,8 +99,8 @@ other path answer an empty `200 OK`.
   buffer, passed through `safe_next`, and appended between two literal
   `core.append_str` calls: no copy, no `${}`
   ([BEST_PRACTICES §3b](../../docs/BEST_PRACTICES.md#3b-dynamic-responses--append-parts-straight-into-out)).
-  The fallback targets (`slash_bytes`, `dashboard_bytes`) are `const`
-  byte arrays built once at startup.
+  The fallback targets are consts: `slash_bytes`, a byte array built once at
+  startup, and `dashboard_target`, a string appended with `core.append_str`.
 - **The open-redirect guard.** `safe_next` accepts only a target that starts
   with `/` and not `//`; anything else becomes `/`. The query value is not
   percent-decoded, so `%2F%2Fevil.com` does not start with `/` and is
