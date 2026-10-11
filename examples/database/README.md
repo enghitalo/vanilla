@@ -33,10 +33,12 @@ docker compose -f examples/database/docker-compose.yml up -d
 v -prod run examples/database/src
 ```
 
-The compose file names its container `postgres` and keeps the data in the
-`database_postgres_data` volume. At startup the example opens 5 connections
-and creates the `users` table if it is missing; then it listens on `:3000`.
-When you are done:
+Compose names the project after the file's directory, `database`: the
+container is `database-postgres-1`, on the `database_default` network, and the
+data is kept in the `database_postgres_data` volume. At startup the example
+opens 5 connections and creates the `users` table if it is missing; then it
+listens on `:3000`. When you are done (this removes the container, the network
+and the volume):
 
 ```sh
 docker compose -f examples/database/docker-compose.yml down -v
@@ -46,8 +48,9 @@ The routes, on a fresh table:
 
 ```sh
 curl -i -X POST localhost:3000/user      # inserts a row named new_user
-curl -i localhost:3000/user              # every row
+curl -i localhost:3000/user              # every row, ordered by id
 curl -i localhost:3000/user/1            # one row, by id
+curl -i localhost:3000/user/99           # an id with no row
 curl -i 'localhost:3000/user/1;DELETE/**/FROM/**/users'
 ```
 
@@ -57,37 +60,54 @@ curl -i 'localhost:3000/user/1;DELETE/**/FROM/**/users'
 HTTP/1.1 201 Created
 Content-Type: application/json
 Content-Length: 0
-Connection: close
+Connection: keep-alive
 ```
 
 After two inserts, `GET /user`:
 
 ```
 HTTP/1.1 200 OK
-Content-Type: text/plain
-Content-Length: 108
-Connection: close
+Content-Type: application/json
+Content-Length: 55
+Connection: keep-alive
 
-pg.Row{
-    vals: [Option('1'), Option('new_user')]
-}
-pg.Row{
-    vals: [Option('2'), Option('new_user')]
-}
+[{"id":1,"name":"new_user"},{"id":2,"name":"new_user"}]
 ```
 
-`GET /user/1` answers the first row alone (`Content-Length: 53`); an id with
-no row answers 200 with an empty body. The injection attempt never reaches
-the database:
+`GET /user/1`:
+
+```
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 26
+Connection: keep-alive
+
+{"id":1,"name":"new_user"}
+```
+
+The query string is not part of the route: `GET /user/1?x=1` gets that same
+answer, and `GET /user?x=1` the list. `GET /user/99`, an id with no row:
+
+```
+HTTP/1.1 404 Not Found
+Content-Length: 0
+Connection: keep-alive
+```
+
+Any other method or path (`GET /nope`, `DELETE /user`) gets that same 404.
+The injection attempt never reaches the database:
 
 ```
 HTTP/1.1 400 Bad Request
 Content-Length: 0
-Connection: close
+Connection: keep-alive
 ```
 
-`GET /` is a 200 with an empty body. Any other method or path is answered
-with that same 400 (there is no 404 here).
+`GET /` is a 200 with an empty body. Every one of these responses keeps the
+connection: curl reuses it from one request to the next, and pipelined
+requests are answered in order. A request head that does not parse gets the
+canned `400 Bad Request` with `Connection: close` instead, and the server
+closes the connection after it.
 
 ## How it works
 
@@ -101,29 +121,37 @@ with that same 400 (there is no 404 here).
   the worker thread; while they do, that worker serves nobody else. This is
   what [BEST_PRACTICES §5](../../docs/BEST_PRACTICES.md#5-side-effects-go-through-the-async-runtime--pools-off-the-hot-path)
   replaces with `pg_async` and `.suspend`.
-- **Injection defense in two layers.** `handle_request` takes the id after
-  `/user/` as a `tos` view into the request buffer (query string included).
-  `is_user_id` accepts only 1-10 ASCII digits that fit in an int4, so
-  anything else is a 400 before the pool is touched.
+- **Injection defense in two layers.** `handle_request` routes on the path
+  up to its first `?` (`route_len`), so the query string never reaches a
+  controller, and takes the id after `/user/` as a `tos` view into the
+  request buffer. `is_user_id` accepts only 1-10 ASCII digits that fit in an
+  int4, so anything else is a 400 before the pool is touched.
   `get_user_controller` then copies the digits into a NUL-terminated stack
   array (libpq reads parameters as C strings) and binds them as `$1` with
   `exec_param`; the id is never spliced into SQL text.
-- **Responses appended into `out`.** The controllers take `mut out []u8`:
-  their fixed responses are `const` strings appended with `core.append_str`
-  (the 400 is `response.tiny_bad_request_response`, appended with `<<`), and
-  `append_rows_response` writes the head (`rows_head`, `rows_tail`), then each
-  row straight into `out`, then splices the `Content-Length` digits in between
-  (one memmove over the tail and body), with no `strings.Builder` and no
-  return-then-copy
+- **JSON appended into `out`.** The controllers take `mut out []u8`: their
+  fixed responses are `const` strings appended with `core.append_str`, and
+  `append_users_response` writes the head (`json_head`, `json_tail`), then
+  the body straight into `out`, then splices the `Content-Length` digits in
+  between (one memmove over the tail and body), with no `strings.Builder`, no
+  `.str()` and no return-then-copy
   ([BEST_PRACTICES §1](../../docs/BEST_PRACTICES.md#1-handlers-append-into-the-connections-write-buffer-zero-alloc),
   [§3](../../docs/BEST_PRACTICES.md#3-avoid--interpolation-on-the-hot-path)).
-  The body is still V's debug rendering of `pg.Row` (`row.str()`, one string
-  per row), and with the query result it is what these routes allocate; the
-  routes that never reach the database allocate nothing.
-- **`Connection: close` is only a header.** Every response says it, but the
-  handler returns `.done`, so the server keeps the connection open: a second
-  pipelined request on it is still answered. curl closes after the first
-  response because of the header.
+  The queries select `id, name` (`ORDER BY id` for the list), and each row
+  becomes `{"id":…,"name":…}`: the id is libpq's text for the int4, its
+  digits, already a JSON number; the name goes through `json_escape_into`,
+  which escapes `"`, `\` and control characters as
+  [examples/async_db_pg](../async_db_pg/) does; SQL NULL is `null`. What
+  these routes allocate comes from db.pg (the result rows, as V strings,
+  among other things); the rendering and the routes that never reach the
+  database allocate nothing.
+- **Every response keeps the connection.** Each one says
+  `Connection: keep-alive`, and `handle_request` returns `.done`, so the
+  header says what the server does (a server that sends `close` must close,
+  [RFC 9112 §9.6](https://www.rfc-editor.org/rfc/rfc9112#section-9.6)). The
+  one exception is a request head that `decode_http_request` rejects: it gets
+  `response.tiny_bad_request_response` (`Connection: close`, appended with
+  `<<`) and `.close`, which closes the connection.
 
 ## Tests
 
@@ -134,10 +162,16 @@ v test examples/database/src
 [main_test.v](src/main_test.v) needs no PostgreSQL (but does need libpq to
 compile): it calls `handle_request` with a closed, empty pool, so a request
 that reaches the database gets the controller's 500. Injection payloads
-(`1/**/OR/**/1=1`, `1;DELETE...`, `abc`, `-1`, `1?x=1`, an int4 overflow,
-11 digits) all get 400, valid ids get 500 (they passed validation),
-`is_user_id` is checked directly, `append_rows_response` frames rows exactly,
-and the routes that stop before the database allocate nothing.
+(`1/**/OR/**/1=1`, `1;DELETE...`, `abc`, `-1`, an int4 overflow, 11 digits,
+with or without a query string) all get the 400, and valid ids get 500 (they
+passed validation; `/user/1?x=1` is one, its query cut off). Every request
+that parses, route by route, is answered `.done` with
+`Connection: keep-alive` (unknown routes with the 404), and a malformed head
+gets the canned 400 and `.close`. `is_user_id` is checked directly (it
+rejects `1?x=1` too). `append_users_response` renders the exact JSON, array
+and object, with escaped names and `null`, framed with its Content-Length,
+and a JSON parser reads the escaped name back. The routes that stop before
+the database allocate nothing, and neither does the rendering.
 
 ## See also
 
