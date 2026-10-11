@@ -38,16 +38,17 @@ ok
 ## How it works
 
 - **Per-worker state.** `make_state` (the `ServerConfig` hook, run once per
-  worker) returns a fresh `DateCache`: the unix second the line was built for
-  (`sec`) and the line itself (`line`, capacity 40). The handler gets it back
+  worker) returns a fresh `DateCache`: the unix second the line holds
+  (`sec`) and the line itself (`line`, 37 bytes: `Date: `, the 29-byte
+  IMF-fixdate, CRLF, seeded from a template). The handler gets it back
   as `worker_state`, so each worker only ever touches its own cache
   ([BEST_PRACTICES §6](../../docs/BEST_PRACTICES.md#6-concurrency-no-shared-mutable-state-without-protection)).
 - **Lazy refresh.** `handle` calls `dc.refresh()` first. `refresh` reads
   `time.unix_now()` (a plain `time()`, served from the vDSO) and returns at
-  once if it equals `dc.sec`. Only on a new second does it clear `line` and
-  rebuild it with `time.utc().push_to_http_header`, so the formatting happens
-  at most once per second per worker, and only on a worker that is serving
-  traffic.
+  once if it equals `dc.sec`. Only on a new second does it touch `line`:
+  `time.update_http_header` rewrites in place just the digits that changed
+  since `dc.sec` (mostly the two seconds digits). That happens at most once
+  per second per worker, and only on a worker that is serving traffic.
 - **Always current.** Because every request checks the second, the header is
   never stale; [date_header](../date_header/)'s ticker can lag up to a second.
 - **The handler is three appends.** `core.append_str(mut out, head)`,
@@ -55,12 +56,13 @@ ok
   around the cached line, straight into `out`
   ([BEST_PRACTICES §3a](../../docs/BEST_PRACTICES.md#3a-static-responses--a-const-string-appended-with-coreappend_str)).
   The handler never parses the request.
-- **Allocation-free between rebuilds.** The `line` buffer keeps its capacity
-  across rebuilds, and `test_handler_allocates_nothing` checks that 20k
-  requests leave the GC heap counter all but unchanged
+- **Allocation-free, rebuilds included.** `test_handler_allocates_nothing`
+  checks that 20k requests, every other one rewriting the line as if a
+  second had passed, leave the GC heap counter all but unchanged
   ([BEST_PRACTICES §4](../../docs/BEST_PRACTICES.md#4-allocate-on-the-hot-path-with-intent)).
-  The rebuild itself still appends `'Date: '.bytes()` and `'\r\n'.bytes()`,
-  a small allocation once a second.
+  Only a whole-date write (a worker's first request, and the first after
+  midnight) allocates: V's weekday lookup builds a small array, once a day
+  per worker.
 
 ## Tests
 
@@ -73,8 +75,8 @@ byte for byte against vlib's `http_header_string`, bracketing each request
 with the clock so the expected second is known: any request (even garbage or
 an empty buffer) gets the same answer; the line is rebuilt in place, not
 appended to, when the second advances; the handler appends after bytes already
-in `out`; and 20k requests through one reused buffer grow the GC heap by less
-than 4 KiB (the once-a-second rebuild aside).
+in `out`; and 20k requests through one reused buffer, half of them rewriting
+the line, grow the GC heap by less than 4 KiB.
 
 ## See also
 

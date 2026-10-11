@@ -21,18 +21,21 @@ import server
 import core
 import time
 
+// "Date: " (6) + IMF-fixdate (29, "Sun, 06 Nov 1994 08:49:37 GMT") + CRLF (2).
+const date_line_len = 37
+const date_line_template = 'Date: Xxx, 00 Xxx 0000 00:00:00 GMT\r\n'
+
 // DateCache is one worker's cached Date line + the unix second it is valid for.
 struct DateCache {
 mut:
-	sec  i64  // unix second the cached line was built for
-	line []u8 // "Date: <rfc1123>\r\n", reused until `sec` changes
+	sec  i64  // unix second the cached line holds (0: only the template)
+	line []u8 // "Date: <IMF-fixdate>\r\n", rewritten in place when `sec` changes
 }
 
 // make_state runs once per worker — each gets its own cache (no lock needed).
 fn make_state() voidptr {
 	return &DateCache{
-		sec:  0
-		line: []u8{cap: 40}
+		line: date_line_template.bytes()
 	}
 }
 
@@ -41,23 +44,20 @@ fn make_state() voidptr {
 fn (mut dc DateCache) refresh() {
 	// Hot path: ONE cheap time.unix_now() (a bare time() call, ~2 ns, served from
 	// the vDSO — no calendar decomposition, no allocation) to detect a second
-	// boundary. Only when the second actually advances do we pay for time.utc()'s
-	// full RFC-1123 formatting — once per second, not per request.
+	// boundary. Only when the second actually advances is the line touched:
+	// time.update_http_header rewrites, in place, just the digits that changed
+	// since `sec` (mostly the two seconds digits) — no allocation. Its first call
+	// and the first after midnight write the whole date with write_http_header,
+	// whose weekday lookup (V's time.day_of_week) allocates a small array: once a
+	// day per worker, not once a second.
 	// (Was: time.utc() on EVERY request just to read its .unix() second.)
 	now_sec := time.unix_now()
 	if now_sec == dc.sec {
 		return
 	}
+	unsafe { time.update_http_header(&dc.line[6], date_line_len - 6, dc.sec, now_sec) or {} }
 	dc.sec = now_sec
-	dc.line.clear()
-	dc.line << 'Date: '.bytes()
-	// push_to_http_header writes "Sun, 06 Nov 1994 08:49:37 GMT" — now allocation-free
-	// itself (wraps time.write_http_header), so this once-a-second rebuild is cheap.
-	time.utc().push_to_http_header(mut dc.line)
-	dc.line << '\r\n'.bytes()
 }
-
-const body = 'ok'.bytes()
 
 const head = 'HTTP/1.1 200 OK\r\n'
 

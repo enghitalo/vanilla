@@ -81,20 +81,25 @@ fn test_appends_after_existing_bytes() {
 	assert second_of(got.all_after('No Content\r\n\r\n'), before, after) >= 0, got
 }
 
-// 20k requests through one reused buffer, as a worker serves them: apart from
-// the once-a-second rebuild, the collector's lifetime allocation counter must
-// not move (under `-gc none`, vanilla's production build, an allocation here
-// would be a permanent leak).
+// Neither the cached path nor the once-a-second rebuild allocates: 20k
+// requests through one reused buffer, as a worker serves them, every other
+// one rebuilding the line as if a second had passed, must not move the
+// collector's lifetime allocation counter. (Under `-gc none`, vanilla's production build, an allocation here
+// would be a permanent leak.)
 fn test_handler_allocates_nothing() {
 	$if gcboehm ? {
 		state := make_state()
+		mut dc := unsafe { &DateCache(state) }
 		req := 'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
 		mut out := []u8{cap: 256}
 		mut event_loop := core.EventLoop{}
-		handle(req, mut out, -1, state, mut event_loop)
+		handle(req, mut out, -1, state, mut event_loop) // warm-up
 		rounds := 20_000
 		before := gc_heap_usage().total_bytes
-		for _ in 0 .. rounds {
+		for i in 0 .. rounds {
+			if i % 2 == 0 {
+				dc.sec-- // as if the second had advanced: refresh() rewrites the line
+			}
 			unsafe {
 				out.len = 0
 			}
