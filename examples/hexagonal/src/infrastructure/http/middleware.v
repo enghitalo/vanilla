@@ -23,7 +23,9 @@ const dummy_password_phc = '$argon2id$v=19$m=65536,t=3,p=4$+HT4+8cnppa9vdY2WNeDe
 // user's PHC string and compares in constant time (argon2 uses hmac.equal) —
 // the verify of examples/auth. ~200 ms BY DESIGN: behind a vanilla server, run
 // it off the event loop as examples/auth does (offload_nix.c.v).
-pub fn (a SimpleAuthService) authenticate(credentials domain.AuthCredentials) !domain.User {
+// A failed login is routine (a mistyped password), so it is `none`, not an
+// error() that boxes a message on every wrong password.
+pub fn (a SimpleAuthService) authenticate(credentials domain.AuthCredentials) ?domain.User {
 	mut known := true
 	user := a.repo.find_by_username(credentials.username) or {
 		known = false
@@ -33,9 +35,9 @@ pub fn (a SimpleAuthService) authenticate(credentials domain.AuthCredentials) !d
 	}
 	password := unsafe { credentials.password.str.vbytes(credentials.password.len) } // view
 	phc := unsafe { user.password_hash.str.vbytes(user.password_hash.len) } // view
-	argon2.compare_hash_and_password(password, phc) or { return error('Authentication failed') }
+	argon2.compare_hash_and_password(password, phc) or { return none }
 	if !known {
-		return error('Authentication failed')
+		return none
 	}
 	return user
 }

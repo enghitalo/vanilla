@@ -7,5 +7,6 @@ pub:
 }
 
 pub interface AuthService {
-	authenticate(credentials AuthCredentials) !User
+	// authenticate answers none when the credentials do not match a user.
+	authenticate(credentials AuthCredentials) ?User
 }

@@ -26,15 +26,15 @@ pub fn (r PgUserRepository) create_table() ! {
 	db.exec('CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, email TEXT NOT NULL, password_hash TEXT NOT NULL)')!
 }
 
-pub fn (r PgUserRepository) find_by_id(id string) !domain.User {
-	conn := r.get_conn()!
+pub fn (r PgUserRepository) find_by_id(id string) ?domain.User {
+	conn := r.get_conn() or { return lookup_failed('find_by_id', err) }
 	defer { r.release_conn(conn) or { panic(err) } }
 	mut db := conn as pg.DB
 	rows := db.exec_param_many('SELECT id, username, email, password_hash FROM users WHERE id = $1', [
 		id,
-	])!
+	]) or { return lookup_failed('find_by_id', err) }
 	if rows.len == 0 {
-		return error('not found')
+		return none
 	}
 	row := rows[0]
 	return domain.User{
@@ -45,15 +45,15 @@ pub fn (r PgUserRepository) find_by_id(id string) !domain.User {
 	}
 }
 
-pub fn (r PgUserRepository) find_by_username(username string) !domain.User {
-	conn := r.get_conn()!
+pub fn (r PgUserRepository) find_by_username(username string) ?domain.User {
+	conn := r.get_conn() or { return lookup_failed('find_by_username', err) }
 	defer { r.release_conn(conn) or { panic(err) } }
 	mut db := conn as pg.DB
 	rows := db.exec_param_many('SELECT id, username, email, password_hash FROM users WHERE username = $1', [
 		username,
-	])!
+	]) or { return lookup_failed('find_by_username', err) }
 	if rows.len == 0 {
-		return error('not found')
+		return none
 	}
 	row := rows[0]
 	return domain.User{

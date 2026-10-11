@@ -8,7 +8,8 @@ pub:
 }
 
 pub interface ProductRepository {
-	find_by_id(id string) !Product
+	// find_by_id answers none when there is no such product.
+	find_by_id(id string) ?Product
 	create(product Product) !Product
 	list() ![]Product
 }

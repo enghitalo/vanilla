@@ -8,8 +8,10 @@ module main
 // (Each register/login pays one argon2id: a few seconds in a debug build.)
 import application
 import db.sqlite
+import hash as wyhash
 import infrastructure.database
 import infrastructure.http
+import infrastructure.repositories
 import os
 import pool
 import time
@@ -31,6 +33,85 @@ fn temp_db_path(name string) string {
 	return path
 }
 
+// serve_register, serve_login and serve_list_users run one HTTP handler into
+// a fresh buffer and return the response it appended.
+fn serve_register(user_uc application.UserUseCase, username string, email string, password string) string {
+	mut out := []u8{}
+	mut dates := http.new_date_cache()
+	http.handle_register(user_uc, username, email, password, mut out, mut dates)
+	return out.bytestr()
+}
+
+fn serve_login(auth_uc application.AuthUseCase, username string, password string) string {
+	mut out := []u8{}
+	mut dates := http.new_date_cache()
+	http.handle_login(auth_uc, username, password, mut out, mut dates)
+	return out.bytestr()
+}
+
+fn serve_list_users(user_uc application.UserUseCase) string {
+	mut out := []u8{}
+	mut dates := http.new_date_cache()
+	http.handle_list_users(user_uc, mut out, mut dates)
+	return out.bytestr()
+}
+
+// The HTTP adapter frames the JSON body it encoded into `out` in place: the
+// head goes in front of this response's body (not at the start of `out`, which
+// may hold earlier pipelined responses), with the exact Content-Length, an
+// ETag of the body and the cached Date line.
+fn test_response_is_framed_in_place() {
+	product_uc := application.new_product_usecase(repositories.DummyProductRepository{})
+	mut dates := http.new_date_cache()
+	mut out := []u8{cap: 16} // small: the framing must survive a grow of `out`
+	out << 'previous'.bytes()
+	http.handle_add_product(product_uc, 'Laptop', 999.5, mut out, mut dates)
+	resp := out.bytestr()
+	assert resp.starts_with('previousHTTP/1.1 201 Created\r\nDate: '), resp
+	head := resp.all_before('\r\n\r\n')
+	body := resp.all_after('\r\n\r\n')
+	assert body == '{"id":"","name":"Laptop","price":999.5}', resp
+	assert head.contains('\r\nContent-Type: application/json\r\n'), resp
+	assert head.contains('\r\nContent-Length: ${body.len}\r\n'), resp
+	etag := wyhash.wyhash_c(body.str, u64(body.len), 0).hex_full()
+	assert head.contains('\r\nEtag: "${etag}"\r\n'), resp
+	assert head.ends_with('\r\nConnection: close'), resp
+	date := head.all_after('\r\nDate: ').all_before('\r\n')
+	assert date.len == 29 && date.ends_with(' GMT'), resp
+
+	// A second response into the same buffer, through the same Date cache.
+	out.clear()
+	http.handle_list_products(product_uc, mut out, mut dates)
+	list := out.bytestr()
+	assert list.starts_with('HTTP/1.1 200 OK\r\nDate: '), list
+	assert list.all_after('\r\nDate: ').all_before('\r\n').len == 29, list
+	assert list.ends_with('\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]'), list
+}
+
+// Framing allocates nothing: the product list (an empty array from the dummy
+// repository, so the use case allocates nothing either) runs 20k times through
+// one reused buffer. The other handlers allocate in the layers below the
+// adapter — argon2, the database rows, json2's number formatting — not in
+// the framing.
+fn test_framing_allocates_nothing() {
+	$if gcboehm ? {
+		product_uc := application.new_product_usecase(repositories.DummyProductRepository{})
+		mut dates := http.new_date_cache()
+		mut out := []u8{cap: 1024}
+		http.handle_list_products(product_uc, mut out, mut dates) // warm-up
+		rounds := 20_000
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. rounds {
+			unsafe {
+				out.len = 0
+			}
+			http.handle_list_products(product_uc, mut out, mut dates)
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert grown < 4096, 'allocated ${grown} bytes over ${rounds} responses'
+	}
+}
+
 fn test_fresh_database_serves_register_login_and_list() ! {
 	path := temp_db_path('fresh')
 	mut dbpool := database.new_sqlite_pool(path, test_pool_cfg)!
@@ -43,12 +124,12 @@ fn test_fresh_database_serves_register_login_and_list() ! {
 	user_uc := application.new_user_usecase(repo)
 	auth_uc := application.new_auth_usecase(http.new_simple_auth_service(repo))
 
-	reg := http.handle_register(user_uc, 'alice', 'alice@example.com', 'password123').bytestr()
+	reg := serve_register(user_uc, 'alice', 'alice@example.com', 'password123')
 	assert reg.starts_with('HTTP/1.1 201 Created\r\n'), reg
-	login := http.handle_login(auth_uc, 'alice', 'password123').bytestr()
+	login := serve_login(auth_uc, 'alice', 'password123')
 	assert login.starts_with('HTTP/1.1 200 OK\r\n'), login
 	assert login.contains('"username":"alice"'), login
-	list := http.handle_list_users(user_uc).bytestr()
+	list := serve_list_users(user_uc)
 	assert list.starts_with('HTTP/1.1 200 OK\r\n'), list
 	assert list.contains('"username":"alice"'), list
 
@@ -92,17 +173,17 @@ fn test_failed_login_is_401() ! {
 	repo := new_user_repository('sqlite', mut dbpool)!
 	user_uc := application.new_user_usecase(repo)
 	auth_uc := application.new_auth_usecase(http.new_simple_auth_service(repo))
-	reg := http.handle_register(user_uc, 'carol', 'carol@example.com', 'password123').bytestr()
+	reg := serve_register(user_uc, 'carol', 'carol@example.com', 'password123')
 	assert reg.starts_with('HTTP/1.1 201 Created\r\n'), reg
 
 	// Wrong password and unknown user: the same 401, not a 404 (and the same
 	// argon2id cost, via the dummy hash, for the unknown user).
 	for resp in [
-		http.handle_login(auth_uc, 'carol', 'wrong password'),
-		http.handle_login(auth_uc, 'carol', ''),
-		http.handle_login(auth_uc, 'mallory', 'password123'),
+		serve_login(auth_uc, 'carol', 'wrong password'),
+		serve_login(auth_uc, 'carol', ''),
+		serve_login(auth_uc, 'mallory', 'password123'),
 	] {
-		assert resp.bytestr().starts_with('HTTP/1.1 401 Unauthorized\r\n'), resp.bytestr()
+		assert resp.starts_with('HTTP/1.1 401 Unauthorized\r\n'), resp
 	}
 }
 
@@ -121,7 +202,7 @@ fn test_password_is_hashed_and_never_serialized() ! {
 	user_uc := application.new_user_usecase(repo)
 	auth_uc := application.new_auth_usecase(http.new_simple_auth_service(repo))
 
-	reg := http.handle_register(user_uc, 'alice', 'alice@example.com', plaintext).bytestr()
+	reg := serve_register(user_uc, 'alice', 'alice@example.com', plaintext)
 	assert reg.starts_with('HTTP/1.1 201'), reg
 	assert reg.contains('"username":"alice"')
 
@@ -137,11 +218,11 @@ fn test_password_is_hashed_and_never_serialized() ! {
 	assert stored != plaintext
 	assert stored.starts_with('$argon2id$')
 
-	login := http.handle_login(auth_uc, 'alice', plaintext).bytestr()
+	login := serve_login(auth_uc, 'alice', plaintext)
 	assert login.starts_with('HTTP/1.1 200'), login
 	assert login.contains('"username":"alice"')
 
-	list := http.handle_list_users(user_uc).bytestr()
+	list := serve_list_users(user_uc)
 	assert list.starts_with('HTTP/1.1 200'), list
 	assert list.contains('"username":"alice"')
 

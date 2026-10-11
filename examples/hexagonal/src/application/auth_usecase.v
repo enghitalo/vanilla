@@ -18,5 +18,5 @@ pub fn (a AuthUseCase) login(username string, password string) ?domain.User {
 		username: username
 		password: password
 	}
-	return a.service.authenticate(credentials) or { return none }
+	return a.service.authenticate(credentials)
 }

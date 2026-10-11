@@ -60,22 +60,31 @@ fn main() {
 	product_uc := application.new_product_usecase(product_repo)
 	auth_uc := application.new_auth_usecase(auth_service)
 
-	// Example usage (replace with real HTTP server integration)
+	// Example usage (replace with real HTTP server integration). The handlers
+	// append into one reused buffer, as a server's write buffer; behind a
+	// server, `out` is the connection's and `dates` is per-worker state.
+	mut dates := http.new_date_cache()
+	mut out := []u8{cap: 1024}
+
 	println('Register user:')
-	resp := http.handle_register(user_uc, 'alice', 'alice@example.com', 'password123')
-	println(resp.bytestr())
+	http.handle_register(user_uc, 'alice', 'alice@example.com', 'password123', mut out, mut
+		dates)
+	println(out.bytestr())
 
 	println('Login:')
-	resp2 := http.handle_login(auth_uc, 'alice', 'password123')
-	println(resp2.bytestr())
+	out.clear()
+	http.handle_login(auth_uc, 'alice', 'password123', mut out, mut dates)
+	println(out.bytestr())
 
 	println('List users:')
-	resp3 := http.handle_list_users(user_uc)
-	println(resp3.bytestr())
+	out.clear()
+	http.handle_list_users(user_uc, mut out, mut dates)
+	println(out.bytestr())
 
 	println('Add product:')
-	resp4 := http.handle_add_product(product_uc, 'Laptop', 999.99)
-	println(resp4.bytestr())
+	out.clear()
+	http.handle_add_product(product_uc, 'Laptop', 999.99, mut out, mut dates)
+	println(out.bytestr())
 }
 
 // new_user_repository wires the `db_backend` user adapter to `dbpool` and
