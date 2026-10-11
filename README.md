@@ -237,6 +237,7 @@ fn main() {
 | `examples/json_api/` | JSON API with multipart upload |
 | `examples/mesh/` | Local mesh: edge on TCP calling a backend on UDS via `http1_1.client` + a pooled per-worker connection + watch/suspend |
 | `examples/https_upstream/` | A handler calling a third-party HTTPS API without blocking its worker: the `http1_1.upstream` pooled client (TLS 1.3 verify-full, keep-alive reuse, deadlines, retries, a resolver thread) |
+| `examples/logging/` | Access log that never writes on the request path: per-worker JSON lines flushed by the worker's timer, size rotation and reopen on `SIGHUP`, shipped to a collector over `http1_1.upstream`, drops counted |
 | `examples/middleware/` | Middleware chain (auth, RBAC, 404) |
 | `examples/observability/` | `/healthz`, `/readyz`, `/metrics` |
 | `examples/proxy_aware/` | `X-Forwarded-For` / real-IP extraction |
@@ -476,7 +477,7 @@ See [BENCHMARK_RESULTS_MACOS.md](BENCHMARK_RESULTS_MACOS.md) for full benchmark 
 - [ ] kqueue (macOS) parity ([#154](https://github.com/enghitalo/vanilla/issues/154)) — `max_connections`, read/write/idle timeouts, a per-connection read buffer (split and pipelined requests), and no busy-spin when `accept` hits `EMFILE`
 - [ ] IOCP (Windows) parity — the watch reactor for `.suspend` ([#117](https://github.com/enghitalo/vanilla/issues/117)), TLS ([#115](https://github.com/enghitalo/vanilla/issues/115)), `TransmitFile` for static assets ([#114](https://github.com/enghitalo/vanilla/issues/114))
 - [ ] `Last-Modified` / `If-Modified-Since` — `static_assets` already precomputes a strong ETag, a 304 and `Cache-Control` per file; no module sends `Last-Modified` yet, and dynamic responses build their own ETag (`examples/etag/`)
-- [x] Logging middleware example — `examples/middleware/` (`access_log.v`: a buffered, zero-alloc access log written to a file) and `examples/observability/` (one structured line per request, plus `/healthz`, `/readyz` and `/metrics`)
+- [x] Logging examples — `examples/logging/` (per-worker JSON lines written by each worker's timer, size rotation and reopen on `SIGHUP`, shipped to a collector over `http1_1.upstream`, drops counted), `examples/middleware/` (`access_log.v`: a buffered, zero-alloc access log written to a file) and `examples/observability/` (one structured line per request, plus `/healthz`, `/readyz` and `/metrics`)
 - [ ] API documentation (godoc-style, inline) — most public functions carry a doc comment; the gaps are mostly in `tls/` and `pg_async/`
 - [x] Architecture documentation — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (the module tree, each module's role, the grep-enforced dependency rule) and [server/README.md](server/README.md) (the engine, its backends, limits and TLS)
 - [ ] Security best-practices guide (injection, timing, header limits) — [docs/BEST_PRACTICES.md](docs/BEST_PRACTICES.md) §8 lists the defaults and points at the `auth`, `cors`, `csrf`, `rate_limit`, `request_limits` and `security_headers` examples; a dedicated guide is still open

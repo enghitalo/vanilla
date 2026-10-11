@@ -49,6 +49,7 @@ jobs:
           - examples/io_uring_demo/src
           - examples/ip_block/src
           - examples/json_api/src
+          - examples/logging/src # per-worker JSON access log: rotation, SIGHUP, shipping to a fake collector (a thread of the test)
           - examples/mesh/src
           - examples/middleware/src
           - examples/observability/src
