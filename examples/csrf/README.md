@@ -77,10 +77,11 @@ A plain `curl -i localhost:3000/transfer` (a `GET`) passes with `200 OK`.
   taken; then both tokens reach `hmac.equal` as `vbytes` views of the request
   buffer
   ([BEST_PRACTICES §2](../../docs/BEST_PRACTICES.md#2-stay-zero-copy-work-with-slices-not-copies)).
-- **The one allocation is the token itself.** `rand.bytes(32)` must produce
-  fresh CSPRNG bytes; `write_hex` hex-encodes them straight into `out`
-  between the `form_head` and `form_tail` consts. All other responses are
-  `const` strings appended with `core.append_str`
+- **No allocation, the token included.** `rand.read` fills a 32-byte stack
+  array with CSPRNG bytes (what makes the token secret is where the bytes
+  come from, not where they are stored); `write_hex` hex-encodes them
+  straight into `out` between the `form_head` and `form_tail` consts. All
+  other responses are `const` strings appended with `core.append_str`
   ([BEST_PRACTICES §3b](../../docs/BEST_PRACTICES.md#3b-dynamic-responses--append-parts-straight-into-out)).
 - The token is not tied to a session here. In an app with logins, bind it to
   the session (or keep it server-side, the synchronizer pattern) and rotate
@@ -96,7 +97,8 @@ v test examples/csrf/src
 64-hex token with `SameSite=Strict` and `Secure`, `cookie_value` finds the
 right segment and is not fooled by `xcsrf=`, every unsafe method is gated,
 missing, mismatched, cookie-less and empty tokens get `403`, a matching pair
-gets `200`, `GET` passes, and malformed input gets the canned 400.
+gets `200`, `GET` passes, malformed input gets the canned 400, and no route
+allocates (a `gc_heap_usage()` delta over 20k rounds).
 
 ## See also
 

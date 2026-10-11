@@ -30,9 +30,10 @@ module main
 //     `vbytes` views of the request buffer — it only reads, never retains.
 //   - Routing and method gating compare bytes IN PLACE (`slice_eq`) — no
 //     `.to_string()`, no `buf[a..b]` slice-marking.
-//   The ONE per-request allocation left is `rand.bytes(32)` on GET /form: the
-//   CSPRNG output must exist as fresh bytes — that is the security property,
-//   don't contort it away.
+//   - The token's 32 CSPRNG bytes land in a stack array (`rand.read` into a
+//     view of it): what makes the token secret is where the bytes come from,
+//     not where they are stored, and they only live until they are
+//     hex-encoded into `out`. No route allocates per request.
 //
 // WORKS TODAY: crypto.rand + crypto.hmac.equal + header/cookie plumbing.
 import server
@@ -133,10 +134,12 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, 
 		return .close
 	}
 
-	// GET the form: issue a fresh CSRF token in a cookie. rand.bytes is the one
-	// unavoidable per-request allocation — CSPRNG output must exist (see header).
+	// GET the form: issue a fresh CSRF token in a cookie. 32 bytes of CSPRNG
+	// entropy -> 64 hex chars, read into a stack array (see header).
 	if slice_eq(req.buffer, req.path, '/form') && slice_eq(req.buffer, req.method, 'GET') {
-		token := rand.bytes(32) or { // 32 bytes of CSPRNG entropy -> 64 hex chars
+		mut raw := [32]u8{}
+		mut token := unsafe { (&raw[0]).vbytes(raw.len) }
+		rand.read(mut token) or {
 			out << response.tiny_bad_request_response
 			return .close
 		}

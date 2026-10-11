@@ -118,6 +118,43 @@ fn test_safe_get_passes_through() {
 	assert serve(req).bytestr().contains('200 OK')
 }
 
+// Every route — token issue, accepted and refused unsafe requests, safe
+// requests — runs 20k times through one reused buffer, as a worker would serve
+// them; the collector's lifetime allocation counter must not move. (Under
+// `-gc none`, vanilla's production build, an allocation here would be a
+// permanent leak: rand.bytes(32) used to cost 64 bytes per GET /form.)
+fn test_requests_allocate_nothing() {
+	$if gcboehm ? {
+		reqs := [
+			'GET /form HTTP/1.1\r\nHost: x\r\n\r\n',
+			'POST /save HTTP/1.1\r\nCookie: sid=1; csrf=abcd\r\nX-CSRF-Token: abcd\r\nContent-Length: 0\r\n\r\n',
+			'POST /save HTTP/1.1\r\nCookie: csrf=aaaa\r\nX-CSRF-Token: bbbb\r\nContent-Length: 0\r\n\r\n',
+			'POST /save HTTP/1.1\r\nContent-Length: 0\r\n\r\n',
+			'GET / HTTP/1.1\r\nHost: x\r\n\r\n',
+		].map(it.bytes())
+		mut out := []u8{cap: 4096}
+		mut event_loop := core.EventLoop{}
+		for r in reqs { // warm-up: `out` reaches its high-water mark
+			unsafe {
+				out.len = 0
+			}
+			handle(r, mut out, -1, unsafe { nil }, mut event_loop)
+		}
+		rounds := 20_000
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. rounds {
+			for r in reqs {
+				unsafe {
+					out.len = 0
+				}
+				handle(r, mut out, -1, unsafe { nil }, mut event_loop)
+			}
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert grown < 4096, 'allocated ${grown} bytes over ${rounds * reqs.len} requests'
+	}
+}
+
 fn test_malformed_request_errors() {
 	// Malformed input gets the canned 400 and the connection is closed.
 	mut out := []u8{}
