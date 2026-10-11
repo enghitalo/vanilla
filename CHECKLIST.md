@@ -130,15 +130,16 @@ concatenates, interpolates or allocates per request. The
 - **Done:** `HttpRequest.get_query_slice(key []u8) ?Slice`
   (`http1_1/request_parser/request_parser.v`) returns a zero-copy `Slice` into
   the request buffer, with no `error()` on the not-found path
-  (`find_byte_idx`). `get_query(key string)` is kept as a deprecated wrapper.
-  Values are raw; `examples/url_form/` percent-decodes them once at the edge.
+  (`find_byte_idx`); `has_query(key []u8) bool` also sees a bare flag
+  (`?debug`), which `get_query_slice` returns as none. Both cut each element at
+  its `&` and compare its name in place, one `memchr` per element.
+  `get_query(key string)` is kept as a deprecated wrapper. Values are raw;
+  `examples/url_form/` percent-decodes them once at the edge.
 - **Testing:** `request_parser_test.v` (single, multiple, last, missing key,
-  no query, `?empty=`, an empty key, special characters).
-- **Remains:**
-  - A flag-only key (`?novalue`) is indistinguishable from a missing one; no
-    presence check (`has_query`).
-  - No percent-decoding helper in the library (an `_into(mut out []u8)` form,
-    so decoding allocates nothing).
+  no query, `?empty=`, an empty key, special characters, bare keys before,
+  between and after valued ones, name prefixes).
+- **Remains:** no percent-decoding helper in the library (an
+  `_into(mut out []u8)` form, so decoding allocates nothing).
 - **Priority:** 🟢 LOW
 
 ### 6. Add Standard HTTP Status Codes — ⚪ OBSOLETE
