@@ -30,16 +30,16 @@ fn C.recv(fd int, buf voidptr, n usize, flags int) int
 const edge_port = 8095
 
 const backend_body = '{"svc":"backend","msg":"hello from the mesh"}'
-const backend_response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${backend_body.len}\r\nConnection: keep-alive\r\n\r\n${backend_body}'.bytes()
+const backend_response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${backend_body.len}\r\nConnection: keep-alive\r\n\r\n${backend_body}'
 
 const edge_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\nedge'
 const edge_bad_gateway = 'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 const edge_busy = 'HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
-const edge_mesh_head = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '.bytes()
-const edge_mesh_sep = '\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const edge_mesh_pre = '{"via":"edge","backend":'.bytes()
-const edge_mesh_post = '}'.bytes()
+const edge_mesh_head = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '
+const edge_mesh_sep = '\r\nConnection: keep-alive\r\n\r\n'
+const edge_mesh_pre = '{"via":"edge","backend":'
+const edge_mesh_post = '}'
 
 const mesh_route = 'GET /mesh '.bytes()
 
@@ -91,7 +91,7 @@ mut:
 }
 
 fn backend_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
-	res << backend_response
+	core.append_str(mut res, backend_response)
 	return .done
 }
 
@@ -241,12 +241,12 @@ fn on_backend_reply(mut out []u8, ready_fd int, ready_fd_error bool, watch_paylo
 		// The decoded body as a view into the slot buffer: a chunked body is
 		// de-chunked in place, so there is no second buffer to fill.
 		body := c.framer.body_in_place(mut c.resp_buf)
-		wb(mut out, edge_mesh_head)
+		core.append_str(mut out, edge_mesh_head)
 		wi(mut out, i64(edge_mesh_pre.len + body.len + edge_mesh_post.len))
-		wb(mut out, edge_mesh_sep)
-		wb(mut out, edge_mesh_pre)
+		core.append_str(mut out, edge_mesh_sep)
+		core.append_str(mut out, edge_mesh_pre)
 		wb(mut out, body)
-		wb(mut out, edge_mesh_post)
+		core.append_str(mut out, edge_mesh_post)
 	}
 	// Exchange complete. The connection carries the next call only when the
 	// framer says so (HTTP/1.1 without `Connection: close`, framed by length)

@@ -129,7 +129,7 @@ fn reuse_backend_conn(fd int) {
 			reply := match mode {
 				1 { close_delimited_reply }
 				2 { connection_close_reply }
-				else { backend_response }
+				else { backend_response.bytes() }
 			}
 			mut off := 0
 			for off < reply.len {

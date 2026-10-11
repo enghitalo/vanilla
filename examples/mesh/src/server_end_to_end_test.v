@@ -233,7 +233,7 @@ fn fake_backend_conn(fd int) {
 			}
 			mut off := 0
 			for off < backend_response.len {
-				w := C.send(fd, unsafe { &backend_response[off] }, usize(backend_response.len - off),
+				w := C.send(fd, unsafe { backend_response.str + off }, usize(backend_response.len - off),
 					C.MSG_NOSIGNAL)
 				if w <= 0 {
 					return
