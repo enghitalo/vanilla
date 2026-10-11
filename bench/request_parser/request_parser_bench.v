@@ -90,6 +90,17 @@ fn main() {
 	}
 	b.measure('has_query')
 
+	// 3c) Percent-decoding a 38-byte query value (6 escapes, 2 '+') into a
+	// reused buffer.
+	encoded := 'caf%C3%A9+au+lait%2C%20sans%20sucre%21'.bytes()
+	mut decoded := []u8{cap: encoded.len}
+	for _ in 0 .. iterations {
+		decoded.clear()
+		request_parser.percent_decode_into(encoded, mut decoded, true)
+		acc += decoded.len
+	}
+	b.measure('percent_decode_into')
+
 	// 4) Request framing — the per-request cost framing adds to read_request.
 	// This worst-cases the no-body fast path: full header walk, CL/TE rejected.
 	for _ in 0 .. iterations {

@@ -470,9 +470,9 @@ fn query_element(buf []u8, path Slice, key []u8, bare_ok bool) ?Slice {
 
 // get_query_slice returns the value of the first query parameter named `key` as
 // a Slice into the request buffer, or none. Zero allocations. The value is raw
-// (not percent-decoded), and `key` is matched byte for byte against the raw
-// names: a key holding '=' or '&' names nothing. A bare `?key` has no value,
-// so it is none here: has_query tells it from a missing key.
+// (not percent-decoded: see percent_decode_into), and `key` is matched byte for
+// byte against the raw names: a key holding '=' or '&' names nothing. A bare
+// `?key` has no value, so it is none here: has_query tells it from a missing key.
 // Example: GET /users?id=123&format=json
 //   get_query_slice('id'.bytes()) -> Slice pointing to "123"
 //   get_query_slice('format'.bytes()) -> "json"; `?q=` -> Slice{len: 0}
@@ -495,6 +495,48 @@ pub fn (req HttpRequest) has_query(key []u8) bool {
 // Deprecated: Use get_query_slice instead; it tells a missing key from an empty value.
 pub fn (req HttpRequest) get_query(key string) Slice {
 	return req.get_query_slice(unsafe { key.str.vbytes(key.len) }) or { Slice{0, 0} }
+}
+
+// percent_decode_into appends src to out with each %XX escape decoded, and each
+// '+' as a space when plus_as_space (query strings and
+// application/x-www-form-urlencoded bodies, not paths). A '%' without two hex
+// digits after it is kept as is (WHATWG URL). out grows by at most src.len,
+// reserved up front: no allocation once out has the room, so decode into `out`
+// itself or a per-worker scratch. src can be a view of a query value:
+// `unsafe { (&buf[s.start]).vbytes(s.len) }` (guard s.len > 0).
+// Decode once: decoding the result again turns `%2527` into `'`. The decoded
+// bytes are user input and may be anything, NUL, CR, LF and invalid UTF-8
+// included: validate or escape them before use.
+@[direct_array_access]
+pub fn percent_decode_into(src []u8, mut out []u8, plus_as_space bool) {
+	if src.len == 0 {
+		return
+	}
+	out.ensure_cap(out.len + src.len)
+	dst := unsafe { &u8(out.data) + out.len }
+	mut n := 0
+	mut i := 0
+	for i < src.len {
+		mut c := src[i]
+		i++
+		if c == `%` && i + 1 < src.len {
+			hi := hex_digit(src[i])
+			lo := hex_digit(src[i + 1])
+			if hi >= 0 && lo >= 0 {
+				c = u8((hi << 4) | lo)
+				i += 2
+			}
+		} else if c == `+` && plus_as_space {
+			c = empty_space
+		}
+		unsafe {
+			dst[n] = c
+		}
+		n++
+	}
+	unsafe {
+		out.len += n
+	}
 }
 
 // ---- request framing -------------------------------------------------------

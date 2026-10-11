@@ -415,6 +415,84 @@ fn test_has_query_bare_key_at_buffer_end() {
 	assert !req.has_query('flagx'.bytes())
 }
 
+fn test_percent_decode_into() {
+	// src, decoded with plus_as_space, decoded without
+	cases := [
+		['', '', ''],
+		['plain', 'plain', 'plain'],
+		['hello%20world', 'hello world', 'hello world'],
+		['c%2B%2B', 'c++', 'c++'],
+		['a+b', 'a b', 'a+b'],
+		['%41%42%43', 'ABC', 'ABC'],
+		['%2f%2F', '//', '//'],
+		['%C3%A9', 'é', 'é'],
+		['%', '%', '%'],
+		['%4', '%4', '%4'],
+		['100%', '100%', '100%'],
+		['%zz', '%zz', '%zz'],
+		['%4g', '%4g', '%4g'],
+		['%%41', '%A', '%A'],
+		['a%2', 'a%2', 'a%2'],
+		['%41', 'A', 'A'],
+		['x%41', 'xA', 'xA'],
+		['%2527', '%27', '%27'], // decoded once, never twice
+		['+%2B+', ' + ', '+++'],
+	]
+	for c in cases {
+		mut out := []u8{}
+		percent_decode_into(c[0].bytes(), mut out, true)
+		assert out.bytestr() == c[1], c[0]
+		out.clear()
+		percent_decode_into(c[0].bytes(), mut out, false)
+		assert out.bytestr() == c[2], c[0]
+	}
+}
+
+fn test_percent_decode_into_appends() {
+	// It appends after what out holds, and decodes any byte, NUL and CR LF included.
+	mut out := 'k='.bytes()
+	percent_decode_into('a%00b%0D%0A'.bytes(), mut out, true)
+	assert out == [u8(`k`), `=`, `a`, 0, `b`, 13, 10]
+}
+
+fn test_percent_decode_into_query_value_view() {
+	// The documented use: a view of a raw query value, decoded into out.
+	buffer := 'GET /s?q=hello%20w%C3%B6rld&tag=c%2B%2B HTTP/1.1\r\nHost: example.com\r\n\r\n'.bytes()
+	req := decode_http_request(buffer) or { panic(err) }
+	mut out := []u8{cap: 64}
+	for key, want in {
+		'q':   'hello wörld'
+		'tag': 'c++'
+	} {
+		s := req.get_query_slice(key.bytes()) or { panic('missing ${key}') }
+		out.clear()
+		percent_decode_into(unsafe { (&req.buffer[s.start]).vbytes(s.len) }, mut out, true)
+		assert out.bytestr() == want
+	}
+}
+
+fn test_percent_decode_into_allocates_nothing() {
+	src := 'hello%20world+and%2Bmore%2F%zz'.bytes()
+	mut out := []u8{cap: src.len}
+	data := out.data
+	$if gcboehm ? {
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. 20_000 {
+			out.clear()
+			percent_decode_into(src, mut out, true)
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert grown < 4096, 'percent_decode_into allocated ${grown} bytes'
+	} $else {
+		for _ in 0 .. 1000 {
+			out.clear()
+			percent_decode_into(src, mut out, true)
+		}
+	}
+	assert out.data == data
+	assert out.bytestr() == 'hello world and+more/%zz'
+}
+
 fn test_get_query_deprecated() {
 	buffer := 'GET /users?id=456 HTTP/1.1\r\nHost: example.com\r\n\r\n'.bytes()
 	req := decode_http_request(buffer) or { panic(err) }

@@ -67,9 +67,11 @@ not parsed as a form: `{}`.
   the body, never a copy. `parse_form` walks `key=value&...` by offsets: no
   `split`, no substrings. Empty pairs (`&&`) are skipped, a key without `=`
   maps to `""`, and a repeated key keeps its last value.
-- **Outputs are owned, on purpose.** `percent_decode` turns `%XX` into a
-  byte and `+` into a space, and returns a new `string`: decoded bytes differ
-  from the wire bytes and become map entries. That copy per key and value
+- **Outputs are owned, on purpose.** `percent_decode` calls the library's
+  `request_parser.percent_decode_into`, which turns `%XX` into a byte and `+`
+  into a space, and returns a new `string`: decoded bytes differ from the wire
+  bytes and become map entries. A handler that only reads a value decodes it
+  into `out` or a per-worker scratch with the same helper, allocating nothing. That copy per key and value
   (plus the map itself) is the allocation this example exists to show;
   everything around it reads the request in place
   ([BEST_PRACTICES §2](../../docs/BEST_PRACTICES.md#2-stay-zero-copy-work-with-slices-not-copies)).
