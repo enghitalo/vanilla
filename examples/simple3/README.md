@@ -49,9 +49,25 @@ Connection: keep-alive
 123
 ```
 
-`GET /` answers an empty `200 OK`, `POST /user` a `201 Created`, and any other
-method or path (`/users`, `/nope`) the canned 400, byte for byte as in
-[simple](../simple/#run).
+Routes match the path up to the first `?` (`/user/7?x=1` echoes `7`), and
+`/user/` has no id, so with or without a query it is a 404 that keeps the
+connection open:
+
+```sh
+curl -i 'localhost:3000/user/?x=1'
+```
+
+```
+HTTP/1.1 404 Not Found
+Content-Length: 0
+Connection: keep-alive
+
+```
+
+`GET /` answers an empty `200 OK` and `POST /user` a `201 Created`; any
+other method or path (`/users`, `/nope`) gets the same 404, and a head that
+does not parse gets the library's canned 400 and a close, all byte for byte
+as in [simple](../simple/#run).
 
 ## How it works
 
@@ -69,11 +85,14 @@ method or path (`/users`, `/nope`) the canned 400, byte for byte as in
   would block that worker's whole event loop;
   [BEST_PRACTICES §5](../../docs/BEST_PRACTICES.md#5-side-effects-go-through-the-async-runtime--pools-off-the-hot-path)
   covers moving it off.
-- **The controllers are simple's.** Each takes `mut out []u8` and appends
-  its response: `get_user_controller` reads the path from the request, takes
-  the id as a view of it (no copy) and frames the reply with
-  `core.append_str` plus `wi`. No route allocates per request.
-  `get_users_controller` exists but no route calls it.
+- **The router and controllers are simple's.** `App.handle_request` decodes
+  with `request_parser.decode_into` (no boxed `error()` for a malformed
+  head), cuts the path at the first `?`, and answers a miss with the 404
+  `const` and `.done`. Each controller takes `mut out []u8` and appends its
+  response: `get_user_controller` gets the id from the router as a view of
+  the path (no copy) and frames the reply with `core.append_str` plus `wi`.
+  No request allocates, a malformed one included. `get_users_controller`
+  exists but no route calls it.
 
 ## Tests
 
@@ -81,13 +100,16 @@ method or path (`/users`, `/nope`) the canned 400, byte for byte as in
 v test examples/simple3/src
 ```
 
-[main_test.v](src/main_test.v) calls `App{}.handle_request` directly on four
-raw requests (home, user, create, an `INVALID` method) and checks that no
-route allocates.
-[server_end_to_end_test.v](src/server_end_to_end_test.v) sends the same four
-over real sockets with `vtest.drive`, wiring the handler through the same
-closure `main` uses. Both use `App{}` with no pool, which these routes never
-touch.
+[main_test.v](src/main_test.v) calls `App{}.handle_request` directly with
+simple's cases (the three routes, the 404 with `.done` for unknown methods
+and paths and for `/user/` with or without a query, the query cut, the 400
+with `.close` for a malformed head) and checks that no request allocates.
+[server_end_to_end_test.v](src/server_end_to_end_test.v) sends requests over
+real sockets with `vtest.drive`, wiring the handler through the same closure
+`main` uses: it checks the bytes, that a 404 leaves the connection open for
+a second request, and that the server closes the connection after a
+malformed head's 400. Both use `App{}` with no pool, which these routes
+never touch.
 
 ## See also
 

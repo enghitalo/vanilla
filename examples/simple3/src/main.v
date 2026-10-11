@@ -13,21 +13,37 @@ pub mut:
 	db_pool ?pool.ConnectionPool
 }
 
+// The answer to a method or path no route matches. The handler returns
+// .done after it, so the connection stays open, as `Connection: keep-alive`
+// says.
+const http_not_found_response = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+
 fn (app App) handle_request(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
-	req := request_parser.decode_http_request(req_buffer) or {
+	// decode_into, not decode_http_request: a malformed request would box an
+	// error() per request there.
+	mut req := request_parser.HttpRequest{
+		buffer: req_buffer
+	}
+	if !request_parser.decode_into(mut req) {
 		out << response.tiny_bad_request_response
 		return .close
 	}
 
 	method := unsafe { tos(&req_buffer[req.method.start], req.method.len) }
-	path := unsafe { tos(&req_buffer[req.path.start], req.path.len) }
+	mut path := unsafe { tos(&req_buffer[req.path.start], req.path.len) }
+	// The query is not part of the route: cut the view at the first '?'.
+	q := path.index_u8(`?`)
+	if q >= 0 {
+		path = unsafe { tos(path.str, q) }
+	}
 
 	if method == 'GET' {
 		if path == '/' {
 			app.home_controller(req, mut out)
 			return .done
-		} else if path.starts_with('/user/') {
-			app.get_user_controller(req, mut out)
+		} else if path.len > 6 && path.starts_with('/user/') { // `/user/` alone has no id: 404
+			id := unsafe { tos(path.str + 6, path.len - 6) } // view, no copy
+			app.get_user_controller(id, mut out)
 			return .done
 		}
 	} else if method == 'POST' {
@@ -37,7 +53,7 @@ fn (app App) handle_request(req_buffer []u8, mut out []u8, _client_fd int, _work
 		}
 	}
 
-	out << response.tiny_bad_request_response
+	core.append_str(mut out, http_not_found_response)
 	return .done
 }
 

@@ -4,9 +4,8 @@
 simple2 serves the same CRUD-shaped routes (plus `GET /users`) with the
 router comparing bytes in place by offsets, and the user id as a zero-copy
 `[]u8` view of the request buffer. Both append the response straight into
-the server's `out` buffer and allocate nothing on any route (only a
-malformed head, which closes the connection, still boxes an `error()` in
-`decode_http_request`).
+the server's `out` buffer and allocate nothing on any request, a malformed
+head included (both decode with `request_parser.decode_into`).
 
 Read it side by side with simple: same file split, same responses, and every
 difference is one of the patterns in
@@ -55,12 +54,14 @@ Connection: keep-alive
 ```
 
 `GET /` answers the same empty `200 OK` and `POST /user` a `201 Created`,
-byte-identical to simple. Unlike simple, `GET /user/` (an empty id) is a 400;
-any unknown method or path gets the canned 400 as before. Pipelined requests
-each get their own answer, appended in order:
+byte-identical to simple. The rest matches simple too: routes match the
+path up to the first `?`, an unknown method or path and `/user/` (no id) get
+a 404 with `Connection: keep-alive`, and a head that does not parse gets the
+canned 400 and a close. Pipelined requests each get their own answer,
+appended in order, and a 404 leaves the connection open for the next one:
 
 ```sh
-printf 'GET /user/1 HTTP/1.1\r\nHost: x\r\n\r\nGET /user/22 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' \
+printf 'GET /user/7?x=1 HTTP/1.1\r\nHost: x\r\n\r\nGET /user/ HTTP/1.1\r\nHost: x\r\n\r\nGET /user/22 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' \
   | socat -t1 - TCP:localhost:3000
 ```
 
@@ -70,7 +71,11 @@ Content-Type: text/plain
 Content-Length: 1
 Connection: keep-alive
 
-1HTTP/1.1 200 OK
+7HTTP/1.1 404 Not Found
+Content-Length: 0
+Connection: keep-alive
+
+HTTP/1.1 200 OK
 Content-Type: text/plain
 Content-Length: 2
 Connection: keep-alive
@@ -83,8 +88,9 @@ Connection: keep-alive
 | | simple | simple2 |
 |---|---|---|
 | method / path match | `tos` views compared with `==`, `starts_with` | `slice_eq` compares the request `Slice` against a literal, byte by byte |
+| the query | `index_u8` finds the `?`, then a shorter `tos` view | a loop finds the `?`, then a shorter `Slice` (same start) |
 | the id | `tos(path.str + 6, ...)`, a `string` view of the path | `unsafe { (&req.buffer[i]).vbytes(n) }`, a `[]u8` view of the request bytes |
-| `GET /user/` | 200 with an empty body | 400 (`req.path.len > prefix.len` requires an id byte) |
+| `GET /user/` (no id) | 404: `path.len > 6` requires an id byte | 404: `path.len > prefix.len` requires an id byte |
 
 The controllers are the same in both: `fn (..., mut out []u8)`, appending
 `const` strings with `core.append_str` and framing the one dynamic reply
@@ -92,10 +98,20 @@ with `core.append_str` plus `wi` for `Content-Length`.
 
 ## How it works
 
-- **Route by offsets.** `slice_eq(buf, slice, lit)` checks the length, then
-  the bytes, against the request buffer; the `/user/` prefix is compared the
-  same way. Nothing is copied to route
+- **Decode without an error box.** `request_parser.decode_into` fills a
+  stack `HttpRequest` and returns `false` for a malformed head, with no
+  `error()` to allocate; that request gets the canned 400
+  (`Connection: close`) and `.close`.
+- **Route by offsets.** Before any match, the path is cut at its first `?`:
+  a loop finds it, and a `Slice` with the same start and the shorter length
+  is the path from then on, so the query never reaches a match or the id.
+  `slice_eq(buf, slice, lit)` checks the length, then the bytes, against the
+  request buffer; the `/user/` prefix is compared the same way. Nothing is
+  copied to route
   ([BEST_PRACTICES §2](../../docs/BEST_PRACTICES.md#2-stay-zero-copy-work-with-slices-not-copies)).
+- **A miss is a 404.** A request no route matches gets the `const`
+  `http_not_found_response` (`Connection: keep-alive`) and `.done`, so the
+  connection stays open, as the header says.
 - **The id is a view.** `get_user_controller(id []u8, mut out)` receives a
   `vbytes` window over the request buffer. The response is built before the
   handler returns, so the view never outlives the buffer.
@@ -104,8 +120,8 @@ with `core.append_str` plus `wi` for `Content-Length`.
   `wi`, which formats the integer with `strconv.write_dec` into a 24-byte
   stack scratch and pushes the digits
   ([BEST_PRACTICES §3b](../../docs/BEST_PRACTICES.md#3b-dynamic-responses--append-parts-straight-into-out)).
-- The id is not decoded or validated, and the query is not stripped:
-  `/user/7?x=1` echoes `7?x=1` as `text/plain`.
+- The id is not decoded or validated: it is echoed as `text/plain` byte for
+  byte (`/user/a%20b` echoes `a%20b`).
 
 ## Tests
 
@@ -114,9 +130,11 @@ v test examples/simple2/src
 ```
 
 [main_test.v](src/main_test.v) calls `handle_request` directly: each route's
-exact bytes, the canned 400 for an unknown method, unknown GET and POST paths
-and the empty id, `.close` plus the 400 for a truncated request head, and
-that no route allocates (a `gc_heap_usage()` delta over 20k rounds).
+exact bytes; the 404 and `.done` for an unknown method, unknown GET and POST
+paths, and `/user/` with and without a query; the query cut (`/user/7?x=1`,
+`/?x=1`, `/users?page=2`, `POST /user?x=1`); `.close` plus the canned 400 for
+a truncated request head; and that no request allocates, the 404s and a
+malformed head included (a `gc_heap_usage()` delta over 20k rounds).
 
 ## See also
 
