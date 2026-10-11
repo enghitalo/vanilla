@@ -5,7 +5,14 @@ import http1_1.response
 import http1_1.request_parser
 import hash as wyhash
 
-const not_modified_response = 'HTTP/1.1 304 Not Modified\r\n\r\n'.bytes()
+// The front-end demo is a different origin (file.serve on :4001), so the 304
+// needs Access-Control-Allow-Origin too — without it the browser turns the
+// 304 into a network error.
+const not_modified_response = 'HTTP/1.1 304 Not Modified\r\nAccess-Control-Allow-Origin: *\r\n\r\n'.bytes()
+
+// `If-None-Match` is not a CORS-safelisted request header, so a cross-origin
+// conditional GET is preceded by an OPTIONS preflight.
+const preflight_response = 'HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET\r\nAccess-Control-Allow-Headers: If-None-Match\r\nAccess-Control-Max-Age: 86400\r\n\r\n'
 
 const http_ok_response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n'.bytes()
 
@@ -69,12 +76,13 @@ fn get_user_controller(params []string, req request_parser.HttpRequest) ![]u8 {
 
 	// Frame the response in ONE builder — no `${}`, no `+`, no `.str()`;
 	// the hex etag is pushed from the stack scratch (Builder IS []u8).
-	mut sb := strings.new_builder(160 + id.len)
+	mut sb := strings.new_builder(180 + id.len)
 	sb.write_string('HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nETag: "')
 	unsafe { sb.push_many(&etag[0], 16) }
 	sb.write_string('"\r\nContent-Length: ')
 	sb.write_decimal(id.len)
-	sb.write_string('\r\nAccess-Control-Allow-Origin: *\r\n\r\n')
+	// Expose-Headers: cross-origin JS can only read the ETag if it is listed.
+	sb.write_string('\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: ETag\r\n\r\n')
 	sb.write_string(id)
 	return sb
 }

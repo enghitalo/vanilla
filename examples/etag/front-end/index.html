@@ -22,7 +22,7 @@
               headers["If-None-Match"] = cachedETag;
             }
 
-            const response = await fetch("http://localhost:3001/user/1", {
+            const response = await fetch("http://localhost:3000/user/1", {
               headers,
             });
 

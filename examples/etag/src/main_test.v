@@ -22,6 +22,7 @@ fn test_handle_request_get_user() {
 	assert res.contains('HTTP/1.1 200 OK')
 	assert res.contains('ETag: ${quoted_etag_of('123')}') // quoted per RFC 9110 §8.8.3
 	assert res.contains('Content-Length: 3')
+	assert res.contains('Access-Control-Expose-Headers: ETag') // front-end reads it cross-origin
 	assert res.ends_with('\r\n\r\n123')
 }
 
@@ -37,6 +38,13 @@ fn test_conditional_get_roundtrip() {
 	res2 := (serve(stale) or { panic(err) }).bytestr()
 	assert res2.contains('200 OK')
 	assert res2.ends_with('123')
+}
+
+fn test_cors_preflight_for_conditional_get() {
+	req_buffer :=
+		'OPTIONS /user/1 HTTP/1.1\r\nHost: localhost:3000\r\nOrigin: http://localhost:4001\r\nAccess-Control-Request-Method: GET\r\nAccess-Control-Request-Headers: if-none-match\r\n\r\n'.bytes()
+	res := (serve(req_buffer) or { panic(err) }).bytestr()
+	assert res == preflight_response
 }
 
 fn test_handle_request_post_user() {

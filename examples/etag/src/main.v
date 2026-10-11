@@ -30,6 +30,11 @@ fn handle_request(req_buffer []u8, mut out []u8, _client_fd int, _worker_state v
 			}
 			return .done
 		}
+	} else if method == 'OPTIONS' {
+		if path.starts_with('/user/') {
+			core.append_str(mut out, preflight_response)
+			return .done
+		}
 	} else if method == 'POST' {
 		if path == '/user' {
 			out << create_user_controller([]) or {
