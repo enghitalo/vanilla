@@ -87,28 +87,30 @@ Content-Length: 41
 ## How it works
 
 - **The peer comes from the socket.** `handle` calls
-  `socket.peer_addr(client_fd)` (one `getpeername` syscall and one small
-  string per request, the deliberate exception to zero allocation) and passes
-  it to `real_client_ip`. That function takes the peer as a parameter, so the
+  `socket.peer_ipv4(client_fd)`, the peer's IPv4 address as a `u32` (one
+  `getpeername` syscall, no allocation), and passes it to `real_client_ip`. That function takes the peer as a parameter, so the
   tests drive every branch with injected peers.
 - **CIDRs parsed once.** `parse_cidrs` turns `trusted_proxies` into
   pre-masked `Cidr` pairs at module init; per request, `ip_in_cidrs` is a
-  `parse_ipv4` byte scan and a mask-and-compare. Real masking gets ranges
+  mask-and-compare on the `u32`. Real masking gets ranges
   right: `10.1.2.3` is inside `10.0.0.0/8`, and `172.16.0.0/12` spans up to
   `172.31.255.255`. A hop that is not an IPv4 address never matches a trusted
   network.
 - **Header scanned from the right, in place.** `real_client_ip` walks the
   `X-Forwarded-For` bytes backwards by offsets, splits on commas, trims spaces
-  and tabs, skips empty hops, and returns the hop as a `tos` view into the
-  request buffer. The view is safe because `handle` copies it into `out`
-  before the buffer is reused
+  and tabs, skips empty hops, and `parse_ipv4` turns each hop, read through a
+  `tos` view of the request buffer, into a `u32`
   ([BEST_PRACTICES §2](../../docs/BEST_PRACTICES.md#2-stay-zero-copy-work-with-slices-not-copies)).
-  An empty peer (Windows, where `peer_addr` returns `''`, or a `getpeername`
-  failure) is untrusted and reported as `unknown`.
+  It is IPv4 only: a right-most untrusted hop that is not IPv4 (an IPv6
+  client, `unknown`) cannot be reported, and every hop left of it is
+  client-written, so the answer is the proxy itself. A peer with no IPv4
+  address (a `getpeername` failure, a Unix-socket listener) is untrusted and
+  reported as `unknown`.
 - **Framed once, straight into `out`.** Content-Length is `body_overhead`
-  plus the lengths of the two dynamic fields, written by `wi`; then the
-  `body_pre`/`body_mid`/`body_tail` consts and the two values are appended
-  with `core.append_str`
+  plus the lengths of the two dynamic fields (`ipv4_len` for the address),
+  written by `wi`; then the `body_pre`/`body_mid`/`body_tail` consts and the
+  two values are appended, the address printed by `write_ipv4` (four `wi`
+  calls), with no allocation
   ([BEST_PRACTICES §3b](../../docs/BEST_PRACTICES.md#3b-dynamic-responses--append-parts-straight-into-out)).
 - **`X-Forwarded-Proto` is echoed as sent**, from any peer, to show the read
   (default `http`). It is client-settable like `X-Forwarded-For`: in
@@ -126,10 +128,11 @@ v test examples/proxy_aware/src
 [main_test.v](src/main_test.v) covers `parse_ipv4` (valid and malformed),
 CIDR membership at range edges, and `real_client_ip` with injected peers:
 right-most untrusted hop, all hops trusted, empty hops, whitespace-only
-header, a trusted peer without the header, an untrusted peer and the empty
-peer. Through `handle` (fd `-1`, so the real `peer_addr` returns `''`) it
-checks the exact response bytes, the default scheme and that a malformed
-request gets no response.
+header, a trusted peer without the header, a non-IPv4 client hop, an
+untrusted peer and the unknown peer, and `write_ipv4` against `ipv4_len`.
+Through `handle` (fd `-1`, so the peer is unknown, and a real loopback
+connection) it checks the exact response bytes, the default scheme, that a
+malformed request gets no response, and that serving allocates nothing.
 
 ## See also
 
