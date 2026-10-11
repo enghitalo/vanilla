@@ -1,9 +1,10 @@
 module main
 
 // Per-route auth guards — "Pattern A": explicit, called at the top of each
-// controller. Public routes call nothing; private routes call require_auth();
-// role-gated routes call require_role(). A guard returns the User, or an error
-// carrying the HTTP status the controller should send.
+// controller. Public routes call nothing; private routes call require_auth()
+// and answer 401 when it returns none; role-gated routes also compare the
+// user's role inline and answer 403. No error values: a denial is routine, and
+// `error()` would allocate one per rejected request.
 import http1_1.request_parser { HttpRequest }
 
 struct User {
@@ -12,43 +13,36 @@ struct User {
 	role string // 'user' | 'admin'
 }
 
-// Ready-made denials, built once.
-const unauthorized_response = 'HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const forbidden_response = 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+// Ready-made denials, appended with core.append_str (§3a).
+const unauthorized_response = 'HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const forbidden_response = 'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
-// require_auth — gate for "any authenticated user". Returns the User, or a 401.
-fn require_auth(req HttpRequest) !User {
+const bearer_prefix = 'Bearer '
+
+// require_auth — gate for "any authenticated user". Returns the User, or none
+// (the controller answers 401).
+fn require_auth(req HttpRequest) ?User {
 	token := bearer_token(req)
 	if token == '' {
-		return error_with_code('missing bearer token', 401)
+		return none
 	}
-	return user_for_token(token) or { return error_with_code('invalid token', 401) }
+	return user_for_token(token)
 }
 
-// require_role — gate for a specific role. 401 if unauthenticated, 403 if the
-// authenticated user lacks the role.
-fn require_role(req HttpRequest, role string) !User {
-	user := require_auth(req)!
-	if user.role != role {
-		return error_with_code('requires role ${role}', 403)
-	}
-	return user
-}
-
-// auth_error_response maps a guard error to its ready-made response (403 vs 401).
-fn auth_error_response(err IError) []u8 {
-	return if err.code() == 403 { forbidden_response } else { unauthorized_response }
-}
-
-// bearer_token extracts the token from `Authorization: Bearer <token>` — a
-// zero-copy slice lookup, materialized to a string only for the matched header.
+// bearer_token returns the token of `Authorization: Bearer <token>`, or '' if
+// there is none. The prefix is compared in place and the token is a `tos` view
+// into the request buffer, not a copy: match on it, never store it.
 fn bearer_token(req HttpRequest) string {
-	slice := req.get_header_value_slice('Authorization') or { return '' }
-	value := slice.to_string(req.buffer)
-	if value.starts_with('Bearer ') {
-		return value['Bearer '.len..]
+	s := req.get_header_value_slice('Authorization') or { return '' }
+	if s.len <= bearer_prefix.len {
+		return ''
 	}
-	return ''
+	unsafe {
+		if tos(&req.buffer[s.start], bearer_prefix.len) != bearer_prefix {
+			return ''
+		}
+		return tos(&req.buffer[s.start + bearer_prefix.len], s.len - bearer_prefix.len)
+	}
 }
 
 // user_for_token resolves a token to a user. DEMO ONLY — in production validate a

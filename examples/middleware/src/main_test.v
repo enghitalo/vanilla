@@ -5,38 +5,39 @@ import core
 import server
 import vtest
 
-// Tests for the middleware reference design. Four layers:
-//   1. the composition mechanics (chain order, single-alloc header injection);
+// Tests for the middleware reference design. Five layers:
+//   1. the composition mechanics (chain order, in-place header splice);
 //   2. the per-route auth policy (public / private / role-gated) end-to-end
 //      through the composed handler;
 //   3. the access log line format (method + path + status), zero-parse path;
-//   4. the wrappers hand the engine's inputs (client_fd, worker_state) to the
+//   4. the composed chain allocates nothing and keeps the write buffer;
+//   5. the wrappers hand the engine's inputs (client_fd, worker_state) to the
 //      wrapped handler unchanged — a real server run, via vtest.
 
 const probe_headers = ('X-Content-Type-Options: nosniff\r\n').bytes()
 
-// ── inject_headers (the single-allocation decorator primitive) ────────────────
+// ── insert_after_status_line (the in-place decorator primitive) ──────────────
 
-fn test_inject_headers_after_status_line() {
-	resp := 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi'.bytes()
-	out := inject_headers(resp, probe_headers).bytestr()
-	assert out.starts_with('HTTP/1.1 200 OK\r\n') // status line still first
-	assert out.contains('X-Content-Type-Options: nosniff')
-	assert out.ends_with('\r\n\r\nhi') // body intact
-	// header sits BETWEEN the status line and the original first header
-	h_at := out.index('X-Content-Type-Options') or { -1 }
-	cl_at := out.index('Content-Length') or { -1 }
-	assert h_at > 0 && cl_at > h_at
+fn test_insert_after_status_line_splices_only_its_response() {
+	// `out` is the connection's write buffer: a pipelined batch already holds
+	// the previous response. The splice must land in the response at `start`.
+	earlier := 'HTTP/1.1 204 No Content\r\n\r\n'
+	mut out := (earlier + 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi').bytes()
+	insert_after_status_line(mut out, earlier.len, probe_headers)
+	assert out.bytestr() == earlier +
+		'HTTP/1.1 200 OK\r\nX-Content-Type-Options: nosniff\r\nContent-Length: 2\r\n\r\nhi'
 }
 
-fn test_inject_headers_noop_on_empty() {
-	resp := 'HTTP/1.1 204 No Content\r\n\r\n'.bytes()
-	assert inject_headers(resp, []u8{}).len == resp.len // nothing added
+fn test_insert_after_status_line_noop_on_empty() {
+	mut out := 'HTTP/1.1 204 No Content\r\n\r\n'.bytes()
+	insert_after_status_line(mut out, 0, []u8{})
+	assert out.bytestr() == 'HTTP/1.1 204 No Content\r\n\r\n' // nothing added
 }
 
-fn test_inject_headers_noop_without_status_line() {
-	resp := 'no-crlf-here'.bytes()
-	assert inject_headers(resp, probe_headers) == resp // returned unchanged
+fn test_insert_after_status_line_noop_without_status_line() {
+	mut out := 'no-crlf-here'.bytes()
+	insert_after_status_line(mut out, 0, probe_headers)
+	assert out.bytestr() == 'no-crlf-here' // left untouched
 }
 
 // ── chain composition order ───────────────────────────────────────────────────
@@ -50,7 +51,7 @@ fn tag_mw(tag string) Middleware {
 			if step != .done {
 				return step
 			}
-			out << tag.bytes()
+			core.append_str(mut out, tag)
 			return .done
 		}
 	}
@@ -58,7 +59,7 @@ fn tag_mw(tag string) Middleware {
 
 fn test_chain_runs_outermost_first() {
 	base := fn (req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
-		out << 'app'.bytes()
+		core.append_str(mut out, 'app')
 		return .done
 	}
 	// A is OUTERMOST: it wraps B, which wraps app. On the way out the response
@@ -74,12 +75,14 @@ fn test_chain_runs_outermost_first() {
 // ── per-route auth policy through the composed handler ────────────────────────
 
 fn serve(target string, auth string) string {
+	return serve_with(target, if auth != '' { 'Authorization: Bearer ${auth}\r\n' } else { '' })
+}
+
+// serve_with runs `target`, plus the raw header lines in `headers`, through the
+// composed handler and returns the response.
+fn serve_with(target string, headers string) string {
 	handler := chain(route, with_security_headers)
-	mut raw := '${target} HTTP/1.1\r\nHost: x\r\n'
-	if auth != '' {
-		raw += 'Authorization: Bearer ${auth}\r\n'
-	}
-	raw += '\r\n'
+	raw := '${target} HTTP/1.1\r\nHost: x\r\n${headers}\r\n'
 	mut out := []u8{}
 	mut event_loop := core.EventLoop{}
 	if handler(raw.bytes(), mut out, -1, unsafe { nil }, mut event_loop) == .close {
@@ -129,6 +132,36 @@ fn test_unknown_route_is_404() {
 	assert serve('GET /nope', 'tok-root').contains('404 Not Found')
 }
 
+fn test_path_with_query_is_not_a_route() {
+	// the router matches the whole request-target, query included
+	assert serve('GET /me?x=1', 'tok-alice').contains('404 Not Found')
+}
+
+fn test_bearer_token_needs_the_scheme_and_a_token() {
+	assert serve_with('GET /me', 'Authorization: Bearer \r\n').contains('401 Unauthorized') // no token
+	assert serve_with('GET /me', 'Authorization: Basic tok-alice\r\n').contains('401 Unauthorized')
+	assert serve_with('GET /me', 'Authorization: Bearertok-alice\r\n').contains('401 Unauthorized')
+	// the header NAME is case-insensitive
+	assert serve_with('GET /me', 'authorization: Bearer tok-alice\r\n').contains('200 OK')
+}
+
+// The 200 responses are framed by hand, so pin their exact bytes: a
+// Content-Length that drifts from the body it announces fails here.
+const decorated_headers = 'X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\n' +
+	"Content-Security-Policy: default-src 'self'\r\n"
+
+fn json_200(body string) string {
+	return 'HTTP/1.1 200 OK\r\n' + decorated_headers +
+		'Content-Type: application/json\r\nContent-Length: ${body.len}\r\nConnection: keep-alive\r\n\r\n' +
+		body
+}
+
+fn test_200_responses_exact_bytes() {
+	assert serve('GET /', '') == json_200('{"page":"home","auth":false}')
+	assert serve('GET /me', 'tok-alice') == json_200('{"id":1,"name":"alice","role":"user"}')
+	assert serve('GET /admin', 'tok-root') == json_200('{"admin":"root","secret":42}')
+}
+
 // ── access log ────────────────────────────────────────────────────────────────
 
 fn test_access_log_writes_method_path_status() {
@@ -136,9 +169,11 @@ fn test_access_log_writes_method_path_status() {
 	os.rm(tmp) or {}
 	log := new_access_log(tmp)!
 	log.record('GET /users/42 HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(),
-		'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'.bytes())
+		'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'.bytes(), 0)
+	// this response starts after an earlier pipelined one: ITS status is logged
+	earlier := 'HTTP/1.1 204 No Content\r\n\r\n'
 	log.record('POST /users HTTP/1.1\r\nHost: x\r\n\r\n'.bytes(),
-		'HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n'.bytes())
+		(earlier + 'HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n').bytes(), earlier.len)
 	log.flush()
 	content := os.read_file(tmp)!
 	assert content == 'GET /users/42 200\nPOST /users 201\n'
@@ -150,18 +185,86 @@ fn test_access_log_skips_malformed_request_line() {
 	os.rm(tmp) or {}
 	log := new_access_log(tmp)!
 	// no space in the request line -> nothing logged, no crash
-	log.record('garbage'.bytes(), 'HTTP/1.1 200 OK\r\n\r\n'.bytes())
+	log.record('garbage'.bytes(), 'HTTP/1.1 200 OK\r\n\r\n'.bytes(), 0)
 	log.flush()
 	assert os.read_file(tmp)! == ''
 	os.rm(tmp) or {}
+}
+
+// ── the point of the design: the composed chain allocates nothing ─────────────
+
+// One request per outcome: public 200, private 200/401, role-gated
+// 200/403/401, 404. (A malformed request is left out: it answers 400 and
+// closes the connection, and decode_http_request's error() allocates.)
+const route_requests = [
+	'GET / HTTP/1.1\r\nHost: x\r\n\r\n',
+	'GET /me HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok-alice\r\n\r\n',
+	'GET /me HTTP/1.1\r\nHost: x\r\n\r\n',
+	'GET /admin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok-root\r\n\r\n',
+	'GET /admin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer tok-alice\r\n\r\n',
+	'GET /admin HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer nope\r\n\r\n',
+	'GET /nope HTTP/1.1\r\nHost: x\r\n\r\n',
+]
+
+// The epoll worker reuses `out` through `clear()` after each flush. Had any
+// layer sliced it (`out[start..]`), the buffer would be marked as shared and
+// `clear()` would drop it (data = nil, cap = 0), so it would be reallocated on
+// every request. Same buffer, same capacity, after every outcome.
+fn test_chain_keeps_the_write_buffer() ! {
+	tmp := os.join_path(os.temp_dir(), 'mw_access_keep.log')
+	log := new_access_log(tmp)!
+	handler := chain(route, with_security_headers, access_log_mw(log))
+	mut out := []u8{cap: 4096}
+	data := out.data
+	mut event_loop := core.EventLoop{}
+	for r in route_requests {
+		assert handler(r.bytes(), mut out, -1, unsafe { nil }, mut event_loop) == .done
+		assert out.len > 0
+		out.clear()
+		assert out.cap == 4096, r
+		assert out.data == data, r
+	}
+	log.flush()
+	os.rm(tmp) or {}
+}
+
+// Every outcome runs 20k times through the full chain (security headers,
+// access log, router) into one reused buffer, as a worker serves them; the
+// collector's lifetime allocation counter must not move. (Under `-gc none`,
+// vanilla's production build, the same allocation would be a permanent leak.)
+fn test_chain_allocates_nothing() ! {
+	$if gcboehm ? {
+		tmp := os.join_path(os.temp_dir(), 'mw_access_alloc.log')
+		log := new_access_log(tmp)!
+		handler := chain(route, with_security_headers, access_log_mw(log))
+		reqs := route_requests.map(it.bytes())
+		mut out := []u8{cap: 4096}
+		mut event_loop := core.EventLoop{}
+		for r in reqs { // warm-up
+			handler(r, mut out, -1, unsafe { nil }, mut event_loop)
+			out.clear()
+		}
+		rounds := 20_000
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. rounds {
+			for r in reqs {
+				handler(r, mut out, -1, unsafe { nil }, mut event_loop)
+				out.clear()
+			}
+		}
+		grown := gc_heap_usage().total_bytes - before
+		log.flush()
+		os.rm(tmp) or {}
+		assert grown < 4096, 'the chain allocated ${grown} bytes over ${rounds * reqs.len} requests'
+	}
 }
 
 // ── the wrappers forward every handler input ──────────────────────────────────
 
 const probe_tag = 0x5eed
 
-const probe_ok = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
-const probe_lost = 'HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const probe_ok = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+const probe_lost = 'HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 struct ProbeState {
 	tag int = probe_tag
@@ -177,11 +280,11 @@ fn probe_state() voidptr {
 // instead of segfaulting the test binary.
 fn probe(_req []u8, mut out []u8, client_fd int, worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
 	if client_fd < 0 || worker_state == unsafe { nil } {
-		out << probe_lost
+		core.append_str(mut out, probe_lost)
 		return .done
 	}
 	state := unsafe { &ProbeState(worker_state) }
-	out << if state.tag == probe_tag { probe_ok } else { probe_lost }
+	core.append_str(mut out, if state.tag == probe_tag { probe_ok } else { probe_lost })
 	return .done
 }
 

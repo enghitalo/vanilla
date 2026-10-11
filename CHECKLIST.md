@@ -157,14 +157,14 @@ concatenates, interpolates or allocates per request. The
   splices into `out` in place, not a library function returning a new array
   (that would be one allocation and a copy per response, against
   [BEST_PRACTICES §1/§4](docs/BEST_PRACTICES.md)).
-  `examples/security_headers/src/main.v` `insert_after_status_line(mut out, start, headers)`
-  inserts a `const` header block after the status line with `vmemmove` /
-  `vmemcpy`, allocation-free once `out` has reached its high-water mark.
+  `insert_after_status_line(mut out, start, headers)` (in
+  `examples/security_headers/src/main.v` and
+  `examples/middleware/src/decorators.v`) inserts a `const` header block after
+  the status line with `vmemmove` / `vmemcpy`, allocation-free once `out` has
+  reached its high-water mark, and never slices `out`.
 - **Testing:** `examples/security_headers/src/main_test.v`,
-  `examples/middleware/src/main_test.v`.
-- **Remains:** `examples/middleware/src/decorators.v` `inject_headers(resp, headers) []u8`
-  still builds a new array per response (and its README recommends it):
-  switch it to the in-place splice.
+  `examples/middleware/src/main_test.v` (`test_chain_allocates_nothing`,
+  `test_chain_keeps_the_write_buffer`).
 
 ---
 
@@ -703,9 +703,8 @@ Docs:
 
 1. #34 - HTTPS example from the sketch above (1 hour)
 2. #40 - Add the 12 tested-but-unrun examples to `build_test_examples_on_linux.yml` (30 min)
-3. #8 - In-place splice in `examples/middleware` `inject_headers` (30 min)
 
-**Total Quick Wins:** ~2 hours for 3 improvements
+**Total Quick Wins:** ~1.5 hours for 2 improvements
 
 ---
 

@@ -7,10 +7,11 @@ module main
 //
 //   chain.v        the composition primitive (Handler/Middleware + chain())
 //   decorators.v   GLOBAL middleware: `fn (next) fn` wrappers (security headers)
-//                  + the single-allocation inject_headers
+//                  + insert_after_status_line, an in-place, zero-alloc splice
 //   access_log.v   GLOBAL middleware: a buffered, zero-alloc, no-reparse access
 //                  log written to a file (efficient under the worker model)
-//   auth.v         PER-ROUTE guards (Pattern A): require_auth / require_role
+//   auth.v         PER-ROUTE guards (Pattern A): require_auth (+ an inline role
+//                  check in the role-gated controller)
 //   controllers.v  the router + controllers; each declares its own auth policy
 //
 // Invariant 2 (zero abstraction) holds: no middleware registry, no DI, no

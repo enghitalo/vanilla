@@ -5,9 +5,15 @@ module main
 // The middleware pattern (examples/middleware) makes two perf claims; this
 // measures both in ns/op so a change can't silently regress them:
 //
-//   1. inject_headers (single allocation) is materially cheaper than the naive
-//      `resp.bytestr()` + string concat + `.bytes()` (three allocations) that
-//      the older security_headers example used to decorate every response.
+//   1. insert_after_status_line (an in-place splice into the reused write
+//      buffer, zero allocations) is materially cheaper than building a new
+//      array per response — both the single-allocation `inject_headers` the
+//      example used before and the naive `resp.bytestr()` + string concat +
+//      `.bytes()` round-trip. Each variant decorates a response sitting in a
+//      reused `out` exactly as its decorator did, and `out` is cleared with
+//      clear() after each response, as the epoll worker does after each flush.
+//      The allocating variants also slice `out` (`out[start..]`), which marks
+//      it as shared, so `trim()` and `clear()` drop it and it is reallocated.
 //   2. chain() composition adds only the cost of the (inlinable) wrapper calls
 //      — composing N middlewares is ~free versus calling the handler directly.
 //
@@ -16,6 +22,7 @@ module main
 // (Use -prod: the default debug build is not representative.)
 import benchmark
 import os
+import core
 import http1_1.request_parser
 
 fn C.memchr(buf voidptr, c int, n usize) voidptr
@@ -30,7 +37,33 @@ const headers = ('X-Content-Type-Options: nosniff\r\n' + 'X-Frame-Options: DENY\
 const headers_str = 'X-Content-Type-Options: nosniff\r\n' + 'X-Frame-Options: DENY\r\n' +
 	"Content-Security-Policy: default-src 'self'\r\n"
 
-// ── approach 1: single allocation (the recommended primitive) ─────────────────
+// ── approach 1: in-place splice (examples/middleware, examples/security_headers) ─
+
+@[direct_array_access]
+fn insert_after_status_line(mut out []u8, start int, hdrs []u8) {
+	if hdrs.len == 0 {
+		return
+	}
+	mut end := -1
+	for i in start .. out.len - 1 {
+		if out[i] == `\r` && out[i + 1] == `\n` {
+			end = i + 2
+			break
+		}
+	}
+	if end < 0 {
+		return
+	}
+	tail := out.len - end
+	out << hdrs
+	unsafe {
+		p := &u8(out.data)
+		vmemmove(p + end + hdrs.len, p + end, tail)
+		vmemcpy(p + end, hdrs.data, hdrs.len)
+	}
+}
+
+// ── approach 2: a new array per response (the old examples/middleware) ────────
 
 @[inline]
 fn index_after_status_line(b []u8) int {
@@ -54,7 +87,7 @@ fn inject_headers(resp []u8, hdrs []u8) []u8 {
 	return out
 }
 
-// ── approach 2: the string round-trip (what security_headers does) ────────────
+// ── approach 3: the string round-trip (three allocations) ─────────────────────
 
 fn inject_headers_string(resp []u8, hdrs string) []u8 {
 	s := resp.bytestr()
@@ -64,7 +97,7 @@ fn inject_headers_string(resp []u8, hdrs string) []u8 {
 
 // ── chain composition (mirrors examples/middleware) ───────────────────────────
 
-type Handler = fn (req []u8, fd int, mut out []u8) !
+type Handler = fn (req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step
 
 type Middleware = fn (Handler) Handler
 
@@ -77,8 +110,8 @@ fn chain(app Handler, mw ...Middleware) Handler {
 }
 
 fn passthrough(next Handler) Handler {
-	return fn [next] (req []u8, fd int, mut out []u8) ! {
-		next(req, fd, mut out)!
+	return fn [next] (req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+		return next(req, mut out, client_fd, worker_state, mut event_loop)
 	}
 }
 
@@ -86,10 +119,10 @@ fn passthrough(next Handler) Handler {
 
 // build_log_line is the access_log.record() body without the fwrite — it measures
 // the CPU work of producing one line: one memchr-found prefix copied into a stack
-// buffer + status + newline. Zero heap allocation, no header parse. Returns the
-// line length.
-fn build_log_line(req_buffer []u8, resp []u8) int {
-	if req_buffer.len < 4 || resp.len < 12 {
+// buffer + the status of the response at out[start] + newline. Zero heap
+// allocation, no header parse. Returns the line length.
+fn build_log_line(req_buffer []u8, out []u8, start int) int {
+	if req_buffer.len < 4 || start < 0 || out.len - start < 12 {
 		return 0
 	}
 	unsafe {
@@ -98,6 +131,9 @@ fn build_log_line(req_buffer []u8, resp []u8) int {
 			return 0
 		}
 		after_method := int(&u8(sp1) - &req_buffer[0]) + 1
+		if after_method >= req_buffer.len {
+			return 0
+		}
 		sp2 := C.memchr(&req_buffer[after_method], ` `, usize(req_buffer.len - after_method))
 		if sp2 == nil {
 			return 0
@@ -111,7 +147,7 @@ fn build_log_line(req_buffer []u8, resp []u8) int {
 		mut n := prefix_len
 		line[n] = ` `
 		n++
-		vmemcpy(&line[n], &resp[9], 3)
+		vmemcpy(&line[n], &out[start + 9], 3)
 		n += 3
 		line[n] = `\n`
 		n++
@@ -125,10 +161,13 @@ fn main() {
 	env_iters := os.getenv('BENCH_ITERS').int()
 	iterations := if env_iters > 0 { env_iters } else { 5_000_000 }
 
-	// Sanity-print once so we know both injectors produce the same result.
-	a := inject_headers(base_resp, headers).bytestr()
-	b := inject_headers_string(base_resp, headers_str).bytestr()
-	println('single-alloc == string-roundtrip : ${a == b}')
+	// Sanity-print once so we know all three injectors produce the same result.
+	mut spliced := base_resp.clone()
+	insert_after_status_line(mut spliced, 0, headers)
+	a := spliced.bytestr()
+	b := inject_headers(base_resp, headers).bytestr()
+	c := inject_headers_string(base_resp, headers_str).bytestr()
+	println('in-place == single-alloc == string-roundtrip : ${a == b && b == c}')
 	println('injected response:\n${a}')
 	println('iterations      = ${iterations}\n')
 
@@ -136,44 +175,69 @@ fn main() {
 
 	mut bm := benchmark.start()
 
-	// 1) inject_headers — single allocation.
+	// 1) in-place splice — zero allocations; `out` keeps its buffer.
+	mut out1 := []u8{cap: 4096}
 	for _ in 0 .. iterations {
-		out := inject_headers(base_resp, headers)
-		acc += out.len
+		start := out1.len
+		out1 << base_resp
+		insert_after_status_line(mut out1, start, headers)
+		acc += out1.len
+		out1.clear()
 	}
-	bm.measure('inject_headers        (1 alloc, recommended)')
+	bm.measure('insert_after_status_line (in place, 0 allocs, recommended)')
 
-	// 2) string round-trip — three allocations (bytestr + concat + bytes).
+	// 2) the old decorator: a new array per response, then trim + copy back.
+	mut out2 := []u8{cap: 4096}
 	for _ in 0 .. iterations {
-		out := inject_headers_string(base_resp, headers_str)
-		acc += out.len
+		start := out2.len
+		out2 << base_resp
+		injected := inject_headers(out2[start..], headers)
+		out2.trim(start)
+		out2 << injected
+		acc += out2.len
+		out2.clear()
 	}
-	bm.measure('inject_headers_string (3 allocs, naive)')
+	bm.measure('inject_headers           (new array + out[start..], old)')
 
-	// 3) direct handler call — the baseline for the chain overhead.
-	base := fn (req []u8, fd int, mut out []u8) ! {
+	// 3) string round-trip — bytestr + concat + bytes, then trim + copy back.
+	mut out3 := []u8{cap: 4096}
+	for _ in 0 .. iterations {
+		start := out3.len
+		out3 << base_resp
+		injected := inject_headers_string(out3[start..], headers_str)
+		out3.trim(start)
+		out3 << injected
+		acc += out3.len
+		out3.clear()
+	}
+	bm.measure('inject_headers_string    (3 allocs + out[start..], naive)')
+
+	// 4) direct handler call — the baseline for the chain overhead.
+	base := fn (req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 		out << base_resp
+		return .done
 	}
 	// One persistent buffer, cleared per call — mirrors the server's reused
 	// per-connection write buffer, so the loop measures call overhead only.
 	mut out_buf := []u8{cap: base_resp.len}
+	mut event_loop := core.EventLoop{}
 	for _ in 0 .. iterations {
 		out_buf.clear()
-		base([]u8{}, -1, mut out_buf) or {}
+		base([]u8{}, mut out_buf, -1, unsafe { nil }, mut event_loop)
 		acc += out_buf.len
 	}
-	bm.measure('direct handler call   (no middleware)')
+	bm.measure('direct handler call      (no middleware)')
 
-	// 4) 3-deep chain — same call through three composed wrappers.
+	// 5) 3-deep chain — same call through three composed wrappers.
 	wrapped := chain(base, passthrough, passthrough, passthrough)
 	for _ in 0 .. iterations {
 		out_buf.clear()
-		wrapped([]u8{}, -1, mut out_buf) or {}
+		wrapped([]u8{}, mut out_buf, -1, unsafe { nil }, mut event_loop)
 		acc += out_buf.len
 	}
-	bm.measure('3-deep chain call     (3 middlewares)')
+	bm.measure('3-deep chain call        (3 middlewares)')
 
-	// 5) access log line — OLD: full decode + 2× to_string + status + interpolate.
+	// 6) access log line — OLD: full decode + 2× to_string + status + interpolate.
 	for _ in 0 .. iterations {
 		req := request_parser.decode_http_request(raw_request) or { continue }
 		method := req.method.to_string(req.buffer)
@@ -184,10 +248,10 @@ fn main() {
 	}
 	bm.measure('access log line  (old: decode + interpolate)')
 
-	// 6) access log line — NEW: one memchr + assemble in a stack buffer, no parse,
+	// 7) access log line — NEW: one memchr + assemble in a stack buffer, no parse,
 	// no heap allocation (the access_log.record() CPU work, minus the fwrite).
 	for _ in 0 .. iterations {
-		acc += build_log_line(raw_request, base_resp)
+		acc += build_log_line(raw_request, base_resp, 0)
 	}
 	bm.measure('access log line  (new: memchr + assemble)')
 

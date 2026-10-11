@@ -56,17 +56,21 @@ fn access_log_mw(log &AccessLog) Middleware {
 			if step != .done {
 				return step
 			}
-			log.record(req_buffer, out[start..])
+			log.record(req_buffer, out, start)
 			return .done
 		}
 	}
 }
 
 // record assembles "METHOD PATH STATUS\n" and writes it in a single fwrite.
-// Zero heap allocation; no header parse. Silently skips a malformed request line
-// or a pathologically long request-target (logging must never break a response).
-fn (l &AccessLog) record(req_buffer []u8, resp []u8) {
-	if req_buffer.len < 4 || resp.len < 12 {
+// The response starts at out[start] (`out` may already hold earlier pipelined
+// responses); its status code is read in place, never through `out[start..]`,
+// which would mark the write buffer as shared and make the worker's
+// `out.clear()` drop it. Zero heap allocation; no header parse. Silently skips
+// a malformed request line or a pathologically long request-target (logging
+// must never break a response).
+fn (l &AccessLog) record(req_buffer []u8, out []u8, start int) {
+	if req_buffer.len < 4 || start < 0 || out.len - start < 12 {
 		return
 	}
 	unsafe {
@@ -86,7 +90,7 @@ fn (l &AccessLog) record(req_buffer []u8, resp []u8) {
 		}
 		prefix_len := int(&u8(sp2) - &req_buffer[0]) // "METHOD SP PATH"
 
-		// line = prefix + ' ' + 3-byte status code (resp[9..12]) + '\n'
+		// line = prefix + ' ' + 3-byte status code (bytes 9..12 of the response) + '\n'
 		total := prefix_len + 1 + 3 + 1
 		mut line := [512]u8{}
 		if total > line.len {
@@ -96,7 +100,7 @@ fn (l &AccessLog) record(req_buffer []u8, resp []u8) {
 		mut n := prefix_len
 		line[n] = ` `
 		n++
-		vmemcpy(&line[n], &resp[9], 3)
+		vmemcpy(&line[n], &out[start + 9], 3)
 		n += 3
 		line[n] = `\n`
 		n++

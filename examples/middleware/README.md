@@ -2,26 +2,27 @@
 
 How cross-cutting concerns compose on vanilla **without** a framework. No
 middleware registry, no DI, no dynamic dispatch — just pure function
-composition, honoring Invariant 2 of the [implementation plan](../../IMPLEMENTATION_PLAN.md).
+composition, honoring rule 2 of [CONTRIBUTING.md](../../CONTRIBUTING.md)
+(keep abstraction to a minimum).
 
 There are exactly two shapes, used for two different jobs.
 
 ## File layout
 
-| File                                 | Responsibility                                                                                                  |
-| ------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
-| [`chain.v`](src/chain.v)             | The composition primitive — `Handler` / `Middleware` types and `chain()`.                                       |
-| [`decorators.v`](src/decorators.v)   | **Global** middleware: `with_security_headers` + the single-allocation `inject_headers`.                        |
-| [`access_log.v`](src/access_log.v)   | **Global** middleware: a buffered, zero-alloc, no-reparse access log written to a file.                         |
-| [`auth.v`](src/auth.v)               | **Per-route** guards (Pattern A): `require_auth`, `require_role`, `auth_error_response`.                         |
-| [`controllers.v`](src/controllers.v) | The router (`route`) + controllers; each declares its own auth policy.                                          |
-| [`main.v`](src/main.v)               | Wiring: `chain(route, with_security_headers, access_log_mw(log))` + flush-on-shutdown + `server.run()`.         |
+| File                                 | Responsibility                                                                                                   |
+| ------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| [`chain.v`](src/chain.v)             | The composition primitive — `Handler` / `Middleware` types and `chain()`.                                        |
+| [`decorators.v`](src/decorators.v)   | **Global** middleware: `with_security_headers` + `insert_after_status_line`, an in-place, zero-alloc splice.     |
+| [`access_log.v`](src/access_log.v)   | **Global** middleware: a buffered, zero-alloc, no-reparse access log written to a file.                          |
+| [`auth.v`](src/auth.v)               | **Per-route** guard (Pattern A): `require_auth` (`?User`), the zero-copy `bearer_token`, the 401/403 responses. |
+| [`controllers.v`](src/controllers.v) | The router (`route`) + controllers; each declares its own auth policy and appends its response into `out`.      |
+| [`main.v`](src/main.v)               | Wiring: `chain(route, with_security_headers, access_log_mw(log))` + flush-on-shutdown + `server.run()`.          |
 
 ## 1. Global middleware → `fn (next) fn` wrappers, composed with `chain()`
 
 For concerns that apply to **every** response (security headers, access logging).
-Composed once at startup, so the hot path pays only the (inlinable) wrapper calls
-— no per-request bookkeeping.
+Composed once at startup, so the hot path pays only the wrapper calls — no
+per-request bookkeeping.
 
 ```v
 handler := chain(route, with_security_headers, access_log_mw(log))
@@ -29,27 +30,63 @@ handler := chain(route, with_security_headers, access_log_mw(log))
 // response flow: route -> log -> security   (first listed = outermost)
 ```
 
+A wrapper notes where its response starts in `out` (the connection's reused
+write buffer, which may already hold earlier pipelined responses), calls
+`next`, then works on the bytes from that offset on:
+
+```v
+start := out.len
+step := next(req_buffer, mut out, client_fd, worker_state, mut event_loop)
+if step != .done {
+	return step
+}
+insert_after_status_line(mut out, start, security_headers) // splice in place
+```
+
 ## 2. Per-route auth → an explicit guard at the top of the controller ("Pattern A")
 
 For policy that **varies per route** (public vs private vs role-gated). The guard
 is right there in the controller — you read the policy where the handler is, and
-no hidden mechanism can apply (or forget) it.
+no hidden mechanism can apply (or forget) it. Controllers append their response
+into `out`; a denial is a `const` response, not an error value.
 
 ```v
 // PUBLIC — no guard
-fn handle_home(_ HttpRequest) []u8 { return ok_json(...) }
+fn handle_home(mut out []u8) {
+	core.append_str(mut out, home_response)
+}
 
 // PRIVATE — any authenticated user
-fn handle_profile(req HttpRequest) []u8 {
-	user := require_auth(req) or { return auth_error_response(err) }   // 401
+fn handle_profile(req HttpRequest, mut out []u8) {
+	user := require_auth(req) or {
+		core.append_str(mut out, unauthorized_response) // 401
+		return
+	}
 	...
 }
 
 // ROLE-GATED — admins only
-fn handle_admin(req HttpRequest) []u8 {
-	user := require_role(req, 'admin') or { return auth_error_response(err) }  // 401 or 403
+fn handle_admin(req HttpRequest, mut out []u8) {
+	user := require_auth(req) or {
+		core.append_str(mut out, unauthorized_response) // 401
+		return
+	}
+	if user.role != 'admin' {
+		core.append_str(mut out, forbidden_response) // 403
+		return
+	}
 	...
 }
+```
+
+A dynamic body is framed without a builder: sum its length first, then append
+the head, the Content-Length digits and the parts.
+
+```v
+append_json_ok_head(mut out, admin_name.len + user.name.len + admin_end.len)
+core.append_str(mut out, admin_name)
+core.append_str(mut out, user.name)
+core.append_str(mut out, admin_end)
 ```
 
 ## The access log, made efficient
@@ -75,60 +112,79 @@ with three wins over the naive `println` + `decode_http_request`:
 
 ## The rules (why it stays fast)
 
-- **Decorators inject headers with `inject_headers()` — a single allocation.**
-  The naive `resp.bytestr()` + concat + `.bytes()` does **three** allocations per
-  response and breaks the zero-alloc-on-hot-path budget.
+- **The composed chain allocates nothing per request** — every route and
+  outcome, checked by `test_chain_allocates_nothing` (20k rounds,
+  `gc_heap_usage()`).
+- **Never slice `out`.** `out[start..]` marks the write buffer as shared, and
+  the worker's `out.clear()` then drops it instead of reusing it, so it is
+  reallocated on the next request. Pass the `start` offset instead:
+  `insert_after_status_line(mut out, start, …)`, `log.record(req_buffer, out, start)`.
+  `test_chain_keeps_the_write_buffer` checks the buffer survives every route.
+- **Decorators splice in place.** `insert_after_status_line` appends to make
+  room, shifts the tail with `vmemmove` and copies the headers into the gap —
+  no new array, no copy back.
+- **Controllers append into `out`.** Fixed responses are `const` strings appended
+  with `core.append_str`; dynamic ones are framed part by part (`core.append_str`
+  + `wi`) — no `${}`, no `strings.Builder`, no return-then-copy.
+- **Guards read views, not copies.** The router matches the path as a `tos` view
+  into `req_buffer`; `bearer_token` compares the `Bearer ` prefix in place and
+  returns the token as a view (matched, never stored); a denial returns `none`,
+  not an `error()`.
 - **The access log neither parses nor allocates** — one `memchr`, a stack buffer,
   a buffered `fwrite`. Logging is the classic place a careless decorator silently
   halves throughput.
-- **`chain()` is composed once at startup** — no dynamic dispatch, ~2 ns per wrapper.
-- **Guards read only the cheap zero-copy slices they need** (`get_header_value_slice`,
-  ~25 ns), never a full decode.
+- **`chain()` is composed once at startup** — no dynamic dispatch, a few ns per
+  wrapper.
 
 ## Benchmarks
 
 ### Micro-bench (ns/op, no network — `v -prod run bench/middleware/middleware_bench.v`)
 
-5M iterations, this machine (16 cores). The point is each **A/B**: single-alloc
-header injection vs the naive string round-trip; the cost of `chain`; and
-producing a log line the cheap way vs decode + interpolate.
+5M iterations, best of 3 runs, Ryzen 7 5800H (16 threads), V 0.5.2 407c52e,
+`-prod` (default GC). The point is each **A/B**: the in-place splice vs building
+a new array per response; the cost of `chain`; and producing a log line the
+cheap way vs decode + interpolate. Each header-injection variant decorates a
+response sitting in a reused `out`, cleared with `clear()` after every response
+as the epoll worker does.
 
-| Operation                                   | Total (5M) | ~ns/op |
-| ------------------------------------------- | ---------: | -----: |
-| `inject_headers` (1 alloc, **recommended**) |     300 ms |    ~60 |
-| `inject_headers_string` (3 allocs, naive)   |     520 ms |   ~104 |
-| direct handler call (no middleware)         |     109 ms |    ~22 |
-| `chain` 3-deep call (3 middlewares)         |     167 ms |    ~33 |
-| access log line — decode + interpolate (old)|     613 ms |   ~123 |
-| access log line — memchr + assemble (new)   |      77 ms |    ~15 |
+| Operation                                                  | Total (5M) | ~ns/op |
+| ---------------------------------------------------------- | ---------: | -----: |
+| `insert_after_status_line` (in place, 0 allocs, **used**)  |     186 ms |    ~37 |
+| `inject_headers` (new array + `out[start..]`, old)         |     850 ms |   ~170 |
+| `inject_headers_string` (3 allocs + `out[start..]`, naive) |   1,113 ms |   ~223 |
+| direct handler call (no middleware)                        |      43 ms |     ~9 |
+| `chain` 3-deep call (3 middlewares)                        |     141 ms |    ~28 |
+| access log line — decode + interpolate (old)               |     934 ms |   ~187 |
+| access log line — memchr + assemble (new)                  |      21 ms |     ~4 |
 
-→ the single-allocation injector is **≈1.7× cheaper**; a 3-deep chain adds
-**~2 ns per wrapper**; the zero-alloc/no-parse log line is **≈8× cheaper** (and
-drops ~4 allocations) — before counting the batched-vs-per-request syscall win.
+→ the in-place splice is **≈4.6× cheaper** than the single-allocation injector
+it replaced (which also lost the write buffer to `out[start..]`) and **≈6×**
+cheaper than the string round-trip; a 3-deep chain adds **~7 ns per wrapper**;
+the zero-alloc/no-parse log line is **≈45× cheaper** — before counting the
+batched-vs-per-request syscall win.
 
-### End-to-end throughput (`wrk -t16 -c512 -d20s`, keep-alive)
+### End-to-end throughput (`wrk -t16 -c512 -d10s`, keep-alive)
 
 Each request goes through the full path: parse → dispatch → (auth guard) →
-build → `access_log_mw` (buffered `fwrite`) → `with_security_headers`. Wiped V
-cache + freed port first; single run, sandbox (numbers swing run-to-run — treat
-as a ballpark, not a gate). For reference, the [veb_like](../veb_like)
-dynamic-route baseline is ~310k req/s.
+append → `access_log_mw` (buffered `fwrite`) → `with_security_headers`. `-prod`
+build, wrk on the same Ryzen 7 5800H, access log on `/dev/null`, best of 2
+runs. The machine was shared and runs swung by up to 30%: treat these as a
+ballpark, not a gate.
 
 | Route        | Policy                  | Requests/sec | Avg latency |
 | ------------ | ----------------------- | -----------: | ----------: |
-| `GET /`      | public (no guard)       |  **361,081** |     1.36 ms |
-| `GET /me`    | `require_auth` (Bearer) |  **333,586** |     1.43 ms |
-| `GET /admin` | `require_role('admin')` |  **335,137** |     1.50 ms |
+| `GET /`      | public (no guard)       |  **289,328** |     1.78 ms |
+| `GET /me`    | `require_auth` (Bearer) |  **284,079** |     1.77 ms |
+| `GET /admin` | `require_auth` + role   |  **289,586** |     1.74 ms |
 
-→ the buffered file logger is **faster than the old per-request `println`** (public
-rose ~314k → ~361k); the per-route auth guard costs ~7% versus the public route.
-The wrapper pattern carries no structural overhead.
+→ the per-route auth guard is within noise of the public route; the wrapper
+pattern carries no structural overhead.
 
 ## Run
 
 ```sh
 v -prod run examples/middleware/src      # serve on :3000 (access log -> ./access.log)
-v test examples/middleware/src           # pure tests (composition + auth + log format)
+v test examples/middleware/src           # composition + auth + log format + zero-alloc chain
 v -prod run bench/middleware/middleware_bench.v   # ns/op micro-bench
 ```
 
