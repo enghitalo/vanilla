@@ -73,9 +73,8 @@ after the request started, not at the 2 s cap.
   endless stream (SSE) holds the drain for the whole grace. The counters are
   per worker, each on its own cache line, so counting costs the hot path
   nothing measurable.
-- **The handler** appends a `'...'.bytes()` literal with `out <<`, which
-  builds a new `[]u8` on every request; the allocation-free form is a `const`
-  string appended with `core.append_str`
+- **The handler** appends a `const` string with `core.append_str`: no
+  allocation per request
   ([BEST_PRACTICES §3a](../../docs/BEST_PRACTICES.md#3a-static-responses--a-const-string-appended-with-coreappend_str)).
 
 ## Tests
@@ -84,7 +83,8 @@ after the request started, not at the 2 s cap.
 v test examples/graceful_shutdown/src
 ```
 
-[main_test.v](src/main_test.v) runs the example's handler on a live server
+[main_test.v](src/main_test.v) checks that the handler allocates nothing, then
+runs it on a live server
 through `vtest.start`: a request is served, `shutdown(2000)` on the idle
 server returns in under a second, and afterwards four fresh connections are
 all refused. The signal-to-pipe wiring in `main` is not covered by the test

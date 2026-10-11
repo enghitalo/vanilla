@@ -1,6 +1,7 @@
 module main
 
 import time
+import core
 import server
 import vtest
 
@@ -19,6 +20,27 @@ import vtest
 // stays in the example's README narrative.
 
 const gs_req = 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
+
+// The handler appends a const: 20k requests through one reused buffer must not
+// move the collector's lifetime allocation counter.
+fn test_handler_allocates_nothing() {
+	$if gcboehm ? {
+		mut out := []u8{cap: 4096}
+		mut event_loop := core.EventLoop{}
+		handle(gs_req, mut out, -1, unsafe { nil }, mut event_loop) // warm-up
+		assert out.bytestr() == ok_response
+		rounds := 20_000
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. rounds {
+			unsafe {
+				out.len = 0
+			}
+			handle(gs_req, mut out, -1, unsafe { nil }, mut event_loop)
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert grown < 4096, 'the handler allocated ${grown} bytes over ${rounds} requests'
+	}
+}
 
 fn test_graceful_drain() ! {
 	mut h := vtest.start(server.ServerConfig{ handler: handle })!

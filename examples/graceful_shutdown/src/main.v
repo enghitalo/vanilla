@@ -27,8 +27,12 @@ import server
 import core
 import os
 
+// A static response is a const string, appended with core.append_str: no
+// per-request copy (docs/BEST_PRACTICES.md §3a).
+const ok_response = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+
 fn handle(_req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
-	out << 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'.bytes()
+	core.append_str(mut out, ok_response)
 	return .done
 }
 
