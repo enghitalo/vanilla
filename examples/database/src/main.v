@@ -12,15 +12,14 @@ fn handle_request(req_buffer []u8, mut out []u8, mut pool ConnectionPool) core.S
 		return .close
 	}
 
-	method := unsafe { tos(&req.buffer[req.method.start], req.method.len) }
-	path := unsafe { tos(&req.buffer[req.path.start], req.path.len) }
+	// Views into `req_buffer`, not `req.buffer`: a view of `req.buffer` that
+	// reaches a callee moves `req` to the heap, a copy on every request.
+	method := unsafe { tos(&req_buffer[req.method.start], req.method.len) }
+	path := unsafe { tos(&req_buffer[req.path.start], req.path.len) }
 
 	if method == 'GET' {
 		if path == '/' {
-			out << home_controller([]) or {
-				out << response.tiny_bad_request_response
-				return .close
-			}
+			home_controller(mut out)
 			return .done
 		} else if path.starts_with('/user/') {
 			// The raw bytes after `/user/` (query string included) are attacker
@@ -28,24 +27,15 @@ fn handle_request(req_buffer []u8, mut out []u8, mut pool ConnectionPool) core.S
 			// integer id (`1/**/OR/**/1=1`, `1;DELETE...`, `abc`) before it
 			// touches the database.
 			id := unsafe { tos(path.str + 6, path.len - 6) } // view, no copy
-			out << get_user_controller(id, mut pool) or {
-				out << response.tiny_bad_request_response
-				return .close
-			}
+			get_user_controller(id, mut pool, mut out)
 			return .done
 		} else if path == '/user' {
-			out << get_users_controller([], mut pool) or {
-				out << response.tiny_bad_request_response
-				return .close
-			}
+			get_users_controller(mut pool, mut out)
 			return .done
 		}
 	} else if method == 'POST' {
 		if path == '/user' {
-			out << create_user_controller([], mut pool) or {
-				out << response.tiny_bad_request_response
-				return .close
-			}
+			create_user_controller(mut pool, mut out)
 			return .done
 		}
 	}

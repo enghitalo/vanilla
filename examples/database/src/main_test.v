@@ -51,6 +51,67 @@ fn test_integer_id_reaches_the_database() {
 	}
 }
 
+// append_rows_response sends exactly what the old builder code did:
+// `row.str()` + '\n' per row for GET /user, the rows joined by '\n' for
+// GET /user/<id>, framed with the body's Content-Length. `out` starts non-empty
+// and full, so the splice runs at an offset and through a regrow.
+fn test_rows_response_matches_the_builder_format() {
+	rows := [pg.Row{
+		vals: [?string('1'), ?string('new_user')]
+	}, pg.Row{
+		vals: [?string('2'), ?string('second')]
+	}]
+	for n in 0 .. rows.len + 1 {
+		for trailing in [true, false] {
+			mut body := ''
+			if trailing {
+				for row in rows[..n] {
+					body += row.str() + '\n'
+				}
+			} else {
+				body = rows[..n].map(it.str()).join('\n')
+			}
+			mut out := 'prefix'.bytes()
+			append_rows_response(mut out, rows[..n], trailing)
+			assert out.bytestr() == 'prefixHTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ${body.len}\r\nConnection: close\r\n\r\n${body}'
+		}
+	}
+}
+
+// The routes that answer before the database allocate nothing: 20k rounds
+// through one reused buffer must not move the collector's lifetime counter.
+// Routes that reach the pool are left out: they block on libpq and allocate
+// its result (and, on this closed pool, acquire's error).
+fn test_routes_before_the_database_allocate_nothing() {
+	$if gcboehm ? {
+		mut pool := closed_pool()
+		reqs := [
+			'GET / HTTP/1.1\r\nHost: x\r\n\r\n',
+			'GET /user/1;DELETE HTTP/1.1\r\nHost: x\r\n\r\n',
+			'GET /nope HTTP/1.1\r\nHost: x\r\n\r\n',
+		].map(it.bytes())
+		mut out := []u8{cap: 4096}
+		for r in reqs { // warm-up: `out` reaches its high-water mark
+			unsafe {
+				out.len = 0
+			}
+			handle_request(r, mut out, mut pool)
+		}
+		rounds := 20_000
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. rounds {
+			for r in reqs {
+				unsafe {
+					out.len = 0
+				}
+				handle_request(r, mut out, mut pool)
+			}
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert grown < 4096, 'the handler allocated ${grown} bytes over ${rounds * reqs.len} requests'
+	}
+}
+
 fn test_is_user_id() {
 	assert is_user_id('1')
 	assert is_user_id('42')

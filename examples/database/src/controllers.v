@@ -1,44 +1,71 @@
 module main
 
-import strings
+// Controllers append the response straight into the caller-owned `out`
+// (docs/BEST_PRACTICES.md §3): no builder, no return-then-copy, no `.str()`.
+// They call libpq synchronously, so a worker thread blocks on every query
+// (BEST_PRACTICES §5); examples/async_db_pg is the non-blocking version.
+import core
+import db.pg
+import strconv
 import http1_1.response
 
-const http_ok_response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
+const http_ok_response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
 
-const http_created_response = 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
+const http_created_response = 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
 
-const tiny_internal_server_error_response = 'HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'.bytes()
+const tiny_internal_server_error_response = 'HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
 
-fn home_controller(params []string) ![]u8 {
-	return http_ok_response
+// The 200 text/plain head, split around its Content-Length digits.
+const rows_head = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: '
+const rows_tail = '\r\nConnection: close\r\n\r\n'
+
+fn home_controller(mut out []u8) {
+	core.append_str(mut out, http_ok_response)
 }
 
-fn get_users_controller(params []string, mut pool ConnectionPool) ![]u8 {
-	mut db := pool.acquire() or { return tiny_internal_server_error_response }
-	defer { pool.release(db) }
-	rows := db.exec('SELECT * FROM users') or { return tiny_internal_server_error_response }
-
-	mut response_body := strings.new_builder(200)
-	for row in rows {
-		response_body.write_string(row.str())
-		response_body.write_string('\n')
-	}
-
-	// response_body_str := response_body.str()
-	defer {
-		unsafe {
-			response_body.free()
-			params.free()
+// append_rows_response appends a 200 text/plain response listing one
+// `row.str()` (V's dump of the pg.Row struct) per row, separated by '\n'
+// (`trailing`: '\n' after every row). The query result and that text are what
+// these routes still allocate. A row's text exists only once `row.str()`
+// has made it, so the body goes straight into `out` and its length is spliced
+// in front of it afterwards (one memmove over the body), instead of building
+// the body in a strings.Builder first just to measure it.
+fn append_rows_response(mut out []u8, rows []pg.Row, trailing bool) {
+	core.append_str(mut out, rows_head)
+	at := out.len // the Content-Length digits go here
+	core.append_str(mut out, rows_tail)
+	body := out.len
+	for i, row in rows {
+		if i > 0 && !trailing {
+			out << `\n`
+		}
+		core.append_str(mut out, row.str())
+		if trailing {
+			out << `\n`
 		}
 	}
+	n := out.len - body
+	digits := strconv.dec_digits(u64(n))
+	moved := out.len - at
+	unsafe {
+		out.grow_len(digits)
+		vmemmove(&out[at + digits], &out[at], moved)
+		mut view := (&out[at]).vbytes(digits)
+		strconv.write_dec(n, mut view) // writes at view[0], i.e. out[at]
+	}
+}
 
-	mut sb := strings.new_builder(200)
-	sb.write_string('HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ')
-	sb.write_string(response_body.len.str())
-	sb.write_string('\r\nConnection: close\r\n\r\n')
-	sb.write(response_body)!
-
-	return sb
+fn get_users_controller(mut pool ConnectionPool, mut out []u8) {
+	mut db := pool.acquire() or {
+		core.append_str(mut out, tiny_internal_server_error_response)
+		return
+	}
+	defer { pool.release(db) }
+	rows := db.exec('SELECT * FROM users') or {
+		core.append_str(mut out, tiny_internal_server_error_response)
+		return
+	}
+	append_rows_response(mut out, rows, true)
 }
 
 // `users.id` is a `serial` (int4): at most 10 digits, at most max_user_id.
@@ -66,41 +93,38 @@ fn is_user_id(id string) bool {
 // the pool is touched; it also keeps the stack copy below in bounds), and then
 // still BOUND as a query parameter ($1), never spliced into the SQL text: two
 // independent defenses against injection.
-@[direct_array_access; manualfree]
-fn get_user_controller(id string, mut pool ConnectionPool) ![]u8 {
+@[direct_array_access]
+fn get_user_controller(id string, mut pool ConnectionPool, mut out []u8) {
 	if !is_user_id(id) {
-		return response.tiny_bad_request_response
+		out << response.tiny_bad_request_response
+		return
 	}
 	// libpq reads parameters as NUL-terminated C strings, and `id` is a view
 	// into the request buffer (not NUL-terminated): copy the digits onto the
 	// stack. The array is zeroed, so the terminator is already in place.
 	mut param := [max_user_id_digits + 1]u8{}
 	unsafe { vmemcpy(&param[0], id.str, id.len) }
-	mut db := pool.acquire() or { return tiny_internal_server_error_response }
+	mut db := pool.acquire() or {
+		core.append_str(mut out, tiny_internal_server_error_response)
+		return
+	}
 	defer { pool.release(db) }
 	result := db.exec_param('SELECT * FROM users WHERE id = $1', unsafe { tos(&param[0], id.len) }) or {
-		return tiny_internal_server_error_response
+		core.append_str(mut out, tiny_internal_server_error_response)
+		return
 	}
-	response_body := result.map(it.str()).join('\n')
-
-	mut sb := strings.new_builder(200)
-	sb.write_string('HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ')
-	sb.write_string(response_body.len.str())
-	sb.write_string('\r\nConnection: close\r\n\r\n')
-	sb.write_string(response_body)
-
-	defer {
-		unsafe { response_body.free() } // never `id`: it borrows the request buffer
-	}
-	return sb
+	append_rows_response(mut out, result, false)
 }
 
-fn create_user_controller(params []string, mut pool ConnectionPool) ![]u8 {
-	dump('create_user_controller')
-	mut db := pool.acquire() or { return tiny_internal_server_error_response }
+fn create_user_controller(mut pool ConnectionPool, mut out []u8) {
+	mut db := pool.acquire() or {
+		core.append_str(mut out, tiny_internal_server_error_response)
+		return
+	}
 	defer { pool.release(db) }
 	db.exec("INSERT INTO users (name) VALUES ('new_user')") or {
-		return tiny_internal_server_error_response
+		core.append_str(mut out, tiny_internal_server_error_response)
+		return
 	}
-	return http_created_response
+	core.append_str(mut out, http_created_response)
 }

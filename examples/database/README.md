@@ -17,7 +17,7 @@ before the database is touched, then bound as a query parameter.
 | ------------------------------------ | ------------------------------------------------------------------------------ |
 | [main.v](src/main.v)                 | `handle_request` (routing), the pool and `users` table setup, the server.      |
 | [database.v](src/database.v)         | `ConnectionPool`: a `chan pg.DB` of open connections, `acquire` / `release`.  |
-| [controllers.v](src/controllers.v)   | One function per route, each returning the whole response as `[]u8`.          |
+| [controllers.v](src/controllers.v)   | One function per route, each appending the whole response into `out`.         |
 
 ## Run
 
@@ -108,19 +108,20 @@ with that same 400 (there is no 404 here).
   `get_user_controller` then copies the digits into a NUL-terminated stack
   array (libpq reads parameters as C strings) and binds them as `$1` with
   `exec_param`; the id is never spliced into SQL text.
-- **Return-then-copy responses.** Unlike most examples, the controllers build
-  and return a `[]u8` (fixed ones are `const ... .bytes()`, dynamic ones a
-  `strings.Builder` with `.str()` for the length) and the handler copies it
-  into `out`. Each dynamic response allocates; the body is V's debug
-  rendering of `pg.Row`. [BEST_PRACTICES §1](../../docs/BEST_PRACTICES.md#1-handlers-append-into-the-connections-write-buffer-zero-alloc)
-  and [§3](../../docs/BEST_PRACTICES.md#3-avoid--interpolation-on-the-hot-path)
-  explain why the rest of the repository appends into `out` instead.
+- **Responses appended into `out`.** The controllers take `mut out []u8`:
+  fixed responses are `const` strings appended with `core.append_str`, and
+  `append_rows_response` writes the head, then each row straight into `out`,
+  then splices the `Content-Length` digits in front of the body (one memmove
+  over it), with no `strings.Builder` and no return-then-copy
+  ([BEST_PRACTICES §1](../../docs/BEST_PRACTICES.md#1-handlers-append-into-the-connections-write-buffer-zero-alloc),
+  [§3](../../docs/BEST_PRACTICES.md#3-avoid--interpolation-on-the-hot-path)).
+  The body is still V's debug rendering of `pg.Row` (`row.str()`, one string
+  per row), and with the query result it is what these routes allocate; the
+  routes that never reach the database allocate nothing.
 - **`Connection: close` is only a header.** Every response says it, but the
   handler returns `.done`, so the server keeps the connection open: a second
   pipelined request on it is still answered. curl closes after the first
   response because of the header.
-- `create_user_controller` prints a `dump(...)` line to stderr on every
-  `POST /user`.
 
 ## Tests
 
@@ -132,8 +133,9 @@ v test examples/database/src
 compile): it calls `handle_request` with a closed, empty pool, so a request
 that reaches the database gets the controller's 500. Injection payloads
 (`1/**/OR/**/1=1`, `1;DELETE...`, `abc`, `-1`, `1?x=1`, an int4 overflow,
-11 digits) all get 400, valid ids get 500 (they passed validation), and
-`is_user_id` is checked directly.
+11 digits) all get 400, valid ids get 500 (they passed validation),
+`is_user_id` is checked directly, `append_rows_response` frames rows exactly,
+and the routes that stop before the database allocate nothing.
 
 ## See also
 
