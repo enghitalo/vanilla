@@ -6,7 +6,7 @@ import http1_1.response
 fn test_handle_request_get_home() {
 	req_buffer := 'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
 	res := serve(req_buffer) or { panic(err) }
-	assert res == http_ok_response
+	assert res.bytestr() == http_ok_response
 }
 
 // quoted_etag_of derives the on-the-wire `"<16 hex>"` for a body — test
@@ -31,7 +31,7 @@ fn test_conditional_get_roundtrip() {
 	fresh :=
 		'GET /user/123 HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: ${quoted_etag_of('123')}\r\n\r\n'.bytes()
 	res := serve(fresh) or { panic(err) }
-	assert res == not_modified_response
+	assert res.bytestr() == not_modified_response
 	// Stale cache: a different ETag must NOT match -> full 200.
 	stale :=
 		'GET /user/123 HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: "0000000000000000"\r\n\r\n'.bytes()
@@ -50,13 +50,50 @@ fn test_cors_preflight_for_conditional_get() {
 fn test_handle_request_post_user() {
 	req_buffer := 'POST /user HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n'.bytes()
 	res := serve(req_buffer) or { panic(err) }
-	assert res == http_created_response
+	assert res.bytestr() == http_created_response
 }
 
 fn test_handle_request_bad_request() {
 	req_buffer := 'INVALID / HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
 	res := serve(req_buffer) or { panic(err) }
 	assert res == response.tiny_bad_request_response
+}
+
+// Every route, the 200 and the 304 included, runs 20k times through one
+// reused buffer, as a worker would serve them; the collector's lifetime
+// allocation counter must not move. (Under `-gc none`, vanilla's epoll build,
+// an allocation here would be a permanent leak.)
+fn test_handler_allocates_nothing() {
+	$if gcboehm ? {
+		reqs := [
+			'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n',
+			'GET /user/123 HTTP/1.1\r\nHost: localhost\r\n\r\n',
+			'GET /user/123 HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: ${quoted_etag_of('123')}\r\n\r\n',
+			'OPTIONS /user/1 HTTP/1.1\r\nHost: localhost\r\n\r\n',
+			'POST /user HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n',
+			'INVALID / HTTP/1.1\r\nHost: localhost\r\n\r\n',
+		].map(it.bytes())
+		mut out := []u8{cap: 4096}
+		mut event_loop := core.EventLoop{}
+		for r in reqs { // warm-up: `out` reaches its high-water mark
+			unsafe {
+				out.len = 0
+			}
+			handle_request(r, mut out, -1, unsafe { nil }, mut event_loop)
+		}
+		rounds := 20_000
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. rounds {
+			for r in reqs {
+				unsafe {
+					out.len = 0
+				}
+				handle_request(r, mut out, -1, unsafe { nil }, mut event_loop)
+			}
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert grown < 4096, 'the handler allocated ${grown} bytes over ${rounds * reqs.len} requests'
+	}
 }
 
 // serve adapts the unified-handler contract (writes into a caller-owned buffer)

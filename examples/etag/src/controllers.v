@@ -1,22 +1,22 @@
 module main
 
-import strings
-import http1_1.response
+import strconv
+import core
 import http1_1.request_parser
 import hash as wyhash
 
 // The front-end demo is a different origin (file.serve on :4001), so the 304
 // needs Access-Control-Allow-Origin too — without it the browser turns the
 // 304 into a network error.
-const not_modified_response = 'HTTP/1.1 304 Not Modified\r\nAccess-Control-Allow-Origin: *\r\n\r\n'.bytes()
+const not_modified_response = 'HTTP/1.1 304 Not Modified\r\nAccess-Control-Allow-Origin: *\r\n\r\n'
 
 // `If-None-Match` is not a CORS-safelisted request header, so a cross-origin
 // conditional GET is preceded by an OPTIONS preflight.
 const preflight_response = 'HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET\r\nAccess-Control-Allow-Headers: If-None-Match\r\nAccess-Control-Max-Age: 86400\r\n\r\n'
 
-const http_ok_response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n'.bytes()
+const http_ok_response = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n'
 
-const http_created_response = 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n'.bytes()
+const http_created_response = 'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n'
 
 const hex_digits = '0123456789abcdef'
 
@@ -51,42 +51,52 @@ fn etag_matches(buf []u8, s request_parser.Slice, etag [16]u8) bool {
 	return true
 }
 
-fn home_controller(_params []string) ![]u8 {
-	return http_ok_response
-}
-
-fn get_users_controller(_params []string) ![]u8 {
-	return http_ok_response
-}
-
-fn get_user_controller(params []string, req request_parser.HttpRequest) ![]u8 {
-	if params.len == 0 {
-		return response.tiny_bad_request_response
+// wi appends n's decimal digits into `out` — itoa into a stack scratch, then
+// append. No allocation, no `.str()`. A fixed-size array is zeroed on every
+// call (V gotcha), so keep the scratch small: 24 bytes covers any i64.
+fn wi(mut out []u8, n i64) {
+	mut scratch := [24]u8{}
+	mut view := unsafe { (&scratch[0]).vbytes(scratch.len) }
+	written := strconv.write_dec(n, mut view)
+	if written > 0 {
+		unsafe { out.push_many(&scratch[0], written) }
 	}
-	id := params[0]
+}
+
+fn home_controller(mut out []u8) {
+	core.append_str(mut out, http_ok_response)
+}
+
+fn get_users_controller(mut out []u8) {
+	core.append_str(mut out, http_ok_response)
+}
+
+// get_user_controller echoes the id back with its ETag, or answers 304 when
+// the client's cached ETag still matches. `id` is a view into the request
+// buffer: read here, never retained.
+fn get_user_controller(id string, req request_parser.HttpRequest, mut out []u8) {
 	// Hash the body bytes straight from the string — a view, no copy.
 	etag := etag_hex(unsafe { id.str.vbytes(id.len) })
 
 	// Conditional GET: if the client's cached ETag matches, save the bytes.
 	if inm := req.get_header_value_slice('If-None-Match') {
 		if etag_matches(req.buffer, inm, etag) {
-			return not_modified_response
+			core.append_str(mut out, not_modified_response)
+			return
 		}
 	}
 
-	// Frame the response in ONE builder — no `${}`, no `+`, no `.str()`;
-	// the hex etag is pushed from the stack scratch (Builder IS []u8).
-	mut sb := strings.new_builder(180 + id.len)
-	sb.write_string('HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nETag: "')
-	unsafe { sb.push_many(&etag[0], 16) }
-	sb.write_string('"\r\nContent-Length: ')
-	sb.write_decimal(id.len)
+	// Frame the response straight into `out` — no `${}`, no `+`, no `.str()`;
+	// the hex etag is pushed from the stack array.
+	core.append_str(mut out, 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nETag: "')
+	unsafe { out.push_many(&etag[0], 16) }
+	core.append_str(mut out, '"\r\nContent-Length: ')
+	wi(mut out, id.len)
 	// Expose-Headers: cross-origin JS can only read the ETag if it is listed.
-	sb.write_string('\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: ETag\r\n\r\n')
-	sb.write_string(id)
-	return sb
+	core.append_str(mut out, '\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: ETag\r\n\r\n')
+	core.append_str(mut out, id)
 }
 
-fn create_user_controller(_params []string) ![]u8 {
-	return http_created_response
+fn create_user_controller(mut out []u8) {
+	core.append_str(mut out, http_created_response)
 }
