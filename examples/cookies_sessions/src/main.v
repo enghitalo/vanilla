@@ -15,7 +15,7 @@ module main
 //
 // Cookie handling is plain header work: the parser hands the Cookie value as a
 // zero-copy Slice (get_header_value_slice) and Set-Cookie is just response
-// bytes; crypto.rand + encoding.hex are stdlib. The only shared state is the
+// bytes; crypto.rand is stdlib. The only shared state is the
 // session store (a mutex-guarded map here; Redis/db in production).
 //
 // THIS IS NOT AUTHENTICATION: `store.create('user-42')` stands in for a real
@@ -48,9 +48,10 @@ import http1_1.request_parser
 import http1_1.response
 import sync
 import crypto.rand
-import encoding.hex
 import strconv
 import time
+
+const hex_digits = '0123456789abcdef'
 
 // Session lifetime: ONE constant feeds both the server-side expiry and the
 // cookie's Max-Age (resp_login_suffix), so the two can never drift.
@@ -140,11 +141,28 @@ fn (mut s Store) sweep(now i64) {
 }
 
 // CSPRNG token — 32 bytes of entropy, hex-encoded. Never a predictable value.
-// rand.bytes + hex.encode allocate; that is fine here — the token must outlive
-// the request as a map key (string API), and this runs per login/session mint.
+// The token outlives the request (it is stored in the session), so it is an
+// owned string: ONE allocation, the 64 hex bytes plus a NUL. The raw entropy
+// is read into a stack array (`rand.read` into a view of it), and the hex is
+// written straight into the string's own bytes — no rand.bytes array, no
+// hex.encode grow-and-copy.
+@[direct_array_access]
 fn new_token() string {
-	buf := rand.bytes(32) or { panic('csprng unavailable') }
-	return hex.encode(buf)
+	mut raw := [32]u8{}
+	mut entropy := unsafe { (&raw[0]).vbytes(raw.len) }
+	rand.read(mut entropy) or { panic('csprng unavailable') }
+	n := 2 * raw.len
+	mut s := unsafe { malloc_noscan(n + 1) }
+	for i, b in raw {
+		unsafe {
+			s[2 * i] = hex_digits[b >> 4]
+			s[2 * i + 1] = hex_digits[b & 0x0F]
+		}
+	}
+	unsafe {
+		s[n] = 0 // NUL-terminated, like every V string; not part of its length
+	}
+	return unsafe { tos(s, n) }
 }
 
 // cookie_value scans the Cookie header value — addressed by OFFSETS into the

@@ -91,8 +91,10 @@ replays the old `sid`) now gets `401 Unauthorized`.
   view, which `get` and `delete` only hash and compare, never keep
   ([BEST_PRACTICES §2](../../docs/BEST_PRACTICES.md#2-stay-zero-copy-work-with-slices-not-copies)).
 - **Owned strings only where they must outlive the request.** `new_token`
-  (`rand.bytes` + `hex.encode`) allocates the id and the per-session
-  `csrf_token`: they live in the store as map keys and values. That happens
+  allocates the id and the per-session `csrf_token`: they live in the store
+  as map keys and values. Each is one allocation, the 64 hex bytes and a
+  NUL: `rand.read` fills a stack array and the hex is written straight into
+  the string's own bytes. That happens
   once per successful login, bounded by `max_sessions`.
 - **Consts around the dynamic part.** `resp_logout`, `resp_401`, `resp_405`
   and `resp_503` are whole consts; `/login` is `resp_login_prefix`, the sid,
@@ -113,7 +115,8 @@ cap failing closed), and the full flow through `handle` with raw requests:
 login sets every cookie attribute and a 64-hex id, `/me` frames the body
 exactly, logout deletes the session and expires the cookie, a replayed id is
 refused, `/login` is POST-only, a full store answers 503, and missing, bogus,
-empty and `xsid=` cookies all get 401.
+empty and `xsid=` cookies all get 401. `new_token` is checked to cost one
+allocation (the string itself).
 
 ## See also
 

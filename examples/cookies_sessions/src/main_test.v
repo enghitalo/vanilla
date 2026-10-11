@@ -61,6 +61,28 @@ fn test_session_ids_unguessable() {
 	assert a != b // never collide / never sequential
 }
 
+// A token is 64 lowercase hex chars backed by ONE allocation: the stored
+// string itself (65 bytes with its NUL). It used to cost about 500 bytes: the
+// rand.bytes array and hex.encode's growing buffer plus its copy.
+fn test_new_token_is_hex_in_one_allocation() {
+	tok := new_token()
+	assert tok.len == 64
+	for c in tok {
+		assert (c >= `0` && c <= `9`) || (c >= `a` && c <= `f`), tok
+	}
+	assert unsafe { tok.str[64] } == 0 // NUL-terminated like any V string
+	assert new_token() != tok
+	$if gcboehm ? {
+		rounds := 20_000
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. rounds {
+			_ := new_token()
+		}
+		per_token := (gc_heap_usage().total_bytes - before) / u64(rounds)
+		assert per_token <= 96, 'new_token allocated ${per_token} bytes per call'
+	}
+}
+
 // The server enforces the lifetime itself — Max-Age is only a client hint.
 fn test_session_expires_server_side() {
 	mut s := Store{}
