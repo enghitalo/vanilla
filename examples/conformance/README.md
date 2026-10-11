@@ -102,4 +102,8 @@ The handler is still covered by `src/main_test.v` (the same decisions asserted
 without a socket), so the deterministic gate stays independent of backend I/O.
 
 The unit tests in [`src/main_test.v`](src/main_test.v) assert every row of the
-table above and always pass regardless of backend I/O behavior.
+table above and always pass regardless of backend I/O behavior. They also
+check that the `Connection` and `Transfer-Encoding` lists are walked in place
+(`list_element`: nothing split, trimmed or lowercased into a copy), that only
+letters fold when tokens compare case-insensitively, and that serving
+allocates nothing.

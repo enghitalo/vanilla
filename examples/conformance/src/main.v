@@ -48,8 +48,10 @@ fn handle_request(req_buffer []u8, mut out []u8, _client_fd int, _worker_state v
 
 	// Route on the method + target. Methods this server implements: GET, HEAD,
 	// POST. Anything else that is syntactically valid is 405 (RFC 9110 §15.5.6),
-	// with an Allow header listing what is supported.
-	method := unsafe { tos(&req.buffer[req.method.start], req.method.len) }
+	// with an Allow header listing what is supported. The view is taken from
+	// req_buffer, not req.buffer: `&req.buffer[...]` would make V copy `req` to
+	// the heap on every request (its address escapes).
+	method := unsafe { tos(&req_buffer[req.method.start], req.method.len) }
 	return match method {
 		'GET' {
 			serve_get(req, mut out)
@@ -102,12 +104,11 @@ fn step_for(req request_parser.HttpRequest) core.Step {
 // via `Connection: close` or by being HTTP/1.0 without `Connection: keep-alive`.
 fn wants_close(req request_parser.HttpRequest) bool {
 	if c := req.get_header_value_slice('Connection') {
-		val := unsafe { tos(&req.buffer[c.start], c.len) }
-		if token_list_has(val, 'close') {
+		if token_list_has(req.buffer, c, 'close') {
 			return true
 		}
 		if version_is(req.buffer, req.version, 'HTTP/1.0') {
-			return !token_list_has(val, 'keep-alive')
+			return !token_list_has(req.buffer, c, 'keep-alive')
 		}
 		return false
 	}
@@ -115,13 +116,22 @@ fn wants_close(req request_parser.HttpRequest) bool {
 	return version_is(req.buffer, req.version, 'HTTP/1.0')
 }
 
-// token_list_has reports whether a comma-separated header value contains `want`
-// (case-insensitive), e.g. `Connection: keep-alive, close`.
-fn token_list_has(val string, want string) bool {
-	for part in val.split(',') {
-		if part.trim_space().to_lower() == want {
+// token_list_has reports whether the comma-separated field value in `list`
+// contains the token `want` (case-insensitive), e.g. `Connection: keep-alive,
+// close`. It walks the list's bytes in place (list_element): nothing is split,
+// trimmed or lowercased into a copy.
+fn token_list_has(buf []u8, list request_parser.Slice, want string) bool {
+	end := list.start + list.len
+	mut pos := list.start
+	for {
+		s, e, next := list_element(buf, pos, end)
+		if s == e {
+			return false
+		}
+		if e - s == want.len && ascii_ci_prefix(buf, s, want) {
 			return true
 		}
+		pos = next
 	}
 	return false
 }

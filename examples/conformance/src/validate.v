@@ -110,14 +110,45 @@ fn version_is(buf []u8, v request_parser.Slice, want string) bool {
 	return true
 }
 
+// ascii_lower folds an ASCII upper-case letter to lower case and leaves every
+// other byte as it is. Tokens compare case-insensitively letter by letter
+// (RFC 9110 §5.6.2): `| 0x20` on any byte would also equate a control byte
+// with a punctuation mark (CR with `-`, SI with `/`).
+@[inline]
+fn ascii_lower(c u8) u8 {
+	return if c >= `A` && c <= `Z` { c + 32 } else { c }
+}
+
 @[direct_array_access]
 fn ascii_ci_prefix(buf []u8, start int, prefix string) bool {
 	for i in 0 .. prefix.len {
-		if (buf[start + i] | 0x20) != (prefix[i] | 0x20) {
+		if ascii_lower(buf[start + i]) != ascii_lower(prefix[i]) {
 			return false
 		}
 	}
 	return true
+}
+
+// list_element finds the next element of a comma-separated field value in
+// buf[pos..end] (RFC 9110 §5.6.1: `#element` is elements separated by commas,
+// with optional whitespace around each, and empty elements are ignored). It
+// returns the element's bounds (s, e), its surrounding SP/HTAB trimmed, and
+// the offset to continue from; s == e once the list holds no more elements.
+@[direct_array_access]
+fn list_element(buf []u8, pos int, end int) (int, int, int) {
+	mut s := pos
+	for s < end && (buf[s] == ` ` || buf[s] == `\t` || buf[s] == `,`) {
+		s++
+	}
+	mut next := s
+	for next < end && buf[next] != `,` {
+		next++
+	}
+	mut e := next
+	for e > s && (buf[e - 1] == ` ` || buf[e - 1] == `\t`) {
+		e--
+	}
+	return s, e, next
 }
 
 // transfer_encoding_ok validates the Transfer-Encoding list: the final coding
@@ -125,35 +156,38 @@ fn ascii_ci_prefix(buf []u8, start int, prefix string) bool {
 // (unknown coding), or .bad_request (chunked present but not final).
 @[direct_array_access]
 fn transfer_encoding_ok(buf []u8, te request_parser.Slice) Verdict {
-	// Split the comma list into trimmed tokens; check the last is chunked and no
-	// token is unknown. Only "chunked" is a coding this server frames; "gzip",
+	// Walk the comma list in place; check the last coding is chunked and no
+	// coding is unknown. Only "chunked" is a coding this server frames; "gzip",
 	// "deflate", "compress" are recognized codings but we don't decode them as a
 	// request body, so a non-final chunked (e.g. "chunked, gzip") is malformed
 	// framing (400) and a lone unknown coding is 501.
-	mut tokens := [][]u8{}
-	mut start := te.start
+	//
+	// One pass, nothing collected: a coding is known to be non-final only once
+	// the next one shows up, so the walk keeps the previous coding's bounds
+	// (ps, pe) and the verdict of the first bad non-final coding, which applies
+	// only if the final coding passes.
 	end := te.start + te.len
-	for i := te.start; i <= end; i++ {
-		if i == end || buf[i] == `,` {
-			mut s := start
-			mut e := i
-			for s < e && (buf[s] == ` ` || buf[s] == `\t`) {
-				s++
-			}
-			for e > s && (buf[e - 1] == ` ` || buf[e - 1] == `\t`) {
-				e--
-			}
-			if e > s {
-				tokens << unsafe { (&buf[s]).vbytes(e - s) }
-			}
-			start = i + 1
+	mut pos := te.start
+	mut ps := -1
+	mut pe := -1
+	mut nonfinal := Verdict.ok
+	for {
+		s, e, next := list_element(buf, pos, end)
+		if s == e {
+			break
 		}
+		if ps >= 0 && nonfinal == .ok {
+			nonfinal = nonfinal_coding_verdict(unsafe { (&buf[ps]).vbytes(pe - ps) })
+		}
+		ps = s
+		pe = e
+		pos = next
 	}
-	if tokens.len == 0 {
+	if ps < 0 {
 		return .bad_request
 	}
 	// The final coding must be chunked (RFC 9112 §6.1).
-	last := tokens[tokens.len - 1]
+	last := unsafe { (&buf[ps]).vbytes(pe - ps) }
 	if !token_ci_eq(last, 'chunked') {
 		// last coding is not chunked: either an unknown final coding (501) or a
 		// known-but-unframed one (still can't delimit the body) → treat unknown as
@@ -163,18 +197,21 @@ fn transfer_encoding_ok(buf []u8, te request_parser.Slice) Verdict {
 		}
 		return .not_impl
 	}
-	// chunked must appear exactly once and be final: any earlier chunked or any
-	// unknown earlier coding is malformed.
-	for i in 0 .. tokens.len - 1 {
-		t := tokens[i]
-		if token_ci_eq(t, 'chunked') {
-			return .bad_request // chunked not final
-		}
-		if !is_known_coding(t) {
-			return .not_impl
-		}
-		// a known non-chunked coding before chunked ("gzip, chunked") is legal
-		// framing-wise; we accept the request (we don't decode the body).
+	return nonfinal
+}
+
+// nonfinal_coding_verdict judges a coding that is followed by another one.
+// chunked must appear exactly once and be final: an earlier chunked or an
+// unknown earlier coding is malformed. A known non-chunked coding before
+// chunked ("gzip, chunked") is legal framing-wise; we accept the request (we
+// don't decode the body).
+@[inline]
+fn nonfinal_coding_verdict(t []u8) Verdict {
+	if token_ci_eq(t, 'chunked') {
+		return .bad_request // chunked not final
+	}
+	if !is_known_coding(t) {
+		return .not_impl
 	}
 	return .ok
 }
@@ -191,7 +228,7 @@ fn token_ci_eq(t []u8, want string) bool {
 		return false
 	}
 	for i in 0 .. want.len {
-		if (t[i] | 0x20) != (want[i] | 0x20) {
+		if ascii_lower(t[i]) != ascii_lower(want[i]) {
 			return false
 		}
 	}

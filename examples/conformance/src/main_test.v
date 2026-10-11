@@ -135,3 +135,113 @@ fn test_connection_close_honored() {
 	out := serve('GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n')
 	assert out.bytestr().to_lower().contains('connection: close')
 }
+
+fn step_of(req string) core.Step {
+	mut out := []u8{}
+	mut event_loop := core.EventLoop{}
+	return handle_request(req.bytes(), mut out, -1, unsafe { nil }, mut event_loop)
+}
+
+// Connection is a comma-separated token list (RFC 9110 §5.6.1, §7.6.1): empty
+// elements and the whitespace around each are skipped, and tokens compare
+// case-insensitively, letter by letter.
+fn test_connection_tokens() {
+	for c in ['close', 'Close', 'CLOSE', 'keep-alive, close', ',,close,,', ' , close ', '\tclose\t',
+		'upgrade,close'] {
+		assert step_of('GET / HTTP/1.1\r\nHost: localhost\r\nConnection: ${c}\r\n\r\n') == .close, c
+	}
+	for c in ['keep-alive', 'closed', 'xclose', 'clos', '"close"', 'clo se', '', ','] {
+		assert step_of('GET / HTTP/1.1\r\nHost: localhost\r\nConnection: ${c}\r\n\r\n') == .done, c
+	}
+	// HTTP/1.0 closes unless the list has keep-alive. U+212A KELVIN SIGN
+	// lowercases to `k` in Unicode, but a token is ASCII: it is not keep-alive.
+	for c in ['keep-alive', 'KEEP-ALIVE', 'foo, Keep-Alive', ' keep-alive ,'] {
+		assert step_of('GET / HTTP/1.0\r\nHost: localhost\r\nConnection: ${c}\r\n\r\n') == .done, c
+	}
+	for c in ['foo', 'keep-alive, close', 'keep_alive', '\xe2\x84\xaaeep-alive'] {
+		assert step_of('GET / HTTP/1.0\r\nHost: localhost\r\nConnection: ${c}\r\n\r\n') == .close, c
+	}
+	assert step_of('GET / HTTP/1.0\r\nHost: localhost\r\n\r\n') == .close
+}
+
+// Every coding of a Transfer-Encoding list is judged: the final one must be
+// chunked, an earlier chunked is 400 and an unknown coding 501; the final
+// coding's verdict comes first.
+fn test_transfer_coding_lists() {
+	for te, want in {
+		'chunked':                          200
+		'CHUNKED':                          200
+		'gzip, chunked':                    200
+		'x-gzip,chunked':                   200
+		' , gzip , , chunked , ':           200
+		'compress, deflate, gzip, chunked': 200
+		'foo, chunked':                     501
+		'gzip, foo, bar, chunked':          501
+		'foo, chunked, chunked':            501
+		'chunked, chunked':                 400
+		'chunked, foo, chunked':            400
+		'gzip chunked':                     501
+		'chunked, gzip':                    400
+		'foo, gzip':                        400
+		'chunked, foo':                     501
+		',':                                400
+	} {
+		got := status_of('POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: ${te}\r\n\r\n5\r\nhello\r\n0\r\n\r\n')
+		assert got == want, te
+	}
+}
+
+// Letters fold, nothing else does: `| 0x20` would equate CR with `-` (x-gzip)
+// and SI with `/` (HTTP/).
+fn test_only_letters_fold() {
+	assert status_of('POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: x\rgzip, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n') == 501
+	assert status_of('GET / HTTP\x0f1.1\r\nHost: localhost\r\n\r\n') == 400
+	assert status_of('GET / http/1.1\r\nHost: localhost\r\n\r\n') == 505
+}
+
+// Serving allocates nothing: every outcome the handler decides itself — the
+// routes, Connection lists, Transfer-Encoding lists, 400 / 501 / 505 — runs
+// 20k times through one reused buffer, and the collector's lifetime
+// allocation counter must not move. (Under -gc none, vanilla's production
+// build, an allocation per request is a leak.) Requests the stdlib parser
+// rejects are left out: its errors are boxed.
+fn test_handle_request_allocates_nothing() {
+	$if gcboehm ? {
+		reqs := [
+			'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n',
+			'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n',
+			'GET /?a=1 HTTP/1.1\r\nHost: localhost\r\nConnection: upgrade, close\r\n\r\n',
+			'GET / HTTP/1.0\r\nHost: localhost\r\nConnection: foo, Keep-Alive\r\n\r\n',
+			'GET / HTTP/1.0\r\nHost: localhost\r\n\r\n',
+			'GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n',
+			'HEAD / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n',
+			'POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello',
+			'POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n',
+			'POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: foo, chunked\r\n\r\n0\r\n\r\n',
+			'POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked, chunked\r\n\r\n0\r\n\r\n',
+			'DELETE / HTTP/1.1\r\nHost: localhost\r\n\r\n',
+			'GET / HTTP/2.0\r\nHost: localhost\r\n\r\n',
+			'GET / HTTP/1.1\r\nHost: localhost\r\nBad Header: value\r\n\r\n',
+		].map(it.bytes())
+		mut out := []u8{cap: 4096}
+		mut event_loop := core.EventLoop{}
+		for r in reqs { // warm-up: `out` reaches its high-water mark
+			unsafe {
+				out.len = 0
+			}
+			handle_request(r, mut out, -1, unsafe { nil }, mut event_loop)
+		}
+		rounds := 20_000
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. rounds {
+			for r in reqs {
+				unsafe {
+					out.len = 0
+				}
+				handle_request(r, mut out, -1, unsafe { nil }, mut event_loop)
+			}
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert grown < 4096, 'serving allocated ${grown} bytes over ${rounds * reqs.len} requests'
+	}
+}
