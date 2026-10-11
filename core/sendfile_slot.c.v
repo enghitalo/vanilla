@@ -5,16 +5,16 @@ module core
 // This is the backend-agnostic bridge that lets a pure `(req, fd, out)` handler
 // ask the running worker to emit a file body with sendfile(2) instead of
 // copying it through the response buffer. Only a sendfile-capable worker (the
-// epoll plain and TLS workers) calls enable_sendfile(); everywhere else
-// queue_file() returns false and the caller writes the bytes itself, so this is
-// a no-op on other backends and non-Linux OSes.
+// epoll worker) calls enable_sendfile(); everywhere else queue_file() returns
+// false and the caller writes the bytes itself, so this is a no-op on other
+// backends and non-Linux OSes. The epoll worker takes a region on every
+// connection: a plain or kernel-TLS one gets it with sendfile(2), a
+// userspace-TLS one (where sendfile would write plaintext) as bytes, read and
+// encrypted a chunk at a time.
 //
-// A worker that can sendfile on some connections but not others narrows the
-// hand-off per request with set_queue_file_allowed(): the epoll TLS worker,
-// where sendfile(2) writes plaintext that only a kernel-TLS socket encrypts,
-// passes false for a userspace-TLS connection. The plain worker only closes it
-// around a call whose region it would never take: a watch continuation, a wake
-// fn or a ConnHandler.
+// The epoll worker closes the hand-off with set_queue_file_allowed() around a
+// call whose region it would never take: a watch continuation, a wake fn or a
+// ConnHandler.
 
 #include "@VMODROOT/core/sendfile_slot.h"
 
@@ -33,21 +33,18 @@ pub:
 }
 
 // enable_sendfile marks the calling worker thread as able to consume a queued
-// file via sendfile(2). Call once per capable worker (the epoll plain and TLS
-// workers). It also allows every request until set_queue_file_allowed says
-// otherwise.
+// file via sendfile(2). Call once per capable worker (the epoll worker). It
+// also allows every request until set_queue_file_allowed says otherwise.
 @[inline]
 pub fn enable_sendfile() {
 	C.vanilla_sf_enable()
 }
 
 // set_queue_file_allowed gates queue_file for the call about to run, on a
-// worker that called enable_sendfile. Call it before every handler call, with
-// false for a connection the worker cannot sendfile to (a userspace-TLS
-// connection), or false around a call whose queued region the worker never
-// takes (the epoll worker's watch continuations, wake fns and ConnHandlers),
-// then true again. A no-op on a worker that never enabled sendfile, and under
-// tcc.
+// worker that called enable_sendfile: false around a call whose queued region
+// the worker never takes (the epoll worker's watch continuations, wake fns
+// and ConnHandlers), then true again. A no-op on a worker that never enabled
+// sendfile, and under tcc.
 @[inline]
 pub fn set_queue_file_allowed(allowed bool) {
 	C.vanilla_sf_set_allowed(allowed)
@@ -55,18 +52,19 @@ pub fn set_queue_file_allowed(allowed bool) {
 
 // queue_file hands a file region to the current worker, to be sent right after
 // the bytes the handler appended to `out`. Returns false when the running
-// backend can't sendfile (a worker that never enabled it, a connection it is
-// not allowed on, a non-epoll backend, or a non-Linux OS) — the caller MUST
-// then write the body bytes itself (on POSIX, core.append_file_region reads
-// them into `out` without allocating). The epoll workers drain the slot after
-// every core.Handler call (a pipelined request, or the head of a streamed
-// large body), whatever the step: a region queued by a step that returns
-// .suspend is dropped, and one queued by a step that returns .close is still
-// sent after the bytes appended to `out`: the plaintext worker closes once all
-// of it is out, the TLS worker after one best-effort send, bounded by the
-// socket send buffer. A streamed-body head the worker rejects (any step but
-// .done) has its region dropped, and the worker's 400 follows whatever the
-// handler appended. Watch continuations, wake fns and ConnHandlers
+// backend can't take it (a worker that never enabled it, a call it is not
+// allowed in, a non-epoll backend, or a non-Linux OS) — the caller MUST then
+// write the body bytes itself (on POSIX, core.append_file_region reads them
+// into `out` without allocating). The epoll worker takes it on plain HTTP and
+// on HTTPS alike: sendfile(2) on a plain or kernel-TLS connection, and on a
+// userspace-TLS one the file read and sent through Mbed TLS a chunk at a time.
+// It drains the slot after every core.Handler call (a
+// pipelined request, or the head of a streamed large body), whatever the step:
+// a region queued by a step that returns .suspend is dropped, and one queued
+// by a step that returns .close is still sent after the bytes appended to
+// `out`, the connection closing once all of it is out. A streamed-body head
+// the worker rejects (any step but .done) has its region dropped, and the
+// worker's 400 follows whatever the handler appended. Watch continuations, wake fns and ConnHandlers
 // (core.ConnHandler) cannot queue a file: queue_file returns false while one
 // runs, so it writes its bytes itself. The fd must stay open and is never
 // closed by the worker (assets keep one fd open for their whole life;

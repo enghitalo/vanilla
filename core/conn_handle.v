@@ -34,7 +34,7 @@ module core
 // both, a watch continuation and a wake fn can be one function, and the
 // signature every existing continuation has stays as it is.
 //
-// The epoll plain worker implements subscriptions (`.closed` and wake_after
+// The epoll worker implements subscriptions (`.closed` and wake_after
 // always; posts only with ServerConfig.push_mailbox_slots > 0). Everywhere
 // else subscribe returns a nil handle and posts report .unsupported.
 

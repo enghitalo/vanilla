@@ -1,5 +1,5 @@
 // vtest build: linux && vanilla_tls?
-// Connection reaping over HTTPS on the epoll TLS worker: a silent TCP connect,
+// Connection reaping over HTTPS on the epoll worker: a silent TCP connect,
 // a stalled handshake, an idle keep-alive connection (after a synchronous
 // send, and after a parked response drains), a partial request and a request
 // trickled one byte at a time must all be closed by the server's own
@@ -7,7 +7,7 @@
 // with idle reaping opted out, must keep working. These are the TLS twins of
 // the check_* reaping scenarios in backend_behaviors_test.v.
 //
-// Only runs with `-d vanilla_tls` on Linux (the TLS worker is the epoll
+// Only runs with `-d vanilla_tls` on Linux (TLS is the epoll
 // backend's; Mbed TLS is opt-in). The build constraint on line 1 makes a
 // default `v test tests/` skip the file, so it needs neither Mbed TLS nor the
 // OpenSSL headers the client below links; the $if gates keep a direct build
@@ -32,18 +32,26 @@ import core
 import tls
 import vtest
 
+#include <sys/socket.h>
+
+fn C.setsockopt(fd int, level int, optname int, optval voidptr, optlen u32) int
+
 const tt_req = 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
 // A request head that stops mid-header (never completes on its own) and the
 // bytes that complete it.
 const tt_partial_head = 'GET / HTTP/1.1\r\nHo'.bytes()
 const tt_head_tail = 'st: x\r\n\r\n'.bytes()
 const tt_ok_response = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'.bytes()
-// GET /big answers with a body larger than loopback can absorb while the
-// client is not reading (see tt_unbufferable_len), so the TLS worker must park
-// the response and drain it on EPOLLOUT.
+// GET /big answers with a body the kernel cannot hold while the client is
+// not reading: the handler pins the server socket's send buffer small
+// (SO_SNDBUF, which also stops its autotuning) and the client pins its
+// receive buffer. So the worker must park the response and drain it on
+// EPOLLOUT. It stays well under the 8 MiB pending-write cap
+// (core.max_pending_write_bytes), which would close the connection instead.
 const tt_big_req = 'GET /big HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
-const tt_big_len = tt_unbufferable_len()
-const tt_big_head = 'HTTP/1.1 200 OK\r\nContent-Length: ${tt_big_len}\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const tt_big_len = 2 * 1024 * 1024
+const tt_big_head = 'HTTP/1.1 200 OK\r\nContent-Length: 2097152\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const tt_big_sndbuf = 32 * 1024
 // A TLS handshake record header announcing a 200-byte ClientHello, followed by
 // a single byte of it: the handshake can never progress.
 const tt_truncated_client_hello = [u8(0x16), 0x03, 0x01, 0x00, 0xc8, 0x01]
@@ -69,6 +77,8 @@ const tt_silent_script = vtest.Script{
 
 fn tt_ok_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if req.len > 5 && req[5] == `b` { // GET /big
+		sndbuf := tt_big_sndbuf
+		C.setsockopt(client_fd, C.SOL_SOCKET, C.SO_SNDBUF, &sndbuf, 4)
 		res << tt_big_head
 		old := res.len
 		unsafe {
@@ -81,22 +91,7 @@ fn tt_ok_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mu
 	return .done
 }
 
-// tt_unbufferable_len is a body size loopback cannot hold while the client is
-// not reading: more than the largest send buffer plus the largest receive
-// buffer TCP autotuning may grow to (the last field of tcp_wmem / tcp_rmem;
-// nothing here sets SO_SNDBUF/SO_RCVBUF). Record and skb overhead only shrink
-// what fits, so the TLS worker is certain to hit WANT_WRITE and park — also
-// on hosts with raised maxima, where a fixed size would be sent at once.
-fn tt_unbufferable_len() int {
-	mut n := 1 << 20
-	for f in ['/proc/sys/net/ipv4/tcp_wmem', '/proc/sys/net/ipv4/tcp_rmem'] {
-		mem := (os.read_file(f) or { '' }).fields() // min default max
-		n += if mem.len == 3 { mem[2].int() } else { 32 << 20 }
-	}
-	return n
-}
-
-// tt_start serves tt_ok_handler over HTTPS on one epoll TLS worker. (`.epoll`
+// tt_start serves tt_ok_handler over HTTPS on one epoll worker. (`.epoll`
 // exists only on Linux, hence the gate.)
 fn tt_start(limits server.Limits) !&vtest.Harness {
 	// The openssl client writes without MSG_NOSIGNAL: a close_notify (or a
@@ -112,7 +107,7 @@ fn tt_start(limits server.Limits) !&vtest.Harness {
 			limits:          limits
 		})
 	} $else {
-		return error('the TLS worker is the Linux epoll backend')
+		return error('TLS is the Linux epoll backend')
 	}
 }
 
@@ -379,6 +374,10 @@ fn check_tls_idle_after_parked_drain() ! {
 	defer {
 		tt_close(mut c)
 	}
+	// A small receive buffer, so the 2 MiB body cannot fit what the kernel
+	// holds for a client that is not reading, whatever tcp_rmem's default.
+	rcvbuf := 32 * 1024
+	C.setsockopt(c.handle, C.SOL_SOCKET, C.SO_RCVBUF, &rcvbuf, 4)
 	tt_write(mut c, tt_big_req)!
 	witness := h.fire([tt_silent_script])!
 	assert witness.conns[0].eof, 'the silent witness must be reaped by read_timeout_ms'
@@ -511,7 +510,7 @@ fn test_tls_silent_connect_reaped() ! {
 	}
 }
 
-// The TLS worker's sweep must survive a stream of EINTRs (GC stop-the-world
+// The worker's sweep must survive a stream of EINTRs (GC stop-the-world
 // signals every 20 ms, against a 100 ms sweep interval): a silent connection
 // is still reaped.
 fn test_tls_silent_connect_reaped_under_gc_signals() ! {

@@ -43,7 +43,7 @@ module server
 // request is never idle-reaped) and re-arm naturally at resume (a read deadline
 // for a buffered partial, else the idle deadline, via iou_arm_recv). Park
 // deadlines (Limits.park_timeout_ms, watch_fd_deadline, vanilla#200) are
-// enforced by the epoll plain worker only: here a deadline watch is a plain
+// enforced by the epoll worker only: here a deadline watch is a plain
 // watch and event_loop.timed_out() stays false, so a hung query pins its slot
 // until the query returns; bound it DB-side with e.g. statement_timeout. A
 // deadline here would also have to retire the oneshot poll still armed on the

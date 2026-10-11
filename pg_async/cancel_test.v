@@ -12,10 +12,10 @@ import transport
 // pg_async/testdata/fake_pg.py, whose `select pg_sleep(S)` a matching
 // CancelRequest interrupts with 57014, plain and (with -d vanilla_tls) over
 // TLS; and against a live server when PGHOST is set. The background watch
-// runs on CtLoop below, a stand-in for the epoll plain worker's clientless
+// runs on CtLoop below, a stand-in for the epoll worker's clientless
 // watches; the e2e on the real reactor is tests/pg_async_cancel_test.v.
 
-// CtLoop runs one clientless watch at a time, as the epoll plain worker does:
+// CtLoop runs one clientless watch at a time, as the epoll worker does:
 // a continuation that re-arms its fd keeps it, .done closes the fd.
 struct CtLoop {
 mut:

@@ -16,7 +16,7 @@ module main
 // watch. It acts only when a step resumes; to bound a step whose fd may never
 // become ready (a hung upstream), park it with event_loop.watch_fd_deadline
 // (or set Limits.park_timeout_ms): its continuation then runs with
-// event_loop.timed_out() when the deadline passes (epoll plain worker).
+// event_loop.timed_out() when the deadline passes (epoll worker).
 import server
 import core
 import time

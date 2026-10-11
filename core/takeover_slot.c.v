@@ -10,7 +10,7 @@ module core
 // and returns .done. The worker sends the response and flips the connection's
 // mode; from then on every readable burst is fed to the ConnHandler instead
 // of the HTTP/1.1 state machine. Only a takeover-capable worker (the epoll
-// plain worker) calls enable_takeover(); everywhere else queue_takeover()
+// worker) calls enable_takeover(); everywhere else queue_takeover()
 // returns false and the handler must answer an error instead of upgrading.
 
 #include "@VMODROOT/core/takeover_slot.h"
@@ -37,7 +37,7 @@ fn C.vanilla_to_pending() bool
 //              sends meanwhile is buffered and handed over, in order, once
 //              the park ends; a peer that closes (FIN) meanwhile closes the
 //              connection at once, dropping the frames it sent before it
-//              (the epoll plain worker; vanilla#230). At most ONE watch may be
+//              (the epoll worker; vanilla#230). At most ONE watch may be
 //              armed per connection (the close-path teardown tracks exactly
 //              one fd). Suspending WITHOUT arming a watch closes the
 //              connection — nothing would ever resume it. To wait for
@@ -66,7 +66,7 @@ pub:
 }
 
 // enable_takeover marks the calling worker thread as able to flip a
-// connection's mode. Call once per capable worker (the epoll plain worker).
+// connection's mode. Call once per capable worker (the epoll worker).
 @[inline]
 pub fn enable_takeover() {
 	C.vanilla_to_enable()
@@ -76,7 +76,7 @@ pub fn enable_takeover() {
 // handler returns .done, the worker sends whatever the handler appended (the
 // switching response) and routes every subsequent readable burst on this
 // connection to `cont`. Returns false when the running backend cannot take
-// connections over (not the epoll plain worker, or a tcc dev build) — the
+// connections over (not the epoll worker, or a tcc dev build) — the
 // caller MUST then answer an error (e.g. 501) instead of upgrading, because
 // the peer would otherwise speak a protocol nobody parses.
 @[inline]

@@ -588,12 +588,23 @@ fn handle_readable(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, kn
 	if unsafe { cs == nil } {
 		cs = state_create(mut st, fd)
 	}
+	// TLS (tls_conn_linux.c.v): the handshake comes first, a userspace session
+	// learns of every edge, and a connection held behind a file waits.
+	if cs.tls != tls_plain && !tls_on_readable(epoll_fd, fd, mut cs, active_conns, mut st) {
+		return
+	}
 	// Already parked on a watch: a readable edge here is either the client hanging
 	// up or pipelining ahead. Peek to detect a close (tear the watch down); any
 	// data stays in the socket buffer and is read once the in-flight watch resumes.
 	if cs.awaiting_fd >= 0 {
 		if cs.takeover != unsafe { nil } {
 			read_while_parked(mut reactor, epoll_fd, fd, limits, active_conns, mut st, mut cs)
+			return
+		}
+		if cs.tls != tls_plain {
+			// A TLS client's bytes are records: a peek cannot tell its
+			// close_notify from a request (tls_while_parked).
+			tls_while_parked(mut reactor, epoll_fd, fd, active_conns, mut st, mut cs)
 			return
 		}
 		mut probe := [1]u8{}
@@ -654,7 +665,7 @@ fn read_while_parked(mut reactor Reactor, epoll_fd int, fd int, limits core.Limi
 			unsafe { cs.read_buf.grow_cap(growth) }
 		}
 		spare := cs.read_buf.cap - cs.read_buf.len
-		n := C.recv(fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, usize(spare), 0)
+		n := conn_recv(mut cs, fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, spare)
 		if n > 0 {
 			unsafe {
 				cs.read_buf.len += n
@@ -682,6 +693,10 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 	} else {
 		core.default_max_request_bytes
 	}
+	// The connection's I/O mode (conn_recv), read once: serving never changes
+	// it, so the read loop below tests a local instead of loading the field
+	// before every recv.
+	plain := cs.tls == tls_plain
 	// Drain requests ALREADY buffered before reading more. A `.done` resume hands
 	// this function a read_buf holding the requests that were pipelined BEHIND the
 	// parked one — they arrived long ago, so no further readable edge is coming on
@@ -727,7 +742,7 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 			} else {
 				cs.read_buf.cap
 			}
-			dn := C.recv(fd, cs.read_buf.data, usize(want), 0)
+			dn := conn_recv(mut cs, fd, &u8(cs.read_buf.data), want)
 			if dn < 0 {
 				if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
 					break
@@ -765,7 +780,11 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 			}
 		}
 		spare := cs.read_buf.cap - cs.read_buf.len
-		n := C.recv(fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, usize(spare), 0)
+		n := if plain {
+			C.recv(fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, usize(spare), 0)
+		} else {
+			tls_recv(mut cs, fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, spare)
+		}
 		if n < 0 {
 			if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
 				break
@@ -814,22 +833,41 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 			flush_then_close(epoll_fd, fd, limits, active_conns, mut st, mut cs)
 			return
 		}
-		// Expect: 100-continue (RFC 9110 §10.1.1). drain_requests left a partial
-		// request in read_buf (its body has not fully arrived); if its head is
-		// complete and asks for 100-continue, prompt the client ONCE by queueing an
-		// interim 100 for the end-of-burst flush. Gated so the hot path pays nothing:
-		// only reached when bytes remain buffered (drain consumed a complete request
-		// otherwise) and never re-scanned once sent_100 is set.
-		if cs.read_buf.len == 0 {
-			if cs.sent_100 {
-				cs.sent_100 = false // request fully consumed — re-arm for the next one
+	}
+	// Expect: 100-continue (RFC 9110 §10.1.1). drain_requests left a partial
+	// request in read_buf (its body has not fully arrived); if its head is
+	// complete and asks for 100-continue, prompt the client ONCE by queueing an
+	// interim 100 for the end-of-burst flush. Checked once the burst is drained
+	// with every request before it answered (none parked, no takeover), so a
+	// head already buffered when this call began (behind a park or a held
+	// file, or read while parked) gets its 100 too, not only one a read just
+	// brought. Gated so the hot path pays nothing: only reached when bytes
+	// remain buffered (drain consumed a complete request otherwise) and never
+	// re-scanned once sent_100 is set.
+	if cs.read_buf.len == 0 {
+		if cs.sent_100 {
+			cs.sent_100 = false // request fully consumed — re-arm for the next one
+		}
+	} else if !cs.sent_100 && cs.body_drain == 0 && cs.awaiting_fd < 0
+		&& cs.takeover == unsafe { nil } {
+		head_len := request_parser.frame_head_len(cs.read_buf)
+		if head_len > 0 && request_parser.head_expects_100_continue(cs.read_buf, head_len) {
+			// A TLS connection sends a file still pending first: the 100 must
+			// not land inside its body (tls_send_file_first). Held, the 100
+			// comes once the file is out, and the request's read deadline does
+			// not run meanwhile (its client waits for the 100).
+			if cs.file_remaining > 0 && !plain {
+				sent := tls_send_file_first(epoll_fd, fd, limits, active_conns, mut st, mut cs)
+				if sent < 0 {
+					return
+				}
+				if sent == 0 {
+					end_read_deadline(mut st, mut cs)
+					return
+				}
 			}
-		} else if !cs.sent_100 && cs.body_drain == 0 {
-			head_len := request_parser.frame_head_len(cs.read_buf)
-			if head_len > 0 && request_parser.head_expects_100_continue(cs.read_buf, head_len) {
-				cs.write_buf << response.status_100_continue_response
-				cs.sent_100 = true
-			}
+			cs.write_buf << response.status_100_continue_response
+			cs.sent_100 = true
 		}
 	}
 	// Read-timeout bookkeeping — BEFORE the flush below, which may close the
@@ -926,7 +964,7 @@ fn serve_takeover_conn(mut reactor Reactor, epoll_fd int, fd int, limits core.Li
 			unsafe { cs.read_buf.grow_cap(growth) }
 		}
 		spare := cs.read_buf.cap - cs.read_buf.len
-		n := C.recv(fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, usize(spare), 0)
+		n := conn_recv(mut cs, fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, spare)
 		if n < 0 {
 			if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
 				break
@@ -1154,7 +1192,9 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 // response to write_buf, and STOPS at the first request that suspends (it parks;
 // the rest stay buffered and are drained when the watch resumes). Mirrors the
 // synchronous drain_requests but with the async step contract. Returns false if
-// the connection was closed (the caller must not touch it).
+// the connection was closed (the caller must not touch it), or held: a TLS
+// connection whose file did not fit the socket ahead of the next request (see
+// tls_send_file_first), which the caller leaves as it is.
 @[direct_array_access; manualfree]
 fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) bool {
 	mut pos := 0
@@ -1173,10 +1213,29 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 		// bytes, in order) BEFORE anything else is appended: this next response,
 		// or the error that ends the batch. A short read (the file shrank) would
 		// leave that body shorter than its Content-Length, with what follows read
-		// as its tail: stop answering, send what is there and close.
-		if cs.file_remaining > 0 && !materialise_file(mut cs) {
-			flush_then_close(epoll_fd, fd, limits, active_conns, mut st, mut cs)
-			return false
+		// as its tail: stop answering, send what is there and close. A TLS
+		// connection sends the file itself first instead, and is held if the
+		// socket cannot take it all (tls_send_file_first).
+		if cs.file_remaining > 0 {
+			if cs.tls != tls_plain {
+				sent := tls_send_file_first(epoll_fd, fd, limits, active_conns, mut st, mut cs)
+				if sent < 0 {
+					return false
+				}
+				if sent == 0 {
+					// Held: this request, complete, waits for the file to drain,
+					// with no read deadline running meanwhile.
+					compact_read_buf(mut cs, pos)
+					end_read_deadline(mut st, mut cs)
+					if pos > 0 {
+						cs.sent_100 = false
+					}
+					return false
+				}
+			} else if !materialise_file(mut cs) {
+				flush_then_close(epoll_fd, fd, limits, active_conns, mut st, mut cs)
+				return false
+			}
 		}
 		if total < -1 {
 			match -total {
@@ -1216,6 +1275,12 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 				cs.file_fd = qf.file_fd
 				cs.file_off = qf.off
 				cs.file_remaining = qf.len
+				// sendfile(2) cannot reach the connection: the file's first chunk
+				// goes behind the headers now (tls_file_lead).
+				if cs.no_sendfile && !tls_file_lead(mut cs) {
+					flush_then_close(epoll_fd, fd, limits, active_conns, mut st, mut cs)
+					return false
+				}
 			}
 		}
 		match step {
@@ -1352,7 +1417,7 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 		// the slot after one, so a region it queued would be taken by the next
 		// .done on this worker and streamed after that response, another
 		// client's. queue_file refuses instead and the continuation writes its
-		// body itself. The plain worker never narrows the gate otherwise, so it
+		// body itself. The worker never narrows the gate otherwise, so it
 		// reopens right after the call.
 		core.set_queue_file_allowed(false)
 		step := cont(mut reactor.scratch, ext_fd, ready_err, entry_udata, state, mut bg_loop)

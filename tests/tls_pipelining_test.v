@@ -1,5 +1,5 @@
 // vtest build: linux && vanilla_tls?
-// HTTP/1.1 pipelining over HTTPS on the epoll TLS worker (issue #152): every
+// HTTP/1.1 pipelining over HTTPS on the epoll worker (issue #152): every
 // complete request a burst carries is answered, in order — in one TLS record,
 // in several records that arrive together, with a partial one behind them —
 // and a response parked on WANT_WRITE is finished, byte-exact, before the
@@ -16,7 +16,6 @@
 // No Limits unless a case is about deadlines: a stranded request then hangs
 // instead of being reaped, and the openssl read timeout is only the hang
 // backstop — a regression fails the elapsed assert, it never blocks forever.
-import os
 import time
 import net.openssl
 import server
@@ -38,11 +37,16 @@ fn C.signal(sig int, handler voidptr) voidptr
 // echoes as the body, so the client can check the order of the answers.
 const tp_ok_head = 'HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\n'.bytes()
 // GET /big answers with a body larger than loopback can absorb while the
-// client is not reading (see tp_slow_reader), so the worker must park it and
-// drain it on EPOLLOUT.
+// client is not reading: the handler pins the server socket's send buffer
+// small (SO_SNDBUF, which also stops its autotuning) and tp_slow_reader the
+// client's receive buffer, so the worker must park it and drain it on
+// EPOLLOUT, whatever the host's tcp_wmem / tcp_rmem. It stays well under the
+// 8 MiB pending-write cap (core.max_pending_write_bytes), which would close
+// the connection instead.
 const tp_big_req = 'GET /big HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
-const tp_big_len = tp_unbufferable_len()
-const tp_big_head = 'HTTP/1.1 200 OK\r\nContent-Length: ${tp_big_len}\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const tp_big_len = 2 * 1024 * 1024
+const tp_big_head = 'HTTP/1.1 200 OK\r\nContent-Length: 2097152\r\nConnection: keep-alive\r\n\r\n'.bytes()
+const tp_big_sndbuf = 32 * 1024
 // GET /pad answers `/pa` and the server socket's TLS_RX_EXPECT_NO_PAD state
 // (see tp_no_pad_state). getsockopt(2) names from linux/tls.h (since 6.0).
 const tp_pad_req = 'GET /pad HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
@@ -53,7 +57,7 @@ const tp_backstop = time.Duration(5 * time.second)
 // Every exchange below completes in milliseconds on loopback (the big
 // response in a few hundred); this bound stays far below the backstop.
 const tp_bound_ms = 3000
-// How long a client that stops reading waits for the TLS worker to park a
+// How long a client that stops reading waits for the worker to park a
 // /big response: its send loop fills the bounded kernel buffers (see
 // tp_slow_reader) in a few ms. Only reaching the park depends on it; a wait
 // too short makes a case miss the path it targets, it never fails one.
@@ -61,6 +65,8 @@ const tp_park_wait = time.Duration(200 * time.millisecond)
 
 fn tp_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if req.len > 5 && req[5] == `b` { // GET /big
+		sndbuf := tp_big_sndbuf
+		C.setsockopt(client_fd, C.SOL_SOCKET, C.SO_SNDBUF, &sndbuf, 4)
 		res << tp_big_head
 		old := res.len
 		unsafe {
@@ -89,17 +95,7 @@ fn tp_no_pad_state(fd int) u8 {
 	return if v != 0 { `1` } else { `0` }
 }
 
-// tp_unbufferable_len is a body size the kernel cannot hold while a
-// tp_slow_reader client is not reading: more than the largest send buffer TCP
-// autotuning may grow the server's socket to (the last field of tcp_wmem;
-// nothing sets SO_SNDBUF) plus the client's locked receive buffer. Record and
-// skb overhead only shrink what fits.
-fn tp_unbufferable_len() int {
-	mem := (os.read_file('/proc/sys/net/ipv4/tcp_wmem') or { '' }).fields() // min default max
-	return (1 << 20) + if mem.len == 3 { mem[2].int() } else { 32 << 20 }
-}
-
-// tp_start serves tp_handler over HTTPS on one epoll TLS worker.
+// tp_start serves tp_handler over HTTPS on one epoll worker.
 fn tp_start(limits server.Limits) !&vtest.Harness {
 	return tp_start_no_pad(limits, false)
 }
@@ -123,7 +119,7 @@ fn tp_start_no_pad(limits server.Limits, no_pad bool) !&vtest.Harness {
 			limits:          limits
 		})
 	} $else {
-		return error('the TLS worker is the Linux epoll backend')
+		return error('TLS is the Linux epoll backend')
 	}
 }
 
@@ -182,11 +178,9 @@ fn tp_cork(c &openssl.SSLConn, on bool) {
 }
 
 // tp_slow_reader locks the client's receive buffer small (no receive
-// autotuning): while the client is not reading, the kernel then holds at most
-// the server's send buffer (wmem max) plus this, so a /big body just past
-// wmem max is certain to park the TLS worker — instead of one past wmem +
-// rmem max (tt_unbufferable_len in tls_timeouts_test.v), which is slow to
-// read through a small window.
+// autotuning): while the client is not reading, the kernel then holds this
+// plus the server's send buffer, which GET /big pins small too, so a /big
+// body is certain to park the worker.
 fn tp_slow_reader(c &openssl.SSLConn) {
 	v := 32 * 1024
 	C.setsockopt(c.handle, C.SOL_SOCKET, C.SO_RCVBUF, &v, sizeof(v))

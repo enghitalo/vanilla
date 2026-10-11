@@ -1,6 +1,6 @@
 module main
 
-// The chat end to end on the epoll plain worker (vanilla#230), with raw
+// The chat end to end on the epoll worker (vanilla#230), with raw
 // WebSocket clients: two members on different workers talk both ways; the
 // keepalive pings through wake_after and closes a peer that never answers
 // (1001); a member that leaves is gone from the room (.closed), and a message

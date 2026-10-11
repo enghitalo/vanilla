@@ -365,7 +365,7 @@ fn check_shutdown_grace_bounds_parked(backend server.IOBackend) ! {
 // check_shutdown_bounded_by_park_deadline (vanilla#200): a request parked on a
 // 5 s timer with a 300 ms deadline of its own. shutdown(5000) waits for the
 // deadline, whose continuation answers 504, and not for the timer or the
-// grace. Epoll plain worker only: the other backends do not enforce park
+// grace. Epoll worker only: the other backends do not enforce park
 // deadlines.
 fn check_shutdown_bounded_by_park_deadline(backend server.IOBackend) ! {
 	sd_reset_parks()

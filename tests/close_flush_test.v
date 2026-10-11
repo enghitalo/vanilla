@@ -334,7 +334,7 @@ fn cf_file_handler(file_fd int, head []u8, step core.Step, accepted &core.Counte
 }
 
 // cf_handoffs_wanted is the number of queue_file hand-offs the worker must
-// accept for `n` handler calls: the epoll plain worker takes them, except in a
+// accept for `n` handler calls: the epoll worker takes them, except in a
 // tcc build, where the slot is compiled inert.
 fn cf_handoffs_wanted(backend server.IOBackend, n i64) i64 {
 	$if tinyc {

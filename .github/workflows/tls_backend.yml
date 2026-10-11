@@ -39,6 +39,7 @@ on:
       - 'tests/tls_pipelining_test.v'
       - 'tests/tls_workers_test.v'
       - 'tests/tls_static_test.v'
+      - 'tests/tls_async_test.v'
       - 'examples/https_upstream/**'
       - 'examples/https/**'
       - '.github/workflows/tls_backend.yml'
@@ -58,6 +59,7 @@ on:
       - 'tests/tls_pipelining_test.v'
       - 'tests/tls_workers_test.v'
       - 'tests/tls_static_test.v'
+      - 'tests/tls_async_test.v'
       - 'examples/https_upstream/**'
       - 'examples/https/**'
       - '.github/workflows/tls_backend.yml'
@@ -223,6 +225,17 @@ jobs:
           VANILLA_NO_IOURING: '1'
         run: |
           v -cc gcc -no-parallel -d vanilla_tls test examples/https/src
+      # What HTTPS gets from the epoll worker it shares with plain HTTP:
+      # .suspend (the requests pipelined behind a park answered after it),
+      # park deadlines, on_worker_start, takeover + server push (a post from
+      # another thread, .closed once), a .close that sends everything first
+      # (#275), streamed uploads and Expect: 100-continue.
+      - name: TLS async e2e (suspend, push, on_worker_start, .close)
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+        run: |
+          v -cc gcc -no-parallel -d vanilla_tls test tests/tls_async_test.v
       # The pooled HTTPS client (http1_1/upstream, #229) through
       # examples/https_upstream's edge, against its fake upstream (a V
       # program the test builds, serving TLS with the test CA): response
@@ -239,14 +252,16 @@ jobs:
           VANILLA_REQUIRE_FAKE_PG: '1'
         run: |
           v -cc gcc -no-parallel -d vanilla_tls test http1_1/upstream examples/https_upstream/src
-      # Static files over HTTPS (static_assets on the TLS worker): bodies at
-      # or above sendfile_min_bytes leave a kTLS connection with sendfile(2)
-      # behind a MSG_MORE header send, and a userspace-TLS one as bytes; every
-      # case runs both ways (kTLS only when the module loaded). Byte-exact
-      # large and pipelined bodies, a slow reader parked mid-file, follow_disk,
-      # a file shorter than its Content-Length or failing in the sendfile phase
-      # (the answers ahead of it still arrive), the sendfile slot drained on
-      # .close/.suspend, clients that reset mid-file, mixed routes.
+      # Static files over HTTPS (static_assets on the epoll worker): bodies at
+      # or above sendfile_min_bytes are handed off with core.queue_file and
+      # leave a kTLS connection with sendfile(2), a userspace-TLS one as bytes
+      # read and sent a chunk at a time; every case runs both ways (kTLS only
+      # when the module loaded). Byte-exact large and pipelined bodies, a slow
+      # reader parked mid-file, a body past the 8 MiB pending-write cap,
+      # follow_disk, a file shorter than its Content-Length or failing in the
+      # sendfile phase (the answers ahead of it still arrive), the sendfile
+      # slot drained on .close/.suspend, clients that reset mid-file, mixed
+      # routes.
       # A runner whose kernel lacks the module only warns: the kTLS runs then
       # fall back to userspace TLS, and the job still checks that path.
       - name: Load the tls kernel module (kTLS)
@@ -255,7 +270,7 @@ jobs:
           if sudo modprobe tls && [ -e /proc/net/tls_stat ]; then
             echo 'kTLS available'
           else
-            echo '::warning title=kTLS not tested::sudo modprobe tls failed: the kTLS runs of tls_pipelining_test.v and tls_static_test.v fall back to userspace TLS, so kTLS RX, TLS_RX_EXPECT_NO_PAD and sendfile(2) over kTLS go untested'
+            echo '::warning title=kTLS not tested::sudo modprobe tls failed: the kTLS runs of tls_pipelining_test.v, tls_static_test.v and tls_async_test.v fall back to userspace TLS, so kTLS RX, TLS_RX_EXPECT_NO_PAD and sendfile(2) over kTLS go untested'
           fi
       # The pipelining suite again, now that kTLS engages: pipelined records on
       # kTLS RX, and test_tls_ktls_rx_no_pad_is_opt_in, which reads
@@ -274,6 +289,14 @@ jobs:
           VANILLA_NO_IOURING: '1'
         run: |
           v -cc gcc -no-parallel -d vanilla_tls test tests/tls_static_test.v
+      # The async suite again, now over kTLS as well (each case runs both
+      # ways once the module is loaded).
+      - name: TLS async e2e over kTLS
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+        run: |
+          v -cc gcc -no-parallel -d vanilla_tls test tests/tls_async_test.v
       # -gc none frees nothing, so a per-request allocation on either path
       # shows as heap growth (the leak case only measures in this build).
       - name: TLS static files e2e under -gc none
@@ -294,7 +317,7 @@ jobs:
           VANILLA_REQUIRE_FAKE_PG: '1'
         run: |
           v -gc none -cc gcc -no-parallel -d vanilla_tls test http1_1/upstream examples/https_upstream/src
-      # The TLS worker under ThreadSanitizer (race_detector.yml has no Mbed
+      # HTTPS on the epoll worker under ThreadSanitizer (race_detector.yml has no Mbed
       # TLS). See race_detector.yml for the two steps that prepare it.
       - name: Make ASLR compatible with ThreadSanitizer
         shell: bash
@@ -316,6 +339,15 @@ jobs:
           VRACE: 'halt_on_error=0'
         run: |
           v -race -cc "$RACE_CC" -no-parallel -d vanilla_tls test tests/tls_static_test.v
+      # The push mailbox posted to from the test thread, into an HTTPS
+      # connection's worker.
+      - name: TLS async e2e under -race
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+          VRACE: 'halt_on_error=0'
+        run: |
+          v -race -cc "$RACE_CC" -no-parallel -d vanilla_tls test tests/tls_async_test.v
       # Four workers' pools and the resolver thread (refreshing every 10 ms)
       # under concurrent HTTPS calls.
       - name: Pooled HTTPS client under -race

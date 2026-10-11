@@ -21,7 +21,7 @@
 // LOG_FLUSH_MS (200), COLLECTOR_HOST (unset: no shipping), COLLECTOR_PORT,
 // COLLECTOR_PATH (/ingest), COLLECTOR_HTTPS (0), COLLECTOR_CA.
 //
-// Platform: the Linux epoll plain worker, the one that runs on_worker_start.
+// Platform: the Linux epoll worker, the one that runs on_worker_start.
 module main
 
 import os

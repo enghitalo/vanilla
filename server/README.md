@@ -48,9 +48,9 @@ per-request allocation.
   requests (a pooled DB or upstream connection) parks with
   `event_loop.watch_fd_persistent(...)` instead, so a client that disconnects
   mid-wait does not close it (epoll and io_uring; the kqueue runtime does not
-  honor it yet). Linux epoll + io_uring and macOS/kqueue;
-  on TLS and Windows/IOCP a `.suspend` closes the connection (no watch reactor
-  there yet).
+  honor it yet). Linux epoll (plain HTTP and HTTPS) + io_uring and
+  macOS/kqueue; on Windows/IOCP a `.suspend` closes the connection (no watch
+  reactor there yet).
 - **Bounding a wait** — a park lasts as long as its fd takes, unless it has a
   deadline: `Limits.park_timeout_ms` for every park, or one per watch with
   `event_loop.watch_fd_deadline(..., timeout_ms)` /
@@ -59,11 +59,12 @@ per-request allocation.
   fd is not ready): answer 504 and return `.done`, or re-arm to keep waiting.
   The watch it stops waiting on is retired — a request-owned fd leaves the
   event loop; a persistent fd keeps a tombstone that consumes the reply still
-  due, in order (see `core.EventLoop.timed_out`). The epoll plain worker
-  enforces it; on io_uring and kqueue a deadline watch is a plain watch.
+  due, in order (see `core.EventLoop.timed_out`). The epoll worker
+  enforces it, with or without TLS; on io_uring and kqueue a deadline watch is
+  a plain watch.
   `event_loop.watch_fd_background(...)` arms a clientless watch from a handler
   or continuation (fire-and-forget I/O on the worker, e.g. pg_async's
-  CancelRequest; epoll plain worker only, false elsewhere).
+  CancelRequest; epoll worker only, false elsewhere).
 - **Server push** — a taken-over connection (WebSocket, SSE, h2c) can
   `event_loop.subscribe(wake_fn, sub_state)`: it keeps reading its client,
   and its wake fn (a `core.WakeFn`, called on its own worker between client
@@ -79,8 +80,8 @@ per-request allocation.
   slot; a post never blocks and reports `.full` / `.too_big` / `.ok`); past
   `push_watermark_bytes` (default 1 MiB) pending, a subscriber is closed. A
   subscription does not park the connection and does not hold
-  `shutdown(grace)`. Epoll plain worker only: elsewhere `subscribe` returns
-  a nil handle and posts report `.unsupported`. See
+  `shutdown(grace)`. Epoll worker only (plain HTTP and HTTPS): elsewhere
+  `subscribe` returns a nil handle and posts report `.unsupported`. See
   `examples/websocket_chat` and `core/conn_handle.v`.
 - **Per-worker state** — set `make_state`: it runs once per worker thread, and
   every handler call on that worker receives the value as the
@@ -88,7 +89,8 @@ per-request allocation.
   pool, no mutex).
 
 `on_worker_start` arms clientless background watches (e.g. a periodic timerfd that
-refreshes per-worker state with no extra thread). Linux/epoll, plaintext only.
+refreshes per-worker state with no extra thread). Linux/epoll, plain HTTP or
+HTTPS.
 
 ## Minimal server
 
@@ -138,7 +140,7 @@ alone also reaps idle keep-alive connections. With both at 0 nothing is armed.
 | `read_timeout_ms` | a request (head + body) must arrive complete within this long, else close. The **first** request's clock starts at **accept**, so it also bounds a connection that never sends a byte and the TLS handshake; a later request's clock starts at its first byte. Not refreshed on progress (the slowloris bound) — size it for your largest upload. **408** only if part of the request arrived and no earlier response is still being sent (plaintext epoll / poll / iocp); otherwise — and always on TLS / io_uring — the connection is closed silently |
 | `write_timeout_ms` | close a connection whose parked response can't drain in time |
 | `idle_timeout_ms` | keep-alive: once a response is fully sent, how long to wait for the first byte of the next request before closing **silently** (no 408). `0` ⇒ `read_timeout_ms`; `-1` (any negative) ⇒ never. With no read timeout it also bounds a new connection's wait for its first byte (over TLS, its first decrypted byte, so the handshake too). Never applies to a request parked on a watch, a parked write, or a taken-over connection (WebSocket, h2c) |
-| `park_timeout_ms` | the default deadline of a request parked on a watch (`.suspend`): past it, the continuation runs once with `event_loop.timed_out()` true and answers (504). Per park — a re-arm gets a fresh one — and overridden per watch by `watch_fd_deadline` (< 0 exempts a watch). The only bound on a parked request: none of the above applies to one. Epoll plain worker only |
+| `park_timeout_ms` | the default deadline of a request parked on a watch (`.suspend`): past it, the continuation runs once with `event_loop.timed_out()` true and answers (504). Per park — a re-arm gets a fresh one — and overridden per watch by `watch_fd_deadline` (< 0 exempts a watch). The only bound on a parked request: none of the above applies to one. Epoll worker only |
 
 Deadlines are enforced by each worker's sweep, which runs every
 `Limits.sweep_interval_ms()` (a quarter of the shortest timeout, clamped to
@@ -194,21 +196,35 @@ deadline expires. Still set a read timeout on any public HTTPS server:
 `idle_timeout_ms` alone does not bound a request that has started arriving
 (slowloris).
 
-HTTP/1.1 pipelining works over TLS as over plaintext: every complete request
-a read burst carries is answered, in order, and the responses go out
-together. While a response waits for the socket to drain (WANT_WRITE),
-nothing more is read or answered on that connection; the requests pipelined
-behind it are answered once it is out.
+An HTTPS connection is served by the same epoll worker, connection state
+and reactor as a plain one (`backend_epoll/tls_conn_linux.c.v` adds the
+handshake and the record I/O), so everything in the handler contract above
+works over TLS too: pipelining, `.suspend` with park deadlines and
+`watch_fd_background`, takeover (WebSocket over TLS), server push
+(`subscribe`, the mailbox, `wake_after`), `on_worker_start`, streamed large
+uploads and `Expect: 100-continue`, and a `.close` that sends all of its
+response before it closes. The limits are the same as well: a peer that
+pipelines without reading is closed once the worker holds 8 MiB unsent for
+it (`core.max_pending_write_bytes`), so hand a large body off with
+`core.queue_file` rather than appending it whole. Two things differ: a read
+timeout closes silently (no 408: it would go out as plaintext), and code that
+touches the client socket itself sees TLS records, not HTTP, on a
+userspace-TLS connection (a readable watch on the client's own fd, or the
+fd-handoff pattern of `examples/sse`, where another thread writes to it).
 
 After the handshake the record crypto moves into the kernel (kTLS) when the
 host has the `tls` module; otherwise the connection stays on Mbed TLS, and the
-server logs the fallback once. On a kTLS connection a handler can hand a file
-body off with `core.queue_file` (static_assets does it for files of at least
-`sendfile_min_bytes`): the headers go out with `MSG_MORE` and `sendfile(2)`
-streams the file into the same record, with no userspace copy. A
-userspace-TLS connection refuses the hand-off, so the handler appends the
-bytes. `tls_config.set_ktls(false)` keeps every new connection on Mbed TLS
-(tests of that path, or an operator kill switch).
+server logs the fallback once. A file body handed off with `core.queue_file`
+(static_assets does it for files of at least `sendfile_min_bytes`) leaves a
+kTLS connection with `sendfile(2)`, with no userspace copy; on a
+userspace-TLS connection the worker reads it and sends it through Mbed TLS a
+chunk at a time (64 KiB), the first one behind the headers. A request
+pipelined behind a file is answered once the file is out: until then the
+connection reads and answers nothing more (the plain path instead reads the
+rest of the file into its write buffer, which past the 8 MiB cap closes the
+connection).
+`tls_config.set_ktls(false)` keeps every new connection on Mbed TLS (tests of
+that path, or an operator kill switch).
 
 Every worker can serve TLS. How much of the crypto runs in parallel depends on
 how Mbed TLS was built. Its PSA Crypto state (the key store, the RNG) is

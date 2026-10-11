@@ -65,11 +65,11 @@ struct SfGateProbe {
 }
 
 // sf_probe_per_request_gate enables sendfile, then closes and reopens the
-// per-request gate as a TLS worker does between connections.
+// per-call gate as the epoll worker does around a continuation.
 fn sf_probe_per_request_gate() SfGateProbe {
 	enable_sendfile()
-	// Closed for this request (a userspace-TLS connection): the caller must
-	// write the bytes itself, and nothing is left queued.
+	// Closed for this call (a continuation): the caller must write the bytes
+	// itself, and nothing is left queued.
 	set_queue_file_allowed(false)
 	queued_closed := queue_file(4, 0, 10)
 	held_closed := sf_slot_holds_a_region()

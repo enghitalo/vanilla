@@ -60,9 +60,9 @@ module upstream
 // re-arms the fd the continuation woke on, so a watch on another pool's fd
 // would never fire).
 //
-// Platform: the Linux epoll plaintext worker (the one that parks requests and
-// runs on_worker_start). Run TLS-terminating workers in front, as for
-// pg_async. TLS needs the `-d vanilla_tls` build.
+// Platform: the Linux epoll worker (the one that parks requests and runs
+// on_worker_start), serving plain HTTP or HTTPS. TLS, to the upstream or to
+// the clients, needs the `-d vanilla_tls` build.
 import tls
 import time
 import transport

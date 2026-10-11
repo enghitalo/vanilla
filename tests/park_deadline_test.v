@@ -1,5 +1,5 @@
 // vtest build: linux
-// Park deadlines (vanilla#200) on the epoll plain worker. A request parked on
+// Park deadlines (vanilla#200) on the epoll worker. A request parked on
 // a watch whose fd never becomes ready (a hung database or upstream: here the
 // read end of a pipe nobody writes) used to wait forever, with every Limits
 // timeout set, because a parked request has no read, write or idle deadline.

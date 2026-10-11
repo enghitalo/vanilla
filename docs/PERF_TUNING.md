@@ -281,7 +281,7 @@ Buffers grow past that size when a request or a response needs it:
   `sendfile_min_bytes` (256 KiB) to `sendfile(2)` on epoll, and io_uring sends
   preloaded assets straight from memory.
 - **Retention differs by backend.** io_uring frees a grown buffer when its
-  connection closes. The epoll plain worker keeps it in the pool, so on epoll
+  connection closes. The epoll worker keeps it in the pool, so on epoll
   every pooled connection keeps the largest size it ever needed. Measured
   with 200 connections fetching a 1 MiB response, 2 workers: once they had
   closed, epoll stayed at 209 MiB RSS (4.8 MiB idle), while io_uring was
@@ -379,7 +379,9 @@ huge pages are `always`, RSS moves in 2 MiB steps with no allocation at all
 
 - TLS is served by the **epoll** backend only, and only in a build with
   `-d vanilla_tls`. `new_server` refuses a `tls_config` on every other
-  backend (io_uring, poll, kqueue, IOCP).
+  backend (io_uring, poll, kqueue, IOCP). HTTPS connections run on the same
+  epoll worker as plain ones, with the same buffers, limits and async
+  features.
 - **Handshakes in parallel** need Mbed TLS built with `MBEDTLS_THREADING_C`
   and `MBEDTLS_THREADING_PTHREAD`. Distro packages usually are not, and then
   every worker takes turns in the crypto library. The server says so at
@@ -398,7 +400,8 @@ huge pages are `always`, RSS moves in 2 MiB steps with no allocation at all
   errno 2 (`ENOENT`) means the module is not loaded: `modprobe tls`, and list
   it in `/etc/modules-load.d/` to load it at boot. With kTLS, static files
   go out through `sendfile(2)` inside the TLS stream with no userspace copy;
-  `/proc/net/tls_stat` counts the kernel's TLS sessions.
+  without it, the worker reads them and encrypts them in userspace, 64 KiB at
+  a time. `/proc/net/tls_stat` counts the kernel's TLS sessions.
 - `tls_config.set_ktls(false)` keeps every new connection in userspace (a
   kill switch). `tls_config.set_ktls_rx_no_pad(true)` saves a copy per
   received record, but only enable it on a kernel that has the fix (v7.2,
@@ -479,5 +482,5 @@ Names as of this writing; grep for them if the code has moved.
 | io_uring availability | `server.iou_backend_available()`, `VANILLA_NO_IOURING` (`server/server_io_uring_linux.c.v`) |
 | limits and timeouts | `core.Limits` (`core/core.v`) |
 | kTLS | `tls.Config.set_ktls`, `set_ktls_rx_no_pad` (`tls/tls_mbedtls_d_vanilla_tls.c.v`); `enable_ktls` (`tls/vanilla_tls.c`) |
-| TLS record buffer | `tls_record_bytes` (`server/backend_epoll/tls_conn_linux.c.v`) |
+| TLS file chunk (userspace TLS) | `tls_file_chunk_bytes` (`server/backend_epoll/tls_conn_linux.c.v`) |
 | sendfile threshold | `static_assets.Config.sendfile_min_bytes` (`static_assets/static_assets.v`) |

@@ -359,7 +359,7 @@ if event_loop.timed_out() {
 `PgConn.cancel` sends PostgreSQL's CancelRequest on a second connection to the
 same server (over TLS when the session is), without blocking the worker: it
 runs as a background watch on the worker's loop. Park deadlines and
-background watches are enforced by the epoll plain worker; on io_uring and
+background watches are enforced by the epoll worker; on io_uring and
 kqueue a deadline watch is a plain watch, and `cancel` fails.
 
 **Do**

@@ -13,7 +13,7 @@ fn C.read(fd int, buf voidptr, count usize) int
 // start_maintenance drives maintain() from a one-shot timerfd on this worker's
 // event loop, and, for a pool following a Resolver, watches the resolver's
 // pipe. Call it from the server's on_worker_start with the pool make_state
-// built (clientless watches: the epoll plain worker runs those):
+// built (clientless watches: the epoll worker runs those):
 //
 //   fn on_start(ws voidptr, mut el core.EventLoop) {
 //       mut st := unsafe { &App(ws) }
@@ -33,7 +33,7 @@ pub fn (mut p Pool) start_maintenance(mut el core.EventLoop) ! {
 	el.watch_fd(fd, .readable, maintenance_tick, voidptr(p))
 	if el.last_watched != fd {
 		C.close(fd)
-		return error('upstream: this event loop cannot watch the maintenance timer (epoll plain worker only)')
+		return error('upstream: this event loop cannot watch the maintenance timer (epoll worker only)')
 	}
 	p.timer_fd = fd
 	p.arm(maintenance_idle_ms)
