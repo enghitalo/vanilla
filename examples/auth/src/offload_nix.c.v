@@ -20,7 +20,8 @@ module main
 //     close pipe_w. It touches ONLY its own job — never the reactor, the
 //     connection, or worker_state — so there is no cross-thread sharing to race.
 //   token_done() (on the worker thread, when the pipe is readable): read the
-//     verdict byte, close the read-end, append the 200+JWT or a 401.
+//     verdict byte, close the read-end, append the 200+JWT (signed with the
+//     worker's AuthState HMAC — only ever touched on the worker thread) or a 401.
 //
 // The pool is PER WORKER (built in make_state): shared-nothing, so verifier
 // threads never contend across workers, and the resume always lands on the
@@ -49,23 +50,24 @@ struct HashJob {
 	pipe_w   int
 }
 
-// AuthState is the per-worker offload handle handed to every handler call as
-// worker_state. One channel + hash_pool_size verifier threads, created once per
-// worker in make_auth_state.
-struct AuthState {
+// HashPool is a worker's offload handle (AuthState.pool): one channel +
+// hash_pool_size verifier threads, created once per worker in make_auth_state.
+@[heap]
+struct HashPool {
 	jobs chan HashJob
 }
 
 // make_auth_state runs ONCE per worker (ServerConfig.make_state), on the worker
-// thread. It starts this worker's private argon2 pool.
+// thread. It starts this worker's private argon2 pool and builds its AuthState
+// (main.v) around it.
 fn make_auth_state() voidptr {
-	mut st := &AuthState{
+	pool := &HashPool{
 		jobs: chan HashJob{cap: hash_queue_cap}
 	}
 	for _ in 0 .. hash_pool_size {
-		spawn hash_worker(st.jobs)
+		spawn hash_worker(pool.jobs)
 	}
-	return voidptr(st)
+	return voidptr(new_auth_state(pool))
 }
 
 // hash_worker is a pool thread: it runs the CPU-heavy, memory-hard argon2 verify
@@ -89,8 +91,7 @@ fn hash_worker(jobs chan HashJob) {
 // try_offload queues the verify and parks the connection. Returns false when the
 // offload could not be set up (pipe failure, or the pool queue is full) — the
 // caller then sheds the request with 503 instead of blocking the worker.
-fn try_offload(worker_state voidptr, password []u8, mut event_loop core.EventLoop) bool {
-	mut st := unsafe { &AuthState(worker_state) }
+fn try_offload(pool &HashPool, password []u8, mut event_loop core.EventLoop) bool {
 	mut fds := [2]i32{} // C ints: V int is 64-bit
 	if C.pipe(unsafe { &fds[0] }) != 0 {
 		return false
@@ -103,7 +104,7 @@ fn try_offload(worker_state voidptr, password []u8, mut event_loop core.EventLoo
 	}
 	mut queued := false
 	select {
-		st.jobs <- job {
+		pool.jobs <- job {
 			queued = true
 		}
 		else {
@@ -123,8 +124,9 @@ fn try_offload(worker_state voidptr, password []u8, mut event_loop core.EventLoo
 
 // token_done resumes a parked /token request when its verify completes. Runs on
 // the worker thread (never a pool thread); appends the same bytes the
-// synchronous path would.
-fn token_done(mut out []u8, ready_fd int, _ready_fd_error bool, _watch_payload voidptr, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
+// synchronous path would. worker_state is this worker's AuthState: a request
+// is only parked when it has a pool.
+fn token_done(mut out []u8, ready_fd int, _ready_fd_error bool, _watch_payload voidptr, worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
 	mut verdict := u8(0)
 	// Read the data byte even on HUP: the pool writes the verdict and THEN closes
 	// pipe_w, so a readable+hung-up read-end still carries the verdict first.
@@ -134,6 +136,7 @@ fn token_done(mut out []u8, ready_fd int, _ready_fd_error bool, _watch_payload v
 		core.append_str(mut out, resp_401)
 		return .done
 	}
-	write_token_200(mut out)
+	mut st := unsafe { &AuthState(worker_state) }
+	write_token_200(mut out, mut st)
 	return .done
 }

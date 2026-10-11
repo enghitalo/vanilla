@@ -35,7 +35,8 @@ fn hol_sync_handler(req_buffer []u8, mut out []u8, _client_fd int, _worker_state
 			core.append_str(mut out, resp_401)
 			return .done
 		}
-		write_token_200(mut out)
+		mut st := new_auth_state(unsafe { nil }) // no make_state here: a fresh state per login
+		write_token_200(mut out, mut st)
 		return .done
 	}
 	core.append_str(mut out, resp_ok_empty)
@@ -48,12 +49,12 @@ fn hol_protected_req() []u8 {
 	payload.write_string('{"sub":"user-42","exp":')
 	payload.write_decimal(time.unix_now() + 3600)
 	payload.write_u8(`}`)
-	token := jwt_sign(payload)
-	mut sb := strings.new_builder(96)
-	sb.write_string('GET /protected HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ')
-	sb.write_string(token.bytestr())
-	sb.write_string('\r\n\r\n')
-	return sb
+	mut st := new_auth_state(unsafe { nil })
+	mut req := []u8{cap: 192}
+	core.append_str(mut req, 'GET /protected HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ')
+	append_jwt(mut req, mut st, payload)
+	core.append_str(mut req, '\r\n\r\n')
+	return req
 }
 
 // measure_protected_tail: with a login in flight, measure how long /protected
