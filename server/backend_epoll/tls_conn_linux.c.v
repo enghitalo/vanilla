@@ -54,6 +54,22 @@ const tls_user = u8(2) // records through Mbed TLS in userspace
 const tls_handshake = u8(3) // handshake running, waiting to read
 const tls_handshake_out = u8(4) // handshake running, waiting to write (EPOLLOUT armed)
 
+fn C.__errno_location() &i32
+
+// set_errno sets errno, so that tls_recv and tls_send fail the way recv(2) and
+// send(2) do. Not `C.errno = e`: with V master as of 2026-10-11, assigning the
+// undeclared C.errno makes the compiler crash at random while it builds a
+// program that imports this module (CI: tests/pg_async_maintenance_test.v).
+// __errno_location() is what glibc and musl expand errno to; errno is a C
+// int, so i32 (V's int is 64-bit on 64-bit targets).
+@[inline]
+fn set_errno(e i32) {
+	unsafe {
+		p := C.__errno_location()
+		*p = e
+	}
+}
+
 // tls_recv is conn_recv for a TLS connection, with recv(2)'s contract.
 // Userspace: the session decrypts (Session.read_into); the peer's close,
 // with or without a close_notify, is the end of the stream, and stays so on
@@ -81,13 +97,13 @@ fn tls_recv(mut cs ConnState, fd int, ptr &u8, len int) int {
 		return n
 	}
 	if n == tls.want {
-		C.errno = C.EAGAIN
+		set_errno(C.EAGAIN)
 		return -1
 	}
 	if cs.sess.peer_closed() {
 		return 0
 	}
-	C.errno = C.ECONNRESET
+	set_errno(C.ECONNRESET)
 	return -1
 }
 
@@ -114,11 +130,11 @@ fn tls_send(mut cs ConnState, fd int, ptr &u8, len int) int {
 	}
 	if r == tls.want_write || r == tls.want {
 		cs.tls_pend = n
-		C.errno = C.EAGAIN
+		set_errno(C.EAGAIN)
 		return -1
 	}
 	cs.tls_pend = 0
-	C.errno = C.EPIPE
+	set_errno(C.EPIPE)
 	return -1
 }
 
