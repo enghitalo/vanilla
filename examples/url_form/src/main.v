@@ -27,35 +27,82 @@ module main
 //   - INPUTS ARE VIEWS: routing, the `?` scan, the Content-Type check and the
 //     pair iteration all read the request buffer in place by offsets — no
 //     `.to_string()`, no `split()`, no substring copies.
-//   - OUTPUTS ARE OWNED — on purpose: a decoded value is a TRANSFORMED byte
-//     sequence (escapes collapsed), and it lives in a map that must outlive
-//     the request buffer. That one `bytestr()` per key/value is the copy this
-//     example exists to demonstrate; everything around it stays zero-copy.
-//   - The response is framed with a const prefix + `wi`/`core.append_str` appends; the JSON
-//     body is genuinely dynamic (map echo), so it gets ONE strings.Builder.
+//   - DECODE STRAIGHT INTO THE OUTPUT: request_parser.percent_decode_into
+//     writes each key and value directly into the JSON echo in `out`, where
+//     it is then escaped in place. The decoded pairs are
+//     used once, within the call, so they never need to exist as strings, in a
+//     map, or in a builder.
+//   - The response is the JSON body written into `out`, then framed in place
+//     (frame_body puts the const prefix and the exact Content-Length in front
+//     of it) — no `${}`, no `+`, no allocation.
+//   - Pairs are echoed in wire order, one JSON member per pair: a repeated
+//     key (`tag=a&tag=b`, the usual multi-value form) appears once per pair.
 import server
 import core
 import http1_1.request_parser
 import http1_1.response
 import strconv
-import strings
 
 // Rune-literal escapes are unreliable in this toolchain (docs/V_PERF_TOOLBOX.md
 // gotcha) — the backslash byte as an explicit numeric value.
 const backslash = u8(92)
 const hex_lower = '0123456789abcdef'
 
-// percent_decode: turn %XX escapes and '+' into bytes. Decode exactly once.
-// The input is a zero-copy view; the RETURN is an owned string on purpose —
-// decoded bytes differ from the wire bytes and become map keys/values that
-// must outlive the request buffer (the justified copy, see header).
-// Malformed escapes (dangling `%`, non-hex) are kept as is. A handler that
-// only reads the value decodes into `out` or a per-worker scratch instead,
-// with no allocation.
-fn percent_decode(s []u8) string {
-	mut out := []u8{cap: s.len}
+// write_decoded_json appends the form-encoded bytes `s` to `out` as the
+// inside of a JSON string. request_parser.percent_decode_into decodes them
+// straight into `out`, exactly once: %XX escapes and '+' as a space, a
+// malformed escape (dangling `%`, non-hex) kept as it is. The JSON escapes are
+// then made in place, from the end backwards (each byte moves right by the
+// escapes still ahead of it, so none is overwritten before it is read): no
+// scratch buffer.
+@[direct_array_access]
+fn write_decoded_json(mut out []u8, s []u8) {
+	start := out.len
 	request_parser.percent_decode_into(s, mut out, true)
-	return out.bytestr()
+	end := out.len
+	mut extra := 0
+	for i in start .. end {
+		extra += json_escape_extra(out[i])
+	}
+	if extra == 0 {
+		return
+	}
+	unsafe { out.grow_len(extra) }
+	mut w := out.len
+	for r := end - 1; r >= start; r-- {
+		c := out[r]
+		if c == `"` || c == backslash {
+			w -= 2
+			out[w] = backslash
+			out[w + 1] = c
+		} else if c < 0x20 {
+			w -= 6
+			out[w] = backslash
+			out[w + 1] = `u`
+			out[w + 2] = `0`
+			out[w + 3] = `0`
+			out[w + 4] = hex_lower[int(c >> 4)]
+			out[w + 5] = hex_lower[int(c & 0x0F)]
+		} else {
+			w--
+			out[w] = c
+		}
+	}
+}
+
+// json_escape_extra is how many bytes longer `c` gets inside a JSON string:
+// RFC 8259 REQUIRES escaping `"`, `\` and control bytes < 0x20. Decoded form
+// values are user input — echoing them raw would produce broken (and
+// injectable) JSON (BEST_PRACTICES §8).
+@[inline]
+fn json_escape_extra(c u8) int {
+	return if c == `"` || c == backslash {
+		1
+	} else if c < 0x20 {
+		5
+	} else {
+		0
+	}
 }
 
 // view returns a zero-copy window into buf, or an empty slice for len == 0
@@ -69,13 +116,15 @@ fn view(buf []u8, start int, len int) []u8 {
 	return unsafe { (&buf[start]).vbytes(len) }
 }
 
-// parse_form: decode `key=val&...` bytes into a map (used for both query
-// strings and x-www-form-urlencoded bodies). Pairs are walked by OFFSET —
-// no split(), no substring copies; the only allocations are the decoded
-// key/value strings the map owns.
+// write_form_json appends the pairs of `key=val&...` bytes (a query string or
+// an x-www-form-urlencoded body) to `out` as a JSON object, decoding each key
+// and value straight into it. Pairs are walked by OFFSET — no split(), no
+// substring copies, no map: one member per pair, in wire order. A pair
+// without '=' is a key with an empty value.
 @[direct_array_access]
-fn parse_form(s []u8) map[string]string {
-	mut out := map[string]string{}
+fn write_form_json(mut out []u8, s []u8) {
+	out << `{`
+	mut first := true
 	mut pos := 0
 	for pos < s.len {
 		mut amp := pos // pair is s[pos..amp), amp = next '&' or end
@@ -90,28 +139,20 @@ fn parse_form(s []u8) map[string]string {
 		for eq < amp && s[eq] != `=` {
 			eq++
 		}
-		if eq < amp {
-			key := percent_decode(view(s, pos, eq - pos))
-			val := percent_decode(view(s, eq + 1, amp - eq - 1))
-			out[key] = val
-		} else {
-			out[percent_decode(view(s, pos, amp - pos))] = ''
+		if !first {
+			out << `,`
 		}
+		first = false
+		out << `"`
+		write_decoded_json(mut out, view(s, pos, eq - pos))
+		core.append_str(mut out, '":"')
+		if eq < amp {
+			write_decoded_json(mut out, view(s, eq + 1, amp - eq - 1))
+		}
+		out << `"`
 		pos = amp + 1
 	}
-	return out
-}
-
-// ---- zero-alloc append helpers (BEST_PRACTICES §3b) -------------------------
-// wi appends n's decimal digits into `out` — itoa into a stack scratch, then
-// append. No allocation, no `.str()`.
-fn wi(mut out []u8, n i64) {
-	mut scratch := [24]u8{}
-	mut view_ := unsafe { (&scratch[0]).vbytes(scratch.len) }
-	written := strconv.write_dec(n, mut view_)
-	if written > 0 {
-		unsafe { out.push_many(&scratch[0], written) }
-	}
+	out << `}`
 }
 
 // slice_eq compares a request Slice against a literal IN PLACE by offsets —
@@ -152,76 +193,69 @@ fn is_form_urlencoded(req request_parser.HttpRequest) bool {
 	return true
 }
 
-// write_json_escaped appends s into the builder with the escapes RFC 8259
-// REQUIRES inside a JSON string: `"`, `\` and control bytes < 0x20. Decoded
-// form values are user input — echoing them raw would produce broken (and
-// injectable) JSON (BEST_PRACTICES §8).
-@[direct_array_access]
-fn write_json_escaped(mut sb strings.Builder, s string) {
-	for i in 0 .. s.len {
-		c := s[i]
-		if c == `"` || c == backslash {
-			sb.write_u8(backslash)
-			sb.write_u8(c)
-		} else if c < 0x20 {
-			sb.write_string('\\u00')
-			sb.write_u8(hex_lower[int(c >> 4)])
-			sb.write_u8(hex_lower[int(c & 0x0F)])
-		} else {
-			sb.write_u8(c)
-		}
+// ---- zero-alloc append helper (BEST_PRACTICES §3b) --------------------------
+// frame_body puts `head`, the body's decimal length and `tail` in front of the
+// body the caller appended at out[mark..], in place: the body is already
+// written, so the Content-Length is exact. Grow `out` by the head's size,
+// shift the body right, copy the head into the gap (the in-place splice of
+// examples/security_headers). No padded length, no scratch buffer, and no
+// allocation once `out` has reached its high-water mark. Never slice `out`:
+// that would make the server drop its write buffer.
+fn frame_body(mut out []u8, mark int, head string, tail string) {
+	body_len := out.len - mark
+	mut digits := [24]u8{}
+	mut view_ := unsafe { (&digits[0]).vbytes(digits.len) }
+	n := strconv.write_dec(i64(body_len), mut view_)
+	gap := head.len + n + tail.len
+	unsafe {
+		out.grow_len(gap)
+		p := &u8(out.data) + mark
+		vmemmove(p + gap, p, body_len)
+		vmemcpy(p, head.str, head.len)
+		vmemcpy(p + head.len, &digits[0], n)
+		vmemcpy(p + head.len + n, tail.str, tail.len)
 	}
 }
 
 const resp_prefix = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: '
+const resp_prefix_tail = '\r\n\r\n'
 
 @[direct_array_access]
 fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
-	req := request_parser.decode_http_request(req_buffer) or {
+	// decode_into, not decode_http_request: a malformed request would box an
+	// error() per request there.
+	mut req := request_parser.HttpRequest{
+		buffer: req_buffer
+	}
+	if !request_parser.decode_into(mut req) {
 		out << response.tiny_bad_request_response
 		return .close
 	}
 
 	// Query string case: find '?' IN PLACE over the path bytes.
-	mut decoded := map[string]string{}
+	mut form_start := 0
+	mut form_len := 0
 	path_end := req.path.start + req.path.len
 	mut q := req.path.start
-	for q < path_end && req.buffer[q] != `?` {
+	for q < path_end && req_buffer[q] != `?` {
 		q++
 	}
 	if q < path_end {
-		decoded = parse_form(view(req.buffer, q + 1, path_end - q - 1))
+		form_start = q + 1
+		form_len = path_end - q - 1
 	}
 
 	// form-urlencoded body case — method and Content-Type compared in place.
-	if slice_eq(req.buffer, req.method, 'POST') && is_form_urlencoded(req) {
-		decoded = parse_form(view(req.buffer, req.body.start, req.body.len))
+	// The body replaces the query.
+	if slice_eq(req_buffer, req.method, 'POST') && is_form_urlencoded(req) {
+		form_start = req.body.start
+		form_len = req.body.len
 	}
 
-	// JSON echo. The body is genuinely dynamic (map contents), so it gets ONE
-	// strings.Builder — decoded output never exceeds the wire input, so the
-	// path+body seed only over-shoots by the escaping (rare). Zero `${}`.
-	mut body := strings.new_builder(64 + req.path.len + req.body.len)
-	body.write_u8(`{`)
-	mut first := true
-	for k, v in decoded {
-		if !first {
-			body.write_u8(`,`)
-		}
-		first = false
-		body.write_u8(`"`)
-		write_json_escaped(mut body, k)
-		body.write_string('":"')
-		write_json_escaped(mut body, v)
-		body.write_u8(`"`)
-	}
-	body.write_u8(`}`)
-	// Frame: const prefix + decimal length + blank line + the builder's bytes
-	// (Builder IS []u8 — it appends into `out` directly, no bytestr()).
-	core.append_str(mut out, resp_prefix)
-	wi(mut out, body.len)
-	core.append_str(mut out, '\r\n\r\n')
-	out << body
+	// JSON echo, decoded straight into `out`, then framed in place.
+	mark := out.len
+	write_form_json(mut out, view(req_buffer, form_start, form_len))
+	frame_body(mut out, mark, resp_prefix, resp_prefix_tail)
 	return .done
 }
 

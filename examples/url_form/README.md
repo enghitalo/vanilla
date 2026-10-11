@@ -63,18 +63,21 @@ not parsed as a form: `{}`.
 ## How it works
 
 - **Inputs are views.** The handler finds the `?` by scanning the path bytes
-  in place, and `view()` hands `parse_form` a `vbytes` window of the query or
-  the body, never a copy. `parse_form` walks `key=value&...` by offsets: no
-  `split`, no substrings. Empty pairs (`&&`) are skipped, a key without `=`
-  maps to `""`, and a repeated key keeps its last value.
-- **Outputs are owned, on purpose.** `percent_decode` calls the library's
-  `request_parser.percent_decode_into`, which turns `%XX` into a byte and `+`
-  into a space, and returns a new `string`: decoded bytes differ from the wire
-  bytes and become map entries. A handler that only reads a value decodes it
-  into `out` or a per-worker scratch with the same helper, allocating nothing. That copy per key and value
-  (plus the map itself) is the allocation this example exists to show;
-  everything around it reads the request in place
+  in place, and `view()` hands `write_form_json` a `vbytes` window of the
+  query or the body, never a copy. `write_form_json` walks `key=value&...` by
+  offsets: no `split`, no substrings, no map. Empty pairs (`&&`) are skipped,
+  a key without `=` gets `""`, and each pair becomes one JSON member, in wire
+  order, so a repeated key (`tag=a&tag=b`, the usual multi-value form) appears
+  once per pair.
+- **Decoded straight into the response.** `write_decoded_json` calls the
+  library's `request_parser.percent_decode_into`, which turns `%XX` into a
+  byte and `+` into a space, writing into `out` itself; the JSON escapes are
+  then made in place. The decoded pairs are used once, within the call, so
+  they never exist as strings, in a map or in a builder: a request allocates
+  nothing
   ([BEST_PRACTICES §2](../../docs/BEST_PRACTICES.md#2-stay-zero-copy-work-with-slices-not-copies)).
+  A handler that must keep a value decodes it into an owned buffer with the
+  same helper.
 - **Decode once.** Decoding an already-decoded value is a classic filter
   bypass (`%2527` → `%27` → `'`). The result of the single pass is final.
   Malformed escapes (`100%`, `%zz`, `%2`) are kept as literal text.
@@ -84,14 +87,15 @@ not parsed as a form: `{}`.
   (a `; charset=...` suffix is fine). A form body replaces any query pairs.
   The core has already framed the body by `Content-Length` or chunked
   encoding, so `req.body` is complete.
-- **Escape what you echo.** `write_json_escaped` escapes `"`, `\` and
+- **Escape what you echo.** `write_decoded_json` escapes `"`, `\` and
   control bytes (`%0A` comes back as `\u000a`), so user input cannot break
   out of the JSON string
   ([BEST_PRACTICES §8](../../docs/BEST_PRACTICES.md#8-security-defaults)).
   Bytes ≥ 0x80 pass through as they are.
-- **Framing.** The JSON body is built in one `strings.Builder` sized from the
-  path and body lengths; the response is `resp_prefix` + `wi` (the length) +
-  the builder's bytes, appended straight into `out`
+- **Framing.** The JSON body is written into `out` first; `frame_body` then
+  puts `resp_prefix`, the exact `Content-Length` and the blank line in front
+  of it, in place (grow `out`, move the body right, copy the head into the
+  gap)
   ([BEST_PRACTICES §3b](../../docs/BEST_PRACTICES.md#3b-dynamic-responses--append-parts-straight-into-out)).
 
 ## Tests
@@ -100,12 +104,13 @@ not parsed as a form: `{}`.
 v test examples/url_form/src
 ```
 
-[main_test.v](src/main_test.v) table-tests `percent_decode` (escapes, `+`,
-empty input, `%2527` decoded once, malformed escapes left literal) and
-`parse_form`, then calls `handle` with raw requests: a decoded query, `+` as
+[main_test.v](src/main_test.v) table-tests the decoder (escapes, `+`, empty
+input, `%2527` decoded once, malformed escapes left literal, JSON escapes) and
+`write_form_json` (repeated keys echoed per pair), checks `frame_body` behind
+earlier bytes, then calls `handle` with raw requests: a decoded query, `+` as
 space, an empty query, form bodies (including odd `Content-Type` casing and a
-charset suffix), a JSON body left unparsed, an escaped `"` in the echo, and
-the canned 400 on garbage.
+charset suffix), a JSON body left unparsed, an escaped `"` in the echo, the
+canned 400 on garbage, and that no request allocates.
 
 ## See also
 
