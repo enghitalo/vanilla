@@ -313,23 +313,26 @@ fn parse_dec(buf []u8, from int, to int) i64 {
 
 // RangeSpec is what parse_range makes of a Range header value.
 enum RangeSpec {
-	ignore        // not one valid byte range: the caller serves the whole file (200)
+	ignore        // a Range the caller ignores: it serves the whole file (200)
 	satisfiable   // the inclusive window start..end, inside the file (206)
-	unsatisfiable // a valid range that selects no byte of the file (416)
+	unsatisfiable // valid but unsatisfiable (RFC 9110 §14.1.2): the caller answers 416
 }
 
 // parse_range reads a Range header value through a byte VIEW: no substr, no
 // split(), no intermediate strings, no error() to box. It takes one byte
 // range, `bytes=FIRST-LAST`, `bytes=FIRST-` or `bytes=-SUFFIX`, each number
-// all digits (RFC 9110 §14.1.1):
-//   - .ignore: anything else, which RFC 9110 §14.2 lets a server ignore (the
-//     caller serves the whole file, 200): a unit other than a lowercase
-//     `bytes`, a malformed spec, more than one range, a LAST below its FIRST.
-//   - .unsatisfiable: a valid range that selects no byte: a FIRST at or past
-//     the end of the file, a SUFFIX of 0, any range on an empty file.
+// all digits (RFC 9110 §14.1.1). RFC 9110 §14.2 lets a server ignore a Range
+// header; §14.1.2 says which ones are unsatisfiable:
+//   - .ignore: anything else (a unit other than a lowercase `bytes`, a
+//     malformed spec, more than one range, a LAST below its FIRST), and a
+//     SUFFIX above 0 on an empty file: satisfiable, but it selects no byte
+//     a 206 could carry, and §14.2 lets a server ignore Range on an empty
+//     representation.
+//   - .unsatisfiable: a FIRST at or past the end of the file, so any FIRST on
+//     an empty file, or a SUFFIX of 0.
 //   - .satisfiable, start, end: the rest, with 0 <= start <= end < size. A
 //     LAST at or past the end of the file, or none, means up to the last
-//     byte, and a SUFFIX longer than the file means the whole file (RFC 9110
+//     byte, and a SUFFIX longer than the file means the whole file (both
 //     §14.1.2).
 @[direct_array_access]
 fn parse_range(h []u8, size i64) (RangeSpec, i64, i64) {
@@ -360,7 +363,7 @@ fn parse_range(h []u8, size i64) (RangeSpec, i64, i64) {
 	if dash == prefix.len {
 		// suffix range "bytes=-N": the LAST N bytes
 		n := parse_dec(h, dash + 1, h.len)
-		if n < 0 {
+		if n < 0 || (n > 0 && size == 0) {
 			return .ignore, 0, 0
 		}
 		start = if n >= size { i64(0) } else { size - n }
@@ -379,8 +382,8 @@ fn parse_range(h []u8, size i64) (RangeSpec, i64, i64) {
 			}
 		}
 	}
-	// start > end: FIRST past the last byte, SUFFIX 0 (start = size), or an
-	// empty file (end = -1).
+	// start > end: a FIRST at or past the end of the file (end = -1 on an
+	// empty one), or a SUFFIX of 0.
 	if start > end {
 		return .unsatisfiable, 0, 0
 	}
@@ -442,13 +445,18 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, m
 
 	// Range request: serve 206 Partial Content (this is how seeking works).
 	// It needs only the size, so the status line is known before the body.
+	// Only a GET looks at Range: RFC 9110 §14.2 defines range handling for
+	// GET alone, and a server MUST ignore Range on any other method, so a HEAD
+	// answers as if it had none.
 	mut spec := RangeSpec.ignore
 	mut start := i64(0)
 	mut end := i64(0)
-	if rng := req.get_header_value_slice('Range') {
-		if rng.len > 0 {
-			rview := unsafe { (&req_buffer[rng.start]).vbytes(rng.len) } // view
-			spec, start, end = parse_range(rview, size)
+	if is_get {
+		if rng := req.get_header_value_slice('Range') {
+			if rng.len > 0 {
+				rview := unsafe { (&req_buffer[rng.start]).vbytes(rng.len) } // view
+				spec, start, end = parse_range(rview, size)
+			}
 		}
 	}
 
@@ -512,8 +520,9 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, m
 			return .done
 		}
 	}
-	// A range that selects no byte: 416, with the file's length in
-	// Content-Range (RFC 9110 §15.5.17, §14.4) and no body, for GET and HEAD.
+	// An unsatisfiable range, which only a GET can have (see above): 416, with
+	// the file's length in Content-Range (RFC 9110 §15.5.17, §14.4) and no
+	// body.
 	if spec == .unsatisfiable {
 		unsafe {
 			out.len = mark

@@ -84,9 +84,8 @@ ETag: "f4a79a6166757a19"
 from vanilla</h1>
 ```
 
-A range that selects no byte (a start at or past the end, `bytes=-0`, any
-range on an empty file) gets a 416 carrying the file's length, on GET and
-HEAD alike:
+A range that cannot be satisfied (a start at or past the end, so any start on
+an empty file, or `bytes=-0`) gets a 416 carrying the file's length:
 
 ```sh
 curl -i -r 500-600 localhost:3000/index.html
@@ -102,7 +101,14 @@ Connection: keep-alive
 
 A spec that is not one valid byte range is ignored, and the whole file comes
 back as a 200 (RFC 9110 §14.2 lets a server ignore `Range`): several ranges
-(`-r 0-1,5-6`), an end before its start (`-r 9-3`), anything malformed.
+(`-r 0-1,5-6`), an end before its start (`-r 9-3`), anything malformed. So is
+a suffix such as `-r -5` on an empty file: RFC 9110 counts it as satisfiable,
+but it selects no byte a 206 could carry, so the empty file comes back as a
+200.
+
+Only a GET looks at `Range`: RFC 9110 §14.2 defines range handling for GET
+alone, so `curl -I -r 500-600 localhost:3000/index.html` gets the same 200
+headers as `curl -I localhost:3000/index.html`.
 
 **ETag / 304** — send the `ETag` back and the body is not resent:
 
@@ -168,7 +174,8 @@ same 404. `curl -i -X POST localhost:3000/index.html` gets
   `out` back to where the response began (`out.len = mark`); a 206 moves its
   window down over the bytes before it (never `content[a..b]`); HEAD drops
   the body.
-- **Range.** `parse_range` reads the header through a `vbytes` view of the
+- **Range.** Only a GET reads the header (RFC 9110 §14.2), so a HEAD answers
+  as if it had none. `parse_range` reads it through a `vbytes` view of the
   request buffer (no substring, no `split`) and returns a `RangeSpec`:
   `.satisfiable` with the window, `.unsatisfiable` or `.ignore`, with no
   `error()` to box. It accepts a single range whose numbers are all digits:
@@ -184,7 +191,7 @@ same 404. `curl -i -X POST localhost:3000/index.html` gets
   `core.append_str` plus the local `wi` for integers
   ([BEST_PRACTICES §3b](../../docs/BEST_PRACTICES.md#3b-dynamic-responses--append-parts-straight-into-out)).
   A request allocates nothing (`test_serving_allocates_nothing`).
-- HEAD gets the same headers as GET with no body (`is_get`).
+- HEAD gets the headers a GET without `Range` gets, and no body (`is_get`).
 
 ## Tests
 
@@ -196,15 +203,17 @@ v test examples/static_files/src
 fixture in a temp dir (with symlinks pointing in and out of the root, a
 directory, a FIFO and an empty file) and calls `handle` directly. It covers
 `parse_range` (normal, suffix, open-ended, an end past the file, the
-unsatisfiable and the ignored specs, numbers past `i64`), `mime_type`,
-traversal (`..`, the `public2` sibling, an escaping symlink, unresolvable
-paths and symlink loops, a NUL, an over-long path), and raw-request cases:
-index, query strip, HEAD, 404 (also for the directory, the FIFO and a path
-ending in `/`), 405, 206 (a window from the middle, an end past the file,
-HEAD), 416 (GET and HEAD, the empty file), a 304 that wins over a 416, the
-fallback to 200, the ETag → 304 round trip, a response already in `out` left
-intact by a 304, a 206 and a 416, the canned 400 on garbage, and that serving
-allocates nothing (a `gc_heap_usage()` delta over 20k rounds of requests).
+unsatisfiable and the ignored specs, a suffix on an empty file, numbers past
+`i64`), `mime_type`, traversal (`..`, the `public2` sibling, an escaping
+symlink, unresolvable paths and symlink loops, a NUL, an over-long path), and
+raw-request cases: index, query strip, HEAD, 404 (also for the directory, the
+FIFO and a path ending in `/`), 405, 206 (a window from the middle, an end
+past the file), 416 (the empty file too), a HEAD with a Range and a suffix on
+the empty file answered byte for byte like the request without one, a 304
+that wins over a 416, the fallback to 200, the ETag → 304 round trip, a
+response already in `out` left intact by a 304, a 206 and a 416, the canned
+400 on garbage, and that serving allocates nothing (a `gc_heap_usage()` delta
+over 20k rounds of requests).
 
 ## See also
 
