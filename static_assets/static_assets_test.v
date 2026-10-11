@@ -8,6 +8,7 @@ import os
 import time
 import sync.stdatomic
 import core
+import http1_1.request_parser
 
 // A small built bundle written to a temp dir for the suite to serve.
 const fixture_root = os.join_path(os.temp_dir(), 'vanilla_static_assets_fixture')
@@ -276,9 +277,11 @@ fn test_large_asset_range() {
 
 // --- conditional GET + Range edge cases (zero-copy slice parsing) ------------
 //
-// These pin the byte-scan etag_matches_slice / parse_range_slice rewrites: same
-// behavior as the old string-split parsers, but reading straight off the request
-// buffer with no per-request allocation.
+// These pin the byte-scan etag_matches_slice / parse_range_slice parsers, which
+// read straight off the request buffer with no per-request allocation. Range
+// follows RFC 9110 §14 (#308): an end past the body is clamped, a range that
+// cannot be satisfied gets a 416, and anything that is not one valid byte range
+// is ignored (a 200).
 
 fn test_etag_weak_validator_matches() {
 	s := server()
@@ -327,18 +330,240 @@ fn test_range_wrong_unit_falls_through_to_200() {
 	assert resp.starts_with('HTTP/1.1 200')
 }
 
-fn test_range_unsatisfiable_falls_through_to_200() {
-	// start beyond EOF (8-byte asset) → none → full 200.
-	resp :=
-		server().respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=900-1000'))!.bytestr()
-	assert resp.starts_with('HTTP/1.1 200')
+// A start past the end of the body (8-byte asset) is unsatisfiable: a 416
+// with the body's length, no body, and no ETag, Cache-Control or Vary (#308;
+// it was ignored for a 200). The same bytes through respond_into.
+fn test_range_unsatisfiable_gets_416() {
+	s := server()
+	want := 'HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */8\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+	for rng in ['bytes=900-1000', 'bytes=8-', 'bytes=8-8', 'bytes=-0'] {
+		r := req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: ' + rng)
+		assert s.respond(r)!.bytestr() == want, rng
+		mut out := []u8{}
+		s.respond_into(r, mut out)!
+		assert out.bytestr() == want, rng
+	}
 }
 
-fn test_range_absurd_number_falls_through_to_200() {
-	// A number past i64 saturates (does not wrap to a valid offset) → none → 200.
+// A number past i64 saturates instead of wrapping (2^64 would wrap to offset
+// 0): as a start it is past the end, a 416 (#308; it was ignored for a 200),
+// and as an end or a suffix it takes the whole body.
+fn test_range_absurd_number_saturates() {
+	s := server()
 	resp :=
-		server().respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=18446744073709551616-'))!.bytestr()
-	assert resp.starts_with('HTTP/1.1 200')
+		s.respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=18446744073709551616-'))!.bytestr()
+	assert resp.starts_with('HTTP/1.1 416 Range Not Satisfiable\r\n')
+	assert resp.contains('\r\nContent-Range: bytes */8\r\n')
+	for rng in ['bytes=0-18446744073709551615', 'bytes=-18446744073709551616'] {
+		whole := s.respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: ' + rng))!
+		assert whole.bytestr().starts_with('HTTP/1.1 206'), rng
+		assert header_value(whole, 'Content-Range') == 'bytes 0-7/8', rng
+		assert body_of(whole) == [u8(0x00), `a`, `s`, `m`, 0x01, 0x00, 0x00, 0x00], rng
+	}
+	// A LAST below its FIRST is not a valid range, saturated or not: ignored.
+	resp2 :=
+		s.respond(req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=18446744073709551616-0'))!.bytestr()
+	assert resp2.starts_with('HTTP/1.1 200')
+}
+
+// range_of is parse_range_slice as a string: `start-end` for a satisfiable
+// range, else the outcome's name. The spec sits inside a larger buffer, with
+// digits after it, so a parser reading outside its slice shows.
+fn range_of(spec string, size i64) string {
+	buf := ('Range: ' + spec + '77').bytes()
+	kind, s, e := parse_range_slice(buf, request_parser.Slice{ start: 7, len: spec.len }, size)
+	return if kind == .satisfiable { '${s}-${e}' } else { '${kind}' }
+}
+
+// On an 18-byte body. RFC 9110 §14.1.2: a LAST at or past the end, or none,
+// runs to the last byte (#308), and a SUFFIX longer than the body is all of it.
+fn test_parse_range_slice() {
+	assert range_of('bytes=0-3', 18) == '0-3'
+	assert range_of('bytes=7-11', 18) == '7-11'
+	assert range_of('bytes=4-4', 18) == '4-4'
+	assert range_of('bytes=7-1000', 18) == '7-17'
+	assert range_of('bytes=0-17', 18) == '0-17'
+	assert range_of('bytes=0-18', 18) == '0-17'
+	assert range_of('bytes=10-', 18) == '10-17' // open-ended
+	assert range_of('bytes=17-', 18) == '17-17'
+	assert range_of('bytes=-3', 18) == '15-17' // suffix: the last 3 bytes
+	assert range_of('bytes=-18', 18) == '0-17'
+	assert range_of('bytes=-100', 18) == '0-17'
+	assert range_of('bytes=007-011', 18) == '7-11' // leading zeros are digits
+}
+
+// RFC 9110 §14.1.2: unsatisfiable are a FIRST at or past the end, so any
+// FIRST on an empty body, and a SUFFIX of 0.
+fn test_parse_range_slice_unsatisfiable() {
+	assert range_of('bytes=900-1000', 18) == 'unsatisfiable'
+	assert range_of('bytes=18-', 18) == 'unsatisfiable'
+	assert range_of('bytes=18-30', 18) == 'unsatisfiable'
+	assert range_of('bytes=-0', 18) == 'unsatisfiable'
+	assert range_of('bytes=0-', 0) == 'unsatisfiable'
+	assert range_of('bytes=0-0', 0) == 'unsatisfiable'
+	assert range_of('bytes=-0', 0) == 'unsatisfiable'
+}
+
+// A SUFFIX above 0 on an empty body is satisfiable (RFC 9110 §14.1.2) but
+// selects no byte a 206 could carry, so it is ignored: a 200 with the empty
+// body (§14.2 lets a server ignore Range on an empty representation).
+fn test_parse_range_slice_suffix_on_empty_body_is_ignored() {
+	assert range_of('bytes=-5', 0) == 'ignore'
+	assert range_of('bytes=-1', 0) == 'ignore'
+	assert range_of('bytes=-99999999999999999999999', 0) == 'ignore'
+	assert range_of('bytes=-1', 1) == '0-0' // one byte is enough for a 206
+}
+
+// Not one valid byte range: ignored, so the caller serves a 200. LAST below
+// FIRST, another unit (the unit is matched lowercase), more than one range, a
+// side that is not all digits (until #308 its leading digits were read, so
+// `bytes= 7-9` was served as bytes 0-9), no number at all.
+fn test_parse_range_slice_ignores_invalid_specs() {
+	for spec in ['bytes=900-100', 'bytes=9-3', 'items=0-9', 'Bytes=0-9', 'bytes=0-99-100',
+		'bytes=0-1,5-6', 'bytes=0-1,5', 'bytes=-1,-2', 'bytes=0-0,-1', 'bytes=-', 'bytes=', 'bytes=5',
+		'bytes=a-b', 'bytes=5x-10', 'bytes=0-9x', 'bytes= 7-9', 'bytes=7 -9', 'bytes=-x', '-5',
+		'', 'bytes'] {
+		assert range_of(spec, 18) == 'ignore', spec
+	}
+	assert range_of('bytes=5-2', 0) == 'ignore' // invalid comes first, even on an empty body
+}
+
+// RFC 9110 §14.1.2: a recipient expects numbers of any length. Past max_i64
+// a position saturates instead of wrapping (2^64 would wrap to offset 0).
+fn test_parse_range_slice_saturates_huge_numbers() {
+	assert range_of('bytes=18446744073709551616-', 18) == 'unsatisfiable'
+	assert range_of('bytes=99999999999999999999999-99999999999999999999999', 18) == 'unsatisfiable'
+	assert range_of('bytes=0-18446744073709551615', 18) == '0-17'
+	assert range_of('bytes=-18446744073709551616', 18) == '0-17'
+	assert range_of('bytes=18446744073709551616-0', 18) == 'ignore' // LAST < FIRST
+	dec := '9223372036854775807 9223372036854775808 922337203685477580 0'.bytes()
+	assert parse_dec_window(dec, 0, 19) == max_i64
+	assert parse_dec_window(dec, 20, 39) == max_i64
+	assert parse_dec_window(dec, 40, 58) == 922337203685477580
+	assert parse_dec_window(dec, 59, 60) == 0
+	assert parse_dec_window(dec, 3, 3) == -1 // empty window
+	assert parse_dec_window(dec, 17, 21) == -1 // `07 9`: not all digits
+}
+
+// A LAST at or past the end of the body runs to its last byte (#308; it was
+// ignored for a 200 with the whole body), and so does a SUFFIX longer than
+// the body. In RAM and disk-backed alike, through respond and respond_into.
+fn test_range_end_past_the_body_is_clamped() {
+	s := server()
+	e_js := s.etag_for('app.abc123.js')!
+	clamped := 'HTTP/1.1 206 Partial Content\r\nContent-Type: text/javascript; charset=utf-8\r\nContent-Range: bytes 7-17/18\r\nContent-Length: 11\r\nAccept-Ranges: bytes\r\nETag: ${e_js}\r\nCache-Control: public, max-age=31536000, immutable\r\nVary: Accept-Encoding\r\nConnection: keep-alive\r\n\r\nconst x = 1'
+	r := req('GET /app.abc123.js HTTP/1.1\r\nRange: bytes=7-1000')
+	assert s.respond(r)!.bytestr() == clamped
+	mut out := []u8{}
+	s.respond_into(r, mut out)!
+	assert out.bytestr() == clamped
+	for rng in ['bytes=0-17', 'bytes=0-99', 'bytes=0-', 'bytes=-18', 'bytes=-100'] {
+		whole := s.respond(req('GET /app.abc123.js HTTP/1.1\r\nRange: ' + rng))!
+		assert whole.bytestr().starts_with('HTTP/1.1 206 Partial Content\r\n'), rng
+		assert header_value(whole, 'Content-Range') == 'bytes 0-17/18', rng
+		assert header_value(whole, 'Content-Length') == '18', rng
+		assert body_of(whole).bytestr() == 'export const x = 1', rng
+	}
+	big_req := req('GET /big.0a1b2c.wasm HTTP/1.1\r\nRange: bytes=524000-9999999')
+	big := s.respond(big_req)!
+	assert header_value(big, 'Content-Range') == 'bytes 524000-524287/${big_size}'
+	assert header_value(big, 'Content-Length') == '288'
+	mut want := []u8{}
+	for i in 524000 .. big_size {
+		want << u8(i & 0xff)
+	}
+	assert body_of(big) == want
+	out.clear()
+	s.respond_into(big_req, mut out)!
+	assert out == big
+}
+
+// A disk-backed body gets the same 416, and respond_into appends it after
+// what `out` already holds (a pipelined response before it).
+fn test_range_unsatisfiable_disk_backed_and_appended() {
+	s := server()
+	want := 'HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */${big_size}\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+	r := req('GET /big.0a1b2c.wasm HTTP/1.1\r\nRange: bytes=${big_size}-')
+	assert s.respond(r)!.bytestr() == want
+	earlier := 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'
+	mut out := earlier.bytes()
+	s.respond_into(r, mut out)!
+	assert out.bytestr() == earlier + want
+}
+
+// Range is evaluated after If-None-Match (RFC 9110 §13.2.2), which is
+// compared with the identity ETag alone, as for a 206: a current identity
+// copy gets its 304, even when the range would get a 416, and a current br
+// copy does not. An If-Range that is not the identity ETag ignores the Range,
+// unsatisfiable or not (§13.1.5).
+fn test_range_unsatisfiable_with_preconditions() {
+	s := server()
+	e_id := s.etag_for('app.abc123.js')!
+	e_br := header_value(s.respond(req('GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: br'))!,
+		'ETag')
+	unsat := 'GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: br\r\nRange: bytes=900-1000'
+	want_416 := 'HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */18\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+	assert s.respond(req(unsat))!.bytestr() == want_416
+	nm := s.respond(req(unsat + '\r\nIf-None-Match: ' + e_id))!.bytestr()
+	assert nm == 'HTTP/1.1 304 Not Modified\r\nETag: ${e_id}\r\nCache-Control: public, max-age=31536000, immutable\r\nVary: Accept-Encoding\r\nConnection: keep-alive\r\n\r\n'
+	// Neither a stale ETag nor the br one validates a range of the identity bytes.
+	for tag in ['"deadbeefdeadbeef"', e_br] {
+		assert s.respond(req(unsat + '\r\nIf-None-Match: ' + tag))!.bytestr() == want_416, tag
+	}
+	// If-Range: the identity ETag lets the Range apply; anything else ignores it,
+	// and the request is served as without one: negotiated, validated.
+	assert s.respond(req(unsat + '\r\nIf-Range: ' + e_id))!.bytestr() == want_416
+	ignored := unsat + '\r\nIf-Range: "deadbeefdeadbeef"'
+	full := s.respond(req(ignored))!
+	assert full.bytestr().starts_with('HTTP/1.1 200')
+	assert header_value(full, 'Content-Encoding') == 'br'
+	assert body_of(full).bytestr() == 'BROTLI-APP-JS'
+	assert s.respond(req(ignored + '\r\nIf-None-Match: ' + e_br))!.bytestr().starts_with('HTTP/1.1 304')
+	mut out := []u8{}
+	s.respond_into(req(ignored), mut out)!
+	assert out == full
+}
+
+// RFC 9110 §14.2 defines range handling for GET only: a HEAD with a Range,
+// whatever it asks for, gets exactly the plain HEAD response, in RAM and
+// disk-backed alike.
+fn test_head_ignores_range() {
+	s := server()
+	for path in ['/app.abc123.js', '/big.0a1b2c.wasm'] {
+		plain := s.respond(req('HEAD ${path} HTTP/1.1'))!
+		assert plain.bytestr().starts_with('HTTP/1.1 200 OK\r\n'), path
+		assert body_of(plain).len == 0, path
+		for rng in ['bytes=0-3', 'bytes=10-100000000', 'bytes=-3', 'bytes=900000-', 'bytes=-0',
+			'bytes=9-3', 'bytes=0-1,5-6', 'items=0-4'] {
+			r := req('HEAD ${path} HTTP/1.1\r\nRange: ' + rng)
+			assert s.respond(r)! == plain, '${path} ${rng}'
+			mut out := []u8{}
+			s.respond_into(r, mut out)!
+			assert out == plain, '${path} ${rng}'
+		}
+	}
+}
+
+// An empty body: any FIRST and a SUFFIX of 0 are unsatisfiable (416 with
+// length 0); a SUFFIX above 0, and an invalid spec, are ignored: the GET gets
+// the plain 200 of the empty file, byte for byte.
+fn test_range_on_an_empty_body() {
+	dir := fd_dir('empty_body')
+	defer {
+		os.rmdir_all(dir) or {}
+	}
+	os.write_file(os.join_path(dir, 'empty.txt'), '') or { panic(err) }
+	s := new(Config{ root: dir }) or { panic(err) }
+	plain := s.respond(req('GET /empty.txt HTTP/1.1'))!
+	assert plain.bytestr().starts_with('HTTP/1.1 200 OK\r\n')
+	assert header_value(plain, 'Content-Length') == '0'
+	want_416 := 'HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */0\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+	for rng in ['bytes=0-', 'bytes=0-0', 'bytes=-0'] {
+		assert s.respond(req('GET /empty.txt HTTP/1.1\r\nRange: ' + rng))!.bytestr() == want_416, rng
+	}
+	for rng in ['bytes=-5', 'bytes=-1', 'bytes=5-2'] {
+		assert s.respond(req('GET /empty.txt HTTP/1.1\r\nRange: ' + rng))! == plain, rng
+	}
 }
 
 // --- url_prefix mount -------------------------------------------------------
@@ -523,10 +748,12 @@ fn test_range_if_none_match_uses_the_identity_etag() {
 	assert header_value(part, 'ETag') == e_id
 	assert body_of(part).bytestr() == 'export'
 	// A Range that does not apply is ignored: the negotiated representation is
-	// validated and served as without one.
-	unsat := 'GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: br\r\nRange: bytes=900-1000\r\nIf-None-Match: '
-	assert s.respond(req(unsat + e_br))!.bytestr().starts_with('HTTP/1.1 304')
-	full := s.respond(req(unsat + e_id))!
+	// validated and served as without one. Here it is not a valid range (a
+	// LAST below its FIRST); an unsatisfiable one applies and gets a 416 (#308,
+	// test_range_unsatisfiable_with_preconditions).
+	ignored := 'GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: br\r\nRange: bytes=9-3\r\nIf-None-Match: '
+	assert s.respond(req(ignored + e_br))!.bytestr().starts_with('HTTP/1.1 304')
+	full := s.respond(req(ignored + e_id))!
 	assert full.bytestr().starts_with('HTTP/1.1 200')
 	assert header_value(full, 'Content-Encoding') == 'br'
 }
@@ -839,6 +1066,12 @@ fn test_follow_range_does_not_revalidate_encoded_representations() {
 		panic(err)
 	}
 	assert body_of(r).bytestr() == 'body'
+	assert voidptr(snap_of(s, 'f.css', slot_br)) == voidptr(br_boot)
+	// So is a 416: the Range is unsatisfiable for the identity body.
+	r416 := s.respond(req('GET /f.css HTTP/1.1\r\nAccept-Encoding: br\r\nRange: bytes=900-')) or {
+		panic(err)
+	}
+	assert r416.bytestr().starts_with('HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */14\r\n')
 	assert voidptr(snap_of(s, 'f.css', slot_br)) == voidptr(br_boot)
 	// The next request that negotiates br picks the new version up.
 	r2 := s.respond(req('GET /f.css HTTP/1.1\r\nAccept-Encoding: br')) or { panic(err) }
@@ -1154,6 +1387,19 @@ fn test_follow_sendfile_handoff() {
 }
 
 // --- no allocation per request -----------------------------------------------
+//
+// Each request is served on its own: a warm-up, then alloc_rounds times while
+// the GC's lifetime allocation counter is watched (it stays 0 on -gc none and
+// -race builds). It must grow by less than alloc_budget, so a path that leaks
+// even one byte per request fails, whichever path it is.
+
+const alloc_rounds = 2000
+const alloc_budget = u64(1024)
+
+// shown names a request in a failure message: its lines, CRLF made visible.
+fn shown(r []u8) string {
+	return r.bytestr().trim_space().replace('\r\n', ' | ')
+}
 
 fn test_respond_into_does_not_allocate() {
 	s := server()
@@ -1168,48 +1414,63 @@ fn test_respond_into_does_not_allocate() {
 		req('GET /app.abc123.js HTTP/1.1\r\nRange: bytes=0-5\r\nIf-Range: "deadbeefdeadbeef"'),
 		req('GET /big.0a1b2c.wasm HTTP/1.1'), // disk-backed on Linux: pread into out
 		req('GET /big.0a1b2c.wasm HTTP/1.1\r\nRange: bytes=100-50000'),
+		req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=2-1000'), // a clamped 206
+		req('GET /big.0a1b2c.wasm HTTP/1.1\r\nRange: bytes=524000-9999999'), // clamped, disk-backed
+		req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=900-1000'), // 416
+		req('GET /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=-0'), // 416
+		req('GET /big.0a1b2c.wasm HTTP/1.1\r\nRange: bytes=99999999999999999999999-'), // 416, saturated
+		req('GET /app.abc123.js HTTP/1.1\r\nRange: bytes=900-\r\nIf-None-Match: ' + e_js), // 304 over a 416
+		req('GET /app.abc123.js HTTP/1.1\r\nRange: bytes=0-1,5-6'), // ignored: 200
+		req('HEAD /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=900-'), // HEAD ignores Range
 		req('GET /users/42 HTTP/1.1'),
 		req('GET /nope.9f3a1c.wasm HTTP/1.1'),
 	]
 	mut out := []u8{cap: 2 * big_size}
-	// Warm up, then count what the GC hands out (0 on -gc none / -race builds).
 	for r in reqs {
-		out.clear()
-		s.respond_into(r, mut out)!
+		for _ in 0 .. 3 {
+			out.clear()
+			s.respond_into(r, mut out)!
+		}
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. alloc_rounds {
+			out.clear()
+			s.respond_into(r, mut out)!
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert grown < alloc_budget, 'respond_into allocated ${grown} bytes over ${alloc_rounds} of: ${shown(r)}'
 	}
-	before := gc_heap_usage().total_bytes
-	for i in 0 .. 10_000 {
-		out.clear()
-		s.respond_into(reqs[i % reqs.len], mut out)!
-	}
-	grown := gc_heap_usage().total_bytes - before
-	assert grown < 16 * 1024, 'respond_into allocated ${grown} bytes over 10k requests'
 }
 
 fn test_respond_does_not_allocate_for_in_memory_replies() {
 	s := server()
 	e_js := s.etag_for('app.abc123.js')!
 	// A 200, HEAD or 304 of a snapshot is a view of its bytes and a 404 or 405
-	// a constant: respond() has nothing to allocate for them.
+	// a constant: respond() has nothing to allocate for them, Range or not.
 	reqs := [
 		req('GET /app.abc123.js HTTP/1.1'),
 		req('GET /app.abc123.js HTTP/1.1\r\nAccept-Encoding: gzip, br'),
 		req('GET /app.abc123.js HTTP/1.1\r\nIf-None-Match: ' + e_js),
 		req('GET /app.abc123.js HTTP/1.1\r\nRange: bytes=0-5\r\nIf-Range: "deadbeefdeadbeef"'),
+		req('GET /app.abc123.js HTTP/1.1\r\nRange: bytes=900-\r\nIf-Range: "deadbeefdeadbeef"'),
+		req('GET /app.abc123.js HTTP/1.1\r\nRange: bytes=900-\r\nIf-None-Match: ' + e_js),
+		req('GET /app.abc123.js HTTP/1.1\r\nRange: bytes=0-1,5-6'),
+		req('HEAD /core.9f3a1c.wasm HTTP/1.1\r\nRange: bytes=900-'),
 		req('HEAD /big.0a1b2c.wasm HTTP/1.1'),
 		req('GET /users/42 HTTP/1.1'),
 		req('GET /nope.9f3a1c.wasm HTTP/1.1'),
 		req('POST / HTTP/1.1'),
 	]
-	mut total := 0
 	for r in reqs {
-		total += s.respond(r)!.len
+		mut total := 0
+		for _ in 0 .. 3 {
+			total += s.respond(r)!.len
+		}
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. alloc_rounds {
+			total += s.respond(r)!.len
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert total > 0
+		assert grown < alloc_budget, 'respond allocated ${grown} bytes over ${alloc_rounds} of: ${shown(r)}'
 	}
-	before := gc_heap_usage().total_bytes
-	for i in 0 .. 10_000 {
-		total += s.respond(reqs[i % reqs.len])!.len
-	}
-	grown := gc_heap_usage().total_bytes - before
-	assert total > 0
-	assert grown < 16 * 1024, 'respond allocated ${grown} bytes over 10k requests'
 }

@@ -27,11 +27,11 @@ module static_assets
 // of one version of its file: the complete precomputed HTTP response for it
 // (status line + headers, plus the body when the body is kept in RAM), its
 // strong ETag (one per representation) and its precomputed 304. A snapshot is
-// never modified after it is published, so `respond()` is a lock-free read
-// shared across all worker threads and every response path, 200, HEAD, 304
-// and 206, appends precomputed or computed-in-place bytes with zero
-// allocation. `respond()` is a pure function of the request bytes —
-// socket-free and E2E-testable exactly like the rest of vanilla.
+// never modified after it is published, so serving is a lock-free read shared
+// across all worker threads. respond_into() appends every response (200,
+// HEAD, 304, 206, 416) with zero allocation; respond() builds a 206, a 416 or
+// a disk-backed body into a new buffer. `respond()` is a pure function of the
+// request bytes — socket-free and E2E-testable like the rest of vanilla.
 //
 // FOLLOWING THE DISK (`Config.follow_disk`, off by default): a representation
 // re-checks its file with one stat(2) per `revalidate_ms` window, made by the
@@ -208,7 +208,7 @@ const slot_gzip = 2
 const etag_placeholder = '"0000000000000000"'
 
 // Room for the status line and the fixed header names and values of a 200,
-// 206 or 304, on top of the content type and cache policy.
+// 206, 304 or 416, on top of the content type and cache policy.
 const head_room = 288
 
 // A body larger than this is never kept in RAM (its length must fit an array).
@@ -408,11 +408,11 @@ fn (s &AssetServer) route(req &request_parser.HttpRequest) ([]u8, &Asset, bool) 
 // socket-free — the testable contract. It never touches a socket, so it is
 // unit-testable by feeding a request and asserting the returned bytes. Returns
 // an error only when the request bytes cannot be parsed (map to 400); every
-// other case (404, 405, ...) is a normal response. A plain 200, HEAD or 304 of
-// a snapshot is returned zero-copy (a read-only view: snapshots are never
-// modified or freed); a disk-backed body or a 206 is assembled into a new
-// buffer. Handlers that want sendfile(2) and no allocation should call
-// respond_into() or respond_req_into() instead.
+// other case (404, 405, 416, ...) is a normal response. A plain 200, HEAD or
+// 304 of a snapshot is returned zero-copy (a read-only view: snapshots are
+// never modified or freed); a disk-backed body, a 206 or a 416 is assembled
+// into a new buffer. Handlers that want sendfile(2) and no allocation should
+// call respond_into() or respond_req_into() instead.
 pub fn (s &AssetServer) respond(req_buffer []u8) ![]u8 {
 	mut hr := request_parser.HttpRequest{
 		buffer: req_buffer
@@ -502,10 +502,11 @@ fn (s &AssetServer) choose_variant(asset &Asset, req &request_parser.HttpRequest
 
 // Reply is what a matched request gets.
 enum Reply {
-	full         // 200 with the body
-	head         // 200 headers only
-	not_modified // 304
-	partial      // 206 of the identity representation
+	full                  // 200 with the body
+	head                  // 200 headers only
+	not_modified          // 304
+	partial               // 206 of the identity representation
+	range_not_satisfiable // 416: a Range the identity representation cannot satisfy
 }
 
 // decide picks the reply and the snapshot it is built from, loading each
@@ -515,22 +516,28 @@ fn (s &AssetServer) decide(asset &Asset, req &request_parser.HttpRequest, head b
 	buf := req.buffer
 	// A Range is always a range of the identity bytes, so a GET whose Range
 	// applies selects the identity representation: If-None-Match, which RFC
-	// 9110 §13.2.2 evaluates before Range, is compared against its ETag, and
-	// the encoded representations are neither negotiated nor stat'ed. A Range
-	// applies when it is satisfiable and its If-Range, if any, matches the
-	// identity ETag; otherwise it is ignored and the full response is served.
+	// 9110 §13.2.2 evaluates before Range, is compared against its ETag alone,
+	// and the encoded representations are neither negotiated nor stat'ed. A
+	// current identity copy gets its 304; a client whose current copy is the
+	// br or gzip one gets the 206 or the 416. A Range applies when it is one
+	// valid byte range (parse_range_slice) and its If-Range, if any, matches
+	// the identity ETag; otherwise it is ignored and the full response is
+	// served. An applied Range that is unsatisfiable gets a 416. Only a GET
+	// reads Range (RFC 9110 §14.2): a HEAD is answered as if it had none.
 	if !head {
 		if rng := req.get_header_value_slice('Range') {
 			isnap := asset.reps[slot_identity].current()
-			if start, end := parse_range_slice(buf, rng, isnap.body_len) {
-				if if_range_allows(req, isnap.etag) {
-					if inm := req.get_header_value_slice('If-None-Match') {
-						if etag_matches_slice(buf, inm, isnap.etag) {
-							return .not_modified, isnap, 0, 0
-						}
+			spec, start, end := parse_range_slice(buf, rng, isnap.body_len)
+			if spec != .ignore && if_range_allows(req, isnap.etag) {
+				if inm := req.get_header_value_slice('If-None-Match') {
+					if etag_matches_slice(buf, inm, isnap.etag) {
+						return .not_modified, isnap, 0, 0
 					}
-					return .partial, isnap, start, end
 				}
+				if spec == .unsatisfiable {
+					return .range_not_satisfiable, isnap, 0, 0
+				}
+				return .partial, isnap, start, end
 			}
 		}
 	}
@@ -585,6 +592,9 @@ fn (s &AssetServer) emit_into(asset &Asset, req &request_parser.HttpRequest, hea
 				append_body(mut out, snap, start, length)
 			}
 		}
+		.range_not_satisfiable {
+			write_416(mut out, snap)
+		}
 	}
 }
 
@@ -619,6 +629,11 @@ fn (s &AssetServer) build_bytes(asset &Asset, req &request_parser.HttpRequest, h
 			} else {
 				append_body(mut b, snap, start, length)
 			}
+			return b
+		}
+		.range_not_satisfiable {
+			mut b := []u8{cap: head_room}
+			write_416(mut b, snap)
 			return b
 		}
 	}
@@ -873,6 +888,21 @@ fn write_206_head(mut out []u8, asset &Asset, snap &Snap, start i64, end i64) {
 	core.append_str(mut out, 'Connection: keep-alive\r\n\r\n')
 }
 
+// write_416 appends the 416 Range Not Satisfiable response for a Range an
+// identity snapshot cannot satisfy, straight into `out`: no body, and a
+// Content-Range with the representation's current length (RFC 9110
+// §15.5.17). Unlike the 304 and the 206, which stand for the representation
+// a cache stores (RFC 9110 §15.4.5, §15.3.7), it carries no Cache-Control,
+// ETag or Vary. A 416 is not heuristically cacheable (§15.1), so no cache
+// stores it without Cache-Control; with the asset's (a year, for a hashed
+// asset), one could, under its key of method and URI (RFC 9111 §2), and
+// reuse it for a request with no Range.
+fn write_416(mut out []u8, snap &Snap) {
+	core.append_str(mut out, 'HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */')
+	put_dec(mut out, snap.body_len)
+	core.append_str(mut out, '\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n')
+}
+
 // append_body appends bytes [off, off+length) of a disk-backed snapshot's body
 // to `out`, read from its fd with no allocation once `out` has the room. A
 // short read (the file shrank under a Content-Length already written) is
@@ -1084,11 +1114,13 @@ fn etag_matches_slice(buf []u8, sl request_parser.Slice, etag string) bool {
 	return false
 }
 
-// if_range_allows reports whether a satisfiable Range may be served as a 206:
-// the request has no If-Range, or its If-Range is `etag` (the identity ETag)
-// exactly. RFC 9110 §13.1.5: entity tags are compared strongly, so a weak
-// `W/` tag never matches, and neither does an HTTP-date (it would be compared
-// with a Last-Modified this module never sends). Byte-level, no allocation.
+// if_range_allows reports whether a valid Range applies, answered with a 206,
+// or with a 416 when it is unsatisfiable: the request has no If-Range, or its
+// If-Range is `etag` (the identity ETag) exactly. Otherwise the Range is
+// ignored and the full response is served. RFC 9110 §13.1.5: entity tags are
+// compared strongly, so a weak `W/` tag never matches, and neither does an
+// HTTP-date (it would be compared with a Last-Modified this module never
+// sends). Byte-level, no allocation.
 @[direct_array_access]
 fn if_range_allows(req &request_parser.HttpRequest, etag string) bool {
 	sl := req.get_header_value_slice('If-Range') or { return true }
@@ -1128,77 +1160,108 @@ fn looks_like_asset_slice(buf []u8, start int, end int) bool {
 	return dot
 }
 
-// parse_range_slice parses `bytes=START-END` from `buf[sl]` into an inclusive,
-// clamped range. Single range only (more than one `-` is rejected, matching the
-// old `split('-')` arity check). Parsed in place — no allocation, no split.
+// RangeSpec is what parse_range_slice makes of a Range header value.
+enum RangeSpec {
+	ignore        // a Range the caller ignores: it serves the full response (200)
+	satisfiable   // the inclusive window start..end, inside the body (206)
+	unsatisfiable // valid but unsatisfiable (RFC 9110 §14.1.2): the caller answers 416
+}
+
+// parse_range_slice reads the Range header value in `buf[sl]` in place: no
+// allocation, no split, no error() to box. It takes one byte range,
+// `bytes=FIRST-LAST`, `bytes=FIRST-` or `bytes=-SUFFIX`, each number all
+// digits (RFC 9110 §14.1.1). RFC 9110 §14.2 lets a server ignore a Range
+// header; §14.1.2 says which ones are unsatisfiable:
+//   - .ignore: anything else (a unit other than a lowercase `bytes`, a
+//     malformed spec, more than one range, a LAST below its FIRST), and a
+//     SUFFIX above 0 on an empty body: satisfiable, but it selects no byte a
+//     206 could carry, and §14.2 lets a server ignore Range on an empty
+//     representation.
+//   - .unsatisfiable: a FIRST at or past the end of the body, so any FIRST
+//     on an empty one, or a SUFFIX of 0.
+//   - .satisfiable, start, end: the rest, with 0 <= start <= end < size. A
+//     LAST at or past the end of the body, or none, means up to the last
+//     byte, and a SUFFIX longer than the body means all of it (both
+//     §14.1.2).
 @[direct_array_access]
-fn parse_range_slice(buf []u8, sl request_parser.Slice, size i64) ?(i64, i64) {
+fn parse_range_slice(buf []u8, sl request_parser.Slice, size i64) (RangeSpec, i64, i64) {
 	prefix := 'bytes='
 	if sl.len < prefix.len {
-		return none
+		return .ignore, 0, 0
 	}
 	start0 := sl.start
 	end0 := sl.start + sl.len
 	for k in 0 .. prefix.len {
 		if buf[start0 + k] != prefix[k] {
-			return none
+			return .ignore, 0, 0
 		}
 	}
-	// Find the single '-' separating START and END.
+	// Find the single '-' separating FIRST and LAST.
 	mut dash := -1
 	for p in start0 + prefix.len .. end0 {
 		if buf[p] == `-` {
 			if dash >= 0 {
-				return none // a second '-' → not a single range
+				return .ignore, 0, 0 // a second '-' → not a single range
 			}
 			dash = p
 		}
 	}
 	if dash < 0 {
-		return none
+		return .ignore, 0, 0
 	}
-	sz := size
 	mut start := i64(0)
-	mut end := sz - 1
+	mut end := size - 1
 	if dash == start0 + prefix.len {
 		// Suffix range `-N`: the last N bytes.
-		n := parse_u64_window(buf, dash + 1, end0)
-		start = if n >= sz { i64(0) } else { sz - n }
-		end = sz - 1
+		n := parse_dec_window(buf, dash + 1, end0)
+		if n < 0 || (n > 0 && size == 0) {
+			return .ignore, 0, 0
+		}
+		start = if n >= size { i64(0) } else { size - n }
 	} else {
-		start = parse_u64_window(buf, start0 + prefix.len, dash)
-		end = if dash == end0 - 1 { sz - 1 } else { parse_u64_window(buf, dash + 1, end0) }
+		start = parse_dec_window(buf, start0 + prefix.len, dash)
+		if start < 0 {
+			return .ignore, 0, 0
+		}
+		if dash < end0 - 1 { // `FIRST-LAST`; an open-ended `FIRST-` keeps end
+			last := parse_dec_window(buf, dash + 1, end0)
+			if last < 0 || last < start {
+				return .ignore, 0, 0
+			}
+			if last < end {
+				end = last
+			}
+		}
 	}
-	if start < 0 || end >= sz || start > end {
-		return none
+	// start > end: a FIRST at or past the end of the body (end = -1 on an
+	// empty one), or a SUFFIX of 0.
+	if start > end {
+		return .unsatisfiable, 0, 0
 	}
-	return start, end
+	return .satisfiable, start, end
 }
 
-// parse_u64_window reads the leading run of ASCII digits in `buf[lo..hi]` as a
-// non-negative i64 (empty / non-digit → 0). It saturates at `range_num_ceiling`
-// rather than wrapping, so an absurd value (e.g. 2^64) fails the `end >= size`
-// bounds check in the caller instead of aliasing a valid offset. The ceiling is
-// far above any real asset and clear of i64 overflow.
+// parse_dec_window parses `buf[lo..hi]` as a decimal number: at least one
+// byte, all of them digits, else -1. RFC 9110 §14.1.2 tells a recipient to
+// expect numbers of any length without overflowing, so the value saturates
+// at max_i64: a huge number reads as larger than any body, never as a
+// wrapped-around offset.
 @[direct_array_access; inline]
-fn parse_u64_window(buf []u8, lo int, hi int) i64 {
+fn parse_dec_window(buf []u8, lo int, hi int) i64 {
+	if lo >= hi {
+		return -1
+	}
 	mut v := i64(0)
 	for i in lo .. hi {
 		c := buf[i]
 		if c < `0` || c > `9` {
-			break
+			return -1
 		}
-		v = v * 10 + i64(c - `0`)
-		if v >= range_num_ceiling {
-			return range_num_ceiling
-		}
+		d := i64(c - `0`)
+		v = if v > (max_i64 - d) / 10 { max_i64 } else { v * 10 + d }
 	}
 	return v
 }
-
-// Above any real asset (64 PiB) yet far enough below i64 max that one more
-// `v * 10 + digit` step never wraps.
-const range_num_ceiling = i64(u64(1) << 56)
 
 // glob_match matches `name` against a pattern where `*` matches any run of
 // characters and `[hash]` matches a content-hash segment (>=6 hex chars). All
