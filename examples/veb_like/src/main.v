@@ -133,7 +133,7 @@ fn (app &App) tags(_ HttpRequest, p &Params, mut out []u8) core.Step {
 
 @['GET /search/:term']
 fn (app &App) search(_ HttpRequest, p &Params, mut out []u8) core.Step {
-	// :term is one segment; richer queries belong in ?q=… (req.get_query).
+	// :term is one segment; richer queries belong in ?q=… (req.get_query_slice).
 	json_field(mut out, '{"term":', p.get('term'), '}')
 	return .done
 }

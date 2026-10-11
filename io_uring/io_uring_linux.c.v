@@ -715,12 +715,6 @@ pub fn pool_init(mut w Worker) {
 	}
 }
 
-// Check if pool has available connections
-@[inline]
-fn pool_has_capacity(w &Worker) bool {
-	return w.free_top > 0
-}
-
 @[manualfree]
 pub fn pool_acquire(mut w Worker, fd int) &Connection {
 	if w.free_top == 0 {

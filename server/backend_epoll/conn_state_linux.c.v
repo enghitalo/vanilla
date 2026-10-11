@@ -543,7 +543,8 @@ fn materialise_file(mut cs ConnState) bool {
 
 // flush_batch writes all pending response bytes then streams any deferred file
 // body with sendfile(2), or parks the remainder for EPOLLOUT. The write buffer
-// is reset (capacity kept) once everything is sent; a closing connection
+// is reset once everything is sent (capacity kept, unless a handler sliced it:
+// see the clear() below); a closing connection
 // (close_after_flush) is then closed. Returns false if the connection was
 // closed (callers must not touch it).
 @[manualfree]
@@ -577,7 +578,11 @@ fn flush_batch(epoll_fd int, fd int, limits core.Limits, active_conns &core.Coun
 			else {}
 		}
 	}
-	cs.write_buf.clear() // len = 0, capacity kept for the next batch
+	// len = 0, capacity kept for the next batch. Not if a handler ever sliced
+	// `out` (`out[a..]`): that marks the buffer for good, and V's clear() then
+	// drops it (data = nil, cap = 0) to keep the slice valid, so the next
+	// request regrows it (#279). Handlers take vbytes views of `out` instead.
+	cs.write_buf.clear()
 	cs.write_off = 0
 	cs.file_fd = -1 // borrowed — never closed here
 	if cs.write_deadline != 0 {

@@ -11,7 +11,6 @@ const crlf = [u8(13), 10]!
 const double_crlf = [u8(13), 10, 13, 10]!
 
 const colon_u8 = u8(`:`)
-const slash_u8 = u8(`/`)
 const question_mark_u8 = u8(`?`)
 const amperstand_u8 = u8(`&`)
 const equal_u8 = u8(`=`)
@@ -37,23 +36,11 @@ pub mut:
 fn C.memchr(buf &u8, char int, len usize) &u8
 fn C.memmem(haystack &u8, h_len usize, needle &u8, n_len usize) &u8
 
-// libc memchr is AVX2-accelerated via glibc IFUNC
-@[inline]
-fn find_byte(buf &u8, len int, c u8) !int {
-	unsafe {
-		p := C.memchr(buf, c, len)
-		if p == nil {
-			return error('byte not found')
-		}
-		return int(&u8(p) - buf)
-	}
-}
-
-// find_byte_idx is the no-Result hot-path twin of find_byte: returns the index of
-// `c`, or -1 when absent. Returning a plain int avoids the `!int` Result boxing
-// (callgrind showed find_byte's wrapper cost ~3x the underlying memchr on the
-// short request line — pure overhead per pipelined request). Used by the framing
-// + request-line parsers that run on every request.
+// find_byte_idx returns the index of `c`, or -1 when absent (libc memchr,
+// AVX2-accelerated via glibc IFUNC). A plain int, not `!int`: a Result wrapper
+// cost ~3x the underlying memchr on the short request line (callgrind), and its
+// error() allocated on every not-found. Used by the framing + request-line
+// parsers that run on every request.
 @[inline]
 fn find_byte_idx(buf &u8, len int, c u8) int {
 	p := unsafe { C.memchr(buf, c, len) }
@@ -103,17 +90,6 @@ fn find_sequence_idx(buf &u8, len int, bytes_ptr &u8, bytes_len int) int {
 			return -1
 		}
 		return int(unsafe { &u8(p) - buf })
-	}
-}
-
-// Fast comparison of two byte slices
-@[inline]
-fn bytes_equal(a &u8, a_len int, b &u8, b_len int) bool {
-	if a_len != b_len {
-		return false
-	}
-	unsafe {
-		return C.memcmp(a, b, a_len) == 0
 	}
 }
 
@@ -309,12 +285,15 @@ pub fn decode_http_request(buffer []u8) !HttpRequest {
 	return error('malformed request head')
 }
 
-// Helper function to convert Slice to string for debugging
+// to_string copies the slice's bytes into a new string. It allocates: use it
+// only when the string must outlive `buffer`, and a `tos` view otherwise.
 pub fn (slice Slice) to_string(buffer []u8) string {
 	if slice.len <= 0 {
 		return ''
 	}
-	return buffer[slice.start..slice.start + slice.len].bytestr()
+	// tos + clone, not buffer[a..b].bytestr(): the slice expression would mark
+	// `buffer` as sliced on every call (V_PERF_TOOLBOX.md).
+	return unsafe { tos(&buffer[slice.start], slice.len) }.clone()
 }
 
 // ascii_ci_eq compares `len` bytes case-insensitively (ASCII only — HTTP header
@@ -450,10 +429,13 @@ pub fn (req HttpRequest) get_query_slice(key []u8) ?Slice {
 	path_start := req.path.start
 	path_len := req.path.len
 
-	// Find '?' in path using memchr. find_byte_idx (no `!int` Result) instead of
-	// find_byte: every not-found return from find_byte calls error(), which allocates a
-	// MessageError — a per-request leak under `-gc none` (query parsing runs on every
-	// request, several lookups each).
+	// An empty key would match a `?=x` element and then index key[0].
+	if key.len == 0 {
+		return none
+	}
+	// Find '?' in path using memchr. find_byte_idx (no `!int` Result): an error()
+	// on not-found allocates a MessageError — a per-request leak under `-gc none`
+	// (query parsing runs on every request, several lookups each).
 	q_pos := find_byte_idx(&req.buffer[path_start], path_len, question_mark_u8)
 	if q_pos < 0 {
 		return none // No query string
@@ -477,6 +459,12 @@ pub fn (req HttpRequest) get_query_slice(key []u8) ?Slice {
 		if key_len == key.len && unsafe { C.memcmp(&req.buffer[pos], &key[0], key.len) } == 0 {
 			// Found matching key, extract value
 			value_start := pos + eq_pos + 1
+			if value_start >= path_end {
+				return Slice{
+					start: value_start
+					len:   0
+				}
+			}
 
 			// Find '&' or end of path using memchr
 			mut value_len := find_byte_idx(&req.buffer[value_start], path_end - value_start,
@@ -502,9 +490,9 @@ pub fn (req HttpRequest) get_query_slice(key []u8) ?Slice {
 	return none
 }
 
-// Deprecated: Use get_query_slice instead for zero-copy performance
+// Deprecated: Use get_query_slice instead; it tells a missing key from an empty value.
 pub fn (req HttpRequest) get_query(key string) Slice {
-	return req.get_query_slice(key.bytes()) or { Slice{0, 0} }
+	return req.get_query_slice(unsafe { key.str.vbytes(key.len) }) or { Slice{0, 0} }
 }
 
 // ---- request framing -------------------------------------------------------
@@ -553,8 +541,8 @@ pub fn frame_request_length_lim(buf []u8, max_header int, max_body int) !int {
 // frame_request_length_lim_idx is the no-Result hot-path twin of
 // frame_request_length_lim: it returns a plain int and never constructs a Result,
 // so the per-request success path skips the !int boxing (builtin___result_ok,
-// which callgrind put at ~5-9% of the pipelined worker's instructions). Mirrors
-// find_byte_idx vs find_byte. Returns a length >= 0 (complete — exactly that many
+// which callgrind put at ~5-9% of the pipelined worker's instructions), as
+// find_byte_idx does for memchr. Returns a length >= 0 (complete — exactly that many
 // bytes), -1 (incomplete — wait for more bytes), or a frame_err_* sentinel that
 // the Result wrapper maps to 400 / 413 / 431.
 @[direct_array_access]
@@ -757,9 +745,9 @@ pub fn frame_expected_total(buf []u8) int {
 	if buf.len < 4 {
 		return -1
 	}
-	// find_byte_idx (no Result), not find_byte: the not-found path of find_byte
-	// allocates a MessageError, which this per-request framer hits on every
-	// incomplete head (and leaks under -gc none). Mirrors frame_request_length_lim.
+	// find_byte_idx (no Result): an error() on not-found would allocate a
+	// MessageError on every incomplete head (and leak under -gc none). Mirrors
+	// frame_request_length_lim.
 	rl := find_byte_idx(&buf[0], buf.len, lf_char)
 	// A bare LF is the framer's 400 (see frame_request_length_lim_idx); never
 	// size a streamed body from a head the framer refuses.

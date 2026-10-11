@@ -213,94 +213,99 @@ pub fn write_ping(mut out []u8, payload []u8) {
 // (RFC 6455 §4.2.2: base64(SHA-1(key + GUID))) straight into the response
 // buffer — the handshake-path form, no intermediate string and no heap
 // allocation: the SHA-1 runs over the key and then the GUID on the stack
-// (Sha1 below). crypto.sha1.sum allocated 8 blocks per call (the key+GUID
-// copy, the Digest and its two arrays, the padding and digest arrays, and one
-// message schedule per block), ~830 B of RSS per upgrade that -gc none never
-// gets back — a reconnecting client leaked it on every connection.
+// (sha1_write / sha1_sum below). crypto.sha1.sum allocated 8 blocks per call
+// (the key+GUID copy, the Digest and its two arrays, the padding and digest
+// arrays, and one message schedule per block), ~830 B of RSS per upgrade that
+// -gc none never gets back — a reconnecting client leaked it on every
+// connection.
 pub fn append_accept_key(mut out []u8, client_key string) {
-	mut s := Sha1{}
-	s.write(client_key.str, client_key.len)
-	s.write(ws_guid.str, ws_guid.len)
+	// Bare fixed-array locals, passed as &a[0]. A struct holding them, with
+	// methods that call each other, is moved to the heap on every call
+	// (V_PERF_TOOLBOX.md: "A struct holding a fixed array stays on the stack
+	// one call deep").
+	mut h := [u32(0x67452301), 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0]!
+	mut block := [64]u8{}
+	mut n := sha1_write(&h[0], &block[0], 0, client_key.str, client_key.len)
+	n = sha1_write(&h[0], &block[0], n, ws_guid.str, ws_guid.len)
 	mut digest := [20]u8{}
-	s.sum(mut digest)
+	sha1_sum(&h[0], &block[0], n, u64(client_key.len + ws_guid.len), &digest[0])
 	start := out.len
 	unsafe { out.grow_len(28) } // base64 of 20 bytes = 28 chars
 	base64.encode_in_buffer(unsafe { (&digest[0]).vbytes(20) }, unsafe { &u8(out.data) + start })
 }
 
-// Sha1 is SHA-1 (FIPS 180-4) in fixed arrays, for append_accept_key only: a
-// value on the caller's stack, fed bytes with write, finished with sum. Not a
+// sha1_write feeds `len` bytes at `p` into the 64-byte `block`, which already
+// holds `n` bytes, folding each full block into the state `h` (SHA-1, FIPS
+// 180-4). Returns the bytes left buffered. For append_accept_key only: not a
 // general hashing API — it exists so the handshake allocates nothing.
-struct Sha1 {
-mut:
-	h     [5]u32 = [u32(0x67452301), 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0]!
-	block [64]u8
-	n     int // bytes buffered in block
-	len   u64 // bytes written in total
-}
-
-@[direct_array_access]
-fn (mut s Sha1) write(p &u8, len int) {
+fn sha1_write(h &u32, block &u8, n int, p &u8, len int) int {
+	mut k := n
 	for i in 0 .. len {
-		s.block[s.n] = unsafe { p[i] }
-		s.n++
-		if s.n == 64 {
-			s.compress()
-			s.n = 0
+		unsafe {
+			block[k] = p[i]
+		}
+		k++
+		if k == 64 {
+			sha1_compress(h, block)
+			k = 0
 		}
 	}
-	s.len += u64(len)
+	return k
 }
 
-// sum pads the message (0x80, zeros, the 64-bit big-endian bit length) and
-// writes the 20-byte digest.
-@[direct_array_access]
-fn (mut s Sha1) sum(mut digest [20]u8) {
-	bits := s.len << 3
-	s.block[s.n] = 0x80
-	s.n++
-	if s.n > 56 {
-		// No room for the length: zero-fill and compress this block first.
-		for s.n < 64 {
-			s.block[s.n] = 0
-			s.n++
+// sha1_sum pads the message (0x80, zeros, the 64-bit big-endian bit length of
+// the `total` bytes written) and writes the 20-byte digest.
+fn sha1_sum(h &u32, block &u8, n int, total u64, digest &u8) {
+	bits := total << 3
+	mut k := n
+	unsafe {
+		block[k] = 0x80
+		k++
+		if k > 56 {
+			// No room for the length: zero-fill and compress this block first.
+			for k < 64 {
+				block[k] = 0
+				k++
+			}
+			sha1_compress(h, block)
+			k = 0
 		}
-		s.compress()
-		s.n = 0
-	}
-	for s.n < 56 {
-		s.block[s.n] = 0
-		s.n++
-	}
-	for i in 0 .. 8 {
-		s.block[56 + i] = u8(bits >> (56 - 8 * i))
-	}
-	s.compress()
-	for i in 0 .. 5 {
-		digest[4 * i] = u8(s.h[i] >> 24)
-		digest[4 * i + 1] = u8(s.h[i] >> 16)
-		digest[4 * i + 2] = u8(s.h[i] >> 8)
-		digest[4 * i + 3] = u8(s.h[i])
+		for k < 56 {
+			block[k] = 0
+			k++
+		}
+		for i in 0 .. 8 {
+			block[56 + i] = u8(bits >> (56 - 8 * i))
+		}
+		sha1_compress(h, block)
+		for i in 0 .. 5 {
+			digest[4 * i] = u8(h[i] >> 24)
+			digest[4 * i + 1] = u8(h[i] >> 16)
+			digest[4 * i + 2] = u8(h[i] >> 8)
+			digest[4 * i + 3] = u8(h[i])
+		}
 	}
 }
 
-// compress folds the full 64-byte block into the state.
+// sha1_compress folds the full 64-byte block into the state.
 @[direct_array_access]
-fn (mut s Sha1) compress() {
+fn sha1_compress(h &u32, block &u8) {
 	mut w := [80]u32{}
 	for i in 0 .. 16 {
 		j := 4 * i
-		w[i] = (u32(s.block[j]) << 24) | (u32(s.block[j + 1]) << 16) | (u32(s.block[j + 2]) << 8) | u32(s.block[j + 3])
+		w[i] = unsafe {
+			(u32(block[j]) << 24) | (u32(block[j + 1]) << 16) | (u32(block[j + 2]) << 8) | u32(block[j + 3])
+		}
 	}
 	for i in 16 .. 80 {
 		x := w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]
 		w[i] = (x << 1) | (x >> 31)
 	}
-	mut a := s.h[0]
-	mut b := s.h[1]
-	mut c := s.h[2]
-	mut d := s.h[3]
-	mut e := s.h[4]
+	mut a := unsafe { h[0] }
+	mut b := unsafe { h[1] }
+	mut c := unsafe { h[2] }
+	mut d := unsafe { h[3] }
+	mut e := unsafe { h[4] }
 	for i in 0 .. 80 {
 		mut f := u32(0)
 		mut k := u32(0)
@@ -324,11 +329,13 @@ fn (mut s Sha1) compress() {
 		b = a
 		a = t
 	}
-	s.h[0] += a
-	s.h[1] += b
-	s.h[2] += c
-	s.h[3] += d
-	s.h[4] += e
+	unsafe {
+		h[0] += a
+		h[1] += b
+		h[2] += c
+		h[3] += d
+		h[4] += e
+	}
 }
 
 // accept_key is append_accept_key's convenience form (allocates the string) —

@@ -133,12 +133,10 @@ concatenates, interpolates or allocates per request. The
   (`find_byte_idx`). `get_query(key string)` is kept as a deprecated wrapper.
   Values are raw; `examples/url_form/` percent-decodes them once at the edge.
 - **Testing:** `request_parser_test.v` (single, multiple, last, missing key,
-  no query, `?empty=`, special characters).
+  no query, `?empty=`, an empty key, special characters).
 - **Remains:**
   - A flag-only key (`?novalue`) is indistinguishable from a missing one; no
     presence check (`has_query`).
-  - An empty `key` reaches `&key[0]` on an empty array: guard `key.len == 0`
-    and return `none`.
   - No percent-decoding helper in the library (an `_into(mut out []u8)` form,
     so decoding allocates nothing).
 - **Priority:** 🟢 LOW
@@ -376,12 +374,9 @@ concatenates, interpolates or allocates per request. The
 - **Resolution:** `examples/veb_like/main.v` and its commented-out blocks were
   replaced in PR #238; the remaining commented code in the tree is usage
   examples inside doc comments.
-- **Leftover** (`v -check` reports the unused ones):
-  - commented-out `C.in_addr` / `C.sockaddr_in` declarations in
-    `socket/socket_windows.c.v`;
-  - unused `find_byte`, `bytes_equal` and `slash_u8` in
-    `http1_1/request_parser/request_parser.v`, and `pool_has_capacity` in
-    `io_uring/io_uring_linux.c.v`.
+  The leftovers `v -check` reported (`find_byte`, `bytes_equal`, `slash_u8`,
+  `pool_has_capacity`, the commented-out Windows `sockaddr_in`) went with
+  [#279](https://github.com/enghitalo/vanilla/issues/279).
 
 ---
 
@@ -706,13 +701,11 @@ Docs:
 
 ## 💡 Quick Wins (< 1 hour each)
 
-1. #5 - Guard an empty `key` in `get_query_slice` (10 min)
-2. #28 - Drop the leftover dead code listed in #28 (15 min)
-3. #34 - HTTPS example from the sketch above (1 hour)
-4. #40 - Add the 12 tested-but-unrun examples to `build_test_examples_on_linux.yml` (30 min)
-5. #8 - In-place splice in `examples/middleware` `inject_headers` (30 min)
+1. #34 - HTTPS example from the sketch above (1 hour)
+2. #40 - Add the 12 tested-but-unrun examples to `build_test_examples_on_linux.yml` (30 min)
+3. #8 - In-place splice in `examples/middleware` `inject_headers` (30 min)
 
-**Total Quick Wins:** ~2.5 hours for 5 improvements
+**Total Quick Wins:** ~2 hours for 3 improvements
 
 ---
 
@@ -720,7 +713,7 @@ Docs:
 
 For contributors wanting to learn:
 
-- **Beginner:** #5, #28, #46
+- **Beginner:** #5, #46
 - **Intermediate:** #34, #36, #40, #42
 - **Advanced:** #4/#19 (kqueue, #154), #16 (#156), #23
 

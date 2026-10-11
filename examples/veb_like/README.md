@@ -44,7 +44,7 @@ fn main() {
 - A param's name belongs to its route: `/users/:id` and
   `/users/:user_id/posts/:post_id` share a trie node without conflict.
 - Matching is byte-exact (case-sensitive, not percent-decoded) and stops at `?`;
-  query values come from `req.get_query('name')`.
+  query values come from `req.get_query_slice(key)`, a view into the request buffer.
 - `p.get(name)` returns a view into the request buffer, valid until the handler
   returns — `.clone()` what must outlive it. Up to 8 params per route.
 

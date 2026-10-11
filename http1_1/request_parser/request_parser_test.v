@@ -320,6 +320,38 @@ fn test_get_query_slice_empty_value() {
 	assert query_slice.to_string(req.buffer) == ''
 }
 
+fn test_get_query_slice_empty_key() {
+	// An element starting with '=' has an empty key; an empty lookup key must not
+	// match it (it used to index key[0] on an empty array: a panic that ended the
+	// process).
+	for target in ['/a?=x', '/a?a=1&=x', '/a?=', '/a?b=2'] {
+		buffer := 'GET ${target} HTTP/1.1\r\nHost: example.com\r\n\r\n'.bytes()
+		req := decode_http_request(buffer) or { panic(err) }
+		assert req.get_query_slice([]u8{}) == none, target
+		assert req.get_query('') == Slice{0, 0}, target
+	}
+}
+
+fn test_get_query_slice_empty_value_at_buffer_end() {
+	// A hand-built request whose path ends the buffer: the empty value's start is
+	// one past the last byte, which must not be indexed.
+	buffer := '/s?q='.bytes()
+	req := HttpRequest{
+		buffer: buffer
+		path:   Slice{0, buffer.len}
+	}
+	value := req.get_query_slice('q'.bytes()) or { panic('Query parameter not found') }
+	assert value.len == 0
+	assert req.get_query('q').len == 0
+}
+
+fn test_get_query_matches_get_query_slice() {
+	buffer := 'GET /api?id=42&name=v HTTP/1.1\r\nHost: example.com\r\n\r\n'.bytes()
+	req := decode_http_request(buffer) or { panic(err) }
+	assert req.get_query('name').to_string(req.buffer) == 'v'
+	assert req.get_query('missing') == Slice{0, 0}
+}
+
 fn test_get_query_slice_special_characters() {
 	buffer := 'GET /api?token=abc-123_xyz HTTP/1.1\r\nHost: example.com\r\n\r\n'.bytes()
 	req := decode_http_request(buffer) or { panic(err) }

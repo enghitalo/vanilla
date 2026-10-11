@@ -41,17 +41,6 @@ fn C.closesocket(s int) int
 fn C.ioctlsocket(s int, cmd int, argptr &u32) int
 fn C.htonl(hostlong u32) u32
 
-// struct C.in_addr {
-// 	s_addr u32
-// }
-
-// struct C.sockaddr_in {
-// 	sin_family u16
-// 	sin_port   u16
-// 	sin_addr   C.in_addr
-// 	sin_zero   [8]u8
-// }
-
 // Helper for client connections (for testing)
 pub fn connect_to_server_on_windows(port int) !int {
 	init_winsock() or {

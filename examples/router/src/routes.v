@@ -168,7 +168,7 @@ fn tags(m Method, mut path Path, mut out []u8) core.Step {
 }
 
 // /search/:term — one segment; a richer query would come from ?q=… (decode the
-// request with request_parser.decode_into, then req.get_query).
+// request with request_parser.decode_into, then req.get_query_slice).
 fn search(m Method, mut path Path, mut out []u8) core.Step {
 	term := path.next()
 	if term == '' || !path.done() {

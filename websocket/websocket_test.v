@@ -17,7 +17,7 @@ fn test_accept_key_rfc_vector() {
 }
 
 fn test_accept_key_matches_crypto_sha1() {
-	// The in-module Sha1 against vlib's, for every key length from 0 to 200:
+	// The in-module SHA-1 against vlib's, for every key length from 0 to 200:
 	// key + GUID then crosses each padding edge (55/56/63/64 bytes mod 64) and
 	// spans one to five blocks.
 	for n in 0 .. 201 {
@@ -28,6 +28,25 @@ fn test_accept_key_matches_crypto_sha1() {
 		k := key.bytestr()
 		want := base64.encode(sha1.sum((k + ws_guid).bytes()))
 		assert accept_key(k) == want, 'key length ${n}'
+	}
+}
+
+fn test_append_accept_key_allocates_nothing() {
+	// The SHA-1 state lived in a struct whose methods called each other, which
+	// V moved to the heap on every upgrade (~100 B that -gc none never freed).
+	$if gcboehm ? {
+		mut out := []u8{cap: 64}
+		append_accept_key(mut out, 'dGhlIHNhbXBsZSBub25jZQ==')
+		rounds := 20_000
+		before := gc_heap_usage().total_bytes
+		for _ in 0 .. rounds {
+			unsafe {
+				out.len = 0
+			}
+			append_accept_key(mut out, 'dGhlIHNhbXBsZSBub25jZQ==')
+		}
+		grown := gc_heap_usage().total_bytes - before
+		assert grown < 4096, 'append_accept_key allocated ${grown} bytes over ${rounds} calls'
 	}
 }
 
