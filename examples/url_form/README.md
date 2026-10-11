@@ -60,6 +60,29 @@ curl -s localhost:3000/submit --data-urlencode 'msg=say "hi" & bye'
 POST with another `Content-Type` (`-H 'Content-Type: application/json'`) is
 not parsed as a form: `{}`.
 
+Decoded bytes need not be UTF-8, but JSON must be (RFC 8259 §8.1):
+
+```sh
+curl -s 'localhost:3000/x?q=caf%C3%A9&bad=%FF%E2%82'
+```
+
+```
+{"q":"café","bad":"��"}
+```
+
+`%C3%A9` (é) is well-formed UTF-8 and comes back as it is. `%FF` never
+starts a UTF-8 sequence, and `%E2%82` is a € (`%E2%82%AC`) cut short, so
+each becomes one U+FFFD, `�`, which is the three bytes `ef bf bd` on the
+wire:
+
+```sh
+curl -s 'localhost:3000/x?q=%FF' | od -An -tx1
+```
+
+```
+ 7b 22 71 22 3a 22 ef bf bd 22 7d
+```
+
 ## How it works
 
 - **Inputs are views.** The handler finds the `?` by scanning the path bytes
@@ -71,10 +94,10 @@ not parsed as a form: `{}`.
   once per pair.
 - **Decoded straight into the response.** `write_decoded_json` calls the
   library's `request_parser.percent_decode_into`, which turns `%XX` into a
-  byte and `+` into a space, writing into `out` itself; the JSON escapes are
-  then made in place. The decoded pairs are used once, within the call, so
-  they never exist as strings, in a map or in a builder: a request allocates
-  nothing (`test_requests_allocate_nothing`)
+  byte and `+` into a space, writing into `out` itself; the bytes are then
+  made JSON-safe in place (below). The decoded pairs are used once, within
+  the call, so they never exist as strings, in a map or in a builder: a
+  request allocates nothing (`test_requests_allocate_nothing`)
   ([BEST_PRACTICES §2](../../docs/BEST_PRACTICES.md#2-stay-zero-copy-work-with-slices-not-copies)).
   A handler that must keep a value decodes it into an owned buffer with the
   same helper.
@@ -91,7 +114,21 @@ not parsed as a form: `{}`.
   control bytes (`%0A` comes back as `\u000a`), so user input cannot break
   out of the JSON string
   ([BEST_PRACTICES §8](../../docs/BEST_PRACTICES.md#8-security-defaults)).
-  Bytes ≥ 0x80 pass through as they are.
+- **Echo UTF-8 only.** `utf8_sequence` checks each sequence against
+  Unicode's table of well-formed UTF-8 (Table 3-7: no overlong forms, no
+  surrogates, nothing past U+10FFFF). Well-formed UTF-8 is kept. Each
+  ill-formed sequence becomes one U+FFFD per maximal subpart, the lead byte
+  and the continuation bytes that still fit it (Unicode §3.9, the practice
+  the WHATWG Encoding Standard's UTF-8 decoder follows): `%C0%80` (an
+  overlong NUL) gives two, `%ED%A0%80` (a surrogate) three, `%E2%82` one.
+- **In place, in two passes.** UTF-8 is validated front to back, while the
+  escapes are written back to front, each byte moving right by the growth
+  still ahead of it so none is overwritten before it is read. So the forward
+  pass replaces a 3-byte maximal subpart with U+FFFD on the spot (also 3
+  bytes), marks a 1- or 2-byte one `FF` or `FE FE` (bytes UTF-8 never uses;
+  one in the input is itself marked `FF`), and adds up the growth. If there
+  is any, `out` grows once, and the backward pass writes the escapes and
+  turns each marker into U+FFFD. No scratch buffer.
 - **Framing.** The JSON body is written into `out` first; `frame_body` then
   puts `resp_prefix`, the exact `Content-Length` and the blank line in front
   of it, in place (grow `out`, move the body right, copy the head into the
@@ -105,12 +142,18 @@ v test examples/url_form/src
 ```
 
 [main_test.v](src/main_test.v) table-tests the decoder (escapes, `+`, empty
-input, `%2527` decoded once, malformed escapes left literal, JSON escapes) and
-`write_form_json` (repeated keys echoed per pair), checks `frame_body` behind
-earlier bytes, then calls `handle` with raw requests: a decoded query, `+` as
-space, an empty query, form bodies (including odd `Content-Type` casing and a
-charset suffix), a JSON body left unparsed, an escaped `"` in the echo, the
-canned 400 on garbage, and that no request allocates.
+input, `%2527` decoded once, malformed escapes left literal, JSON escapes),
+its UTF-8 handling (well-formed sequences kept; `%FF`, a lone continuation
+byte, overlong, surrogate, truncated and past-U+10FFFF sequences replaced per
+maximal subpart; the four examples of Unicode §3.9, Tables 3-8 to 3-11;
+U+FFFD next to escapes; every one- and two-byte input coming out as valid
+UTF-8) and `write_form_json` (repeated keys echoed per pair), checks
+`frame_body` behind earlier bytes, then calls `handle` with raw requests: a
+decoded query, `+` as space, an empty query, form bodies (including odd
+`Content-Type` casing and a charset suffix), a JSON body left unparsed, an
+escaped `"` in the echo, ill-formed UTF-8 in a query (percent-encoded and
+raw) and in a form body, the canned 400 on garbage, and that no request
+allocates, ill-formed UTF-8 included.
 
 ## See also
 

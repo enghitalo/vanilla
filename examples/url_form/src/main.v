@@ -17,6 +17,8 @@ module main
 // a classic filter-bypass — `%2527` becoming `%27` becoming `'`. Decode at the
 // boundary and treat the result as final. And what you decoded is USER INPUT:
 // echoing it into JSON needs string escaping, or the response is injectable.
+// It can also be any bytes (`%FF`), while JSON must be UTF-8 (RFC 8259 §8.1):
+// ill-formed UTF-8 is echoed as U+FFFD.
 //
 // WORKS TODAY (pure byte transformation). Body framing is handled by the core:
 // every read loop frames the request by Content-Length/chunked before dispatch,
@@ -29,9 +31,9 @@ module main
 //     `.to_string()`, no `split()`, no substring copies.
 //   - DECODE STRAIGHT INTO THE OUTPUT: request_parser.percent_decode_into
 //     writes each key and value directly into the JSON echo in `out`, where
-//     it is then escaped in place. The decoded pairs are
-//     used once, within the call, so they never need to exist as strings, in a
-//     map, or in a builder.
+//     it is then escaped (and ill-formed UTF-8 replaced) in place. The decoded
+//     pairs are used once, within the call, so they never need to exist as
+//     strings, in a map, or in a builder.
 //   - The response is the JSON body written into `out`, then framed in place
 //     (frame_body puts the const prefix and the exact Content-Length in front
 //     of it) — no `${}`, no `+`, no allocation.
@@ -51,18 +53,50 @@ const hex_lower = '0123456789abcdef'
 // write_decoded_json appends the form-encoded bytes `s` to `out` as the
 // inside of a JSON string. request_parser.percent_decode_into decodes them
 // straight into `out`, exactly once: %XX escapes and '+' as a space, a
-// malformed escape (dangling `%`, non-hex) kept as it is. The JSON escapes are
-// then made in place, from the end backwards (each byte moves right by the
-// escapes still ahead of it, so none is overwritten before it is read): no
-// scratch buffer.
+// malformed escape (dangling `%`, non-hex) kept as it is. The decoded bytes
+// are then made JSON-safe in place, in two passes and with no scratch buffer:
+//   1. Forwards, since UTF-8 is validated front to back: well-formed UTF-8
+//      stays, and each ill-formed sequence (its maximal subpart, see
+//      utf8_sequence) is to become one U+FFFD, so the JSON is UTF-8
+//      (RFC 8259 §8.1). A 3-byte one is replaced right away, U+FFFD being 3
+//      bytes too; a 1- or 2-byte one is marked FF or FE FE. UTF-8 never uses
+//      FE or FF (one in the input is a 1-byte subpart, marked FF), so after
+//      this pass every FE and FF is a marker. The pass also adds up how much
+//      longer the bytes get: 2 per FF, 1 per FE FE, and the JSON escapes.
+//   2. If they get longer, backwards, once `out` has grown by that much (each
+//      byte moves right by the growth still ahead of it, so none is
+//      overwritten before it is read): `"`, `\` and control bytes are
+//      escaped, and each marker becomes U+FFFD.
 @[direct_array_access]
 fn write_decoded_json(mut out []u8, s []u8) {
 	start := out.len
 	request_parser.percent_decode_into(s, mut out, true)
 	end := out.len
 	mut extra := 0
-	for i in start .. end {
-		extra += json_escape_extra(out[i])
+	mut i := start
+	for i < end {
+		c := out[i]
+		if c < 0x80 {
+			extra += json_escape_extra(c)
+			i++
+			continue
+		}
+		n, ok := utf8_sequence(out, i, end)
+		if !ok {
+			if n == 3 {
+				out[i] = 0xEF // U+FFFD REPLACEMENT CHARACTER
+				out[i + 1] = 0xBF
+				out[i + 2] = 0xBD
+			} else if n == 2 {
+				out[i] = 0xFE
+				out[i + 1] = 0xFE
+				extra++
+			} else {
+				out[i] = 0xFF
+				extra += 2
+			}
+		}
+		i += n
 	}
 	if extra == 0 {
 		return
@@ -83,6 +117,14 @@ fn write_decoded_json(mut out []u8, s []u8) {
 			out[w + 3] = `0`
 			out[w + 4] = hex_lower[int(c >> 4)]
 			out[w + 5] = hex_lower[int(c & 0x0F)]
+		} else if c >= 0xFE { // a marker
+			if c == 0xFE {
+				r-- // the first byte of FE FE
+			}
+			w -= 3
+			out[w] = 0xEF
+			out[w + 1] = 0xBF
+			out[w + 2] = 0xBD
 		} else {
 			w--
 			out[w] = c
@@ -90,10 +132,57 @@ fn write_decoded_json(mut out []u8, s []u8) {
 	}
 }
 
-// json_escape_extra is how many bytes longer `c` gets inside a JSON string:
-// RFC 8259 REQUIRES escaping `"`, `\` and control bytes < 0x20. Decoded form
-// values are user input — echoing them raw would produce broken (and
-// injectable) JSON (BEST_PRACTICES §8).
+// utf8_sequence reads the UTF-8 sequence that starts at buf[i] (i < end;
+// nothing at or past `end` is read). When it is well-formed (Unicode
+// Table 3-7: no overlong form, no surrogate, nothing past U+10FFFF), it
+// returns its length, 1 to 4, and true. Otherwise it returns the length of
+// its maximal subpart, 1 to 3, and false: the lead byte and the continuation
+// bytes that still fit it, which one U+FFFD replaces (Unicode §3.9 "U+FFFD
+// Substitution of Maximal Subparts", as the WHATWG UTF-8 decoder does). A
+// byte that cannot lead (a stray continuation 80..BF, C0, C1, F5..FF) is a
+// maximal subpart of its own.
+@[direct_array_access]
+fn utf8_sequence(buf []u8, i int, end int) (int, bool) {
+	b := buf[i]
+	if b < 0x80 {
+		return 1, true
+	}
+	mut need := 0 // continuation bytes after the lead
+	mut lo := u8(0x80) // the range the next continuation byte must be in
+	mut hi := u8(0xBF)
+	if b >= 0xC2 && b <= 0xDF {
+		need = 1
+	} else if b >= 0xE0 && b <= 0xEF {
+		need = 2
+		if b == 0xE0 {
+			lo = 0xA0 // E0 80..9F would be an overlong form
+		} else if b == 0xED {
+			hi = 0x9F // ED A0..BF would be a surrogate
+		}
+	} else if b >= 0xF0 && b <= 0xF4 {
+		need = 3
+		if b == 0xF0 {
+			lo = 0x90 // F0 80..8F would be an overlong form
+		} else if b == 0xF4 {
+			hi = 0x8F // F4 90..BF would be past U+10FFFF
+		}
+	} else {
+		return 1, false
+	}
+	for k in 1 .. need + 1 {
+		if i + k >= end || buf[i + k] < lo || buf[i + k] > hi {
+			return k, false
+		}
+		lo = 0x80
+		hi = 0xBF
+	}
+	return need + 1, true
+}
+
+// json_escape_extra is how many bytes longer the ASCII byte `c` gets inside a
+// JSON string: RFC 8259 REQUIRES escaping `"`, `\` and control bytes < 0x20.
+// Decoded form values are user input — echoing them raw would produce broken
+// (and injectable) JSON (BEST_PRACTICES §8).
 @[inline]
 fn json_escape_extra(c u8) int {
 	return if c == `"` || c == backslash {
