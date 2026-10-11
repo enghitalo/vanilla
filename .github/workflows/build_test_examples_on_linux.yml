@@ -30,31 +30,48 @@ jobs:
           - examples/async_sse
           - examples/async_time_limit
           - examples/async_timer
+          - examples/async_watch_hangup
+          - examples/auth/src
           - examples/chunked_streaming/src
           - examples/compression/src
           - examples/conformance/src
+          - examples/cookies_sessions/src
           - examples/cors/src
+          - examples/csrf/src
           - examples/database/src
+          - examples/date_header/src
+          - examples/efficient_date
           - examples/etag/src
           - examples/graceful_shutdown/src
           - examples/hexagonal/src
           - examples/http2_cleartext/src
           - examples/https_upstream/src # the pooled upstream client (plain HTTP here; HTTPS in tls_backend.yml), against its fake upstream (V)
           - examples/io_uring_demo/src
+          - examples/ip_block/src
           - examples/json_api/src
           - examples/mesh/src
+          - examples/middleware/src
+          - examples/observability/src
           - examples/per_server_workers/src
           - examples/pg_transactions/src # its e2e test runs against fake_pg.py (python3)
+          - examples/proxy_aware/src
           - examples/rate_limit/src
+          - examples/redirects/src
           - examples/request_limits/src
           - examples/router/src
+          - examples/security_headers/src
           - examples/simple/src
           - examples/simple2/src
+          - examples/simple3/src
+          - examples/spa_static_assets/src
           - examples/sse/src
           - examples/static_files/src
+          - examples/tiny/src
+          - examples/url_form/src
           - examples/veb_like/src
-          - examples/websocket_echo/src
+          - examples/video_stream/src # routing, Range and MJPEG framing only: the tests never open /dev/video0, so no V4L2 device is needed
           - examples/websocket_chat/src # server push: subscriptions, the mailbox, wake_after (#230)
+          - examples/websocket_echo/src
     steps:
       - uses: actions/checkout@v4
       - name: Set up V

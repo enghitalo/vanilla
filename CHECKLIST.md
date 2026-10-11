@@ -528,18 +528,15 @@ concatenates, interpolates or allocates per request. The
 ### 40. E2E Integration Tests — 🟡 PARTIAL
 - **Done:** the `vtest/` scripted client ([docs/VTEST.md](docs/VTEST.md),
   PR #113), the `tests/` e2e suites (TLS, UDS, shutdown drain, pg_async), and
-  `build_test_examples_on_linux.yml` running 33 examples' tests.
+  every example's tests in CI: `build_test_examples_on_linux.yml` runs all 50
+  examples, `build_test_examples_on_darwin.yml` the 28 that run on macOS.
+  `async_watch_hangup`, `efficient_date`, `io_uring_demo` and `tiny` have
+  tests ([#129](https://github.com/enghitalo/vanilla/issues/129)), and the
+  `graceful_shutdown` and `request_limits` tests assert real behaviour on
+  vtest ([#128](https://github.com/enghitalo/vanilla/issues/128)).
 - **Remains:**
-  - Examples with tests that no workflow runs: `cookies_sessions`, `csrf`,
-    `date_header`, `ip_block`, `observability`, `proxy_aware`, `redirects`,
-    `security_headers`, `simple3`, `spa_static_assets`, `url_form`,
-    `video_stream`.
-  - Examples with no test: `async_watch_hangup`, `efficient_date`,
-    `io_uring_demo`, `tiny` ([#129](https://github.com/enghitalo/vanilla/issues/129)).
   - Consistency sweep of example tests: byte-exact asserts, shared helpers
     ([#130](https://github.com/enghitalo/vanilla/issues/130)).
-  - [#128](https://github.com/enghitalo/vanilla/issues/128) (graceful_shutdown
-    and request_limits stub tests) looks done: both now assert real behaviour.
 
 ### 41. Performance Benchmarks — ✅ RESOLVED
 - **Resolution:** `bench/request_parser` (parse, header lookup, query,
@@ -652,7 +649,7 @@ Open and partial items only.
 - [x] #32 - Response caching (obsolete)
 - [x] #38 - Parser tests
 - [ ] #39 - Soak test
-- [ ] #40 - Every example's tests in CI
+- [ ] #40 - Consistent example tests (#130)
 - [x] #41 - Benchmarks
 
 ### Phase 6: Documentation
@@ -702,9 +699,8 @@ Docs:
 ## 💡 Quick Wins (< 1 hour each)
 
 1. #34 - HTTPS example from the sketch above (1 hour)
-2. #40 - Add the 12 tested-but-unrun examples to `build_test_examples_on_linux.yml` (30 min)
 
-**Total Quick Wins:** ~1.5 hours for 2 improvements
+**Total Quick Wins:** ~1 hour for 1 improvement
 
 ---
 

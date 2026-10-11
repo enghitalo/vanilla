@@ -32,20 +32,37 @@ jobs:
       fail-fast: false # Continue other jobs if one fails
       matrix:
         folder:
+          # async_watch_hangup (on_worker_start) and efficient_date (a hard-coded
+          # `io_multiplexing: .epoll`) are Linux-only: they run in the Linux lane.
           - examples/async_pipe/src
+          - examples/auth/src # its argon2-offload e2e test is Linux-only (vtest build: linux)
           - examples/chunked_streaming/src
           - examples/compression/src
           - examples/conformance/src
+          - examples/cookies_sessions/src
+          - examples/csrf/src
           - examples/database/src
+          - examples/date_header/src
           - examples/etag/src
           - examples/hexagonal/src
           - examples/io_uring_demo/src
+          - examples/ip_block/src
+          - examples/middleware/src
+          - examples/observability/src
+          - examples/proxy_aware/src
+          - examples/redirects/src
           - examples/router/src
+          - examples/security_headers/src
           # - examples/simple/src
           - examples/simple2/src
+          - examples/simple3/src
+          - examples/spa_static_assets/src
           - examples/sse/src
           - examples/static_files/src
+          - examples/tiny/src
+          - examples/url_form/src
           - examples/veb_like/src
+          - examples/video_stream/src # no V4L2 on macOS: /webcam reports unavailable, and the tests never touch the camera
     steps:
       - uses: actions/checkout@v4
       # Cache the V toolchain so setup-v restores a prebuilt compiler instead of
@@ -71,9 +88,10 @@ jobs:
         if: matrix.folder == 'examples/compression/src'
         shell: bash
         run: brew install brotli
-      # sqlite3: the hexagonal example links against it for its user repository.
-      - name: Install sqlite3 (hexagonal only)
-        if: matrix.folder == 'examples/hexagonal/src'
+      # sqlite3: hexagonal links against it for its user repository, simple3
+      # for its connection pool.
+      - name: Install sqlite3 (hexagonal and simple3 only)
+        if: matrix.folder == 'examples/hexagonal/src' || matrix.folder == 'examples/simple3/src'
         shell: bash
         run: brew install sqlite3
       - name: Build ${{ matrix.folder }}
