@@ -257,7 +257,7 @@ fn main() {
 | `examples/video_stream/` | HTTP video streaming |
 | `examples/async_sse/` | SSE via async handler (suspend/resume on fd) |
 | `examples/async_db_pg/` | PostgreSQL queries via async handler |
-| `examples/pg_transactions/` | An atomic PostgreSQL transaction in one round trip (`async_submit_batch`), run again on a serialization failure (40001) as `pg_async.TxRetry` decides |
+| `examples/pg_transactions/` | An atomic PostgreSQL transaction in one round trip (`async_submit_batch`), run again on a serialization failure (40001) as `pg_async.TxRetry` decides, after a jittered wait on a timerfd |
 | `examples/async_timer/` | Async per-request timer |
 | `examples/io_uring_demo/` | Backend selection through `ServerConfig.io_multiplexing`: io_uring on Linux where the process can use it, epoll otherwise |
 

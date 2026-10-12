@@ -5,7 +5,8 @@
 together in a single round trip. Under `SERIALIZABLE` (and always on Aurora
 DSQL) a transaction that collides with a concurrent one fails with SQLSTATE
 `40001` and must run again, whole; the continuation asks `pg_async.TxRetry`
-whether to, and resubmits the same batch.
+whether to, waits a random, growing time on a timerfd without holding a
+connection, and resubmits the same batch.
 
 It is the pattern for any multi-statement write from a handler: no blocking
 the worker, no `BEGIN` held open across requests, and honest status codes for
@@ -63,20 +64,26 @@ Content-Length: 0
 Connection: keep-alive
 ```
 
-200 concurrent transfers (`xargs -P 32`) against the `SERIALIZABLE` database
-answered, in one run (count, body, status):
+2000 transfers from 32 concurrent clients, each on a connection of its own,
+against the `SERIALIZABLE` database (PostgreSQL 16, 4 workers with
+`VANILLA_WORKERS=4`, so 16 pooled connections) answered, in one run (count,
+status, body):
 
 ```
-     55 {"attempts":1} 200
-     37 {"attempts":2} 200
-     21 {"attempts":3} 200
-     15 {"attempts":4} 200
-     20 {"attempts":5} 200
-     52  409
+    911 200 {"attempts":1}
+    286 200 {"attempts":2}
+    197 200 {"attempts":3}
+    167 200 {"attempts":4}
+    121 200 {"attempts":5}
+    307 409
+     11 503
 ```
 
-148 transfers committed and the two balances still summed to the start
-total; the 52 that conflicted on all 5 attempts got `409 Conflict`.
+1682 transfers committed, and account 2 then held exactly 1682: none was
+lost or applied twice. The 307 that conflicted on all 5 attempts got
+`409 Conflict`; the 11 that found every connection busy got `503`. Running
+each attempt again at once, with no wait, the same load got 41–45% `409`s
+instead of 10–16%: transfers that collided collided again.
 
 ## How it works
 
@@ -85,29 +92,43 @@ total; the 52 that conflicted on all 5 attempts got `409 Conflict`.
   with a single Sync, so PostgreSQL runs them as one implicit transaction: no
   `BEGIN`/`COMMIT`, one round trip.
 - **Park, don't block.** `run_attempt` submits, flushes, then parks on the
-  pooled fd with `event_loop.watch_fd_persistent(..., on_reply, idx)` and
+  pooled fd with `event_loop.watch_fd_persistent(..., on_reply, parked(idx, attempt))` and
   returns `.suspend`; the worker serves other connections until the reply
   arrives
   ([BEST_PRACTICES §5](../../docs/BEST_PRACTICES.md#5-side-effects-go-through-the-async-runtime--pools-off-the-hot-path)).
   A pooled fd must be watched persistently, so a client that hangs up
   mid-query does not close the database connection.
-- **Retry in the continuation.** `on_reply` calls `conn.async_on_readable()`.
-  On an error, `policy.retry(attempt, err)` (`TxRetry{max_attempts: 5}`) is
-  true only for a serialization failure with attempts left: the batch did
-  nothing, so `run_attempt` submits it again on the same connection. Out of
+- **Retry in the continuation.** `on_reply` calls `conn.async_on_readable()`
+  and `release`s the connection on every path. On an error,
+  `policy.retry(attempt, err)` is true only for a serialization failure with
+  attempts left: the batch did nothing, so it runs again, whole. Out of
   attempts, `pg_async.is_serialization_failure(err)` picks 409; anything else
-  is 500. The connection is `release`d on every path.
-- **No backoff yet.** The retry runs at once on the connection the request
-  holds (`acquire()`), not after `policy.backoff_ms` on a timerfd: until
-  [vanilla#247](https://github.com/enghitalo/vanilla/pull/247) a continuation
-  parked on a pooled connection cannot safely step to another fd. The comment
-  at the top of [main.v](src/main.v) has the details, and how the code changes
-  once #247 lands.
-- **Attempt counts in worker state.** `build_state` (the `make_state` hook)
-  gives each worker a `TxState`: its `PgPool` and an `attempts` slot per
-  pooled connection. The count lives there rather than in `watch_payload`
-  (which only carries the connection index), so a continuation that keeps
-  running after its client left still stops at `max_attempts`.
+  is 500.
+- **Back off on a timerfd, without the connection.** Before the next attempt
+  the request waits `policy.backoff_ms(attempt)`: random, up to 10 ms after
+  the first conflict and doubling to at most 500 ms
+  (`TxRetry{max_attempts: 5, base_backoff_ms: 10, max_backoff_ms: 500}`), so
+  transfers that collided do not collide again in lockstep.
+  `policy.park_backoff` arms a one-shot timerfd and parks the request on it.
+  The connection was released first, so other requests use it meanwhile;
+  `on_backoff` acquires one again when the timer fires (503 if none is free)
+  and runs the attempt. Where no timerfd exists (not Linux), the attempt
+  runs at once.
+- **The attempt number travels with the request.** It is in `watch_payload`
+  (packed with the connection index while the request is parked on its
+  connection), not in the connection's state: the request may get another
+  connection after a wait.
+- **Who closes the timer.** `on_reply` closes the timer of the wait its
+  attempt came from (`TxState.timers`), not `on_backoff`: the runtime takes
+  the timer out of the event loop only once `on_backoff` has returned, and a
+  number closed before then could already be a connection another thread
+  just accepted, which would be taken out instead and never served.
+- **A client that leaves ends the transfer.** While it waits on the timer,
+  the runtime closes the timer and drops the request. While its batch is in
+  flight, the runtime still runs `on_reply` for the reply, to keep the
+  connection in step; a conflict there releases the connection and steps to
+  a timer, which the runtime closes without resuming the request. Either
+  way no attempt follows and the connection is back in the pool.
 - **Shed, don't queue.** No free connection in the pool, or one that broke
   before the batch was queued: `503 Service Unavailable`, a backpressure
   shed, not an error.
@@ -117,9 +138,10 @@ total; the 52 that conflicted on all 5 attempts got `409 Conflict`.
   appends the digits
   ([BEST_PRACTICES §3b](../../docs/BEST_PRACTICES.md#3b-dynamic-responses--append-parts-straight-into-out)).
   `starts_with` matches `POST /transfer ` in place with `vmemcmp`.
-- **No park deadline.** The park has no `watch_fd_deadline` and the config
-  sets no `park_timeout_ms`, so a database that stops answering holds the
-  request (§5, "Bound every park").
+- **No park deadline.** The park on the connection has no
+  `watch_fd_deadline` and the config sets no `park_timeout_ms`, so a
+  database that stops answering holds the request (§5, "Bound every park").
+  The timer is its own deadline.
 
 A transaction that needs one statement's result before sending the next is
 `BEGIN … COMMIT` across park/resume instead, also on `acquire()`, never
@@ -132,14 +154,24 @@ v test examples/pg_transactions/src
 ```
 
 [server_end_to_end_test.v](src/server_end_to_end_test.v) runs the real
-handler, continuation and `build_state` against the fake PostgreSQL in
+handler, continuations and `make_state` against the fake PostgreSQL in
 [pg_async/testdata/fake_pg.py](../../pg_async/testdata/fake_pg.py) (needs
-`python3`; Linux only), which fails the first N writes with `40001`. It
-checks that a transfer conflicting twice commits on its third attempt
-(`{"attempts":3}`), that one conflicting every time gives up with 409 after
-exactly `max_attempts` queries, that other paths are 404, and that a client
-hanging up mid-retry still lets the attempts stop and frees its connection
-(every pooled connection then serves a transfer on its first attempt).
+`python3`; Linux only), which fails the first N writes with `40001`. The
+server runs in the test process, so the tests count its timerfds in
+`/proc/self/fd`. They check that:
+
+- a transfer conflicting twice commits on its third attempt
+  (`{"attempts":3}`);
+- one conflicting every time waits on a timer between attempts (one at a
+  time) and gives up with 409 after exactly `max_attempts` queries;
+- other paths are 404;
+- while a transfer waits, its connection serves other transfers (all
+  `pool_size` connections commit one at once), and when its client hangs up
+  during the wait the timer is closed and no attempt follows;
+- a client hanging up while an attempt is in flight, before or after a
+  wait, stops the retries, leaves no timer open and frees its connection.
+
+Each transfer test also checks that no timer is left open.
 
 ## See also
 

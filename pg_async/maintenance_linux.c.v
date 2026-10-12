@@ -48,6 +48,16 @@ fn arm_timer(fd int, ms int) {
 	C.timerfd_settime(fd, 0, unsafe { voidptr(&spec[0]) }, unsafe { nil })
 }
 
+// one_shot_timer is a timerfd that fires once, `ms` from now, or -1:
+// TxRetry.park_backoff's wait between attempts.
+fn one_shot_timer(ms int) int {
+	fd := C.timerfd_create(C.CLOCK_MONOTONIC, C.TFD_NONBLOCK | C.TFD_CLOEXEC)
+	if fd >= 0 {
+		arm_timer(fd, ms)
+	}
+	return fd
+}
+
 // maintenance_tick is the timer's clientless continuation: run maintain(),
 // re-arm for when it next has work, keep watching. After close() it returns
 // .done, and the runtime closes the timerfd.

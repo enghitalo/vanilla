@@ -1,6 +1,8 @@
 // vtest build: !windows
 module pg_async
 
+import core
+import os
 import time
 import testkit
 
@@ -8,8 +10,8 @@ import testkit
 // tracks the transaction status like PostgreSQL and answers a batch's
 // statements at its one Sync): the status byte, the pool keeping sessions in
 // a transaction to themselves, the ROLLBACK at release, batches, and a
-// conflict retried with TxRetry. Skipped without python3 unless
-// VANILLA_REQUIRE_FAKE_PG is set.
+// conflict retried with TxRetry, after a wait on a timerfd (park_backoff).
+// Skipped without python3 unless VANILLA_REQUIRE_FAKE_PG is set.
 
 fn tx_cfg(port int) ConnConfig {
 	return ConnConfig{
@@ -418,4 +420,221 @@ fn test_fake_batch_retried_on_serialization_failure() {
 		assert false, 'every attempt conflicts'
 	}
 	assert tries == policy.max_attempts
+}
+
+fn C.timerfd_gettime(fd int, curr_value voidptr) int
+
+const tx_transfer = [
+	Stmt{
+		sql: 'update accounts set balance = balance - 1 where id = 1'
+	},
+	Stmt{
+		sql: 'update accounts set balance = balance + 1 where id = 2'
+	},
+]
+
+// BoLoop stands in for the worker's loop that park_backoff parks a request
+// on: it records the watch armed (one at a time), or refuses every watch, as
+// an event loop that watches nothing does.
+struct BoLoop {
+mut:
+	fd      int         = -1
+	cont    core.WakeFn = unsafe { nil }
+	payload voidptr
+	refuse  bool
+}
+
+fn bo_register(mut w core.EventLoop, fd int, interest core.WatchInterest, cont core.WakeFn, payload voidptr) {
+	mut l := unsafe { &BoLoop(w.reactor) }
+	if l.refuse {
+		w.last_watched = -1
+		return
+	}
+	l.fd = fd
+	l.cont = cont
+	l.payload = payload
+	w.last_watched = fd
+}
+
+// bo_loop is the event loop a continuation would hand park_backoff: one for
+// a request (client_fd 7), on the BoLoop.
+fn bo_loop(l &BoLoop) core.EventLoop {
+	return core.EventLoop{
+		client_fd: 7
+		reactor:   voidptr(l)
+		register:  bo_register
+	}
+}
+
+// bo_fired is what a request resumes with when its wait is over: here it only
+// closes the timer, which is the request's own.
+fn bo_fired(mut _ []u8, ready_fd int, _ bool, _ voidptr, _ voidptr, mut _ core.EventLoop) core.Step {
+	C.close(ready_fd)
+	return .done
+}
+
+// timer_left_ms is how long the timerfd has left to run, in whole ms rounded
+// up; 0 once it fired. -1 if it is periodic, which a wait must not be.
+fn timer_left_ms(fd int) int {
+	mut spec := [4]i64{} // struct itimerspec: it_interval {sec, nsec}, it_value {sec, nsec}
+	r := C.timerfd_gettime(fd, unsafe { voidptr(&spec[0]) })
+	assert r == 0
+	if spec[0] != 0 || spec[1] != 0 {
+		return -1
+	}
+	return int(spec[2] * 1000 + (spec[3] + 999_999) / 1_000_000)
+}
+
+// timerfds counts this process's open timerfds.
+fn timerfds() int {
+	mut n := 0
+	for name in os.ls('/proc/self/fd') or { return -1 } {
+		target := os.readlink('/proc/self/fd/' + name) or { continue }
+		if target == 'anon_inode:[timerfd]' {
+			n++
+		}
+	}
+	return n
+}
+
+// A conflict is run again after a wait on a timerfd armed for backoff_ms,
+// spent without the connection (it serves another query meanwhile), with the
+// next attempt's number in the watch payload, until it commits. Running out
+// of attempts gives up with the 40001. Every timer is closed.
+fn test_fake_conflict_waits_on_a_timerfd_between_attempts() {
+	$if linux {
+		if !testkit.fake_pg_available() {
+			return
+		}
+		mut fake := testkit.start_fake_pg(['--conflicts', '2'])!
+		defer {
+			fake.stop()
+		}
+		mut pool := new_pool(tx_cfg(fake.port), 1)!
+		defer {
+			pool.close()
+		}
+		policy := TxRetry{
+			base_backoff_ms: 30
+			max_backoff_ms:  30
+		}
+		t0 := timerfds()
+		mut l := BoLoop{}
+		mut scratch := []u8{}
+		mut attempt := 1
+		mut waits := 0
+		for {
+			i := pool.acquire() or { panic('the connection is free') }
+			mut c := pool.conn(i)
+			submitted := c.async_submit_batch(tx_transfer)!
+			assert submitted
+			res := run_poll(mut c) or {
+				pool.release(i)
+				assert policy.retry(attempt, err)
+				mut el := bo_loop(&l)
+				parked := policy.park_backoff(attempt, mut el, bo_fired, voidptr(usize(attempt + 1)))
+				assert parked
+				assert el.last_watched == l.fd
+				assert el.timeout_ms == -1, 'the timer is its own deadline'
+				assert os.readlink('/proc/self/fd/${l.fd}')! == 'anon_inode:[timerfd]'
+				left := timer_left_ms(l.fd)
+				assert left >= 0 && left <= 30, 'one-shot, armed for backoff_ms(attempt)'
+				// The connection was released: it serves a query during the wait.
+				j := pool.acquire() or { panic('the connection was not released') }
+				assert j == i
+				mut cj := pool.conn(j)
+				r7 := run_sql(mut cj, 'select 7')!
+				mut it := r7.rows()
+				assert (it.next() or { panic('row') }).int4(0)! == 7
+				pool.release(j)
+				ready := C.pg_async_wait(l.fd, C.POLLIN, 2000)
+				assert ready > 0, 'the timer fires'
+				waits++
+				mut fired := bo_loop(&l)
+				step := l.cont(mut scratch, l.fd, false, l.payload, unsafe { nil }, mut fired)
+				assert step == .done
+				attempt = int(usize(l.payload))
+				continue
+			}
+			pool.release(i)
+			assert res.statement(1)!.rows_affected == 1
+			break
+		}
+		assert attempt == 3
+		assert waits == 2
+		assert fake.stat('conflicts') == 2
+		assert timerfds() == t0, 'every timer closed'
+
+		// More conflicts than attempts: two waits, then the policy gives up.
+		mut fake2 := testkit.start_fake_pg(['--conflicts', '10'])!
+		defer {
+			fake2.stop()
+		}
+		mut pool2 := new_pool(tx_cfg(fake2.port), 1)!
+		defer {
+			pool2.close()
+		}
+		quick := TxRetry{
+			max_attempts:    3
+			base_backoff_ms: 1
+			max_backoff_ms:  2
+		}
+		attempt = 1
+		waits = 0
+		for {
+			i := pool2.acquire() or { panic('the connection is free') }
+			mut c := pool2.conn(i)
+			submitted := c.async_submit_batch(tx_transfer)!
+			assert submitted
+			run_poll(mut c) or {
+				pool2.release(i)
+				if !quick.retry(attempt, err) {
+					assert is_serialization_failure(err)
+					break
+				}
+				mut el := bo_loop(&l)
+				parked := quick.park_backoff(attempt, mut el, bo_fired, voidptr(usize(attempt + 1)))
+				assert parked
+				ready := C.pg_async_wait(l.fd, C.POLLIN, 2000)
+				assert ready > 0
+				waits++
+				mut fired := bo_loop(&l)
+				l.cont(mut scratch, l.fd, false, l.payload, unsafe { nil }, mut fired)
+				attempt = int(usize(l.payload))
+				continue
+			}
+			assert false, 'every attempt conflicts'
+		}
+		assert attempt == quick.max_attempts
+		assert waits == quick.max_attempts - 1
+		assert fake2.stat('conflicts') == quick.max_attempts
+		assert timerfds() == t0, 'every timer closed'
+	}
+}
+
+// Where no timer can be armed (an event loop that watches nothing; no
+// timerfd outside Linux), park_backoff arms nothing and says so: the caller
+// runs the next attempt at once, or answers. Nothing is left open.
+fn test_park_backoff_without_a_watch_arms_nothing() {
+	mut l := BoLoop{
+		refuse: true
+	}
+	mut el := bo_loop(&l)
+	$if linux {
+		t0 := timerfds()
+		refused := TxRetry{}.park_backoff(1, mut el, bo_fired, unsafe { nil })
+		assert !refused
+		assert timerfds() == t0, 'the timer it could not watch is closed'
+		l.refuse = false
+		mut el2 := bo_loop(&l)
+		parked := TxRetry{}.park_backoff(1, mut el2, bo_fired, unsafe { nil })
+		assert parked
+		assert timerfds() == t0 + 1
+		C.close(l.fd)
+	} $else {
+		l.refuse = false
+		parked := TxRetry{}.park_backoff(1, mut el, bo_fired, unsafe { nil })
+		assert !parked
+		assert l.fd == -1, 'no timerfd here: nothing watched'
+	}
 }

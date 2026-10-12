@@ -1,5 +1,6 @@
 module pg_async
 
+import core
 import time
 
 // Transactions (vanilla#199).
@@ -31,15 +32,18 @@ import time
 // locks), a conflict fails the transaction with SQLSTATE 40001 — on DSQL
 // usually at COMMIT, with OC000 (data conflict) or OC001 (schema conflict) in
 // the message. The fix is to run the WHOLE transaction again: TxRetry decides
-// whether to, and computes a randomized wait between attempts — never a
-// sleep on the worker. A request learns of the conflict in a continuation
-// parked on its pooled connection. Until vanilla#247 lands, that continuation
-// cannot step to another fd (a timerfd for the wait) when the request is
-// pipelined or its client disconnected meanwhile, and a disconnected client's
-// re-arm keeps its first watch_payload: run the next attempt at once on the
-// connection the request holds (acquire()), counting attempts outside
-// watch_payload (examples/pg_transactions). Once #247 is in, backoff_ms can
-// arm a timerfd the request parks on between attempts.
+// whether to, and park_backoff waits a randomized time between attempts on a
+// timerfd — never a sleep on the worker. A request learns of the conflict in
+// a continuation parked on its pooled connection. That continuation releases
+// the connection, parks on the timer, and acquires a connection again when it
+// fires (examples/pg_transactions): other requests use the connection
+// meanwhile, and the attempt number travels with the request in
+// watch_payload. The step from the pooled fd to the timer is safe for a
+// pipelined request, for one that holds its connection alone, and for one
+// whose client disconnected meanwhile (vanilla#247). For the last, the
+// runtime closes the timer once the continuation returns and never resumes
+// the request: the retries end there, and the release before the step is
+// what hands the connection back.
 //
 // Aurora DSQL's transaction limits, which a batch or a retried transaction
 // must stay within (exceeding one is a clear error from the server, not
@@ -85,16 +89,16 @@ pub fn is_serialization_failure(err IError) bool {
 
 // TxRetry is a retry policy for transactions that fail with a serialization
 // failure: up to max_attempts runs in all, the first included, with a
-// jittered exponential wait in between where the caller can wait. It is a
-// value with no state of its own (the caller counts the attempts), and every
-// method is allocation-free.
+// jittered exponential wait in between. It is a value with no state of its
+// own (the caller counts the attempts, in watch_payload), and every method is
+// allocation-free.
 //
 //   poll := conn.async_on_readable() or {
-//       if policy.retry(st.attempts[idx], err) {
-//           st.attempts[idx]++
-//           // submit the whole transaction again on conn and re-arm the
-//           // same fd (until vanilla#247: see above); afterwards, park on a
-//           // timerfd armed for policy.backoff_ms(attempt) first
+//       pool.release(idx) // on every path, and before the step below
+//       if policy.retry(attempt, err) {
+//           if policy.park_backoff(attempt, mut event_loop, on_backoff, voidptr(usize(attempt + 1))) {
+//               return .suspend // on_backoff: acquire, submit it all again
+//           }
 //       }
 //       ...
 //   }
@@ -118,10 +122,42 @@ pub fn (r TxRetry) retry(attempt int, err IError) bool {
 // max_backoff_ms. The randomness spreads apart transactions that conflicted
 // with each other, so they do not collide again; it comes from the monotonic
 // clock, so it needs no state and no lock. Never 0, so it can arm a timerfd
-// (where a 0 expiry disarms it) — from a continuation on a pooled connection
-// once vanilla#247 lands (see the top of this file).
+// (where a 0 expiry disarms it): park_backoff waits it out.
 pub fn (r TxRetry) backoff_ms(attempt int) int {
 	return r.backoff_from(attempt, time.sys_mono_now())
+}
+
+// park_backoff parks the request for backoff_ms(attempt) before its next
+// attempt, without blocking the worker: it arms a one-shot timerfd and
+// watches it (event_loop.watch_fd_deadline, the timer its own deadline), so
+// `continuation` runs, with the timer as ready_fd and `watch_payload`, once
+// the wait is over. Return .suspend after it. Release the connection first:
+// other requests can use it meanwhile, and if the client is gone nothing
+// else hands it back (below). The timer is the request's to close
+// (os.fd_close), but not from the continuation that parks on a connection
+// again: the runtime takes a fd a continuation steps away from out of the
+// event loop only once the continuation has returned, and a number closed
+// before then can already be a connection another thread just accepted,
+// which would be taken out instead and never served. Close it in the next
+// continuation (the attempt's reply), or in this one if it answers without
+// a watch (examples/pg_transactions). The runtime closes it itself when the
+// client disconnects during the wait (the continuation never runs), and
+// when the client was already gone (a tombstone draining its reply), whose
+// request the runtime never resumes after this step: its retries end here.
+// Returns false, arming nothing, where no timer can be armed (no timerfd:
+// not Linux; timerfd_create failed; an event loop that watches nothing): run
+// the next attempt at once, or answer.
+pub fn (r TxRetry) park_backoff(attempt int, mut event_loop core.EventLoop, continuation core.WakeFn, watch_payload voidptr) bool {
+	fd := one_shot_timer(r.backoff_ms(attempt))
+	if fd < 0 {
+		return false
+	}
+	event_loop.watch_fd_deadline(fd, .readable, continuation, watch_payload, -1)
+	if event_loop.last_watched != fd {
+		C.close(fd)
+		return false
+	}
+	return true
 }
 
 // backoff_from is backoff_ms with its random input given.
