@@ -2,11 +2,12 @@
 module backend_epoll
 
 import core
+import epoll
 
 // Unit tests for the push mailbox ring (mailbox_linux.c.v): the size rounding,
-// .full without blocking, .too_big, FIFO order across many laps, and the
-// sleep announcement's re-check. Delivery to connections and producer
-// threads are tests/conn_push_test.v.
+// .full without blocking, .too_big, FIFO order across many laps, the sleep
+// announcement's re-check, and the shutdown handshake. Delivery to
+// connections and producer threads are tests/conn_push_test.v.
 
 // mb_take is the worker's side, as drain_mailbox does it: the next message's
 // tag and first data byte, then the slot is freed.
@@ -82,4 +83,52 @@ fn test_mailbox_announce_sees_a_ready_post() {
 	assert core.ConnHandle{
 		fd: 3
 	}.post_bytes(1, [u8(1)]) == .unsupported
+}
+
+// mb_eventfd_count reads (and resets) an eventfd: 0 when nothing was written.
+fn mb_eventfd_count(fd int) u64 {
+	mut n := u64(0)
+	if C.read(fd, &n, 8) != 8 {
+		return 0
+	}
+	return n
+}
+
+// The shutdown handshake. A mailbox with no ring has no eventfd until it is
+// armed. Server.shutdown() on an idle one (nothing subscribed on its worker,
+// or the worker never ran) holds no in-flight count, and the worker that arms
+// it afterwards wakes itself. On an armed one it holds one count (the worker
+// gives it back after delivering .shutdown) and writes the eventfd, once.
+fn test_mailbox_shutdown_handshake() {
+	efd := epoll.create_epoll_fd()
+	assert efd >= 0
+	defer {
+		C.close(efd)
+	}
+	mut inflight := &core.Counter{}
+	// Idle, then armed late.
+	mut idle := unsafe { &Mailbox(new_mailbox(0)) }
+	assert idle.slots.len == 0 && idle.wake_fd == -1
+	mailbox_signal_shutdown(voidptr(idle), inflight)
+	assert idle.state == sig_early
+	assert inflight.n == 0, 'shutdown waits for a worker with nothing to tell'
+	idle_armed := idle.arm(efd)
+	assert idle_armed
+	assert idle.wake_fd >= 0
+	assert idle.state == sig_early
+	assert mb_eventfd_count(idle.wake_fd) == 1, 'a late arm must wake its own worker'
+	// Armed, then signalled (twice).
+	mut armed := unsafe { &Mailbox(new_mailbox(0)) }
+	armed_ok := armed.arm(efd)
+	assert armed_ok
+	assert armed.state == sig_armed
+	assert mb_eventfd_count(armed.wake_fd) == 0
+	mailbox_signal_shutdown(voidptr(armed), inflight)
+	assert armed.state == sig_signalled
+	assert inflight.n == 1, 'the armed worker owes one count'
+	mailbox_signal_shutdown(voidptr(armed), inflight)
+	assert inflight.n == 1, 'a second shutdown takes nothing more'
+	assert mb_eventfd_count(armed.wake_fd) == 1
+	C.close(idle.wake_fd)
+	C.close(armed.wake_fd)
 }

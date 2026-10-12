@@ -12,8 +12,8 @@ module core
 //               post_bytes, from any thread): event_loop.post_tag() and
 //               event_loop.post_data() (a view valid during the call);
 //   .timeout  — the timer armed with event_loop.wake_after(ms) expired;
-//   .shutdown — Server.shutdown() was called (the mailbox is on): say
-//               goodbye, e.g. a WebSocket close 1001, and return .close;
+//   .shutdown — Server.shutdown() was called: say goodbye, e.g. a WebSocket
+//               close 1001, and return .close;
 //   .closed   — the LAST call: the connection is gone, for whatever reason
 //               (peer, error, timeout, pending-write cap, shutdown). `response`
 //               is scratch. Unsubscribe from your registries and free the
@@ -34,9 +34,10 @@ module core
 // both, a watch continuation and a wake fn can be one function, and the
 // signature every existing continuation has stays as it is.
 //
-// The epoll worker implements subscriptions (`.closed` and wake_after
-// always; posts only with ServerConfig.push_mailbox_slots > 0). Everywhere
-// else subscribe returns a nil handle and posts report .unsupported.
+// The epoll worker implements subscriptions (.closed, .shutdown and
+// wake_after always; posts only with ServerConfig.push_mailbox_slots > 0).
+// Everywhere else subscribe returns a nil handle and posts report
+// .unsupported.
 
 // ConnHandle addresses one connection from any thread. It is a value (32
 // bytes): copy it into your registries freely. The owning worker checks the

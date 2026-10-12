@@ -264,9 +264,11 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 	st.listen_port = listen_port
 	st.listen_uds = listen_uds
 	st.births_q = births_q
-	// Subscriptions (push_linux.c.v): the mailbox, when posts are on, and the
-	// pending-write bound of a pushed connection.
+	// Subscriptions (push_linux.c.v): the mailbox (posts, when its ring is on,
+	// and the shutdown signal) and the pending-write bound of a pushed
+	// connection.
 	st.mbox = mbox
+	st.posts = mbox != unsafe { nil } && mbox.slots.len > 0
 	st.push_watermark = if push_watermark > 0 && push_watermark < core.max_pending_write_bytes {
 		push_watermark
 	} else if push_watermark > 0 {
@@ -274,10 +276,12 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 	} else {
 		push_default_watermark
 	}
-	if st.mbox != unsafe { nil } {
-		// Producers wake this worker through it (mailbox_post), and so does
-		// Server.shutdown() (mailbox_signal_shutdown).
-		if epoll.add_fd_to_epoll(epoll_fd, st.mbox.wake_fd, u32(C.EPOLLIN) | u32(C.EPOLLET)) < 0 {
+	if st.posts {
+		// Producers wake this worker through its eventfd (mailbox_post), and
+		// so does Server.shutdown() (mailbox_signal_shutdown). With posts off
+		// the first subscription arms it (subscribe_conn).
+		st.mbox_armed = st.mbox.arm(epoll_fd)
+		if !st.mbox_armed {
 			exit(1)
 		}
 	}
@@ -349,7 +353,7 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 		// look at the ring once more: a post published before the announcement
 		// is seen here, one published after it writes the eventfd.
 		mut mbox_announced := false
-		if st.mbox != unsafe { nil } && wait_ms != 0 {
+		if st.posts && wait_ms != 0 {
 			if st.mbox.announce() {
 				wait_ms = 0
 				grace = false
@@ -400,7 +404,7 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 				rested = true
 			}
 		}
-		if st.mbox != unsafe { nil } {
+		if st.posts {
 			// Posts published so far, delivered between client bursts (one
 			// atomic load when there are none).
 			drain_mailbox(mut reactor, epoll_fd, limits, counter, active_conns, mut st, state)
@@ -441,7 +445,7 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 					C.read(fd, &n, 8)
 					continue
 				}
-				if st.mbox != unsafe { nil } && fd == st.mbox.wake_fd {
+				if st.mbox_armed && fd == st.mbox.wake_fd {
 					// A producer posted while this worker waited (drain_mailbox
 					// takes the posts), or Server.shutdown() signalled.
 					on_mailbox_wake(mut reactor, epoll_fd, limits, counter, active_conns, mut
@@ -616,7 +620,7 @@ pub fn run_epoll_backend(socket_fd int, handler core.Handler, make_state fn () v
 		}
 
 		counter := inflight[i] // this worker's own in-flight counter
-		// The worker's mailbox (new_mailbox), when posts are on.
+		// The worker's mailbox (new_mailbox): posts, and the shutdown signal.
 		mbox := if i < mailboxes.len {
 			unsafe { &Mailbox(mailboxes[i]) }
 		} else {

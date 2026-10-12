@@ -69,10 +69,16 @@ fn subscribe_conn(mut el core.EventLoop, wake_fn core.WakeFn, sub_state voidptr)
 	if st.closed_q.cap == 0 {
 		st.closed_q = []ClosedNote{cap: 64} // once per worker; reused by every close
 	}
+	if !st.mbox_armed && st.mbox != unsafe { nil } {
+		// Posts off: the worker's first subscription arms its mailbox, so
+		// Server.shutdown() can reach it (.shutdown). Retried by the next
+		// subscription if no eventfd could be made.
+		st.mbox_armed = st.mbox.arm(el.loop_fd)
+	}
 	cs.wake_fn = wake_fn
 	cs.sub_state = sub_state
 	return core.ConnHandle{
-		post:  if st.mbox != unsafe { nil } { mailbox_post } else { unsafe { nil } }
+		post:  if st.posts { mailbox_post } else { unsafe { nil } }
 		mbox:  voidptr(st.mbox)
 		fd:    fd
 		epoch: st.stamp_of(fd)
@@ -175,14 +181,21 @@ fn drain_mailbox(mut reactor Reactor, epoll_fd int, limits core.Limits, counter 
 
 // on_mailbox_wake handles the mailbox eventfd's event: reset it (the drain at
 // the top of every loop iteration takes the posts), and deliver .shutdown
-// once Server.shutdown() has signalled.
+// once Server.shutdown() has signalled (sig_signalled), or came before the
+// mailbox was armed (sig_early, a wake arm wrote itself).
 fn on_mailbox_wake(mut reactor Reactor, epoll_fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, state voidptr) {
 	mut n := u64(0)
 	C.read(st.mbox.wake_fd, &n, 8)
-	if !st.shutdown_seen && stdatomic.load_u64(&st.mbox.shutdown) != 0 {
+	if st.shutdown_seen {
+		return
+	}
+	sig := stdatomic.load_u64(&st.mbox.state)
+	if sig == sig_signalled || sig == sig_early {
 		st.shutdown_seen = true
 		deliver_shutdown(mut reactor, epoll_fd, limits, counter, active_conns, mut st, state)
-		stdatomic.add_i64(&counter.n, -1) // mailbox_signal_shutdown's count
+		if sig == sig_signalled {
+			stdatomic.add_i64(&counter.n, -1) // mailbox_signal_shutdown's count
+		}
 	}
 }
 
