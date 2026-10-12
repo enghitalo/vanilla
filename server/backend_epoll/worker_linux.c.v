@@ -515,9 +515,10 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 					continue // connection closed — skip the EPOLLIN half of this event
 				}
 				if cs.held && cs.write_off >= cs.write_buf.len && cs.file_remaining <= 0 {
-					// HTTPS: the file that held the connection is out
-					// (tls_send_file_first): serve what waited behind it now, as
-					// if the client had spoken; no edge reports bytes already read.
+					// The file that held the connection is out (send_file_first):
+					// serve what waited behind it now (an HTTPS request, or a 100
+					// Continue owed), as if the client had spoken; no edge reports
+					// bytes already read.
 					cs.held = false
 					ev |= u32(C.EPOLLIN)
 				}

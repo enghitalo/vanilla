@@ -10,7 +10,8 @@
 // behind a large response, and a .suspend that armed no watch. While a close is
 // pending nothing more is served, a read timeout does not cut a closing flush
 // short, and a client that half-closes, even with a partial request buffered
-// and a read timeout set, still gets everything.
+// and a read timeout set, still gets everything, from a worker that sleeps
+// until that client reads.
 //
 // The responses that must survive backpressure are 512 KiB (the first flush
 // gets at most ~80 KiB out on main), sent through a client socket whose
@@ -18,12 +19,18 @@
 // they are out. Takeover is inert under tcc (#173): that check runs with gcc,
 // as CI does. io_uring runs the checks for the paths this change touches on
 // it (its resume arms, and the closing release that drains unread input): its
-// rings leak across servers in one process (#153), so it keeps to five.
+// rings leak across servers in one process (#153), so it keeps to five. The
+// poll reactor (-d vanilla_poll; no watches, no takeover) runs every check
+// that needs neither (vanilla#275):
+//
+//   v -cc gcc -no-parallel -d vanilla_poll -run-only 'test_poll_*' test tests/close_flush_test.v
 import os
 import server
 import core
+import socket
 import sync.stdatomic
 import time
+import transport
 import vtest
 
 #include <sys/socket.h>
@@ -31,6 +38,9 @@ import vtest
 
 fn C.read(fd int, buf voidptr, count usize) int
 fn C.write(fd int, buf voidptr, count usize) int
+fn C.send(fd int, buf voidptr, len usize, flags int) int
+fn C.recv(fd int, buf voidptr, len usize, flags int) int
+fn C.clock_gettime(clk int, ts &C.timespec) int
 fn C.close(fd int) int
 fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
 fn C.setsockopt(fd int, level int, optname int, optval voidptr, optlen u32) int
@@ -403,6 +413,56 @@ fn check_close_serves_nothing_more(backend server.IOBackend) ! {
 	assert out.active_after == 0
 }
 
+// One write carries the .close request and 300 × /second behind it (more than
+// one 8 KiB read): nothing behind the .close may be answered.
+fn check_close_drops_pipelined_leftover(backend server.IOBackend) ! {
+	mut burst := []u8{cap: cf_req.len + 300 * cf_second_req.len}
+	burst << cf_req
+	for _ in 0 .. 300 {
+		burst << cf_second_req
+	}
+	out := vtest.drive(server.ServerConfig{
+		io_multiplexing: backend
+		handler:         cf_big_handler
+		workers:         1
+	}, [
+		vtest.Script{
+			rounds:   [vtest.Round{
+				send: burst
+			}]
+			then_eof: true
+		},
+	])!
+	cf_assert_big(backend, 'requests pipelined behind .close', out.conns[0], cf_big_close_head)!
+	assert out.active_after == 0
+}
+
+// One write carries the .close request and the start of another, with a read
+// timeout set. The partial can never complete: its read deadline must not cut
+// the closing flush short.
+fn check_close_with_partial_behind(backend server.IOBackend) ! {
+	mut burst := []u8{cap: cf_req.len + 8}
+	burst << cf_req
+	burst << 'GET /pa'.bytes()
+	out := vtest.drive(server.ServerConfig{
+		io_multiplexing: backend
+		handler:         cf_big_handler
+		workers:         1
+		limits:          server.Limits{
+			read_timeout_ms: 50 // the sweep runs every 25 ms; the reply takes longer
+		}
+	}, [
+		vtest.Script{
+			rounds:   [vtest.Round{
+				send: burst
+			}]
+			then_eof: true
+		},
+	])!
+	cf_assert_big(backend, '.close with a partial request behind it', out.conns[0], cf_big_close_head)!
+	assert out.active_after == 0
+}
+
 // A client that half-closes (SHUT_WR) right after its request still reads: the
 // EOF must not cut the pending close short (RFC 9112 §9.6).
 fn check_close_half_closed_peer(backend server.IOBackend) ! {
@@ -513,6 +573,73 @@ fn check_half_close_with_partial_request(backend server.IOBackend) ! {
 	assert out.active_after == 0
 }
 
+// cf_cpu_ns is the CPU time this process, the server's workers included, has
+// used so far.
+fn cf_cpu_ns() i64 {
+	mut ts := C.timespec{}
+	C.clock_gettime(C.CLOCK_PROCESS_CPUTIME_ID, &ts)
+	return i64(ts.tv_sec) * 1_000_000_000 + i64(ts.tv_nsec)
+}
+
+// How long the client below reads nothing, and the CPU time the server may
+// use meanwhile: a third of it.
+const cf_pause_ms = 300
+const cf_pause_cpu_ms = cf_pause_ms / 3
+
+// A client sends a request, half-closes, then reads nothing for a while: the
+// 512 KiB keep-alive reply parks, and nothing can move until the client
+// reads. The worker must sleep meanwhile, not wake for the peer's EOF again
+// and again (poll is level-triggered: asked for POLLIN, it reports that EOF
+// on every call, one core at 100%). The check reads the process's CPU time
+// across the pause: a parked worker uses next to none of it whatever the
+// load, so a busy host can only hide a spin, never fail a worker that
+// sleeps. Then the client reads: the whole reply, then an orderly close.
+fn check_half_closed_peer_sleeps_while_parked(backend server.IOBackend) ! {
+	mut h := vtest.start(server.ServerConfig{
+		io_multiplexing: backend
+		handler:         cf_big_keep_handler
+		workers:         1
+	})!
+	defer {
+		h.stop()
+	}
+	fd := transport.dial_tcp('127.0.0.1', h.port())!
+	defer {
+		transport.close_fd(fd)
+	}
+	// A fixed receive buffer (no autotuning, whatever the host's tcp_rmem):
+	// the reply cannot fit in the sockets' buffers. Not much smaller: the
+	// read at the end would crawl through tiny windows.
+	rcvbuf := i32(64 * 1024)
+	C.setsockopt(fd, C.SOL_SOCKET, C.SO_RCVBUF, &rcvbuf, u32(sizeof(i32)))
+	socket.set_blocking(fd, true)
+	if C.send(fd, cf_req.data, usize(cf_req.len), C.MSG_NOSIGNAL) != cf_req.len {
+		return error('${backend}: the request did not go out')
+	}
+	socket.shutdown_write(fd)
+	time.sleep(100 * time.millisecond) // the worker reads the request and the EOF, and parks
+	cpu0 := cf_cpu_ns()
+	time.sleep(cf_pause_ms * time.millisecond)
+	used_ms := (cf_cpu_ns() - cpu0) / 1_000_000
+	mut got := 0
+	mut last := 0
+	mut buf := []u8{len: 64 * 1024}
+	for {
+		last = C.recv(fd, buf.data, usize(buf.len), 0)
+		if last <= 0 {
+			break
+		}
+		got += last
+	}
+	if used_ms > cf_pause_cpu_ms {
+		return error('${backend}: the server used ${used_ms} ms of CPU in ${cf_pause_ms} ms parked behind a half-closed peer')
+	}
+	want := cf_big_keep_head.len + cf_big_len
+	if got != want || last != 0 {
+		return error('${backend}: ${got} of ${want} bytes, then recv returned ${last}: no orderly close after the reply')
+	}
+}
+
 // --- a ConnHandler's .close ------------------------------------------------------
 
 // After the upgrade, any byte gets the 512 KiB blob and .close.
@@ -616,6 +743,18 @@ fn test_epoll_half_close_with_partial_request() ! {
 	check_half_close_with_partial_request(.epoll)!
 }
 
+fn test_epoll_close_drops_pipelined_leftover() ! {
+	check_close_drops_pipelined_leftover(.epoll)!
+}
+
+fn test_epoll_close_with_partial_behind() ! {
+	check_close_with_partial_behind(.epoll)!
+}
+
+fn test_epoll_half_closed_peer_sleeps_while_parked() ! {
+	check_half_closed_peer_sleeps_while_parked(.epoll)!
+}
+
 fn test_epoll_takeover_close_backpressure() ! {
 	$if tinyc {
 		eprintln('[test] takeover is inert under tcc; skipping')
@@ -667,4 +806,72 @@ fn test_iouring_close_serves_nothing_more() ! {
 		return
 	}
 	check_close_serves_nothing_more(.io_uring)!
+}
+
+// --- poll (-d vanilla_poll) --------------------------------------------------------
+
+fn test_poll_handler_close_backpressure() ! {
+	$if vanilla_poll ? {
+		check_handler_close_backpressure(.poll)!
+	}
+}
+
+fn test_poll_handler_close_with_read_timeout() ! {
+	$if vanilla_poll ? {
+		check_handler_close_with_read_timeout(.poll)!
+	}
+}
+
+fn test_poll_handler_close_file_backpressure() ! {
+	$if vanilla_poll ? {
+		check_handler_close_file_backpressure(.poll)!
+	}
+}
+
+fn test_poll_close_serves_nothing_more() ! {
+	$if vanilla_poll ? {
+		check_close_serves_nothing_more(.poll)!
+	}
+}
+
+fn test_poll_close_half_closed_peer() ! {
+	$if vanilla_poll ? {
+		check_close_half_closed_peer(.poll)!
+	}
+}
+
+fn test_poll_error_close_behind_large_response() ! {
+	$if vanilla_poll ? {
+		check_error_close_behind_large_response(.poll)!
+	}
+}
+
+fn test_poll_suspend_without_watch_flushes() ! {
+	$if vanilla_poll ? {
+		check_suspend_without_watch_flushes(.poll)!
+	}
+}
+
+fn test_poll_half_close_with_partial_request() ! {
+	$if vanilla_poll ? {
+		check_half_close_with_partial_request(.poll)!
+	}
+}
+
+fn test_poll_close_drops_pipelined_leftover() ! {
+	$if vanilla_poll ? {
+		check_close_drops_pipelined_leftover(.poll)!
+	}
+}
+
+fn test_poll_close_with_partial_behind() ! {
+	$if vanilla_poll ? {
+		check_close_with_partial_behind(.poll)!
+	}
+}
+
+fn test_poll_half_closed_peer_sleeps_while_parked() ! {
+	$if vanilla_poll ? {
+		check_half_closed_peer_sleeps_while_parked(.poll)!
+	}
 }

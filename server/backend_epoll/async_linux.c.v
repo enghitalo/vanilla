@@ -852,12 +852,13 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 		&& cs.takeover == unsafe { nil } {
 		head_len := request_parser.frame_head_len(cs.read_buf)
 		if head_len > 0 && request_parser.head_expects_100_continue(cs.read_buf, head_len) {
-			// A TLS connection sends a file still pending first: the 100 must
-			// not land inside its body (tls_send_file_first). Held, the 100
-			// comes once the file is out, and the request's read deadline does
-			// not run meanwhile (its client waits for the 100).
-			if cs.file_remaining > 0 && !plain {
-				sent := tls_send_file_first(epoll_fd, fd, limits, active_conns, mut st, mut cs)
+			// A file still pending goes out first: the 100 must not land
+			// inside its body (vanilla#275), and it keeps sendfile(2)
+			// (send_file_first). Held, the 100 comes once the file is out, and
+			// the request's read deadline does not run meanwhile (its client
+			// waits for the 100).
+			if cs.file_remaining > 0 {
+				sent := send_file_first(epoll_fd, fd, limits, active_conns, mut st, mut cs)
 				if sent < 0 {
 					return
 				}
@@ -1194,7 +1195,7 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 // synchronous drain_requests but with the async step contract. Returns false if
 // the connection was closed (the caller must not touch it), or held: a TLS
 // connection whose file did not fit the socket ahead of the next request (see
-// tls_send_file_first), which the caller leaves as it is.
+// send_file_first), which the caller leaves as it is.
 @[direct_array_access; manualfree]
 fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) bool {
 	mut pos := 0
@@ -1215,10 +1216,10 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 		// leave that body shorter than its Content-Length, with what follows read
 		// as its tail: stop answering, send what is there and close. A TLS
 		// connection sends the file itself first instead, and is held if the
-		// socket cannot take it all (tls_send_file_first).
+		// socket cannot take it all (send_file_first).
 		if cs.file_remaining > 0 {
 			if cs.tls != tls_plain {
-				sent := tls_send_file_first(epoll_fd, fd, limits, active_conns, mut st, mut cs)
+				sent := send_file_first(epoll_fd, fd, limits, active_conns, mut st, mut cs)
 				if sent < 0 {
 					return false
 				}

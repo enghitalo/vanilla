@@ -159,10 +159,13 @@ mut:
 	// one, or a kTLS socket that refused it), so a queued file region goes out
 	// as bytes (tls_file_chunk). Never set on a plain connection.
 	no_sendfile bool
-	// held: a TLS connection whose file region did not fit the socket when
-	// its next request (or a 100 Continue) was due; nothing more is read or
-	// answered until it drains (tls_send_file_first). Never set on a plain
-	// connection.
+	// held: a connection whose file region did not fit the socket when a 100
+	// Continue (or, over TLS, its next request) was due (send_file_first);
+	// the worker loop serves it again once the file is out. A TLS one reads
+	// and answers nothing meanwhile (tls_on_readable). A plain one goes on
+	// reading: a request completed meanwhile reads the rest of the region
+	// into write_buf ahead of its answer (materialise_file), as any pipelined
+	// request does, and the 100 is then not needed.
 	held bool
 	// The conn-mode seam (issue #136): nil (the default) means the HTTP/1.1
 	// state machine drives this connection — the hot path pays exactly one
@@ -610,6 +613,29 @@ fn materialise_file(mut cs ConnState) bool {
 	cs.file_fd = -1
 	cs.file_remaining = 0
 	return got == want
+}
+
+// send_file_first sends what the connection owes ahead of a file region an
+// earlier request queued, and the file, before anything else is appended: a
+// 100 Continue (serve_conn), or on a TLS connection the next pipelined
+// request (drain_requests). The region keeps sendfile(2), where
+// materialise_file would read all of it into write_buf. Returns 1 when all of
+// it went out, -1 when the connection was closed or is now closing (the file
+// came up short: what it had goes out, then the close), and 0 when the
+// socket could not take it all: the connection is then held (ConnState.held)
+// and the worker loop resumes it from the writable edge that finishes the
+// file. The caller ends the read deadline of the request it holds back (the
+// file runs on write_timeout_ms), so a slow download does not reap it.
+@[noinline]
+fn send_file_first(epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState) int {
+	if !flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) || cs.close_after_flush {
+		return -1
+	}
+	if cs.file_remaining > 0 || cs.write_off < cs.write_buf.len {
+		cs.held = true
+		return 0
+	}
+	return 1
 }
 
 // flush_batch writes all pending response bytes then streams any deferred file

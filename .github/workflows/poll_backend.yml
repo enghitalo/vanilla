@@ -85,6 +85,16 @@ jobs:
           VANILLA_NO_IOURING: '1'
         run: |
           v -cc gcc -no-parallel -d vanilla_poll -run-only 'test_poll_*' test tests/epoll_timeouts_test.v
+      # A close whose flush parks sends all of it, then closes: nothing behind
+      # it is read as a request, a read deadline does not cut it short, and a
+      # peer that half-closed does not wake the worker on its EOF until it
+      # reads (#275).
+      - name: Closing flush with the poll reactor
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+        run: |
+          v -cc gcc -no-parallel -d vanilla_poll -run-only 'test_poll_*' test tests/close_flush_test.v
       # Out of fds, accept() fails with EMFILE: every worker must pause
       # accepting instead of polling a listener that stays readable (#256).
       - name: Accept pause when out of fds, with the poll reactor
