@@ -946,6 +946,41 @@ fn test_epoll_push_subscribe_after_shutdown_gets_shutdown() ! {
 	assert cp_until(&c.closed, 1, 2000) == 1
 }
 
+// A connection that subscribes after its worker has already delivered
+// .shutdown (an upgrade on a keep-alive connection during the drain) gets
+// .shutdown too, at once, mailbox on or off. Before, it stayed open:
+// nothing told it the server was going.
+fn test_epoll_push_subscribe_after_delivery_gets_shutdown() ! {
+	$if tinyc {
+		return
+	}
+	for slots in [0, 64] {
+		cp_reset()
+		mut h := vtest.start(cp_config(1, slots, 0))!
+		defer {
+			h.stop()
+		}
+		mut a, _, _ := cp_sub(h.port(), '/sub')!
+		defer {
+			a.close()
+		}
+		// Accepted before the listener goes: an HTTP/1.1 connection, not subscribed.
+		mut x := cp_dial(h.port(), 'GET / HTTP/1.1\r\nHost: x\r\n\r\n')!
+		defer {
+			x.close()
+		}
+		assert x.until('\r\n\r\nok', 2000)
+		x.acc.clear()
+		h.server_ref().shutdown(2000) // returns once the worker delivered .shutdown to A
+		assert a.until('shutdown\n', 2000) && a.eof(2000)
+		x.send('GET /sub HTTP/1.1\r\nHost: x\r\n\r\n')!
+		assert x.until('\r\n\r\nsub ', 2000), x.acc.bytestr()
+		assert x.until('shutdown\n', 2000) && x.eof(2000), 'a subscription after the delivery missed .shutdown (slots ${slots}): ${x.acc.bytestr()}'
+		c := unsafe { cp }
+		assert cp_until(&c.closed, 2, 2000) == 2
+	}
+}
+
 // shutdown(grace) on a server that never ran (or a worker with nothing
 // subscribed) has no goodbyes to wait for: it returns at once, mailbox on or
 // off. Before, a mailbox held one in-flight count per worker that no worker

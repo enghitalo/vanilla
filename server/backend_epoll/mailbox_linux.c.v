@@ -37,7 +37,9 @@ module backend_epoll
 // it has delivered .shutdown; an idle one (nothing subscribed there yet, or
 // the worker never ran) goes to early, and shutdown waits for nothing. A
 // worker that arms after that finds early and wakes itself: what subscribed
-// on it during the drain gets .shutdown too.
+// on it during the drain gets .shutdown too. So does a connection that
+// subscribes after its worker delivered .shutdown (subscribe_conn queues it
+// and writes the eventfd).
 //
 // Every atomic here is sync.stdatomic's (C11, seq_cst) or the C11 CAS it
 // declares; the slot's plain fields are published by the seq store and read

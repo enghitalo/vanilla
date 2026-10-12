@@ -12,8 +12,9 @@ module core
 //               post_bytes, from any thread): event_loop.post_tag() and
 //               event_loop.post_data() (a view valid during the call);
 //   .timeout  — the timer armed with event_loop.wake_after(ms) expired;
-//   .shutdown — Server.shutdown() was called: say goodbye, e.g. a WebSocket
-//               close 1001, and return .close;
+//   .shutdown — Server.shutdown() was called (also for a connection that
+//               subscribes afterwards): say goodbye, e.g. a WebSocket close
+//               1001, and return .close;
 //   .closed   — the LAST call: the connection is gone, for whatever reason
 //               (peer, error, timeout, pending-write cap, shutdown). `response`
 //               is scratch. Unsubscribe from your registries and free the

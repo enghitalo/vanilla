@@ -29,6 +29,14 @@ struct ClosedNote {
 	sub_state voidptr
 }
 
+// LateShutdown is a connection that subscribed after its worker delivered
+// .shutdown: it is due one too (deliver_late_shutdown), if it is still the
+// same connection (its close stamp) by then.
+struct LateShutdown {
+	fd    int
+	epoch u64
+}
+
 // conn_loop is the EventLoop a handler, ConnHandler, continuation or wake fn
 // of connection fd runs with.
 @[inline]
@@ -74,6 +82,17 @@ fn subscribe_conn(mut el core.EventLoop, wake_fn core.WakeFn, sub_state voidptr)
 		// Server.shutdown() can reach it (.shutdown). Retried by the next
 		// subscription if no eventfd could be made.
 		st.mbox_armed = st.mbox.arm(el.loop_fd)
+	}
+	if st.shutdown_seen && cs.wake_fn == unsafe { nil } {
+		// This worker has delivered .shutdown already (a keep-alive connection
+		// upgrading during the drain): the new subscription gets it too, once
+		// its takeover is in, at the worker's next wake (on_mailbox_wake).
+		st.late_shutdown << LateShutdown{
+			fd:    fd
+			epoch: st.stamp_of(fd)
+		}
+		one := u64(1)
+		C.write(st.mbox.wake_fd, &one, 8)
 	}
 	cs.wake_fn = wake_fn
 	cs.sub_state = sub_state
@@ -182,11 +201,16 @@ fn drain_mailbox(mut reactor Reactor, epoll_fd int, limits core.Limits, counter 
 // on_mailbox_wake handles the mailbox eventfd's event: reset it (the drain at
 // the top of every loop iteration takes the posts), and deliver .shutdown
 // once Server.shutdown() has signalled (sig_signalled), or came before the
-// mailbox was armed (sig_early, a wake arm wrote itself).
+// mailbox was armed (sig_early, a wake arm wrote itself), and afterwards to
+// the connections that subscribed since (subscribe_conn wrote it).
 fn on_mailbox_wake(mut reactor Reactor, epoll_fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, state voidptr) {
 	mut n := u64(0)
 	C.read(st.mbox.wake_fd, &n, 8)
 	if st.shutdown_seen {
+		if st.late_shutdown.len > 0 {
+			deliver_late_shutdown(mut reactor, epoll_fd, limits, counter, active_conns, mut
+				st, state)
+		}
 		return
 	}
 	sig := stdatomic.load_u64(&st.mbox.state)
@@ -209,6 +233,27 @@ fn deliver_shutdown(mut reactor Reactor, epoll_fd int, limits core.Limits, count
 			deliver_wake(mut reactor, epoll_fd, fd, .shutdown, 0, unsafe { nil }, 0, limits,
 				counter, active_conns, mut st, mut cs, state)
 		}
+	}
+}
+
+// deliver_late_shutdown wakes, with .shutdown, the connections that subscribed
+// after this worker delivered it (subscribe_conn), each still the same
+// connection and still subscribed. No in-flight count: shutdown() may have
+// returned already.
+@[direct_array_access]
+fn deliver_late_shutdown(mut reactor Reactor, epoll_fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, state voidptr) {
+	for i := 0; i < st.late_shutdown.len; i++ {
+		note := st.late_shutdown[i]
+		if note.fd < st.conns.len && st.stamp_of(note.fd) == note.epoch {
+			mut cs := st.conns[note.fd]
+			if unsafe { cs != nil } && cs.wake_fn != unsafe { nil } {
+				deliver_wake(mut reactor, epoll_fd, note.fd, .shutdown, 0, unsafe { nil }, 0,
+					limits, counter, active_conns, mut st, mut cs, state)
+			}
+		}
+	}
+	unsafe {
+		st.late_shutdown.len = 0
 	}
 }
 
