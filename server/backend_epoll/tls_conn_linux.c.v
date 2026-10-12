@@ -26,12 +26,14 @@ module backend_epoll
 //     still pending into write_buf before the next answer is appended
 //     (materialise_file), but whole, and a large one would trip the 8 MiB
 //     pending-write cap (core.max_pending_write_bytes). A TLS connection
-//     sends the file first instead (tls_send_file_first) ahead of the next
-//     pipelined request or a 100 Continue, and when the socket cannot take
-//     it all it is held: nothing more is read or answered until it drains
-//     (ConnState.held), as the old TLS worker did. (Two rare paths still read
-//     the file whole, as the plain path does: a request too large to buffer,
-//     answered 413, or a streamed upload pipelined behind the file.)
+//     sends the file first instead (send_file_first) ahead of the next
+//     pipelined request, and when the socket cannot take it all it is
+//     held: nothing more is read or answered until it drains
+//     (ConnState.held), as the old TLS worker did. A 100 Continue waits for
+//     the file on both paths (a plain connection goes on reading meanwhile).
+//     (Two rare paths still read the file whole, as the plain path does: a
+//     request too large to buffer, answered 413, or a streamed upload
+//     pipelined behind the file.)
 //   • a parked request's client: its bytes are records, so a raw peek cannot
 //     tell a close_notify from data; they go through the session
 //     (tls_while_parked);
@@ -145,7 +147,7 @@ fn tls_send(mut cs ConnState, fd int, ptr &u8, len int) int {
 // handshake's next step. Returns true when the caller goes on to serve the
 // connection (established, maybe with a request already waiting), false
 // while the handshake waits, after it failed and closed the connection, or
-// while the connection is held behind a file (tls_send_file_first): what the
+// while the connection is held behind a file (send_file_first): what the
 // client sent then waits until the file is out.
 @[noinline]
 fn tls_on_readable(epoll_fd int, fd int, mut cs ConnState, active_conns &core.Counter, mut st PlainState) bool {
@@ -156,29 +158,6 @@ fn tls_on_readable(epoll_fd int, fd int, mut cs ConnState, active_conns &core.Co
 		return !cs.held
 	}
 	return tls_handshake_step(epoll_fd, fd, mut cs, active_conns, mut st) == 1
-}
-
-// tls_send_file_first sends what the connection owes ahead of a file region
-// an earlier request queued, and the file, before anything else is answered
-// or appended: the next pipelined request (drain_requests) or a 100 Continue
-// (serve_conn). Returns 1 when all of it went out, -1 when the connection was
-// closed or is now closing (the file came up short: what it had goes out,
-// then the close), and 0 when the socket could not take it all: the
-// connection is then held (ConnState.held) until it drains, reading and
-// answering nothing meanwhile, and the worker loop resumes it from the
-// writable edge that finishes the file. The caller ends the read deadline of
-// the request it holds back (the file runs on write_timeout_ms), so a slow
-// download does not reap it.
-@[noinline]
-fn tls_send_file_first(epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState) int {
-	if !flush_batch(epoll_fd, fd, limits, active_conns, mut st, mut cs) || cs.close_after_flush {
-		return -1
-	}
-	if cs.file_remaining > 0 || cs.write_off < cs.write_buf.len {
-		cs.held = true
-		return 0
-	}
-	return 1
 }
 
 // tls_while_parked takes what the client of a TLS connection parked on a

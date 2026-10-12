@@ -58,6 +58,7 @@ mut:
 	close_after_flush bool
 	sent_100          bool
 	idle              bool // read_deadline is an idle deadline (nothing of a request has arrived yet): the first byte clears it, expiry closes silently
+	eof               bool // closing, and the peer's EOF was read: POLLIN is no longer asked for (level-triggered, it would report that EOF on every poll)
 }
 
 struct WorkerState {
@@ -136,8 +137,20 @@ fn (mut w WorkerState) close_conn_at(i int, active_conns &core.Counter) {
 	cs.close_after_flush = false
 	cs.sent_100 = false
 	cs.idle = false
+	cs.eof = false
 	w.conns.delete(i)
 	w.free_conns << cs
+}
+
+// close_drained closes a closing connection once its last response has been
+// handed to the kernel. It first reads and drops what the client sent that
+// nothing will serve: closing with unread input makes the kernel answer with a
+// reset, which can discard the response's untransmitted tail (RFC 9112 §9.6).
+fn (mut w WorkerState) close_drained(i int, active_conns &core.Counter) {
+	cs := w.conns[i]
+	for C.recv(cs.fd, cs.read_buf.data, usize(cs.read_buf.cap), 0) > 0 {
+	}
+	w.close_conn_at(i, active_conns)
 }
 
 // buf_view — the same non-owning window as the epoll backend's (see the
@@ -216,6 +229,50 @@ fn update_read_deadline(limits core.Limits, mut w WorkerState, mut cs PollConn) 
 	} else if cs.read_deadline != 0 && !cs.idle {
 		cs.read_deadline = 0
 		w.parked--
+	}
+}
+
+// begin_close puts the connection in the closing state (close_after_flush),
+// the epoll worker's twin: what is already appended still goes out, then the
+// connection closes. No further request is served, so the buffered leftover
+// goes, and so does a read deadline (an idle one too), which would cut the
+// flush short (the write deadline bounds it).
+@[inline]
+fn begin_close(mut w WorkerState, mut cs PollConn) {
+	unsafe {
+		cs.read_buf.len = 0
+	}
+	if cs.read_deadline != 0 {
+		cs.read_deadline = 0
+		cs.idle = false
+		w.parked--
+	}
+	cs.close_after_flush = true
+}
+
+// discard_while_closing reads and drops what a closing connection receives
+// (close_after_flush: its last bytes still going out): nothing more is
+// served, and unread bytes would turn the close into a reset that can cut
+// those last bytes off. Closes on error, and on EOF once nothing is left to
+// send. With bytes owed, a peer that half-closed still reads (RFC 9112 §9.6):
+// handle_writable sends them, then closes, and meanwhile the connection asks
+// for POLLOUT only (eof). Returns false if the connection was closed.
+fn discard_while_closing(mut w WorkerState, i int, active_conns &core.Counter) bool {
+	mut cs := w.conns[i]
+	for {
+		n := C.recv(cs.fd, cs.read_buf.data, usize(cs.read_buf.cap), 0)
+		if n > 0 {
+			continue
+		}
+		if n < 0 && (C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK) {
+			return true
+		}
+		if n == 0 && cs.write_off < cs.write_buf.len {
+			cs.eof = true
+			return true
+		}
+		w.close_conn_at(i, active_conns)
+		return false
 	}
 }
 
@@ -336,8 +393,8 @@ fn start_body_drain(h core.Handler, mut cs PollConn, limits core.Limits, state v
 }
 
 // serve_readable drains the socket, answers complete requests (pipelining),
-// and leaves any response bytes pending (the caller flushes). Returns false
-// if the connection was closed.
+// and flushes the batch at the end; what the socket cannot take waits for
+// POLLOUT (handle_writable). Returns false if the connection was closed.
 @[direct_array_access]
 fn serve_readable(h core.Handler, mut w WorkerState, i int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, state voidptr) bool {
 	stdatomic.add_i64(&counter.n, 1)
@@ -345,12 +402,16 @@ fn serve_readable(h core.Handler, mut w WorkerState, i int, limits core.Limits, 
 		stdatomic.add_i64(&counter.n, -1)
 	}
 	mut cs := w.conns[i]
+	// Closing, its last bytes still going out (a must-close, or a reply owed
+	// to a peer that half-closed): nothing more is served.
+	if cs.close_after_flush {
+		return discard_while_closing(mut w, i, active_conns)
+	}
 	req_cap := if limits.max_request_bytes > 0 {
 		limits.max_request_bytes
 	} else {
 		core.default_max_request_bytes
 	}
-	mut must_close := false
 	for {
 		// Streamed large body: consume + discard (head already answered).
 		if cs.body_drain > 0 {
@@ -388,13 +449,13 @@ fn serve_readable(h core.Handler, mut w WorkerState, i int, limits core.Limits, 
 			if target > pl_stream_body_above && target <= req_cap {
 				match start_body_drain(h, mut cs, limits, state, target) {
 					1 { continue } // draining started; keep consuming the body
-					2 { must_close = true }
+					2 { begin_close(mut w, mut cs) }
 					else {}
 				}
 
 				// head incomplete — fall through to grow
 
-				if must_close {
+				if cs.close_after_flush {
 					break
 				}
 			}
@@ -415,9 +476,12 @@ fn serve_readable(h core.Handler, mut w WorkerState, i int, limits core.Limits, 
 		}
 		if n == 0 {
 			// Half-close (EOF). A pending response is still owed on the open write
-			// half (RFC 9112 §9.6); with nothing pending, close now.
+			// half (RFC 9112 §9.6): it goes out, then the close, and a partial
+			// request behind it can never complete. With nothing pending, close
+			// now.
 			if cs.body_drain == 0 && cs.write_buf.len > cs.write_off {
-				cs.close_after_flush = true
+				begin_close(mut w, mut cs)
+				cs.eof = true
 				break
 			}
 			w.close_conn_at(i, active_conns)
@@ -436,7 +500,7 @@ fn serve_readable(h core.Handler, mut w WorkerState, i int, limits core.Limits, 
 		}
 		buffered := cs.read_buf.len
 		if !drain_requests(h, mut cs, limits, state) {
-			must_close = true
+			begin_close(mut w, mut cs) // nothing behind it is answered
 			break
 		}
 		if cs.read_deadline != 0 && cs.read_buf.len < buffered {
@@ -452,7 +516,7 @@ fn serve_readable(h core.Handler, mut w WorkerState, i int, limits core.Limits, 
 		}
 		if cs.read_buf.len > req_cap {
 			cs.write_buf << response.status_413_response
-			must_close = true
+			begin_close(mut w, mut cs)
 			break
 		}
 		// Expect: 100-continue — prompt exactly once per mid-read request.
@@ -477,18 +541,15 @@ fn serve_readable(h core.Handler, mut w WorkerState, i int, limits core.Limits, 
 				return false
 			}
 			0 {
-				// Parked on POLLOUT. A must-close (framing error / .close) or
-				// half-closed connection finishes closing once the batch drains.
-				if must_close {
-					cs.close_after_flush = true
-				}
+				// Parked on POLLOUT. A closing connection (a must-close, or a
+				// peer that half-closed) closes once the batch drains.
 				return true
 			}
 			else {}
 		}
 	}
-	if must_close || cs.close_after_flush {
-		w.close_conn_at(i, active_conns)
+	if cs.close_after_flush {
+		w.close_drained(i, active_conns)
 		return false
 	}
 	// Keep-alive: everything answered is flushed (a parked batch returned
@@ -518,7 +579,7 @@ fn handle_writable(mut w WorkerState, i int, limits core.Limits, active_conns &c
 	}
 
 	if cs.close_after_flush {
-		w.close_conn_at(i, active_conns)
+		w.close_drained(i, active_conns)
 		return false
 	}
 	// The parked batch drained: back to waiting for the next request.
@@ -584,7 +645,9 @@ fn poll_worker(listener int, handler core.Handler, make_state fn () voidptr, lim
 	for {
 		// Rebuild the pollfd set from connection state — O(nfds), the floor's
 		// documented cost (poll(2) itself is O(nfds) anyway). Interest derives
-		// from state: write pending ⇒ POLLOUT, everything ⇒ POLLIN.
+		// from state: write pending ⇒ POLLOUT, everything but a closing
+		// connection whose peer's EOF was read ⇒ POLLIN (POLLERR and POLLHUP
+		// are reported whatever the events).
 		w.pfds.clear()
 		if w.accepting {
 			w.pfds << C.vanilla_pollfd{
@@ -593,7 +656,7 @@ fn poll_worker(listener int, handler core.Handler, make_state fn () voidptr, lim
 			}
 		}
 		for cs in w.conns {
-			mut ev := poll.pollin
+			mut ev := if cs.eof { i16(0) } else { poll.pollin }
 			if cs.write_off < cs.write_buf.len && cs.body_drain == 0 {
 				ev |= poll.pollout
 			}
