@@ -400,11 +400,13 @@ kqueue a deadline watch is a plain watch, and `cancel` fails.
   left in a transaction gets a ROLLBACK before anyone else can take it. On a
   serialization failure (40001: SERIALIZABLE, every conflict on Aurora DSQL)
   run the whole transaction again, as `pg_async.TxRetry` decides — never by
-  sleeping on the worker. Until
-  [vanilla#247](https://github.com/enghitalo/vanilla/pull/247) lands, run the
-  next attempt at once on the connection the request holds (`acquire()`),
-  re-arming that same fd; afterwards `backoff_ms` can arm a timerfd the
-  request parks on between attempts
+  sleeping on the worker: `release()` the connection, park on
+  `policy.park_backoff(attempt, ...)` (a timerfd armed for
+  `backoff_ms(attempt)`), and acquire a connection again when it fires, with
+  the attempt number in `watch_payload`. Close that timer in the next
+  continuation, not in the one that steps away from it: the runtime takes it
+  out of the event loop only after that one returns, and by then its number
+  may be a newly accepted connection
   ([examples/pg_transactions](../examples/pg_transactions/src/main.v)).
   Aurora DSQL also caps a transaction at 3,000 modified rows, 10 MiB written
   and 5 minutes, and keeps DDL and DML apart (`pg_async/tx.v`).

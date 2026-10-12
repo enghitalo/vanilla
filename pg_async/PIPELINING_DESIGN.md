@@ -155,20 +155,26 @@ ROLLBACK undoes it, and after a failed statement every one of them fails with
   belongs on `acquire()`.
 - **Retries.** A serialization failure (40001: SERIALIZABLE, and every OCC
   conflict on Aurora DSQL, often at COMMIT) means running the whole
-  transaction again. `TxRetry` holds no state: `retry(attempt, err)` and
-  `backoff_ms(attempt)` (full jitter, from the monotonic clock).
-- **Until vanilla#247 lands, no backoff wait after a DB reply.** Before
-  #247, a continuation parked on a pooled fd cannot step to ANOTHER fd (a
-  timerfd for the wait) when it is pipelined (`drain_pipelined` keeps the
-  slot at the head, and the next reply on the connection runs it again — a
-  FIFO misalignment, seen here as requests hanging forever while every
-  backend sat idle) or when its client disconnected (a tombstone's re-arm
-  of another fd, or of its own fd with a new continuation or payload, is not
-  taken). So `examples/pg_transactions` runs the next attempt at once on the
-  connection the request holds and re-arms the same fd, counting attempts
-  in the worker state rather than in the watch payload. Once #247 is in, the
-  continuation can arm a timerfd for `backoff_ms(attempt)` and park on it in
-  both cases, and a tombstone's re-arm takes the new payload.
+  transaction again. `TxRetry` holds no state: `retry(attempt, err)`,
+  `backoff_ms(attempt)` (full jitter, from the monotonic clock) and
+  `park_backoff(attempt, ...)`, which parks the request on a one-shot
+  timerfd armed for that wait.
+- **The wait between attempts is spent without the connection.** The
+  continuation that reads the 40001 releases the connection, parks on the
+  timer, and acquires a connection again when it fires
+  (`examples/pg_transactions`); the attempt number travels in the watch
+  payload. A continuation parked on a pooled fd may step to another fd
+  whether its request is a pipelined head or holds the connection alone,
+  and a tombstone's re-arm takes the new continuation and payload
+  (vanilla#247). A client that disconnected ends its retries at that step:
+  the runtime closes the timer once the draining run returns and never
+  resumes the request, so the release before the step is what returns the
+  connection. The timer is closed by the next continuation (the attempt's
+  reply), not by the one that steps away from it: the runtime detaches a
+  stepped-away fd after that continuation returns, and a number closed
+  before then can already be a connection the acceptor just registered.
+  (Before #247 a step after a DB reply lost the FIFO alignment, so the
+  example re-ran each attempt at once on the held connection.)
 
 ## Local validation harness
 `bench/pg_async/` pipeline-tests pg_async locally against a seeded PG

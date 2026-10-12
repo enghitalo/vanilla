@@ -12,23 +12,24 @@ module main
 // Under SERIALIZABLE, and always on Aurora DSQL (optimistic concurrency), a
 // transaction that conflicts with a concurrent one fails with SQLSTATE 40001
 // and must be run again, whole: the continuation asks pg_async.TxRetry whether
-// to, and submits the same batch again. Retries used up: 409. Pool busy: 503,
-// a shed, not an error. Any other failure: 500.
+// to, waits, and submits the same batch again. Retries used up: 409. Pool
+// busy: 503, a shed, not an error. Any other failure: 500.
 //
-// The next attempt runs at once, on the connection the request holds
-// (acquire()), not after TxRetry.backoff_ms on a timerfd: until vanilla#247
-// lands, a continuation parked on a pooled connection cannot step to another
-// fd when the request is pipelined (acquire_pipelined) or its client
-// disconnected meanwhile — the connection's park queue keeps the stale slot
-// at its head, and the next reply on that connection runs the wrong
-// continuation. Re-running on the held connection is right in every case: the
-// failed batch left the session idle, and only this request uses it. Once
-// #247 is in, the continuation can release the connection, park on a timerfd
-// armed for backoff_ms, and acquire again when it fires. (The batch itself is
-// safe pipelined: it has no BEGIN, so its Sync ends its transaction.) A
-// transaction that needs a statement's result before the next one is BEGIN …
-// COMMIT across park/resume instead, on acquire() too: release() rolls back a
-// connection left in a transaction (pg_async/tx.v).
+// The wait is TxRetry.backoff_ms, jittered, on a timerfd (park_backoff), and
+// the request spends it without a connection: on_reply releases the one it
+// holds before parking on the timer, and on_backoff acquires one again when
+// the timer fires. The jitter spreads apart transactions that collided, and
+// meanwhile the connection serves other requests. The attempt number travels
+// with the request, in watch_payload. A client that disconnects mid-transfer
+// stops it: while it waits on the timer, the runtime closes the timer and
+// drops the request; while its batch is in flight, the runtime still runs
+// on_reply to drain the reply, and a conflict there releases the connection
+// and steps to a timer that the runtime closes without resuming the request.
+// (The batch itself would be safe pipelined too: it has no BEGIN, so its
+// Sync ends its transaction.) A transaction that needs a statement's result
+// before the next one is BEGIN … COMMIT across park/resume instead, on
+// acquire(): release() rolls back a connection left in a transaction
+// (pg_async/tx.v).
 //
 // Setup, then run with PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE set:
 //   create table accounts (id int4 primary key, balance int4 not null check (balance >= 0));
@@ -55,10 +56,12 @@ const transfer = [
 	},
 ]
 
-// policy: up to 5 runs of a transfer in all (its backoff fields are unused
-// here until vanilla#247: see above).
+// policy: up to 5 runs of a transfer in all, with a wait before each rerun
+// that starts at up to 10 ms and doubles, to at most 500 ms.
 const policy = pg_async.TxRetry{
-	max_attempts: 5
+	max_attempts:    5
+	base_backoff_ms: 10
+	max_backoff_ms:  500
 }
 
 const resp_404 = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
@@ -80,20 +83,24 @@ fn env_or(name string, dflt string) string {
 	return if v != '' { v } else { dflt }
 }
 
-// TxState is one worker's make_state value: its pool, and the attempt number
-// of the transfer holding each connection. The count lives here, per held
-// connection, not in watch_payload: when the client of a parked request
-// disconnects, the runtime still runs its continuation to drain the reply,
-// and until vanilla#247 a re-arm from there keeps the payload of the first
-// park.
+// TxState is one worker's make_state value: its pool, its retry policy, and
+// per connection the timer the request holding it waited on before its
+// current attempt (-1 if none). What a request carries from one wait to the
+// next, its attempt number, is in its watch_payload.
 struct TxState {
 mut:
-	pool     &pg_async.PgPool
-	attempts []int
+	pool   &pg_async.PgPool
+	policy pg_async.TxRetry
+	timers []int
 }
 
 // build_state is make_state: this worker's pool, as the opaque worker state.
 fn build_state() voidptr {
+	return new_state(policy)
+}
+
+// new_state brings up this worker's pool, retrying conflicts as `p` says.
+fn new_state(p pg_async.TxRetry) voidptr {
 	port_env := os.getenv('PGPORT')
 	cfg := pg_async.ConnConfig{
 		host:     env_or('PGHOST', 'localhost')
@@ -106,8 +113,9 @@ fn build_state() voidptr {
 		panic('pg_transactions: pool bring-up failed: ${err}')
 	}
 	return voidptr(&TxState{
-		pool:     pool
-		attempts: []int{len: pool_size}
+		pool:   pool
+		policy: p
+		timers: []int{len: pool_size, init: -1}
 	})
 }
 
@@ -117,17 +125,18 @@ fn handler(req []u8, mut out []u8, _ int, worker_state voidptr, mut event_loop c
 		return .done
 	}
 	mut st := unsafe { &TxState(worker_state) }
+	return run_attempt(mut st, 1, -1, mut out, mut event_loop)
+}
+
+// run_attempt runs attempt number `attempt`: it takes a connection
+// (acquire(): the request's alone until release()), submits the batch on it
+// and parks there. `timer` is the wait it comes from (-1 for the first
+// attempt): when the attempt parks, its on_reply closes it.
+fn run_attempt(mut st TxState, attempt int, timer int, mut out []u8, mut event_loop core.EventLoop) core.Step {
 	idx := st.pool.acquire() or {
 		core.append_str(mut out, resp_503) // every connection is busy: shed
 		return .done
 	}
-	st.attempts[idx] = 1
-	return run_attempt(mut st, idx, mut out, mut event_loop)
-}
-
-// run_attempt submits the batch on connection idx (held: acquire()) and parks
-// on it, the slot in watch_payload.
-fn run_attempt(mut st TxState, idx int, mut out []u8, mut event_loop core.EventLoop) core.Step {
 	mut conn := st.pool.conn(idx)
 	submitted := conn.async_submit_batch(transfer) or {
 		// Empty, or larger than the send buffer: no connection will ever take
@@ -144,26 +153,46 @@ fn run_attempt(mut st TxState, idx int, mut out []u8, mut event_loop core.EventL
 	// From here the batch is in the connection's in-flight FIFO: park for its
 	// outcome whatever the flush did (a partial flush finishes in on_reply).
 	conn.async_flush() or {}
-	event_loop.watch_fd_persistent(st.pool.fd(idx), .readable, on_reply, voidptr(usize(idx)))
+	st.timers[idx] = timer
+	event_loop.watch_fd_persistent(st.pool.fd(idx), .readable, on_reply, parked(idx, attempt))
 	return .suspend
+}
+
+// parked is the watch_payload of a request parked on its connection: the
+// connection's index and the attempt number, packed into the pointer (no
+// allocation).
+@[inline]
+fn parked(idx int, attempt int) voidptr {
+	return voidptr((usize(attempt) << 16) | usize(idx))
 }
 
 fn on_reply(mut out []u8, ready_fd int, _ bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut st := unsafe { &TxState(worker_state) }
-	idx := int(usize(watch_payload))
+	idx := int(usize(watch_payload) & 0xffff)
+	attempt := int(usize(watch_payload) >> 16)
+	if st.timers[idx] >= 0 {
+		// The timer this attempt waited on: on_backoff stepped away from it,
+		// and the runtime has taken it out of the event loop since.
+		os.fd_close(st.timers[idx])
+		st.timers[idx] = -1
+	}
 	mut conn := st.pool.conn(idx)
 	if conn.async_wants_write() {
 		conn.async_flush() or {}
 	}
 	poll := conn.async_on_readable() or {
-		if policy.retry(st.attempts[idx], err) {
-			// A conflict: the batch did nothing. Run it again, whole, on the
-			// same connection (see the top of the file for why not after a wait,
-			// until vanilla#247).
-			st.attempts[idx]++
-			return run_attempt(mut st, idx, mut out, mut event_loop)
-		}
+		// Released on every path, and before the step to the timer: when the
+		// client is gone the request is never resumed after it.
 		st.pool.release(idx)
+		if st.policy.retry(attempt, err) {
+			// A conflict: the batch did nothing. Wait, then run it again, whole
+			// (on_backoff: the next attempt's number is its payload).
+			next := voidptr(usize(attempt + 1))
+			if st.policy.park_backoff(attempt, mut event_loop, on_backoff, next) {
+				return .suspend
+			}
+			return run_attempt(mut st, attempt + 1, -1, mut out, mut event_loop) // no timerfd here: at once
+		}
 		core.append_str(mut out, if pg_async.is_serialization_failure(err) {
 			resp_409
 		} else {
@@ -178,8 +207,24 @@ fn on_reply(mut out []u8, ready_fd int, _ bool, watch_payload voidptr, worker_st
 		return .suspend
 	}
 	st.pool.release(idx)
-	answer_attempts(mut out, st.attempts[idx])
+	answer_attempts(mut out, attempt)
 	return .done
+}
+
+// on_backoff runs when the wait before attempt number `watch_payload` is
+// over, and runs it. The timer (ready_fd) is the request's, but not this run's
+// to close once the attempt parks on a connection: the runtime takes a fd a
+// continuation steps away from out of the event loop only after the
+// continuation returns, and a number closed before then can already be a
+// connection another thread just accepted, which would be taken out instead.
+// The attempt's on_reply closes it.
+fn on_backoff(mut out []u8, ready_fd int, _ bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	mut st := unsafe { &TxState(worker_state) }
+	step := run_attempt(mut st, int(usize(watch_payload)), ready_fd, mut out, mut event_loop)
+	if step != .suspend {
+		os.fd_close(ready_fd) // answered without a watch: nothing steps away from it
+	}
+	return step
 }
 
 // answer_attempts appends 200 {"attempts":N}: parts appended straight into
