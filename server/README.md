@@ -82,7 +82,9 @@ per-request allocation.
   subscription does not park the connection and does not hold
   `shutdown(grace)`. Epoll worker only (plain HTTP and HTTPS): elsewhere
   `subscribe` returns a nil handle and posts report `.unsupported`. See
-  `examples/websocket_chat` and `core/conn_handle.v`.
+  `examples/websocket_chat`, `examples/sse` (a stream with no frames to read:
+  a drain-only takeover plus a subscription), `examples/async_sse` (a timer
+  stream, no mailbox) and `core/conn_handle.v`.
 - **Per-worker state** — set `make_state`: it runs once per worker thread, and
   every handler call on that worker receives the value as the
   **`worker_state`** parameter (e.g. a per-thread DB connection — no shared
@@ -151,8 +153,10 @@ or without any other timeout set. A request parked with a deadline holds
 `shutdown(grace)` only until that deadline answers it.
 
 Use `idle_timeout_ms: -1` when a handler hands its fd to another thread to
-stream (the fd-handoff pattern in `examples/sse` and `examples/video_stream`):
-the core has seen the response finish, so the connection looks idle to it.
+stream (the fd-handoff pattern in `examples/video_stream`): the core has seen
+the response finish, so the connection looks idle to it. A stream on server
+push (`examples/sse`) needs no such opt-out: a taken-over connection is not
+idle-reaped.
 Behind a load balancer that pools upstream connections, keep `idle_timeout_ms`
 longer than the balancer's own idle timeout, or it will reuse a connection the
 server is closing and answer 502.
@@ -210,7 +214,8 @@ it (`core.max_pending_write_bytes`), so hand a large body off with
 timeout closes silently (no 408: it would go out as plaintext), and code that
 touches the client socket itself sees TLS records, not HTTP, on a
 userspace-TLS connection (a readable watch on the client's own fd, or the
-fd-handoff pattern of `examples/sse`, where another thread writes to it).
+fd-handoff pattern of `examples/video_stream`, where another thread writes to
+it).
 
 After the handshake the record crypto moves into the kernel (kTLS) when the
 host has the `tls` module; otherwise the connection stays on Mbed TLS, and the

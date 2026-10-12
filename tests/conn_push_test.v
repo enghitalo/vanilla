@@ -16,8 +16,9 @@
 // reuse (a handle never reaches the connection that reuses its number);
 // ordering and atomicity from two producer threads; backpressure (.full, the
 // push watermark, a .close whose flush parks); wake_after liveness with
-// default Limits; .shutdown; the unsupported paths; and no allocation per
-// post under -gc none. Takeover is inert under tcc (#173): run with gcc.
+// default Limits; .shutdown, with the mailbox on and off; the unsupported
+// paths; and no allocation per post under -gc none. Takeover is inert under
+// tcc (#173): run with gcc.
 import server
 import core
 import sync
@@ -469,9 +470,19 @@ fn cp_stats_until(mut h vtest.Harness, stale u64, ms int) server.PushStats {
 
 // --- the checks -----------------------------------------------------------------
 
-// Repro A inverted: a subscribed connection keeps reading its client — echo
-// and pong come back while no post is pending — and a post from another
-// thread arrives between bursts.
+// cp_at sleeps until `ms` milliseconds into `sw`.
+fn cp_at(sw time.StopWatch, ms i64) {
+	left := ms - sw.elapsed().milliseconds()
+	if left > 0 {
+		time.sleep(left * time.millisecond)
+	}
+}
+
+// Repro A inverted, on its timeline: the client sends text #1 at t=0, #2 at
+// t=0.5 and a ping at t=0.7, and a producer thread posts at t=1.0. The echoes
+// and the pong each come back within 100 ms of being sent, before the post
+// (a parked connection held them until the post woke it, 1.3-1.5 s late),
+// and the post arrives at ~1.0 s.
 fn test_epoll_push_reads_while_subscribed() ! {
 	$if tinyc {
 		eprintln('[test] takeover is inert under tcc; skipping')
@@ -486,18 +497,26 @@ fn test_epoll_push_reads_while_subscribed() ! {
 	defer {
 		a.close()
 	}
-	a.send('one\n')!
-	assert a.until('echo:one\n', 2000)
-	a.send('two\n')!
-	assert a.until('echo:two\n', 2000), 'a subscribed connection must keep reading: ${a.acc.bytestr()}'
-	a.send('ping\n')!
-	assert a.until('pong\n', 2000)
 	handle := cp_reg_get(idx)
-	t := spawn fn [handle] () core.PostResult {
+	sw := time.new_stopwatch()
+	t := spawn fn [handle, sw] () core.PostResult {
+		cp_at(sw, 1000)
 		return handle.post_bytes(1, 'hello'.bytes())
 	}()
-	assert t.wait() == .ok
+	for step in [['0', 'one\n', 'echo:one\n'], ['500', 'two\n', 'echo:two\n'],
+		['700', 'ping\n', 'pong\n']] {
+		cp_at(sw, step[0].i64())
+		sent := sw.elapsed().milliseconds()
+		a.send(step[1])!
+		assert a.until(step[2], 2000), 'a subscribed connection must keep reading: ${a.acc.bytestr()}'
+		took := sw.elapsed().milliseconds() - sent
+		assert took < 100, '${step[2].trim_space()} came back ${took} ms after it was sent'
+	}
+	assert !a.acc.bytestr().contains('push:'), 'the post came before its time: ${a.acc.bytestr()}'
 	assert a.until('push:hello\n', 2000), a.acc.bytestr()
+	pushed := sw.elapsed().milliseconds()
+	assert t.wait() == .ok
+	assert pushed >= 1000 && pushed < 1300, 'the post arrived at ${pushed} ms'
 	assert handle.post_wake(42) == .ok
 	assert a.until('wake:42\n', 2000), a.acc.bytestr()
 	// Still reading after the posts.
@@ -521,8 +540,12 @@ fn test_epoll_push_cross_worker() ! {
 		a.close()
 	}
 	// Accept round-robins: one of the next connections lands on the other worker.
+	// A's client frames are served in between the posts.
 	mut other := -1
-	for _ in 0 .. 4 {
+	for i in 0 .. 4 {
+		a.send('frame' + i.str() + '\n')!
+		assert a.until('echo:frame' + i.str() + '\n', 2000), a.acc.bytestr()
+		a.acc.clear()
 		mut b := cp_dial(h.port(), 'GET /notify/' + idx.str() + ' HTTP/1.1\r\nHost: x\r\n\r\n')!
 		body := b.line_after('\r\n\r\n', 2000) or { '' }
 		b.close()
@@ -866,12 +889,122 @@ fn test_epoll_push_shutdown_says_goodbye() ! {
 	assert cp_until(&c.closed, 2, 2000) == 2
 }
 
+// The same with the mailbox off: .shutdown does not need posts. The worker's
+// first subscription armed its signal. Before, nothing told the worker, and
+// both connections stayed open after shutdown() returned.
+fn test_epoll_push_shutdown_says_goodbye_without_mailbox() ! {
+	$if tinyc {
+		return
+	}
+	cp_reset()
+	mut h := vtest.start(cp_config(2, 0, 0))!
+	defer {
+		h.stop()
+	}
+	mut a, _, _ := cp_sub(h.port(), '/sub')!
+	defer {
+		a.close()
+	}
+	mut b, _, _ := cp_sub(h.port(), '/sub')!
+	defer {
+		b.close()
+	}
+	sw := time.new_stopwatch()
+	h.server_ref().shutdown(5000)
+	waited := sw.elapsed().milliseconds()
+	assert waited < 2000, 'subscribed connections held shutdown(5000) for ${waited} ms'
+	assert a.until('shutdown\n', 2000) && a.eof(2000), 'no .shutdown with the mailbox off: ${a.acc.bytestr()}'
+	assert b.until('shutdown\n', 2000) && b.eof(2000), 'no .shutdown with the mailbox off: ${b.acc.bytestr()}'
+	c := unsafe { cp }
+	assert cp_until(&c.closed, 2, 2000) == 2
+}
+
+// A connection that subscribes after shutdown() was called, on a worker where
+// nothing had subscribed (so shutdown found nothing to signal there), still
+// gets .shutdown: the worker's late arm wakes itself.
+fn test_epoll_push_subscribe_after_shutdown_gets_shutdown() ! {
+	$if tinyc {
+		return
+	}
+	cp_reset()
+	mut h := vtest.start(cp_config(1, 0, 0))!
+	defer {
+		h.stop()
+	}
+	// Accepted before the listener goes: an HTTP/1.1 connection, not subscribed.
+	mut x := cp_dial(h.port(), 'GET / HTTP/1.1\r\nHost: x\r\n\r\n')!
+	defer {
+		x.close()
+	}
+	assert x.until('\r\n\r\nok', 2000)
+	x.acc.clear()
+	h.server_ref().shutdown(0)
+	x.send('GET /sub HTTP/1.1\r\nHost: x\r\n\r\n')!
+	assert x.until('\r\n\r\nsub ', 2000), x.acc.bytestr()
+	assert x.until('shutdown\n', 2000) && x.eof(2000), 'a late subscription missed .shutdown: ${x.acc.bytestr()}'
+	c := unsafe { cp }
+	assert cp_until(&c.closed, 1, 2000) == 1
+}
+
+// A connection that subscribes after its worker has already delivered
+// .shutdown (an upgrade on a keep-alive connection during the drain) gets
+// .shutdown too, at once, mailbox on or off. Before, it stayed open:
+// nothing told it the server was going.
+fn test_epoll_push_subscribe_after_delivery_gets_shutdown() ! {
+	$if tinyc {
+		return
+	}
+	for slots in [0, 64] {
+		cp_reset()
+		mut h := vtest.start(cp_config(1, slots, 0))!
+		defer {
+			h.stop()
+		}
+		mut a, _, _ := cp_sub(h.port(), '/sub')!
+		defer {
+			a.close()
+		}
+		// Accepted before the listener goes: an HTTP/1.1 connection, not subscribed.
+		mut x := cp_dial(h.port(), 'GET / HTTP/1.1\r\nHost: x\r\n\r\n')!
+		defer {
+			x.close()
+		}
+		assert x.until('\r\n\r\nok', 2000)
+		x.acc.clear()
+		h.server_ref().shutdown(2000) // returns once the worker delivered .shutdown to A
+		assert a.until('shutdown\n', 2000) && a.eof(2000)
+		x.send('GET /sub HTTP/1.1\r\nHost: x\r\n\r\n')!
+		assert x.until('\r\n\r\nsub ', 2000), x.acc.bytestr()
+		assert x.until('shutdown\n', 2000) && x.eof(2000), 'a subscription after the delivery missed .shutdown (slots ${slots}): ${x.acc.bytestr()}'
+		c := unsafe { cp }
+		assert cp_until(&c.closed, 2, 2000) == 2
+	}
+}
+
+// shutdown(grace) on a server that never ran (or a worker with nothing
+// subscribed) has no goodbyes to wait for: it returns at once, mailbox on or
+// off. Before, a mailbox held one in-flight count per worker that no worker
+// would ever give back, so it waited out the whole grace.
+fn test_epoll_shutdown_of_a_server_that_never_ran() ! {
+	for slots in [0, 64] {
+		mut srv := server.new_server(server.ServerConfig{
+			...cp_config(2, slots, 0)
+			port: 0
+		})!
+		sw := time.new_stopwatch()
+		srv.shutdown(3000)
+		waited := sw.elapsed().milliseconds()
+		assert waited < 1000, 'shutdown(3000) of a server that never ran took ${waited} ms (slots ${slots})'
+	}
+}
+
 // Repro C inverted: a taken-over connection parked on a watch that never
 // fires, whose client sends a frame and then its FIN. The connection closes at
-// once (it no longer waits for the watch), the continuation never runs, the
-// frame before the FIN is dropped (the frame-before-FIN policy:
-// read_while_parked), and its subscription gets .closed. Before, only a
-// 1-byte peek looked at a parked connection: it saw the frame, never the FIN.
+// once (it no longer waits for the watch), its watch fd is torn down, the
+// continuation never runs, the frame before the FIN is dropped (the
+// frame-before-FIN policy: read_while_parked), and its subscription gets
+// .closed. Before, only a 1-byte peek looked at a parked connection: it saw
+// the frame, never the FIN.
 fn test_epoll_parked_takeover_sees_fin_behind_a_frame() ! {
 	$if tinyc {
 		return
@@ -901,6 +1034,11 @@ fn test_epoll_parked_takeover_sees_fin_behind_a_frame() ! {
 	c := unsafe { cp }
 	assert cp_until(&c.closed, 1, 2000) == 1
 	assert stdatomic.load_i64(&c.park_runs) == 0, 'the continuation of a closed park ran'
+	// The watch was torn down with the connection: the runtime closed the
+	// pipe's read end (a request-owned watch_fd), so a write finds no reader.
+	one := u8(1)
+	wrote := C.write(int(stdatomic.load_i64(&c.park_w)), &one, 1)
+	assert wrote < 0 && C.errno == C.EPIPE, 'the parked watch fd is still open'
 }
 
 // While parked the connection keeps taking its client's bytes into its
@@ -986,6 +1124,35 @@ fn test_iouring_push_unsupported() ! {
 		x.close()
 	}
 	assert x.until('501', 2000), x.acc.bytestr()
+	assert h.server_ref().push_stats().posted == 0
+}
+
+// The poll reactor (-d vanilla_poll) has no takeover either: the upgrade is
+// refused, the server keeps serving, and shutdown has nothing to signal.
+fn test_poll_push_unsupported() ! {
+	$if !vanilla_poll ? {
+		eprintln('[test] built without -d vanilla_poll; skipping')
+		return
+	}
+	cp_reset()
+	mut h := vtest.start(server.ServerConfig{
+		...cp_config(1, 64, 0)
+		io_multiplexing: .poll
+	})!
+	defer {
+		h.stop()
+	}
+	mut x := cp_dial(h.port(), 'GET /sub HTTP/1.1\r\nHost: x\r\n\r\n')!
+	defer {
+		x.close()
+	}
+	assert x.until('501', 2000), x.acc.bytestr()
+	assert x.eof(2000)
+	mut y := cp_dial(h.port(), 'GET / HTTP/1.1\r\nHost: x\r\n\r\n')!
+	defer {
+		y.close()
+	}
+	assert y.until('\r\n\r\nok', 2000), y.acc.bytestr()
 	assert h.server_ref().push_stats().posted == 0
 }
 

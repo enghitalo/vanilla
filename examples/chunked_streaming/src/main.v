@@ -27,9 +27,9 @@ module main
 //
 // RESPONSE side: a handler produces one buffer per request, so a chunked
 // response built here is framing, not true streaming — for incremental
-// delivery backed by the fd (backpressure via the event loop) see the async
-// examples (examples/async_sse). The frames below are still byte-exact wire
-// format; curl decodes them like any chunked response.
+// delivery (backpressure via the event loop) see the async examples
+// (examples/async_incremental_read, examples/async_sse). The frames below are
+// still byte-exact wire format; curl decodes them like any chunked response.
 import server
 import core
 import http1_1.request_parser

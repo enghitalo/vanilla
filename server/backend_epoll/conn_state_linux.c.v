@@ -260,14 +260,19 @@ mut:
 	// wait timeout, so it works with no other timeout set.
 	park_ns u64
 	timers  []ParkTimer
-	// Subscriptions (push_linux.c.v): the worker's mailbox (nil: posts off),
-	// the .closed notifications due at the end of this loop iteration (reused,
-	// never shrunk), the pending-write bound of a pushed connection, and
-	// whether .shutdown was delivered.
+	// Subscriptions (push_linux.c.v): the worker's mailbox (mailbox_linux.c.v),
+	// whether it has a ring (posts on) and whether it is armed (its eventfd is
+	// in this epoll), the .closed notifications due at the end of this loop
+	// iteration (reused, never shrunk), the pending-write bound of a pushed
+	// connection, whether .shutdown was delivered, and the subscriptions made
+	// since that are due one too.
 	mbox           &Mailbox = unsafe { nil }
+	posts          bool
+	mbox_armed     bool
 	closed_q       []ClosedNote
 	push_watermark int
 	shutdown_seen  bool
+	late_shutdown  []LateShutdown
 	// tls_cfg is the server's TLS config, nil for plain HTTP. An HTTPS
 	// server's connections start with their handshake (state_create).
 	tls_cfg &tls.Config = unsafe { nil }

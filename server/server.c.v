@@ -72,9 +72,10 @@ pub mut:
 	// acceptor stops once its listener reports the shutdown (EPOLLHUP) or accept()
 	// says the listener is gone (socket.listener_gone).
 	draining &core.Counter = &core.Counter{}
-	// Server push (vanilla#230): one mailbox per epoll worker when
-	// ServerConfig.push_mailbox_slots > 0 (empty otherwise), opaque here and
-	// never freed (ConnHandles may outlive the server).
+	// Server push (vanilla#230): one mailbox per epoll worker (empty on the
+	// other backends), opaque here and never freed (ConnHandles may outlive
+	// the server). Its ring exists when ServerConfig.push_mailbox_slots > 0;
+	// shutdown() signals .shutdown through it either way.
 	mailboxes []voidptr
 	// push_watermark is the pending-write bound of a pushed connection
 	// (ServerConfig.push_watermark_bytes; 0 = the default, 1 MiB).
@@ -113,9 +114,12 @@ pub fn (s &Server) push_stats() PushStats {
 // In flight includes a request PARKED on a watch (.suspend: an async DB query,
 // an upstream call, a timer) until its continuation answers it, so size
 // grace_ms for the slowest parked operation (DB or upstream timeout); a
-// request parked for good (an endless SSE stream) holds the drain for the
-// whole grace. A parked client that disconnects stops counting at once on
-// epoll and kqueue; io_uring notices only when its request resumes.
+// request parked for good (a stream that waits on a watch) holds the drain
+// for the whole grace. A parked client that disconnects stops counting at
+// once on epoll and kqueue; io_uring notices only when its request resumes.
+// A subscribed connection (epoll, core.EventLoop.subscribe: an SSE stream, a
+// WebSocket) is not parked: its wake fn gets .shutdown, and the drain waits
+// for that delivery, not for the connection.
 //
 // The drain is PRECISE: it sums the per-worker in-flight counters and returns
 // the instant they all hit zero, so an idle server shuts down in ~milliseconds
@@ -250,8 +254,9 @@ pub:
 	// slots (rounded up to a power of two; ~280 B each: 4096 slots are ~1.1 MiB
 	// per worker), through which any thread can post to a subscribed
 	// connection (core.ConnHandle.post_wake / post_bytes, vanilla#230). 0 (the
-	// default) = off: posts report .unsupported; subscriptions, wake_after and
-	// .closed still work. The epoll backend only, with or without TLS.
+	// default) = off: posts report .unsupported; subscriptions, wake_after,
+	// .shutdown and .closed still work. The epoll backend only, with or
+	// without TLS.
 	push_mailbox_slots int
 	// push_watermark_bytes bounds what a subscribed connection may have
 	// waiting to be sent after its wake fn ran: past it the connection is
@@ -425,10 +430,12 @@ pub fn new_server(config ServerConfig) !Server {
 	}
 
 	// Server push mailboxes (vanilla#230): one per epoll worker, built once the
-	// listeners are open, here so shutdown() can reach them; never freed.
+	// listeners are open, here so shutdown() can reach them; never freed. With
+	// push_mailbox_slots = 0 one has no ring and no eventfd until its worker's
+	// first subscription, only what shutdown() needs to deliver .shutdown.
 	mut mailboxes := []voidptr{}
 	$if linux {
-		if config.push_mailbox_slots > 0 && io_multiplexing == .epoll {
+		if io_multiplexing == .epoll {
 			mailboxes = new_push_mailboxes(n_workers, config.push_mailbox_slots)
 		}
 	}

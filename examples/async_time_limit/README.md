@@ -119,6 +119,6 @@ and a closed connection.
   timerfd
 - [examples/async_multi_watch](../async_multi_watch/) — a chain of different
   fds in one request
-- [examples/async_sse](../async_sse/) — a periodic timerfd that streams
+- [examples/async_sse](../async_sse/) — a periodic timer (`wake_after`) that streams
   instead of answering once
 - [BEST_PRACTICES §5 — bound every park](../../docs/BEST_PRACTICES.md#5-side-effects-go-through-the-async-runtime--pools-off-the-hot-path)

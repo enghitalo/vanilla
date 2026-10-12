@@ -46,8 +46,9 @@ pub fn (mut srv Server) run() {
 	run_selected_backend(srv, mut srv.threads)
 }
 
-// new_push_mailboxes builds one push mailbox per epoll worker
-// (ServerConfig.push_mailbox_slots, vanilla#230).
+// new_push_mailboxes builds one push mailbox per epoll worker, with a ring of
+// ServerConfig.push_mailbox_slots (none for 0: only the shutdown signal),
+// vanilla#230.
 fn new_push_mailboxes(workers int, slots int) []voidptr {
 	mut out := []voidptr{cap: workers}
 	for _ in 0 .. workers {
@@ -56,9 +57,9 @@ fn new_push_mailboxes(workers int, slots int) []voidptr {
 	return out
 }
 
-// signal_push_shutdown tells every worker with a mailbox to deliver .shutdown
-// to its subscribed connections; each holds one count of its in-flight
-// counter until it has.
+// signal_push_shutdown tells every epoll worker to deliver .shutdown to its
+// subscribed connections; each armed one (posts on, or something subscribed
+// there) holds one count of its in-flight counter until it has.
 fn signal_push_shutdown(mailboxes []voidptr, inflight []&core.Counter) {
 	for i, m in mailboxes {
 		if i < inflight.len {

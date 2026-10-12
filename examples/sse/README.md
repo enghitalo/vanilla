@@ -8,6 +8,12 @@ It listens on port 3000: `GET /events` subscribes, `POST /broadcast` sends its
 body to every subscriber as one `data:` event, and every subscriber gets a
 `: keepalive` comment every 15 s.
 
+Streams need the Linux epoll worker, built with gcc or clang (`-prod`):
+connection takeover is inert in a tcc build, the default without `-prod`, and
+the other backends (kqueue on macOS, IOCP on Windows) have no takeover. There
+`GET /events` answers `501 Not Implemented`; `POST /broadcast` still answers
+200, with nobody to send to.
+
 ### Serve the front-end
 
 ```sh
@@ -20,64 +26,78 @@ v -e 'import net.http.file; file.serve(folder: "examples/sse/front-end")'
 curl -X POST -d 'hello' http://localhost:3000/broadcast
 ```
 
-### Subscribers are keyed by the registry's own descriptor
-
-The broadcaster writes to subscribers from other threads, so it keeps a
-registry of them. It must not key that registry by the core's fd number. The
-core owns that fd and closes it when the client goes away, without telling the
-app, and the kernel gives the number to the next accepted connection. An
-fd-keyed registry then sends every later event and heartbeat to that
-connection, which never subscribed. One disconnect followed by one new
-connection is enough, with no timeout involved
-([#232](https://github.com/enghitalo/vanilla/issues/232)).
-
-So `Clients.add` registers a `dup()` of the connection instead, and
-`GET /events` returns `.close`: the core sends the SSE head and closes its own
-fd, and the registry's descriptor is the connection's only one. The dup keeps
-the socket open, so its number cannot be reused while it is in the registry,
-and only the registry closes it, under its lock. Since the core never reads
-the connection again, a client that pipelines more requests behind
-`GET /events` subscribes once, instead of taking a descriptor per request.
-
-A subscriber is dropped when a send does not take the whole event: the client
-is gone (`EPIPE`, on the second send after it left), or it stopped reading
-(`EAGAIN` or a partial write). The registry then shuts the socket down, so the
-stream ends at once: an `EventSource` discards an event cut short, and
-reconnects.
-
-The costs: a departed subscriber's socket lingers until that failed send, up
-to about 30 s with the heartbeat. A subscriber is the registry's, not the
-core's, so it does not count toward `max_connections`, and `srv.shutdown()`
-does not end it. On Windows a `SOCKET` has no `dup()`, so there the core keeps
-the connection (`.done`) and the registry keys its handle. Any request on a
-handle drops it from the registry, but a reused handle that has not sent one
-yet can still receive a departed subscriber's events.
-
-Two things need core support
-([#230](https://github.com/enghitalo/vanilla/issues/230)): a close
-notification, to learn of a departure at once instead of from a failed send,
-and a single writer per socket. For example, a broadcast that runs between
-`Clients.add` and the core's flush of the SSE head reaches the client before
-the head.
-
-### Timeouts
-
-On POSIX the core lets go of a subscriber right after the SSE head, so no
-`Limits` timeout applies to a stream. On Windows `GET /events` returns `.done`,
-so to the core the subscriber looks like an **idle keep-alive connection**.
-This example sets no `Limits`, so nothing reaps it. If you add a
-`read_timeout_ms`, also set `idle_timeout_ms: -1`: the default (`0`) inherits
-the read timeout, so the core would close every subscriber that long after it
-subscribed.
-
-```v
-limits: server.Limits{
-	read_timeout_ms: 10_000 // bounds silent connects and slow requests
-	idle_timeout_ms: -1     // never reap idle connections: subscribers look idle
-}
+```sh
+curl -N http://localhost:3000/events
 ```
 
-The cost is that idle keep-alive connections on the other routes are not
-reaped either. The async variant ([`examples/async_sse`](../async_sse/main.v):
-`.suspend` + `watch_fd`) keeps each stream parked inside the core, and a parked
-request is never idle-reaped, so it needs no opt-out.
+```
+data: hello
+
+: keepalive
+
+```
+
+A body of up to 240 bytes is one event: that is what a mailbox slot carries
+(below). A larger one gets `413 Content Too Large`. Each line of the body
+becomes a `data:` line of the event, so a body cannot end its event early or
+add a field of its own.
+
+### How it works
+
+A subscriber stays the server's connection, on server push
+([#230](https://github.com/enghitalo/vanilla/issues/230)):
+
+- **Subscribe.** `GET /events` appends the SSE head, hands the connection to
+  `drain_conn` with `core.queue_takeover` (what the client sends from now on
+  is not HTTP, and is dropped: a request pipelined behind the subscribe does
+  not subscribe again), and calls `event_loop.subscribe(sse_wake, id)`. The
+  returned `core.ConnHandle` goes into the `Hub`, with the subscriber's id.
+  Then `event_loop.wake_after(15_000)` arms the first heartbeat.
+- **Broadcast.** `POST /broadcast`, on whichever worker serves it, calls
+  `post_bytes` on every handle in the hub. The post goes through the owning
+  worker's mailbox (`push_mailbox_slots: 4096`), and `sse_wake` runs there with
+  `.posted`: it appends the `data:` event to the connection's write buffer,
+  which the worker sends with the same backpressure as any response. No thread
+  writes to a socket it does not own, and an event never lands inside another
+  write. A post never blocks: a subscriber whose worker's mailbox is full
+  misses the event.
+- **Heartbeat.** On `.timeout`, `sse_wake` appends `: keepalive` and re-arms
+  the timer: one timer per subscriber in its worker's timer heap, no thread.
+- **Departure.** However the connection ends (the client leaves, an error, a
+  subscriber that stops reading and passes the push watermark, shutdown),
+  `sse_wake` runs once more with `.closed`, and the subscriber leaves the hub.
+  A handle carries its connection's generation: a post that races the
+  departure is dropped on the worker (`Server.push_stats().stale`), never
+  delivered to the new connection that reuses the fd number
+  ([#232](https://github.com/enghitalo/vanilla/issues/232)).
+- **Shutdown.** `srv.shutdown(grace)` does not wait for the streams: they are
+  not parked requests. Each gets `.shutdown`, and `sse_wake` ends it; an
+  `EventSource` reconnects later.
+
+The hub (subscribers by handle) is the only shared state. Every worker reaches
+it through its `make_state` value, and its lock is taken once per subscribe,
+departure and broadcast, never per event delivered or per heartbeat. A
+subscriber's state is its id, carried as the subscription's state itself: a
+subscriber costs its hub entry, and nothing is allocated per event or per
+heartbeat.
+
+The streams count toward `max_connections`, and no `Limits` timeout reaps
+them: a taken-over connection is never idle-reaped, so `read_timeout_ms` and
+`idle_timeout_ms` can be set for the other routes without touching the
+streams.
+
+### Tests
+
+```sh
+v -cc gcc test examples/sse/src
+```
+
+[main_test.v](src/main_test.v) checks the routes, the 413 and 400s, the 501
+without push, the subscribe path through stand-in backend hooks, the events
+`sse_wake` frames (line splitting included), and that serving and delivering
+allocate nothing. [server_end_to_end_test.v](src/server_end_to_end_test.v)
+runs the server: a broadcast reaching 8 subscribers on two workers, a
+pipelined subscribe registering once, heartbeats, a departed subscriber whose
+fd number a new connection takes (a post to its old handle, and a broadcast,
+reach nobody), and shutdown ending every stream at once. The streams need
+gcc or clang; under tcc only the 501 is checked.
