@@ -1,45 +1,50 @@
 module main
 
-// Async-runtime example: Server-Sent Events (SSE), the canonical user of
-// flush-on-suspend. One periodic `timerfd` drives the stream; each time it fires
-// the continuation appends ONE `data:` event and re-arms — and because a
-// continuation that wrote bytes before returning `.suspend` has them flushed
-// immediately (not buffered until `.done`), the client receives each event the
-// instant it is produced. Each worker keeps serving everyone else between
-// ticks, so thousands of open streams cost one timerfd each, not a thread each.
+// Server-Sent Events from a timer, over server push (vanilla#230): `/events`
+// streams five `data:` events, one per second, then `data: bye`.
 //
-// This stream is finite (5 ticks, then "bye"), so the client must be able to
-// see where it ends. Each event goes out as one HTTP chunk
-// (`Transfer-Encoding: chunked`), and a zero-size chunk ends the body
-// (RFC 9112 §7.1). The connection then stays open for the client's next
-// request. Without that framing the body would be close-delimited (§6.3): on a
-// keep-alive connection it would never end, and the client would hang.
+// The stream is a subscribed connection. `handle` appends the head, hands the
+// connection to drain_conn (core.queue_takeover: what the client sends from
+// now on is not HTTP), subscribes it (event_loop.subscribe) and arms its timer
+// (event_loop.wake_after). Each time the timer fires, sse_tick appends ONE
+// event to the connection's write buffer, which goes out at once, and re-arms.
+// The connection is never parked: it does not hold Server.shutdown(grace),
+// and on .shutdown the stream ends early, with its `bye`. Each worker keeps
+// serving everyone else between ticks, so thousands of open streams cost a
+// timer each in the worker's heap: no thread, no fd, no allocation.
 //
-// Run:   v run examples/async_sse/
+// This stream is finite, so the client must be able to see where it ends.
+// Each event goes out as one HTTP chunk (`Transfer-Encoding: chunked`), and a
+// zero-size chunk ends the body (RFC 9112 §7.1). A taken-over connection does
+// not go back to HTTP/1.1, so the connection then closes, as the head's
+// `Connection: close` says.
+//
+// Run:   v -prod run examples/async_sse/
+//        (-prod: a tcc build, V's default without it, leaves the takeover
+//        inert and /events answers 501)
 // Try:   curl -N http://localhost:8092/events
 //        # -> data: tick 1 of 5   (one line per second, then "bye")
 //
-// The same append-flush-suspend loop is how a chat feed, a progress stream, or a
-// log tail would push to many clients from one thread. See core.Handler.
+// The same subscribe-and-tick loop is how a progress stream or a log tail
+// would push to many clients from one thread; examples/sse adds events
+// posted from other workers.
 import server
 import core
 import strconv
 import http1_1.request_parser
 import http1_1.response
 
-#include <sys/timerfd.h>
-#include <unistd.h>
-
-fn C.timerfd_create(clockid int, flags int) int
-fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
-fn C.read(fd int, buf voidptr, count usize) int
-
-// max_events ends the stream after this many ticks.
+// max_events ends the stream after this many ticks, tick_ms apart.
 const max_events = 5
 
-const sse_headers = 'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n'
+const tick_ms = 1000
+
+const sse_headers = 'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n'
 
 const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
+
+// 501: this server cannot keep a stream (no takeover or no subscriptions here).
+const not_implemented = 'HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
 
 // The literal parts of one `data: tick N of M\n\n` event.
 const tick_head = 'data: tick '
@@ -53,17 +58,6 @@ const event_end = '\n\n'
 const bye_and_end = 'b\r\ndata: bye\n\n\r\n0\r\n\r\n'
 
 const hex_digits = '0123456789abcdef'
-
-// arm_periodic programs a timerfd to fire every `ms` (it_value = it_interval).
-fn arm_periodic(tfd int, ms int) {
-	// struct itimerspec = { it_interval{sec,nsec}, it_value{sec,nsec} } = 4×i64.
-	mut spec := [4]i64{}
-	spec[0] = i64(ms / 1000)
-	spec[1] = i64(ms % 1000) * 1_000_000
-	spec[2] = spec[0]
-	spec[3] = spec[1]
-	C.timerfd_settime(tfd, 0, unsafe { voidptr(&spec[0]) }, unsafe { nil })
-}
 
 // route_is reports whether the request path, without its query string, is
 // `lit`. req.path includes the query, so the compare stops at the first `?`.
@@ -117,25 +111,49 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
 		core.append_str(mut out, not_found)
 		return .done
 	}
-	tfd := C.timerfd_create(C.CLOCK_MONOTONIC, 0)
-	arm_periodic(tfd, 1000) // one event per second
-	// Headers go out NOW: async_serve flushes the write buffer after the initial
-	// .suspend, so the client sees `200 text/event-stream` before any tick.
+	if !core.queue_takeover(drain_conn, unsafe { nil }) {
+		core.append_str(mut out, not_implemented)
+		return .close
+	}
+	// The stream's only state is the number of events sent, carried in the
+	// subscription's state itself (none yet): nothing is allocated per stream.
+	if event_loop.subscribe(sse_tick, unsafe { nil }).is_nil() {
+		// Taken over but not subscribed: nothing could ever tick. The takeover
+		// queued above is dropped with this .close.
+		core.append_str(mut out, not_implemented)
+		return .close
+	}
+	event_loop.wake_after(tick_ms)
+	// The head goes out NOW, with the response: the client sees
+	// `200 text/event-stream` before any tick.
 	core.append_str(mut out, sse_headers)
-	// The stream's only state is the number of events sent, carried in
-	// watch_payload itself (none yet): nothing is allocated per stream.
-	event_loop.watch_fd(tfd, .readable, sse_tick, unsafe { nil })
-	return .suspend
+	return .done
 }
 
-// sse_tick fires once per timer expiry: emit one event and re-arm. The appended
-// bytes are flushed on .suspend (the streaming primitive), so each event ships
-// immediately instead of waiting for the stream to finish. watch_payload is the
-// number of events sent so far (an integer, not a pointer), and ready_fd is the
-// stream's timerfd.
+// drain_conn is the stream's ConnHandler: the client has nothing more to say
+// after GET /events, so what it sends is dropped. Its EOF closes the
+// connection, and its timer goes with it.
+fn drain_conn(buf []u8, mut out []u8, client_fd int, takeover_state voidptr, worker_state voidptr, mut event_loop core.EventLoop) (int, core.Step) {
+	return buf.len, core.Step.done
+}
+
+// sse_tick is the stream's wake fn. On each timer expiry (.timeout) it
+// appends ONE event as a chunk, which goes out at once, and re-arms the
+// timer; the last tick ends the body and closes. On .shutdown the stream ends
+// early, with its `bye`. watch_payload is the number of events sent so far
+// (an integer, not a pointer); re-subscribing stores the new count (it
+// replaces the subscription's state, same handle).
 fn sse_tick(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
-	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8) // drain the timerfd expiry count
+	match event_loop.reason() {
+		.timeout {}
+		.shutdown {
+			core.append_str(mut out, bye_and_end)
+			return .close
+		}
+		else {
+			return .done // .closed: nothing to free
+		}
+	}
 	sent := int(usize(watch_payload)) + 1
 	// One chunk: `<size in hex>\r\n<event>\r\n`. The size is the literal parts
 	// plus the digits of the two counters.
@@ -151,11 +169,11 @@ fn sse_tick(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidp
 	core.append_str(mut out, '\r\n')
 	if sent >= max_events {
 		core.append_str(mut out, bye_and_end)
-		C.close(ready_fd) // request owns the timerfd; closing it removes it from epoll
-		return .done // the body is complete; the connection stays open
+		return .close // the body is complete; it goes out, then the connection closes
 	}
-	event_loop.watch_fd(ready_fd, .readable, sse_tick, voidptr(usize(sent))) // keep streaming
-	return .suspend
+	event_loop.subscribe(sse_tick, voidptr(usize(sent)))
+	event_loop.wake_after(tick_ms) // keep streaming
+	return .done
 }
 
 fn main() {

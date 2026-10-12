@@ -127,7 +127,7 @@ leaves no zombie child behind: the test process ignores `SIGCHLD` from
 
 ## See also
 
-- [examples/async_sse](../async_sse/) — the same chunk-per-suspend streaming,
+- [examples/async_sse](../async_sse/) — chunk-per-tick streaming on server push,
   driven by a timer
 - [examples/async_pipe](../async_pipe/) — the minimal park/resume on a pipe
 - [examples/chunked_streaming](../chunked_streaming/) — chunked responses
