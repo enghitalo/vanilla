@@ -313,8 +313,7 @@ concatenates, interpolates or allocates per request. The
   - kqueue: `response.send_response` fails on `EAGAIN` and the connection is
     closed (#4, [#154](https://github.com/enghitalo/vanilla/issues/154)).
   - Server push: a per-connection outbound queue
-    ([#23](https://github.com/enghitalo/vanilla/issues/23)); `examples/sse`
-    still drops a client on a short `C.send`.
+    ([#23](https://github.com/enghitalo/vanilla/issues/23)).
   - Close paths: the untransmitted tail is lost when the client keeps sending
     after `close()` ([#272](https://github.com/enghitalo/vanilla/issues/272));
     gaps after #268 ([#275](https://github.com/enghitalo/vanilla/issues/275);

@@ -498,7 +498,8 @@ is a first-class guarantee — keep it that way.
   goes through the owning worker's mailbox and its wake fn writes the bytes,
   on that worker, in order with everything else the connection sends. Keep
   your registries keyed by handle, and drop a handle in the wake fn's
-  `.closed` (see [examples/websocket_chat](../examples/websocket_chat/src/main.v)).
+  `.closed` (see [examples/websocket_chat](../examples/websocket_chat/src/main.v)
+  and [examples/sse](../examples/sse/src/main.v)).
 
 **Don't**
 
