@@ -216,3 +216,54 @@ fn test_client_config_errors() {
 		c.free()
 	}
 }
+
+// set_session_tickets (#236): a server config that sends TLS 1.3
+// NewSessionTickets sends them at the end of the handshake, so records wait
+// on the client's socket before any data; the client reads past them to the
+// data, and the session falls back from kTLS. Without it nothing follows the
+// handshake.
+fn test_server_session_tickets() {
+	$if vanilla_tls ? {
+		for n in [0, 2] {
+			srv_cfg := new_self_signed() or { panic(err) }
+			srv_cfg.set_session_tickets(n) or { panic(err) }
+			cli_cfg := new_client('', .off) or { panic(err) }
+			fds := nonblocking_pair()
+			srv := srv_cfg.new_session(fds[0]) or { panic('server session') }
+			cli := cli_cfg.new_client_session(fds[1], 'localhost') or { panic('client session') }
+			cr, sr := handshake_both(cli, srv)
+			assert cr == 0 && sr == 0, cli.handshake_error()
+			mut peek := [4096]u8{}
+			waiting := C.recv(fds[1], &peek[0], usize(peek.len), C.MSG_PEEK | C.MSG_DONTWAIT)
+			if n == 0 {
+				assert waiting < 0, 'nothing should follow the handshake, got ${waiting} bytes'
+			} else {
+				assert waiting > 0, 'the tickets should follow the handshake'
+			}
+			// The ticket check comes first: the session stays on userspace TLS
+			// whatever the socket (here AF_UNIX, where kTLS cannot attach).
+			assert !srv.enable_ktls(fds[0])
+			assert !srv.ktls_failed()
+			msg := 'after the tickets'
+			assert srv.write_from(msg.str, msg.len) == msg.len
+			mut got := [64]u8{}
+			cli.mark_readable()
+			r := cli.read_into(&got[0], got.len)
+			assert r == msg.len, 'the client read ${r}'
+			assert unsafe { tos(&got[0], r) } == msg
+			srv.free()
+			cli.free()
+			C.close(fds[0])
+			C.close(fds[1])
+			cli_cfg.free()
+			srv_cfg.free()
+		}
+		cfg := new_self_signed() or { panic(err) }
+		if _ := cfg.set_session_tickets(70000) {
+			assert false, 'more than 65535 tickets must be an error'
+		}
+		cfg.free()
+	}
+}
+
+fn C.recv(fd int, buf voidptr, n usize, flags int) int

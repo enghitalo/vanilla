@@ -10,6 +10,7 @@
 
 #include <mbedtls/ssl.h>
 #include <mbedtls/ssl_ciphersuites.h>
+#include <mbedtls/ssl_ticket.h> /* vtls_set_session_tickets */
 #include <mbedtls/net_sockets.h>
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/pk.h>
@@ -75,6 +76,13 @@ struct vtls_ctx {
     // server's certificate is checked (VTLS_VERIFY_*).
     mbedtls_x509_crt cachain;
     int verify;
+    // vtls_set_session_tickets: NewSessionTickets per handshake (0 = none),
+    // and the key context that encrypts them, set up on the first call.
+    int tickets;
+#if defined(MBEDTLS_SSL_TICKET_C)
+    int ticket_ready;
+    mbedtls_ssl_ticket_context ticket;
+#endif
 };
 
 // kTLS key capture: the TLS 1.3 application traffic secrets, filled by
@@ -99,6 +107,7 @@ typedef struct {
     int ktls;        // 1 once kTLS TX+RX are both installed (reads/writes are plaintext)
     int ktls_failed; // 1 if a setsockopt failed AFTER the ULP attached → caller must close
     int ktls_off;    // the config's vtls_set_ktls(0), as of this session's creation
+    int tickets;     // the config sends NewSessionTickets (vtls_set_session_tickets): never kTLS
     int ktls_rx_no_pad; // the ctx's opt-in: enable_ktls sets TLS_RX_EXPECT_NO_PAD
     // The socket may hold unread bytes: set by vtls_mark_readable (every
     // readable edge), cleared by a recv that came back short or EAGAIN.
@@ -209,6 +218,9 @@ vtls_ctx *vtls_ctx_new(void) {
     mbedtls_x509_crt_init(&c->srvcert);
     mbedtls_x509_crt_init(&c->cachain);
     mbedtls_pk_init(&c->pkey);
+#if defined(MBEDTLS_SSL_TICKET_C)
+    mbedtls_ssl_ticket_init(&c->ticket);
+#endif
     return c;
 }
 
@@ -220,6 +232,9 @@ void vtls_ctx_free(vtls_ctx *c) {
     if (c->key_id != 0) psa_destroy_key(c->key_id);
     mbedtls_pk_free(&c->pkey);
     mbedtls_ssl_config_free(&c->conf);
+#if defined(MBEDTLS_SSL_TICKET_C)
+    mbedtls_ssl_ticket_free(&c->ticket); // destroys its PSA keys
+#endif
     VTLS_UNLOCK();
     free(c);
 }
@@ -382,6 +397,7 @@ static int setup(vtls_ctx *c) {
     // after Finished, which encrypts under the server app key and advances the TX
     // record sequence to 1 before any app data — breaking the kTLS rec_seq=0 handoff.
     // Off => the first kernel-emitted application record is sequence 0.
+    // (vtls_set_session_tickets turns them on for tests, without kTLS.)
 #if defined(MBEDTLS_SSL_SESSION_TICKETS)
     mbedtls_ssl_conf_new_session_tickets(&c->conf, 0);
 #endif
@@ -435,6 +451,36 @@ int vtls_set_alpn(vtls_ctx *c, const char *list) {
 // enable_ktls for when that is safe). No lock: called before the server starts.
 void vtls_set_ktls_rx_no_pad(vtls_ctx *c, int enabled) {
     if (c) c->ktls_rx_no_pad = enabled != 0;
+}
+
+// A server context's TLS 1.3 NewSessionTickets: Mbed TLS writes them at the
+// end of the handshake, and only when the config has ticket callbacks and the
+// client offered a PSK key exchange mode (Mbed TLS clients do by default;
+// OpenSSL servers send theirs either way). The key context generates its AES
+// key from PSA's RNG, under the lock. setup() turns tickets off; this turns
+// them back on, for tests.
+int vtls_set_session_tickets(vtls_ctx *c, int n) {
+    if (!c || n < 0 || n > 0xffff) return MBEDTLS_ERR_SSL_BAD_INPUT_DATA;
+#if defined(MBEDTLS_SSL_SESSION_TICKETS) && defined(MBEDTLS_SSL_TICKET_C) && defined(MBEDTLS_SSL_SRV_C)
+    int ret = 0;
+    VTLS_LOCK();
+    if (n > 0 && !c->ticket_ready) {
+        ret = mbedtls_ssl_ticket_setup(&c->ticket, PSA_ALG_GCM, PSA_KEY_TYPE_AES, 256, 86400);
+        if (ret == 0) {
+            mbedtls_ssl_conf_session_tickets_cb(&c->conf, mbedtls_ssl_ticket_write,
+                                                mbedtls_ssl_ticket_parse, &c->ticket);
+            c->ticket_ready = 1;
+        }
+    }
+    if (ret == 0) {
+        mbedtls_ssl_conf_new_session_tickets(&c->conf, (uint16_t)n);
+        c->tickets = n;
+    }
+    VTLS_UNLOCK();
+    return ret;
+#else
+    return n == 0 ? 0 : MBEDTLS_ERR_SSL_FEATURE_UNAVAILABLE;
+#endif
 }
 
 // ---- per-connection session -------------------------------------------------
@@ -554,6 +600,7 @@ void *vtls_session_new(vtls_ctx *c, int fd) {
     int ktls_off; // a local: tcc miscompiles a load into a field (see the top)
     __atomic_load(&c->ktls_off, &ktls_off, __ATOMIC_RELAXED);
     s->ktls_off = ktls_off;
+    s->tickets = c->tickets > 0;
     s->ktls_rx_no_pad = c->ktls_rx_no_pad;
     mbedtls_ssl_set_bio(&s->ssl, &s->net, vtls_bio_send, vtls_bio_recv, NULL);
     // Capture the TLS 1.3 application traffic secrets for the kTLS handoff (per-ssl;
@@ -974,7 +1021,8 @@ static int fill_crypto_info(const unsigned char secret[32],
     memcpy(ci->key, key, 16);
     memcpy(ci->salt, iv12, 4);     // implicit/fixed nonce prefix
     memcpy(ci->iv, iv12 + 4, 8);   // explicit nonce
-    // rec_seq stays all-zero: tickets are disabled, so the first app record is seq 0.
+    // rec_seq stays all-zero: tickets are off (a session whose config sends
+    // them never gets here, see enable_ktls), so the first app record is seq 0.
     memset(key, 0, 16);
     memset(iv12, 0, 12);
     return 0;
@@ -993,6 +1041,7 @@ static int fill_crypto_info(const unsigned char secret[32],
 static int ktls_logged_ok = 0;
 static int ktls_logged_fb = 0;
 static int ktls_logged_off = 0;
+static int ktls_logged_tickets = 0;
 // ktls_first reports whether this call is the first to claim `flag`. The load
 // keeps every later call from writing the shared line.
 static int ktls_first(int *flag) {
@@ -1020,6 +1069,14 @@ static int enable_ktls(vtls_session *s, int fd) {
 
     // Turned off on the config (vtls_set_ktls): the same clean fallback as a host
     // without the `tls` module, logged once under its own flag.
+    // The config sends NewSessionTickets: each one went out under the server
+    // application key, so the first application record is not sequence 0.
+    if (s->tickets) {
+        if (ktls_first(&ktls_logged_tickets)) {
+            fprintf(stderr, "[ktls] userspace TLS: the config sends session tickets (tls.Config.set_session_tickets)\n");
+        }
+        goto done;
+    }
     if (s->ktls_off) {
         if (ktls_first(&ktls_logged_off)) {
             fprintf(stderr, "[ktls] userspace TLS: disabled by tls.Config.set_ktls(false)\n");

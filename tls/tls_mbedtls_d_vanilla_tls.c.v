@@ -40,6 +40,7 @@ fn C.vtls_ktls_failed(sess voidptr) int
 fn C.vtls_ktls_abort(sess voidptr)
 fn C.vtls_set_ktls(ctx voidptr, enabled int)
 fn C.vtls_set_ktls_rx_no_pad(ctx voidptr, enabled int)
+fn C.vtls_set_session_tickets(ctx voidptr, n int) int
 fn C.vtls_peer_closed(sess voidptr) int
 fn C.vtls_peer_close_notify(sess voidptr) int
 fn C.vtls_verify_failed(sess voidptr) int
@@ -215,6 +216,24 @@ pub fn (c &Config) set_ktls(enabled bool) {
 // copies it when created: call it before the server starts.
 pub fn (c &Config) set_ktls_rx_no_pad(enabled bool) {
 	C.vtls_set_ktls_rx_no_pad(c.ctx, int(enabled))
+}
+
+// set_session_tickets makes a server config send `n` TLS 1.3
+// NewSessionTickets at the end of each handshake: 0, the default, sends none.
+// For tests of clients against servers that do, as OpenSSL-based ones (nginx,
+// most CDNs and HTTPS APIs) send two by default. Nothing here resumes a
+// session from a ticket. A session from such a config never enables kTLS
+// (enable_ktls returns false: each ticket advances the record sequence before
+// the first application byte), and Mbed TLS sends tickets only to a client
+// that offers a PSK key exchange mode, which its own clients do by default.
+// Each session copies the setting when created: call it before serving.
+// Errors when n is outside 0..65535 or Mbed TLS was built without
+// MBEDTLS_SSL_TICKET_C.
+pub fn (c &Config) set_session_tickets(n int) ! {
+	rc := C.vtls_set_session_tickets(c.ctx, n)
+	if rc != 0 {
+		return error('vtls: cannot send ${n} session tickets: ${error_text(rc)}')
+	}
 }
 
 // cert_pem returns the certificate as PEM, to hand to clients that must trust

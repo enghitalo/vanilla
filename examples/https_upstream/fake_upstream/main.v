@@ -2,12 +2,17 @@
 // http1_1/upstream client's end-to-end tests (../src/upstream_e2e_test.v,
 // which builds and starts it as its own process).
 //
-// usage: fake_upstream --port-file F --stats-file S [--bind IP] [--tls CERTDIR [--cert server|wronghost]]
+// usage: fake_upstream --port-file F --stats-file S [--bind IP] [--tls CERTDIR [--cert server|wronghost] [--tickets N] [--ticket-delay-ms MS]]
 //
 // Listens on 127.0.0.1:<ephemeral>, or on --bind's address (::1); the port
 // goes to --port-file once it listens. One thread per connection. With --tls
 // it serves TLS 1.3 through vanilla's own tls server side, with
-// CERTDIR/<cert>.crt / .key (from pg_async/testdata/gen_test_ca.sh).
+// CERTDIR/<cert>.crt / .key (from pg_async/testdata/gen_test_ca.sh), and
+// sends --tickets TLS 1.3 NewSessionTickets at the end of each handshake (0
+// by default; OpenSSL-based servers send 2). --ticket-delay-ms holds the
+// handshake's last step that long once the client's last flight is waiting:
+// the client, done with its own side, is sending its request meanwhile, so
+// the tickets arrive mid-request.
 // Keep-alive HTTP/1.1; the path picks the answer:
 //
 //   /ok           200, Content-Length JSON (HEAD: no body)
@@ -27,8 +32,8 @@
 //   /big/<n>      200, an n-byte body
 //   /e413         413 + Connection: close right after the head; reads nothing more for 1 s
 //
-// The stats file holds key=value lines: accepted, handshakes, requests, and
-// path:<path>=<count>.
+// The stats file holds key=value lines: accepted, handshakes, held_handshakes
+// (--ticket-delay-ms), tickets (sent), requests, and path:<path>=<count>.
 //
 // It exits within 200 ms of its parent process (the test) exiting: a test that
 // panics never runs its deferred stop(), and a fake left behind would keep the
@@ -73,6 +78,8 @@ const io_wait_ms = 10_000
 struct App {
 mut:
 	cfg        &tls.Config = unsafe { nil }
+	tickets    int
+	delay_ms   int // --ticket-delay-ms
 	mu         &sync.Mutex = sync.new_mutex()
 	counts     map[string]int
 	stats_path string
@@ -99,6 +106,7 @@ struct Conn {
 mut:
 	fd   int
 	sess tls.Session
+	held bool // handshake held its last step (--ticket-delay-ms)
 }
 
 // wait polls the socket for `events` (POLLIN / POLLOUT) up to `ms`. EINTR
@@ -117,8 +125,23 @@ fn (c &Conn) wait(events int, ms int) bool {
 	return false
 }
 
-fn (mut c Conn) handshake() bool {
+// client_flight_waiting reports whether the client's last handshake flight is
+// next in the socket: a ChangeCipherSpec (20) or an encrypted record (23),
+// where the ClientHello was a handshake record (22). The server session reads
+// the handshake exactly, so what it has not processed is still there.
+fn (c &Conn) client_flight_waiting() bool {
+	mut b := u8(0)
+	return C.recv(c.fd, &b, 1, C.MSG_PEEK | C.MSG_DONTWAIT) == 1 && (b == 20 || b == 23)
+}
+
+// handshake drives the server side to the end: false if it failed. With
+// delay_ms it holds the last step that long (c.held).
+fn (mut c Conn) handshake(delay_ms int) bool {
 	for {
+		if delay_ms > 0 && !c.held && c.client_flight_waiting() {
+			time.sleep(delay_ms * time.millisecond)
+			c.held = true
+		}
 		r := c.sess.handshake()
 		if r == 0 {
 			return true
@@ -306,11 +329,17 @@ fn serve(mut a App, fd int) {
 			C.close(fd)
 			return
 		}
-		if !c.handshake() {
+		if !c.handshake(a.delay_ms) {
 			c.close()
 			return
 		}
 		a.bump('handshakes')
+		if c.held {
+			a.bump('held_handshakes')
+		}
+		for _ in 0 .. a.tickets {
+			a.bump('tickets')
+		}
 	}
 	mut buf := []u8{cap: 65536}
 	for {
@@ -438,6 +467,8 @@ fn main() {
 	mut bind := '127.0.0.1'
 	mut certs := ''
 	mut cert := 'server'
+	mut tickets := 0
+	mut delay_ms := 0
 	for i := 1; i + 1 < os.args.len; i += 2 {
 		match os.args[i] {
 			'--port-file' { port_file = os.args[i + 1] }
@@ -445,19 +476,24 @@ fn main() {
 			'--bind' { bind = os.args[i + 1] }
 			'--tls' { certs = os.args[i + 1] }
 			'--cert' { cert = os.args[i + 1] }
+			'--tickets' { tickets = os.args[i + 1].int() }
+			'--ticket-delay-ms' { delay_ms = os.args[i + 1].int() }
 			else { panic('fake_upstream: unknown option ${os.args[i]}') }
 		}
 	}
 	if port_file == '' || stats_file == '' {
-		eprintln('usage: fake_upstream --port-file F --stats-file S [--bind IP] [--tls CERTDIR [--cert server|wronghost]]')
+		eprintln('usage: fake_upstream --port-file F --stats-file S [--bind IP] [--tls CERTDIR [--cert server|wronghost] [--tickets N] [--ticket-delay-ms MS]]')
 		exit(2)
 	}
 	mut app := &App{
 		stats_path: stats_file
+		tickets:    tickets
+		delay_ms:   delay_ms
 	}
 	if certs != '' {
 		app.cfg = tls.new_from_pem(os.read_bytes(os.join_path(certs, cert + '.crt'))!,
 			os.read_bytes(os.join_path(certs, cert + '.key'))!)!
+		app.cfg.set_session_tickets(tickets)!
 	}
 	mut a := transport.ip_addr(bind, 0) or { panic('fake_upstream: bad --bind ${bind}') }
 	lfd := C.socket(a.family, C.SOCK_STREAM, 0)
