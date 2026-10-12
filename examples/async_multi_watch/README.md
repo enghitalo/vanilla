@@ -8,6 +8,7 @@ whose result feeds a second query.
 
 The steps of one request are sequential: a request waits on one fd at a time.
 Different requests overlap freely, because the worker is free between stages.
+To wait on several fds at once, see [async_fan_out](../async_fan_out/).
 
 ## Run
 
@@ -84,6 +85,8 @@ connection, and nothing is left parked or open afterwards.
 
 ## See also
 
+- [examples/async_fan_out](../async_fan_out/) — N fds at once, behind one
+  watched aggregator fd
 - [examples/async_timer](../async_timer/) — the single-step version
 - [examples/async_pipe](../async_pipe/) — park/resume on a pipe, portable to
   kqueue
