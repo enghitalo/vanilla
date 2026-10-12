@@ -333,6 +333,26 @@ and once every slot has leaked the worker sheds every query with 503
 `watch_fd` for per-request fds (a timerfd, a pipe), which must be closed with
 their request.
 
+**Fan-out: N operations, one watched fd.** A request waits on one fd at a
+time. To wait on N at once (N upstreams for one page, a scatter-gather),
+register their fds in an epoll instance of the request's own, an aggregator,
+and watch that: it is readable whenever a member is. Each wake drains the
+members that finished (`epoll_wait(agg, …, 0)`, closing each) and parks
+again until none is left, so the request takes as long as its slowest member,
+not the sum, with no engine change and nothing on the hot path. Watch the
+aggregator with `watch_fd_persistent_deadline`, not `watch_fd`: the request
+owns the members, and on a client hangup the epoll runtime closes a
+request-owned fd without running the continuation, which would leave all N
+members open. A caller-owned aggregator becomes a tombstone instead, whose
+continuation runs when a member is ready and closes them. After a timeout,
+cancel the members still open (fire a timer now, `shutdown(2)` a socket)
+rather than closing the aggregator: the tombstone stays on its number until
+the run that closes the last member, and that run closes the aggregator too.
+[examples/async_fan_out](../examples/async_fan_out/) does all of this with
+per-worker groups and no allocation. Several watches armed for one connection
+by the engine itself is a different design:
+[vanilla#141](https://github.com/enghitalo/vanilla/issues/141).
+
 **Bound every park.** A parked request has no read, write or idle deadline:
 it waits as long as its fd does, so a database or upstream that stops
 answering holds the request, its client and its pool slot for good. Set
