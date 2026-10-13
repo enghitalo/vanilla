@@ -17,7 +17,7 @@ the other backends (kqueue on macOS, IOCP on Windows) have no takeover. There
 ### Serve the front-end
 
 ```sh
-v -e 'import net.http.file; file.serve(folder: "examples/sse/front-end")'
+(cd examples/sse/front-end && v -http)
 ```
 
 ### Send a notification

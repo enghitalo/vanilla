@@ -11,7 +11,7 @@ v -prod run examples/etag/src
 To serve the front-end files, execute:
 
 ```sh
-v -e 'import net.http.file; file.serve(folder: "examples/etag/front-end")'
+(cd examples/etag/front-end && v -http)
 ```
 
 Then open <http://localhost:4001/> and click the button twice: the first click
