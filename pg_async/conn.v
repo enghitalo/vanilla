@@ -251,6 +251,13 @@ pub:
 	// connection's lifetime, so the connections every worker opened at startup
 	// do not all come due in the same tick. max_lifetime_ms stays the bound.
 	lifetime_jitter_ms int
+	// max_inflight caps each connection's pipeline depth: how many queries
+	// may be in flight on it at once (async_submit, acquire_pipelined). A
+	// pool sheds a pipelined query (Shed, .pipeline_full) once every
+	// connection holds this many. Each slot keeps a reply accumulator of
+	// 16 KiB for the life of the connection, so raising it costs
+	// max_inflight × 16 KiB per connection, per worker. 1..max_inflight_limit.
+	max_inflight int = max_inflight
 }
 
 // check_startup_params refuses run-time parameters the StartupMessage cannot
@@ -316,6 +323,9 @@ mut:
 	send_off int  // [0, send_off) already sent
 	send_len int  // [send_off, send_len) written, still to send
 	inflight []PendingQuery
+	// inflight_cap is ConnConfig.max_inflight, as the connection was opened
+	// with (0 = the max_inflight default): see inflight_limit.
+	inflight_cap int
 	// ready_status is the transaction status byte of the last ReadyForQuery
 	// that completed a query: tx_idle, tx_in_block or tx_failed (tx.v). A
 	// fresh session starts idle.
@@ -394,8 +404,10 @@ struct Msg {
 // reports ReadyForQuery.
 pub fn PgConn.connect(cfg ConnConfig) !PgConn {
 	check_startup_params(cfg.params)!
+	check_max_inflight(cfg.max_inflight)!
 	mut c := PgConn{
-		recv_buf: []u8{cap: 16 * 1024}
+		recv_buf:     []u8{cap: 16 * 1024}
+		inflight_cap: cfg.max_inflight
 	}
 	if cfg.ssl_mode != .disable {
 		c.tls_cfg = new_tls_config(&cfg)!

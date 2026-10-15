@@ -15,8 +15,8 @@ module main
 // /db, /dbp and /dbslow render pg_async_demo (3 rows, seeded by
 // pg_async/testdata/throwaway_pg.sh) as JSON. Configuration: the PG* env vars
 // (PGSSLMODE + PGSSLROOTCERT for TLS, in a -d vanilla_tls build), PG_POOL_SIZE
-// (connections per worker, default 4), BENCH_PORT (default 8099),
-// VANILLA_WORKERS. Driven by bench/pg_async/e2e.sh and leak.sh (TLS=1 for both).
+// (connections per worker, default 4), PG_MAX_INFLIGHT (ConnConfig.max_inflight,
+// default 8), BENCH_PORT (default 8099), VANILLA_WORKERS. Driven by bench/pg_async/e2e.sh and leak.sh (TLS=1 for both).
 import os
 import strconv
 import server
@@ -71,6 +71,7 @@ fn build_state() voidptr {
 			panic('pg_async bench: PGSSLMODE must be disable, require, verify-ca or verify-full')
 		}
 		ssl_root_cert: os.getenv('PGSSLROOTCERT')
+		max_inflight:  env_or('PG_MAX_INFLIGHT', '8').int()
 	}
 	pool := pg_async.new_pool(cfg, env_or('PG_POOL_SIZE', '4').int()) or {
 		panic('pg_async bench: pool bring-up failed: ${err}')
