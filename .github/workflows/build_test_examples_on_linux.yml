@@ -151,6 +151,15 @@ jobs:
           VANILLA_NO_IOURING: '1'
         run: |
           v -cc gcc -no-parallel test tests/
+      # On its own: its connection churn (32 clients, a new connection per
+      # request) would compete with the timing-sensitive suites above.
+      - name: 'late_detach_stress_test.v (epoll: close a watch fd, then step away, under churn, #337)'
+        shell: bash
+        env:
+          VANILLA_NO_IOURING: '1'
+          LD_STRESS: '1'
+        run: |
+          v -cc gcc -no-parallel test tests/late_detach_stress_test.v
       # The http2 module's unit tests (HPACK against the RFC 7541 Appendix C
       # vectors, frame codec, ServerConn state machine) — pure-bytes tests
       # with no sockets, so they run here rather than in an example lane.

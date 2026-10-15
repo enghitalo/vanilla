@@ -9,11 +9,13 @@
 // not only /step) were taken out of the worker's epoll by a late
 // EPOLL_CTL_DEL and never answered.
 //
-// A request with no answer within LD_TIMEOUT_S (default 5) counts as hung,
-// and its server-side socket is inspected: still in the worker's epoll or
-// not, request bytes unread or not. LD_STRESS_SECS (default 3) and
-// LD_STRESS_CLIENTS (default 32) size the run; LD_KEEP_OPEN=1 is the control
-// (the timer is closed one step later).
+// It runs only with LD_STRESS=1: its connection churn would compete with the
+// timing-sensitive suites that `v test tests/` runs beside it, so CI runs it
+// on its own (build_test_examples_on_linux.yml). A request with no answer
+// within LD_TIMEOUT_S (default 5) counts as hung, and its server-side socket
+// is inspected: still in the worker's epoll or not, request bytes unread or
+// not. LD_STRESS_SECS (default 3) and LD_STRESS_CLIENTS (default 32) size the
+// run; LD_KEEP_OPEN=1 is the control (the timer is closed one step later).
 module main
 
 import os
@@ -229,6 +231,10 @@ fn client(port int, id int, timeout_s i64) {
 }
 
 fn test_epoll_stress_close_then_step_away() {
+	if os.getenv('LD_STRESS') != '1' {
+		eprintln('late_detach_stress_test: skipped, set LD_STRESS=1 to run it')
+		return
+	}
 	secs := (os.getenv_opt('LD_STRESS_SECS') or { '3' }).int()
 	nclients := (os.getenv_opt('LD_STRESS_CLIENTS') or { '32' }).int()
 	timeout_s := (os.getenv_opt('LD_TIMEOUT_S') or { '5' }).i64()
