@@ -772,17 +772,35 @@ fn conn_birth(fd int, start u64, mut st PlainState) &ConnState {
 // registration, and a DEL could only hit a number accept reused meanwhile),
 // and not for a socket accepted on this server's listener (its local address
 // is the listener's: accept reused the number, and its tagged birth event
-// follows). One getsockname, only on this rare path.
+// follows). One getsockname, only on this rare path, and two getsockopt when
+// the address is the listener's.
 @[direct_array_access; inline]
 fn (st &PlainState) leftover_fd(fd int) bool {
 	family, port, named := sock_local(fd)
 	if family == -1 {
 		return C.errno != C.EBADF // not a socket (a timerfd, pipe…) but open
 	}
-	if st.listen_uds {
-		return !(family == C.AF_UNIX && named)
+	on_listener := if st.listen_uds {
+		family == C.AF_UNIX && named
+	} else {
+		(family == C.AF_INET || family == C.AF_INET6) && port == st.listen_port
 	}
-	return !((family == C.AF_INET || family == C.AF_INET6) && port == st.listen_port)
+	// The address alone also matches an app's socket of another kind (a UDP
+	// socket on the listener's port, a bound datagram socket, a listener).
+	return !on_listener || !accepted_stream(fd)
+}
+
+// accepted_stream reports whether fd is a stream socket that is not
+// listening, as one accept returns is.
+@[noinline]
+fn accepted_stream(fd int) bool {
+	mut v := i32(0)
+	mut l := u32(4)
+	if C.getsockopt(fd, C.SOL_SOCKET, C.SO_TYPE, &v, &l) != 0 || v != C.SOCK_STREAM {
+		return false
+	}
+	l = 4
+	return C.getsockopt(fd, C.SOL_SOCKET, C.SO_ACCEPTCONN, &v, &l) == 0 && v == 0
 }
 
 // sock_local reads fd's local address (getsockname): its family (-1 when fd

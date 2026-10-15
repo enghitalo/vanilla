@@ -63,6 +63,9 @@ fn C.send(fd int, buf voidptr, n usize, flags int) int
 fn C.recv(fd int, buf voidptr, n usize, flags int) int
 fn C.setsockopt(fd int, level int, opt int, val voidptr, len u32) int
 fn C.shutdown(fd int, how int) int
+fn C.bind(fd int, addr voidptr, len u32) int
+fn C.sendto(fd int, buf voidptr, n usize, flags int, addr voidptr, len u32) int
+fn C.clock() i64 // this process's CPU time, in CLOCKS_PER_SEC (1e6 on POSIX) units
 
 const ok_resp = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'
 const stepped_resp = 'HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: keep-alive\r\n\r\nstepped'
@@ -84,7 +87,7 @@ mut:
 	c2_sent     i64 // test → continuation (control): a client connected and sent its request
 	reused      i64 // the continuation saw the freed number registered for a client before it returned
 	keep        i64 = -1 // control: the fd to close at the next step
-	shared_fd   i64 = -1 // /pipe and /tomb: the persistent fd their requests park on
+	shared_fd   i64 = -1 // /pipe, /tomb: the persistent fd their requests park on; /udp: the app socket; the background watch's trigger
 	parks       i64 // /pipe and /tomb: requests parked on it
 	redial      i64 // pg case: 1 until the re-dial's password_fn call
 }
@@ -217,6 +220,12 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
 		stdatomic.store_i64(&p.parks, parks + 1)
 		return .suspend
 	}
+	if req.len > 9 && req[5] == `u` { // GET /udp: watch the test's UDP socket, keep it, step away
+		next := C.eventfd(1, C.EFD_NONBLOCK | C.EFD_CLOEXEC)
+		event_loop.watch_fd(int(stdatomic.load_i64(&rp.shared_fd)), .readable, keep_and_step,
+			unsafe { voidptr(isize(next)) })
+		return .suspend
+	}
 	core.append_str(mut out, ok_resp)
 	return .done
 }
@@ -281,13 +290,24 @@ fn close_and_step(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload
 	return .suspend
 }
 
-// bg_start arms a clientless watch: a timer that fires once the test is
-// ready (its client sockets exist). Its continuation closes the timer, then
+// keep_and_step leaves the socket it woke on open and unread (the app keeps
+// it), and steps to its next fd.
+fn keep_and_step(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	mut p := unsafe { rp }
+	stdatomic.store_i64(&p.loop_fd, event_loop.loop_fd)
+	event_loop.watch_fd(int(isize(watch_payload)), .readable, after_b, unsafe { nil })
+	return .suspend
+}
+
+// bg_start arms a clientless watch on an eventfd that the test writes once it
+// is ready (its client sockets exist). Its continuation closes that fd, then
 // steps to another fd (core.WorkerStartFn: "if you re-arm a DIFFERENT fd the
 // runtime only detaches the old one").
 fn bg_start(worker_state voidptr, mut event_loop core.EventLoop) {
 	b := C.eventfd(1, C.EFD_NONBLOCK | C.EFD_CLOEXEC)
-	a := one_shot_timer(300)
+	a := C.eventfd(0, C.EFD_NONBLOCK | C.EFD_CLOEXEC)
+	mut p := unsafe { rp }
+	stdatomic.store_i64(&p.shared_fd, a)
 	event_loop.watch_fd(a, .readable, bg_after_a, unsafe { voidptr(isize(b)) })
 }
 
@@ -521,10 +541,13 @@ fn test_epoll_background_continuation_closing_its_fd() {
 	defer {
 		h.stop()
 	}
-	socks := tcp_sockets(victims) // before the timer fires and the continuation frees its number
+	assert wait_for(&rp.shared_fd, 0), 'the background watch was not armed'
+	socks := tcp_sockets(victims) // before the continuation frees its number
 	defer {
 		close_all(socks)
 	}
+	one := u64(1)
+	C.write(int(stdatomic.load_i64(&rp.shared_fd)), &one, 8) // the background watch fires
 	assert wait_go(), 'the background continuation never ran'
 	clients := connect_until_reused(h.port(), socks)
 	time.sleep(100 * time.millisecond) // the continuation returns at once; let the worker loop go round
@@ -612,6 +635,60 @@ fn test_epoll_tombstone_continuation_closing_its_fd() {
 	assert reused(), 'interleaving not reached: no client got the freed number'
 	assert still, 'a late EPOLL_CTL_DEL took the client on fd ${freed()} out of the worker epoll'
 	assert served, 'a client was never served'
+}
+
+// udp_on_loopback returns a UDP socket bound to 127.0.0.1:port, and a second
+// one that has sent it a datagram, so the first is readable until read.
+fn udp_on_loopback(port int) (int, int) {
+	mut a := [16]u8{}
+	unsafe {
+		*(&u16(&a[0])) = u16(C.AF_INET)
+	}
+	a[2] = u8(port >> 8)
+	a[3] = u8(port & 0xff)
+	a[4] = 127
+	a[7] = 1
+	fd := C.socket(C.AF_INET, C.SOCK_DGRAM | C.SOCK_CLOEXEC, 0)
+	if C.bind(fd, voidptr(&a[0]), 16) != 0 {
+		panic('bind failed')
+	}
+	peer := C.socket(C.AF_INET, C.SOCK_DGRAM | C.SOCK_CLOEXEC, 0)
+	C.sendto(peer, c'x', 1, 0, voidptr(&a[0]), 16)
+	return fd, peer
+}
+
+// The guard must not keep every socket on the listener's address: an app
+// socket of another kind there (here a UDP socket on the listener's port),
+// kept open by a continuation that steps away from it, is detached as
+// before. Left registered and readable, it would report on every wait, with
+// no watch and no connection behind it, and the worker would spin.
+fn test_epoll_step_away_from_an_app_socket_on_the_listener_port() {
+	rp_reset(false)
+	mut h := start(server.ServerConfig{
+		handler: handle
+	})
+	defer {
+		h.stop()
+	}
+	udp, peer := udp_on_loopback(h.port())
+	mut p := unsafe { rp }
+	stdatomic.store_i64(&p.shared_fd, udp)
+	c1 := tcp_socket()
+	defer {
+		C.close(c1)
+		C.close(udp)
+		C.close(peer)
+	}
+	tcp_connect(c1, h.port())
+	send_str(c1, 'GET /udp HTTP/1.1\r\nHost: x\r\n\r\n')
+	assert read_until(c1, stepped_resp.len) == stepped_resp
+	still := in_epoll(loop_fd(), udp)
+	cpu0 := C.clock()
+	time.sleep(300 * time.millisecond)
+	cpu_us := C.clock() - cpu0
+	eprintln('[udp on the listener port, kept open] still in the worker epoll: ${still}; process CPU in 300 ms: ${cpu_us} us')
+	assert !still, 'the app socket was left in the worker epoll'
+	assert cpu_us < 100_000, 'the worker spun on a readable app socket left registered: ${cpu_us} us of CPU in 300 ms'
 }
 
 // ── pg_async: a re-dial in a continuation that steps away ───────────────────
