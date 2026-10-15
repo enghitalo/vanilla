@@ -201,6 +201,30 @@ fn (mut r Reactor) close_watch_fd(epoll_fd int, fd int) {
 	epoll.remove_fd_from_epoll(epoll_fd, fd)
 }
 
+// detach_watch_fd takes fd, a watch fd the app keeps, out of the epoll set
+// without closing it, once a continuation stopped waiting on it (it stepped
+// to another fd, or to none). That continuation has run by then, and it owns
+// fd: it may have closed it. The close dropped the registration, and the
+// number may name another file now, maybe a connection the accept thread
+// just registered here, which a DEL by number would take out of the set: its
+// request would never be read (#337). So, as the worker loop does for a
+// leftover's event, only an open fd that is not a socket accepted on the
+// listener is detached (leftover_fd), and never the mailbox's eventfd, which
+// a subscription during the continuation may have made with the freed
+// number. A number the continuation watched again never gets here (callers
+// check last_watched and the table). What is left is a check-then-act gap:
+// another thread would have to take the number, close it, and have it
+// accepted again, between the getsockname and the DEL. One getsockname per
+// step away, never on a re-arm of the same fd.
+@[noinline]
+fn (mut r Reactor) detach_watch_fd(epoll_fd int, fd int) {
+	if r.st != unsafe { nil } && (!r.st.leftover_fd(fd)
+		|| (r.st.mbox_armed && fd == r.st.mbox.wake_fd)) {
+		return
+	}
+	epoll.detach_fd_from_epoll(epoll_fd, fd)
+}
+
 // reactor_clear_if_drained deactivates ext_fd's watch when its pipelined queue
 // has just been fully consumed. MUST run at the pop that drains the queue,
 // BEFORE any continuation/serve that could re-park on ext_fd: a trailing
@@ -1433,8 +1457,9 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 		reactor.reactor_clear(ext_fd) // re-arm-then-.done could have re-set active
 		if step == .suspend {
 			// Stepped to a DIFFERENT fd (now armed): detach ext_fd from epoll but do
-			// NOT close it — the app still owns it and may reuse it later.
-			epoll.detach_fd_from_epoll(epoll_fd, ext_fd)
+			// NOT close it — the app still owns it, may reuse it later, or has
+			// closed it already (detach_watch_fd).
+			reactor.detach_watch_fd(epoll_fd, ext_fd)
 		} else {
 			reactor.close_watch_fd(epoll_fd, ext_fd) // done (.done/.close): DEL + close
 		}
@@ -1460,7 +1485,9 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 // resume_step carries out what a resumed parked request's continuation
 // returned: on_watch_ready's, after its watched fd fired, and on_park_timeout's,
 // after its deadline passed. The connection is already unparked; `event_loop`
-// is the one the continuation ran with.
+// is the one the continuation ran with. ext_fd is the fd it woke on, -1 when
+// the caller took that fd out of the epoll set before the continuation ran
+// (on_park_timeout): nothing then touches its number again.
 @[direct_array_access; manualfree]
 fn resume_step(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int, client_fd int, cont_step core.Step, mut event_loop core.EventLoop, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) {
 	if cont_step != .suspend && event_loop.last_watched >= 0 {
@@ -1516,19 +1543,19 @@ fn resume_step(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int, cl
 			// is pending (the DB-style "park, write later" case appends nothing here).
 			// flush_batch returns false only if it already closed the conn (peer gone /
 			// write error) — then we must NOT re-park it.
-			if event_loop.last_watched != ext_fd && !reactor.watches[ext_fd].active {
-				// Stepped away from ext_fd (to another fd, or to none) and kept it
-				// open: it is still registered, level-triggered, with nothing
-				// behind it. Left there it reports on every wait (a spin while it
-				// is writable), and with births off an event on an fd with no
-				// state is served as a new connection. Detach it — never close
-				// it, the app owns it; its next watch_fd adds it back — as the
-				// clientless path does. The client's own socket keeps its
+			if ext_fd >= 0 && event_loop.last_watched != ext_fd && !reactor.watches[ext_fd].active {
+				// Stepped away from ext_fd (to another fd, or to none). Kept open,
+				// it is still registered, level-triggered, with nothing behind
+				// it: left there it reports on every wait (a spin while it is
+				// writable). Detach it — never close it, the app owns it; its
+				// next watch_fd adds it back — as the clientless path does,
+				// unless the continuation closed it and the number names another
+				// file now (detach_watch_fd). The client's own socket keeps its
 				// registration: restore it at once.
 				if ext_fd == client_fd {
 					epoll.mod_fd_in_epoll(epoll_fd, client_fd, u32(C.EPOLLIN) | u32(C.EPOLLET))
 				} else {
-					epoll.detach_fd_from_epoll(epoll_fd, ext_fd)
+					reactor.detach_watch_fd(epoll_fd, ext_fd)
 				}
 			}
 			if event_loop.last_watched < 0 {
@@ -1643,8 +1670,9 @@ fn run_tombstone(mut reactor Reactor, epoll_fd int, ext_fd int, slot ParkSlot, r
 	reactor.reactor_clear_if_drained(ext_fd)
 	if stepped_away && !reactor.watches[ext_fd].active {
 		// Nothing else waits on ext_fd: detach it, never close it (the
-		// app owns it), as on_watch_ready does.
-		epoll.detach_fd_from_epoll(epoll_fd, ext_fd)
+		// app owns it, and may have closed it: a re-dial closes a lost
+		// connection's socket), as on_watch_ready does.
+		reactor.detach_watch_fd(epoll_fd, ext_fd)
 	}
 	return true
 }
@@ -1739,7 +1767,7 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 					reactor.watches[ext_fd].queue.delete(0)
 					reactor.reactor_clear_if_drained(ext_fd)
 					if !reactor.watches[ext_fd].active {
-						epoll.detach_fd_from_epoll(epoll_fd, ext_fd) // as on_watch_ready
+						reactor.detach_watch_fd(epoll_fd, ext_fd) // as on_watch_ready
 					}
 					if cs.write_buf.len > cs.write_off {
 						if !flush_batch(epoll_fd, client_fd, limits, active_conns, mut st, mut cs) {

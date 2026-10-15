@@ -125,6 +125,10 @@ jobs:
         shell: bash
         run: |
           v -race -cc "$RACE_CC" -no-parallel -run-only 'test_epoll_*' test tests/park_deadline_test.v
+      - name: 'late_detach_test.v (epoll: a watch fd its continuation closes never takes a new client out of the epoll set, #337)'
+        shell: bash
+        run: |
+          v -race -cc "$RACE_CC" -no-parallel -run-only 'test_epoll_*' test tests/late_detach_test.v
       # The push mailbox is a lock-free MPSC ring: producer threads against
       # the worker that drains it, and Server.shutdown() against the workers
       # it signals (vanilla#230). examples/sse is the fd-reuse check with no
