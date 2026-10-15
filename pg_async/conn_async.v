@@ -19,9 +19,10 @@ fn C.recv(fd int, buf voidptr, len usize, flags int) int
 fn C.send(fd int, buf voidptr, len usize, flags int) int
 fn C.fcntl(fd int, cmd int, arg int) int
 
-// max_inflight bounds the per-connection pipeline depth. Postgres has no wire
-// limit; this caps memory (one PendingQuery accumulator each) and bounds how much
-// one readable edge can complete. The caller sheds when a connection is full.
+// max_inflight is the default per-connection pipeline depth cap
+// (ConnConfig.max_inflight). Postgres has no wire limit; this caps memory (one
+// PendingQuery accumulator each) and bounds how much one readable edge can
+// complete. The caller sheds when a connection is full (Shed, shed.v).
 const max_inflight = 8
 
 // send_buf_cap is the fixed per-connection send-buffer size. Allocated once and
@@ -92,7 +93,7 @@ pub fn (c &PgConn) inflight_count() int {
 // (live, and pipeline depth below max_inflight). The caller sheds when this is
 // false on every pooled connection.
 pub fn (c &PgConn) can_submit() bool {
-	return c.state == .ready && c.inflight.len < max_inflight
+	return c.state == .ready && c.inflight.len < c.inflight_limit()
 }
 
 // async_submit serializes one extended-protocol query (binary results) and
@@ -101,9 +102,10 @@ pub fn (c &PgConn) can_submit() bool {
 // its own Sync so Postgres replies in submit order. Returns false (and submits
 // nothing) when the connection is saturated — the ring is full or the send
 // buffer cannot fit the frame — or broken (is_broken), so the caller must shed.
+// false does not say which: submit (shed.v) returns the reason as a typed error.
 // Pair with async_flush (on writable) and async_on_readable (on readable).
 pub fn (mut c PgConn) async_submit(query_text string, params []?[]u8) bool {
-	if c.state != .ready || c.inflight.len >= max_inflight {
+	if c.state != .ready || c.inflight.len >= c.inflight_limit() {
 		return false
 	}
 	c.reset_scratch()
@@ -171,7 +173,7 @@ pub fn (mut c PgConn) async_submit_batch(stmts []Stmt) !bool {
 	if c.submit_scratch.len > send_buf_cap {
 		return err_batch_too_large
 	}
-	if c.state != .ready || c.inflight.len >= max_inflight || !c.append_send(c.submit_scratch) {
+	if c.state != .ready || c.inflight.len >= c.inflight_limit() || !c.append_send(c.submit_scratch) {
 		return false
 	}
 	c.push_inflight()
@@ -199,19 +201,20 @@ fn (mut c PgConn) reset_scratch() {
 @[inline]
 fn (mut c PgConn) push_inflight() {
 	// Borrow a reply accumulator from the per-connection pool instead of allocating
-	// one per query (which would leak under `-gc none`). The pool holds max_inflight
-	// buffers reused round-robin; a slot is only reused after a full ring cycle, by
-	// which time the query that last used it has been drained AND rendered (at most
-	// max_inflight queries are in flight, enforced by the submit guards), so the
-	// borrow can never alias a still-in-use reply.
-	if c.frame_pool.len < max_inflight {
-		c.frame_pool = [][]u8{cap: max_inflight}
-		for _ in 0 .. max_inflight {
+	// one per query (which would leak under `-gc none`). The pool holds
+	// inflight_limit() buffers reused round-robin; a slot is only reused after a
+	// full ring cycle, by which time the query that last used it has been drained
+	// AND rendered (at most inflight_limit() queries are in flight, enforced by the
+	// submit guards), so the borrow can never alias a still-in-use reply.
+	limit := c.inflight_limit()
+	if c.frame_pool.len < limit {
+		c.frame_pool = [][]u8{cap: limit}
+		for _ in 0 .. limit {
 			c.frame_pool << []u8{cap: frame_buf_cap}
 		}
 	}
 	slot := c.frame_ring
-	c.frame_ring = (c.frame_ring + 1) % max_inflight
+	c.frame_ring = (c.frame_ring + 1) % limit
 	mut fbuf := c.frame_pool[slot]
 	unsafe {
 		fbuf.len = 0

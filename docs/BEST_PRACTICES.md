@@ -403,7 +403,29 @@ kqueue a deadline watch is a plain watch, and `cancel` fails.
   when the pool is momentarily full, not `400`/`404`. A backpressure shed is not
   a client error — misreporting it as `4xx` showed up as spurious failures in the
   benchmark (see the wiki's *Gotchas* page). Genuine `400` (bad body) / `404`
-  (missing row) stay as they are.
+  (missing row) stay as they are. The pool tells a shed from a real failure
+  (`pg_async/shed.v`, [vanilla#51](https://github.com/enghitalo/vanilla/issues/51)):
+  take the connection with `pool.acquire_pipelined_for(pg_async.query_frame_len(sql, params))`
+  (`batch_frame_len` for a batch) and submit with `conn.submit(sql, params)` /
+  `conn.submit_batch(stmts)`, then map the error by its type:
+
+  | error | meaning | answer |
+  |---|---|---|
+  | `pg_async.Shed` (`.reason`: `no_connection`, `pipeline_full`, `send_buffer_full`) | momentarily full; nothing was sent | `503` with `Retry-After` (a second or two), and count it |
+  | `pg_async.FrameTooLarge` | the frame is larger than `max_frame_len` (the 64 KiB send buffer): no connection will ever take it | `500`, or `413` when the size comes from the request; bound that input |
+  | `pg_async.ConnBroken` | the connection was lost; the pool re-dials it | `503` (or retry once on a fresh `acquire_pipelined_for`) |
+
+  `acquire_pipelined_for` already looked at every connection: a shed from it
+  is final for this request, and a submit on the connection it returned
+  succeeds. Refusing allocates nothing (`Shed` and `FrameTooLarge` are
+  constants, and an oversized frame is never serialized).
+  `acquire_pipelined()` / `async_submit()` keep their `none` / `false`, which
+  do not say why. `ConnConfig.max_inflight` (default 8, up to 256) is the
+  pipeline depth per connection: each slot keeps a reply buffer for the life
+  of the connection, 16 KiB grown to the largest reply it held, so it costs at
+  least `max_inflight × 16 KiB` per connection per worker. A deeper pipeline
+  helps cheap queries and turns a slow one's sheds into latency
+  ([pg_async/PIPELINING_DESIGN.md](../pg_async/PIPELINING_DESIGN.md)).
 - Keep the pool sized to the worker/thread model.
 - Expect pooled connections to die (restart, failover, `pg_terminate_backend`,
   idle or lifetime caps): the pool skips a broken connection and re-dials it
@@ -482,9 +504,10 @@ kqueue a deadline watch is a plain watch, and `cancel` fails.
 - Park on a database or an upstream with no deadline: one that stops
   answering then holds every request parked on it, for good
   (`Limits.park_timeout_ms`, `watch_fd_deadline`, above).
-- Return `200` with empty data for a *write* that was shed (it's a lie about a
-  mutation) — `503` is the honest answer. (The backpressure policy is tracked in
-  [vanilla#51](https://github.com/enghitalo/vanilla/issues/51).)
+- Return `200` for a request whose query was shed: empty data for a read
+  that never ran, or success for a *write* that never happened (a lie about a
+  mutation). `503` with `Retry-After` is the honest answer to a `Shed`
+  ([vanilla#51](https://github.com/enghitalo/vanilla/issues/51)).
 - Log synchronously to disk on the hot path — batch or hand off (see
   [examples/middleware](../examples/middleware) access log).
 

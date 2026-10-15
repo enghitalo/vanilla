@@ -149,7 +149,8 @@ ROLLBACK undoes it, and after a failed statement every one of them fails with
   failing statement with its index in `PgError.statement` (the batch's length
   when the commit at the Sync failed). A batch that can never fit the fixed
   send buffer (`send_buf_cap`), or an empty one, is an error on every
-  connection; a momentarily full connection returns false, a shed (#51). A
+  connection; a momentarily full connection returns false, a shed (#51;
+  `submit_batch` returns the typed `Shed` / `FrameTooLarge`, shed.v). A
   batch without BEGIN is as pipeline-safe as one query; one that opens an
   explicit transaction leaves the session in `T` (or `E`) after its Sync and
   belongs on `acquire()`.
@@ -176,6 +177,114 @@ ROLLBACK undoes it, and after a failed statement every one of them fails with
   fd and not a connection accepted on it (vanilla#337).
   (Before #247 a step after a DB reply lost the FIFO alignment, so the
   example re-ran each attempt at once on the held connection.)
+
+## Backpressure contract (vanilla#51)
+A pipelined query is refused for one of three reasons, and each needs a
+different answer, so the refusal is typed (`shed.v`):
+- **`Shed`** — momentarily full; nothing was sent. `.reason` is
+  `no_connection` (every connection held by `acquire()`, in a transaction,
+  rolling back or broken), `pipeline_full` (every candidate at
+  `max_inflight`) or `send_buffer_full` (a pipeline slot, but no send buffer
+  with room for the frame). The caller answers 503 with `Retry-After`. The
+  three `Shed` values are constants, so a shed allocates nothing: under
+  overload the shed path is the hot path, and under `-gc none` a boxed error
+  per shed would leak.
+- **`FrameTooLarge`** — the frame is larger than the 64 KiB send buffer
+  (`max_frame_len`): no connection will ever take it. It is checked before
+  anything else, so it is the same answer on every connection, and from the
+  frame's computed size, so an oversized frame is never serialized. A
+  constant too: when the size comes from the request, a client drives this
+  path.
+- The constants are built by a function call (`shed_error`): V 2f94b87
+  emits a const `IError(Struct{...})` of plain fields as a zero C
+  initializer, which panics on `msg()`.
+- **`ConnBroken`** — the connection is lost. `acquire_pipelined_for` never
+  returns one, so only a caller that took a connection some other way sees it.
+
+`acquire_pipelined_for(frame_len)` returns the shortest pipeline among the
+connections whose send buffer has room for `frame_len` bytes now
+(`send_buf_cap - (send_len - send_off)`), skipping exactly what
+`acquire_pipelined()` skips. `query_frame_len` / `batch_frame_len` give the
+size without serializing. `submit` / `submit_batch` are `async_submit` /
+`async_submit_batch` with the reason as a typed error. A worker is single
+threaded, so nothing changes between `acquire_pipelined_for` and the submit
+on the connection it returned: that submit succeeds, and a shed from
+`acquire_pipelined_for` is final for the request. The existing calls keep
+their `none` / `false`.
+
+**No `acquire_pipelined_except(idx)`.** It was proposed for retrying on
+another connection after a refused submit. With `acquire_pipelined_for` that
+refusal does not happen (the connection was chosen because the frame fits),
+and `except(idx)` would not be enough anyway: with three or more connections
+the second choice can lack room too, which needs an exclusion set — what
+`acquire_pipelined_for` already computes in one pass.
+
+**`max_inflight` is configurable** (`ConnConfig.max_inflight`, 1..256,
+default 8). Each slot keeps a reply accumulator for the life of the
+connection: 16 KiB, grown to the largest reply it held (`pop_front` writes
+the grown buffer back), so the cost is at least `max_inflight × 16 KiB` per
+connection. The limit is 256, not more: the in-flight FIFO pops with
+`delete(0)`, which moves the queries behind the front, so a pop costs about
+2.4 µs more at depth 1024 than at 8 (a review microbenchmark, `-prod`).
+Measured (1 worker, 2 connections, PostgreSQL 18 in Docker on loopback,
+`wrk -t4 -d8s`, Ryzen 7 5800H), with `bench/pg_async/e2e_server` and
+`PG_MAX_INFLIGHT`, its pipelined handler switched to
+`acquire_pipelined_for` + `submit` (the committed one still uses
+`acquire_pipelined` + `async_submit`; for these 3-row queries both shed at
+the same points, since no send buffer fills):
+
+| path | wrk conns | max_inflight | 200/s | shed % | p50 | p99 | RSS peak |
+|---|---|---|---|---|---|---|---|
+| `/dbp` (cheap query) | 64 | 4 | 5,414 | 85.4 | 1.4 ms | 4.3 ms | 3.7 MiB |
+| | 64 | 8 | 5,119 | 73.0 | 2.8 ms | 12.7 ms | 3.8 MiB |
+| | 64 | 16 | 5,211 | 42.4 | 6.9 ms | 21.2 ms | 3.8 MiB |
+| | 64 | 32 | 8,323 | 0 | 6.6 ms | 21.4 ms | 4.0 MiB |
+| | 64 | 64 | 8,562 | 0 | 6.5 ms | 19.2 ms | 4.3 MiB |
+| | 256 | 4 | 866 | 95.6 | 10.4 ms | 35.1 ms | 5.3 MiB |
+| | 256 | 8 | 1,713 | 91.7 | 11.0 ms | 28.2 ms | 5.4 MiB |
+| | 256 | 32 | 6,670 | 65.2 | 11.8 ms | 38.0 ms | 5.6 MiB |
+| | 256 | 64 | 7,894 | 34.2 | 19.9 ms | 58.4 ms | 5.9 MiB |
+| `/dbslow` (5 ms query) | 64 | 4 | 361 | 98.9 | 1.4 ms | 23.0 ms | 3.7 MiB |
+| | 64 | 8 | 357 | 98.6 | 1.7 ms | 46.0 ms | 3.8 MiB |
+| | 64 | 32 | 353 | 6.1 | 179.5 ms | 186.1 ms | 4.0 MiB |
+| | 64 | 64 | 358 | 0 | 176.9 ms | 189.2 ms | 4.3 MiB |
+| | 256 | 64 | 356 | 99.3 | 2.6 ms | 347.2 ms | 5.9 MiB |
+
+- A connection runs its pipeline one query after another, so a deeper
+  pipeline only helps when the query is cheap and the round trip dominates.
+  For a 5 ms query, 2 connections finish ~360 queries/s whatever the depth:
+  a deeper pipeline turns sheds into queueing (p50 from 1.7 ms to 180 ms at
+  32), with no more queries done.
+- With a cheap query, depth raises throughput until connections × depth
+  covers the offered concurrency (64 → 0 sheds at 32). Below that, 503s are
+  not free: `wrk` resends at once (it ignores `Retry-After`), and at 256
+  connections the worker spends most of its time answering 503s (866/s
+  served at depth 4).
+- RSS barely moves with depth: +0.5 MiB at idle from 4 to 64 on 2
+  connections, against 1.9 MiB of accumulators allocated. They are touched
+  only as far as the replies reach (3 rows here); replies that fill them make
+  the whole `max_inflight × 16 KiB` per connection resident, and larger
+  replies grow them for good. The HTTP connections, not the depth, move peak
+  RSS.
+
+So the default stays 8: raise it for cheap, round-trip-bound queries, and
+bound the latency it adds with a park deadline (`Limits.park_timeout_ms`).
+
+**A bounded wait queue (proposal, not implemented).** Instead of shedding, a
+request would wait, in a per-pool FIFO bounded in length and in time, for a
+pipeline slot.
+- For: a burst shorter than a query's time is absorbed instead of answered
+  503; a waiter, unlike a pipelined query, has sent nothing, so it can be
+  dropped on its deadline or on a client disconnect without a CancelRequest.
+- Against: it needs the reactor to resume a waiting continuation when a slot
+  frees, which pg_async cannot do alone (a timer or a self-pipe in the
+  runtime: a `core` change); each waiter holds its request's memory;
+  saturation that is not transient only turns into latency, as the
+  `/dbslow` rows show for a deeper pipeline, which is already a bounded queue
+  (in the socket instead of in the pool); and with `Retry-After` honoured by
+  clients, a short burst mostly passes.
+- Recommendation: not now. Revisit with a workload that sheds at low average
+  utilization (bursts), measured as above.
 
 ## Local validation harness
 `bench/pg_async/` pipeline-tests pg_async locally against a seeded PG

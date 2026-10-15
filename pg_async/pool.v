@@ -63,6 +63,7 @@ pub fn PgPool.connect(cfg ConnConfig, size int) !PgPool {
 		return error('pg pool: size must be >= 1')
 	}
 	check_startup_params(cfg.params) or { return error('pg pool: ${err}') }
+	check_max_inflight(cfg.max_inflight) or { return error('pg pool: ${err}') }
 	mut tls_cfg := &tls.Config(unsafe { nil })
 	if cfg.ssl_mode != .disable {
 		tls_cfg = new_tls_config(&cfg) or { return error('pg pool: ${err}') }
@@ -71,9 +72,10 @@ pub fn PgPool.connect(cfg ConnConfig, size int) !PgPool {
 	scram := &ScramCache{}
 	for i in 0 .. size {
 		mut c := PgConn{
-			recv_buf:    []u8{cap: 16 * 1024}
-			scram_cache: scram
-			tls_cfg:     tls_cfg
+			recv_buf:     []u8{cap: 16 * 1024}
+			scram_cache:  scram
+			tls_cfg:      tls_cfg
+			inflight_cap: cfg.max_inflight
 		}
 		c.bring_up(&cfg) or {
 			c.teardown()
@@ -296,7 +298,10 @@ fn (mut p PgPool) finish_rollback(i int) bool {
 
 // acquire_pipelined returns the index of the connection with the FEWEST in-flight
 // queries (the shortest pipeline), or none if every connection is already at the
-// max_inflight cap (the caller sheds). Unlike acquire(), it does NOT take a
+// max_inflight cap (the caller sheds). It does not look at the send buffer,
+// and none does not say why: acquire_pipelined_for (shed.v) picks a
+// connection that can take a given frame now, and tells a shed from a frame
+// that can never fit. Unlike acquire(), it does NOT take a
 // connection exclusively: a connection multiplexes up to max_inflight queries, so
 // several parked requests share one. Depth is read straight from the connection
 // (no idle bookkeeping), and an idle connection (depth 0) is taken immediately.
@@ -320,22 +325,16 @@ fn (mut p PgPool) finish_rollback(i int) bool {
 // its reply (or error) with async_on_readable, even when the flush failed.
 pub fn (mut p PgPool) acquire_pipelined() ?int {
 	mut best := -1
-	mut best_depth := max_inflight
+	mut best_depth := 0
 	for i in 0 .. p.conns.len {
-		if !p.idle[i] && (p.conns[i].rollback_deadline == 0 || !p.finish_rollback(i)) {
-			continue // held by acquire() (its borrower may be mid-transaction), or rolling back
-		}
-		if p.conns[i].state != .ready && !p.conns[i].redial(p.cfg) {
+		if !p.pipelinable(i) {
 			continue
-		}
-		if p.conns[i].ready_status != tx_idle {
-			continue // in a transaction: whatever is pipelined here would run inside it
 		}
 		d := p.conns[i].inflight_count()
 		if d == 0 {
 			return i // idle connection — optimal, take it now
 		}
-		if d < best_depth {
+		if d < p.conns[i].inflight_limit() && (best < 0 || d < best_depth) {
 			best = i
 			best_depth = d
 		}
@@ -344,6 +343,22 @@ pub fn (mut p PgPool) acquire_pipelined() ?int {
 		return none
 	}
 	return best
+}
+
+// pipelinable reports whether connection i may take a pipelined query, its
+// depth aside: not held by acquire(), its release-time ROLLBACK answered,
+// live (a broken one gets its re-dial advanced one step), and not in a
+// transaction. What acquire_pipelined and acquire_pipelined_for both skip.
+@[inline]
+fn (mut p PgPool) pipelinable(i int) bool {
+	if !p.idle[i] && (p.conns[i].rollback_deadline == 0 || !p.finish_rollback(i)) {
+		return false // held by acquire() (its borrower may be mid-transaction), or rolling back
+	}
+	if p.conns[i].state != .ready && !p.conns[i].redial(p.cfg) {
+		return false
+	}
+	// In a transaction, whatever is pipelined here would run inside it.
+	return p.conns[i].ready_status == tx_idle
 }
 
 // conn returns a mutable reference to connection `idx`. The connection array is
