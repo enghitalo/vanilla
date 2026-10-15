@@ -417,11 +417,15 @@ kqueue a deadline watch is a plain watch, and `cancel` fails.
 
   `acquire_pipelined_for` already looked at every connection: a shed from it
   is final for this request, and a submit on the connection it returned
-  succeeds. Shedding allocates nothing (the `Shed` errors are constants).
+  succeeds. Refusing allocates nothing (`Shed` and `FrameTooLarge` are
+  constants, and an oversized frame is never serialized).
   `acquire_pipelined()` / `async_submit()` keep their `none` / `false`, which
-  do not say why. `ConnConfig.max_inflight` (default 8) is the pipeline depth
-  per connection: each slot keeps a 16 KiB reply buffer for the life of the
-  connection, so it costs `max_inflight × 16 KiB` per connection per worker.
+  do not say why. `ConnConfig.max_inflight` (default 8, up to 256) is the
+  pipeline depth per connection: each slot keeps a reply buffer for the life
+  of the connection, 16 KiB grown to the largest reply it held, so it costs at
+  least `max_inflight × 16 KiB` per connection per worker. A deeper pipeline
+  helps cheap queries and turns a slow one's sheds into latency
+  ([pg_async/PIPELINING_DESIGN.md](../pg_async/PIPELINING_DESIGN.md)).
 - Keep the pool sized to the worker/thread model.
 - Expect pooled connections to die (restart, failover, `pg_terminate_backend`,
   idle or lifetime caps): the pool skips a broken connection and re-dials it

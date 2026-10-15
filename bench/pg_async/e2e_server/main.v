@@ -15,8 +15,9 @@ module main
 // /db, /dbp and /dbslow render pg_async_demo (3 rows, seeded by
 // pg_async/testdata/throwaway_pg.sh) as JSON. Configuration: the PG* env vars
 // (PGSSLMODE + PGSSLROOTCERT for TLS, in a -d vanilla_tls build), PG_POOL_SIZE
-// (connections per worker, default 4), PG_MAX_INFLIGHT (ConnConfig.max_inflight,
-// default 8), BENCH_PORT (default 8099), VANILLA_WORKERS. Driven by bench/pg_async/e2e.sh and leak.sh (TLS=1 for both).
+// (connections per worker, default 4), PG_MAX_INFLIGHT
+// (ConnConfig.max_inflight, default 8), BENCH_PORT (default 8099),
+// VANILLA_WORKERS. Driven by bench/pg_async/e2e.sh and leak.sh (TLS=1 for both).
 import os
 import strconv
 import server

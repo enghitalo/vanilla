@@ -254,9 +254,10 @@ pub:
 	// max_inflight caps each connection's pipeline depth: how many queries
 	// may be in flight on it at once (async_submit, acquire_pipelined). A
 	// pool sheds a pipelined query (Shed, .pipeline_full) once every
-	// connection holds this many. Each slot keeps a reply accumulator of
-	// 16 KiB for the life of the connection, so raising it costs
-	// max_inflight × 16 KiB per connection, per worker. 1..max_inflight_limit.
+	// connection holds this many. Each slot keeps a reply accumulator for
+	// the life of the connection: 16 KiB, grown to the largest reply it held.
+	// So raising it costs at least max_inflight × 16 KiB per connection, per
+	// worker. 1..max_inflight_limit (256).
 	max_inflight int = max_inflight
 }
 

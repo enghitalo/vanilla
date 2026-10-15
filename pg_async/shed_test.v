@@ -188,6 +188,25 @@ fn test_max_inflight_defaults_to_8_and_is_bounded() {
 		} else {
 			assert err.msg().contains('max_inflight'), err.msg()
 		}
+		if mut one := PgConn.connect(ConnConfig{
+			host:         '127.0.0.1'
+			port:         fake.port
+			user:         'vanilla'
+			password:     'secret'
+			database:     'vanilla'
+			max_inflight: bad
+		})
+		{
+			one.close()
+			assert false, 'PgConn.connect took max_inflight ${bad}'
+		} else {
+			assert err.msg().contains('max_inflight'), err.msg()
+		}
+	}
+	for good in [1, max_inflight_limit] {
+		mut p := shed_pool(fake.port, 1, good)!
+		assert p.conn(0).inflight_limit() == good
+		p.close()
 	}
 }
 
@@ -248,7 +267,7 @@ fn test_room_counts_the_unsent_bytes_after_a_partial_flush() {
 		pool.close()
 	}
 	small := 4096
-	C.setsockopt(pool.fd(0), C.SOL_SOCKET, C.SO_SNDBUF, &small, sizeof(int))
+	assert C.setsockopt(pool.fd(0), C.SOL_SOCKET, C.SO_SNDBUF, &small, sizeof(int)) == 0
 	// One reply, then the server reads nothing on connection 0 for 1.5 s.
 	pool.conn(0).submit('select 1', []?[]u8{})!
 	drain_all(mut pool.conn(0))!
@@ -260,9 +279,17 @@ fn test_room_counts_the_unsent_bytes_after_a_partial_flush() {
 	assert pool.conn(0).send_room() == send_buf_cap - unsent
 	pool.conn(1).submit('select 1', []?[]u8{})!
 	pool.conn(1).submit('select 2', []?[]u8{})!
-	n := query_frame_len(sql, echo_param(pool.conn(0).send_room()))
+	room := pool.conn(0).send_room()
+	n := query_frame_len(sql, echo_param(room))
 	assert pool.acquire_pipelined_for(n)! == 1
 	assert pool.acquire_pipelined()? == 0
+	// A frame of exactly the room left is taken there, and its submit
+	// succeeds: what append_send compacts is what send_room counted.
+	exact := echo_param(room - query_frame_len(sql, echo_param(0)))
+	assert query_frame_len(sql, exact) == room
+	assert pool.acquire_pipelined_for(room)! == 0
+	pool.conn(0).submit(sql, exact)!
+	assert pool.conn(0).send_room() == 0
 	for i in 0 .. 2 {
 		drain_all(mut pool.conn(i))!
 	}
@@ -289,7 +316,6 @@ fn test_a_frame_larger_than_the_send_buffer_is_an_error() {
 	} else {
 		assert err is FrameTooLarge, err.msg()
 		if err is FrameTooLarge {
-			assert err.len == max_frame_len + 1
 			assert err.cap == max_frame_len
 		}
 	}
@@ -344,7 +370,66 @@ fn test_a_connection_held_by_acquire_is_never_chosen() {
 	}
 	pool.release(held)
 	pool.release(other)
-	assert pool.acquire_pipelined_for(n)! >= 0
+	pool.acquire_pipelined_for(n)!
+}
+
+// A connection whose session is in a transaction is never chosen either.
+fn test_a_connection_in_a_transaction_is_never_chosen() {
+	if !testkit.fake_pg_available() {
+		return
+	}
+	mut fake := testkit.start_fake_pg([])!
+	defer {
+		fake.stop()
+	}
+	mut pool := shed_pool(fake.port, 2, 8)!
+	defer {
+		pool.close()
+	}
+	n := query_frame_len('select 1', []?[]u8{})
+	pool.conns[0].ready_status = tx_in_block
+	for _ in 0 .. 3 {
+		assert pool.acquire_pipelined_for(n)! == 1
+		pool.conn(1).submit('select 1', []?[]u8{})!
+	}
+	pool.conns[1].ready_status = tx_failed
+	if j := pool.acquire_pipelined_for(n) {
+		assert false, 'acquire_pipelined_for returned ${j} with both sessions in a transaction'
+	} else {
+		assert shed_reason(err) == .no_connection
+	}
+	pool.conns[0].ready_status = tx_idle
+	pool.conns[1].ready_status = tx_idle
+	drain_all(mut pool.conn(1))!
+}
+
+// One connection's pipeline is full and the other's send buffer is: the
+// shed says the buffer, the reason a smaller frame could still pass.
+fn test_a_full_buffer_wins_over_a_full_pipeline_in_the_reason() {
+	if !testkit.fake_pg_available() {
+		return
+	}
+	mut fake := testkit.start_fake_pg([])!
+	defer {
+		fake.stop()
+	}
+	mut pool := shed_pool(fake.port, 2, 2)!
+	defer {
+		pool.close()
+	}
+	pool.conn(0).submit('select 1', []?[]u8{})!
+	pool.conn(0).submit('select 2', []?[]u8{})!
+	sql := 'select \$1::text'
+	pool.conn(1).submit(sql, echo_param(60 * 1024))!
+	n := query_frame_len(sql, echo_param(10 * 1024))
+	if j := pool.acquire_pipelined_for(n) {
+		assert false, 'acquire_pipelined_for returned ${j}'
+	} else {
+		assert shed_reason(err) == .send_buffer_full
+	}
+	for i in 0 .. 2 {
+		drain_all(mut pool.conn(i))!
+	}
 }
 
 // A submit on a lost connection is ConnBroken, not a shed.
@@ -370,7 +455,8 @@ fn test_submit_on_a_lost_connection_is_conn_broken() {
 	assert c.inflight.len == 0
 }
 
-// Shedding allocates nothing: the Shed errors are constants.
+// Refusing allocates nothing: the Shed and FrameTooLarge errors are
+// constants, and an oversized frame is never serialized.
 fn test_shedding_allocates_nothing() {
 	mut c := PgConn{}
 	c.state = .ready
@@ -381,6 +467,7 @@ fn test_shedding_allocates_nothing() {
 		idle:  [true]
 	}
 	n := query_frame_len('select 1', []?[]u8{})
+	huge := echo_param(max_frame_len)
 	mut sheds := 0
 	for round in 0 .. 2 {
 		before := gc_heap_usage().bytes_since_gc
@@ -396,12 +483,23 @@ fn test_shedding_allocates_nothing() {
 				}
 				-1
 			}
+			pool.conns[0].submit('select \$1::text', huge) or {
+				if err is FrameTooLarge {
+					sheds++
+				}
+			}
+			_ := pool.acquire_pipelined_for(max_frame_len + 1) or {
+				if err is FrameTooLarge {
+					sheds++
+				}
+				-1
+			}
 		}
 		grown := gc_heap_usage().bytes_since_gc - before
 		if round == 1 {
-			assert grown == 0, 'shedding allocated ${grown} bytes over 2000 sheds'
+			assert grown == 0, 'refusing allocated ${grown} bytes over 4000 refusals'
 		}
 	}
-	assert sheds == 4000
+	assert sheds == 8000
 	pool.conns[0].inflight.clear()
 }

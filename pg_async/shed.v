@@ -12,14 +12,17 @@ module pg_async
 //                  buffer (max_frame_len): it can never be sent, on any
 //                  connection, now or later. A bug or an input to bound:
 //                  answer 500 (or 413 when the size comes from the request).
+//                  Nothing is serialized before the size is checked.
 //   ConnBroken     the connection chosen is lost (PgConn.is_broken). The pool
 //                  re-dials it on its own; acquire_pipelined_for never
 //                  returns one, so this reaches only a caller that submits on
 //                  a connection it took some other way.
 //
-// Test with `err is Shed`, `err is FrameTooLarge`, `err is ConnBroken`. The
-// Shed errors are constants: shedding allocates nothing, which matters under
-// -gc none, where the shed path is the hot path of an overload.
+// Test with `err is Shed`, `err is FrameTooLarge`, `err is ConnBroken`. Shed
+// and FrameTooLarge are constants: refusing allocates nothing, which matters
+// under -gc none, where the shed path is the hot path of an overload and a
+// request-sized frame is a path a client drives. ConnBroken carries the loss's
+// reason and is boxed per call: a lost connection is rare.
 
 // max_frame_len is the largest wire frame (a query or a batch, as
 // query_frame_len and batch_frame_len count it) that a connection can ever
@@ -27,16 +30,22 @@ module pg_async
 pub const max_frame_len = send_buf_cap
 
 // max_inflight_limit bounds ConnConfig.max_inflight. Each pipeline slot
-// keeps a reply accumulator of frame_buf_cap bytes (16 KiB) for the life of
-// the connection, so the limit bounds that memory: 1024 slots are 16 MiB per
-// connection.
-pub const max_inflight_limit = 1024
+// keeps a reply accumulator of at least frame_buf_cap bytes (16 KiB) for the
+// life of the connection, grown to the largest reply it held, so the limit
+// bounds that memory: 256 slots are 4 MiB per connection at least. It also
+// bounds the in-flight FIFO, whose pop moves the queries behind the front.
+pub const max_inflight_limit = 256
 
 // ShedReason says what was full when a query was shed.
 pub enum ShedReason {
-	no_connection    // no connection could take a pipelined query: each is held by acquire(), in a transaction, rolling back, or broken
-	pipeline_full    // every candidate connection has max_inflight queries in flight
-	send_buffer_full // a connection had a pipeline slot, but no send buffer had room for the frame now
+	// no connection could take a pipelined query: each is held by acquire(),
+	// in a transaction, rolling back, or broken
+	no_connection
+	// every candidate connection has max_inflight queries in flight
+	pipeline_full
+	// a connection had a pipeline slot, but no send buffer had room for the
+	// frame now
+	send_buffer_full
 }
 
 // Shed is the error for a query refused because the pool or the connection
@@ -56,19 +65,19 @@ pub fn (e Shed) msg() string {
 	}
 }
 
-// FrameTooLarge is the error for a query or batch whose wire frame (`len`
-// bytes) is larger than a connection's send buffer (`cap`, max_frame_len):
-// it can never be sent, on any connection.
+// FrameTooLarge is the error for a query or batch whose wire frame is larger
+// than a connection's send buffer (`cap`, max_frame_len): it can never be
+// sent, on any connection. The frame's size is what the caller passed or can
+// count (query_frame_len, batch_frame_len).
 pub struct FrameTooLarge {
 	Error
 pub:
-	len int
 	cap int
 }
 
-// msg gives the frame's size and the send buffer's.
+// msg gives the send buffer's size.
 pub fn (e FrameTooLarge) msg() string {
-	return 'pg: the query frame (${e.len} bytes) is larger than the send buffer (${e.cap} bytes) and can never be sent'
+	return 'pg: the query frame is larger than the send buffer (${e.cap} bytes) and can never be sent'
 }
 
 // ConnBroken is the error for a query submitted on a lost connection
@@ -84,20 +93,32 @@ pub fn (e ConnBroken) msg() string {
 	return 'pg: connection lost: ${e.reason}'
 }
 
-const err_shed_no_connection = IError(Shed{
-	reason: .no_connection
-})
-const err_shed_pipeline_full = IError(Shed{
-	reason: .pipeline_full
-})
-const err_shed_send_buffer_full = IError(Shed{
-	reason: .send_buffer_full
-})
+// The refusals, boxed once. Built by a function call: V (2f94b87) emits a
+// const `IError(Struct{...})` of plain fields as a zero C initializer, which
+// panics on msg(); a call moves the initialization to module start.
+const err_shed_no_connection = shed_error(.no_connection)
+const err_shed_pipeline_full = shed_error(.pipeline_full)
+const err_shed_send_buffer_full = shed_error(.send_buffer_full)
+const err_frame_too_large = frame_too_large_error()
+
+fn shed_error(reason ShedReason) IError {
+	return Shed{
+		reason: reason
+	}
+}
+
+fn frame_too_large_error() IError {
+	return FrameTooLarge{
+		cap: send_buf_cap
+	}
+}
 
 // Wire sizes of the extended-protocol messages async_submit writes, with the
 // unnamed statement and portal: type byte + length + body.
 const parse_overhead = 1 + 4 + 1 + 1 + 2 // name '' + NUL, SQL NUL, 0 type oids
-const bind_overhead = 1 + 4 + 1 + 1 + 2 + 2 + 2 + 2 // portal, statement, format counts, result formats
+// Bind: portal, statement, 0 parameter formats, the parameter count, 1
+// result format and its code.
+const bind_overhead = 1 + 4 + 1 + 1 + 2 + 2 + 2 + 2
 const describe_len = 1 + 4 + 1 + 1
 const execute_len = 1 + 4 + 1 + 4
 const sync_len = 1 + 4
@@ -144,7 +165,8 @@ fn (c &PgConn) send_room() int {
 	return send_buf_cap - (c.send_len - c.send_off)
 }
 
-// check_max_inflight refuses a ConnConfig.max_inflight out of 1..max_inflight_limit.
+// check_max_inflight refuses a ConnConfig.max_inflight out of
+// 1..max_inflight_limit.
 fn check_max_inflight(n int) ! {
 	if n < 1 || n > max_inflight_limit {
 		return error('pg: max_inflight must be in 1..${max_inflight_limit}, got ${n}')
@@ -159,15 +181,18 @@ fn check_max_inflight(n int) ! {
 //   - ConnBroken when the connection is lost;
 //   - Shed (.pipeline_full) when max_inflight queries are already in flight;
 //   - Shed (.send_buffer_full) when the send buffer has no room for it now.
+// The frame is sized (query_frame_len) and checked before it is serialized,
+// so a refusal costs no serialization and never grows the submit scratch.
 // Pair with async_flush and async_on_readable, as async_submit.
 pub fn (mut c PgConn) submit(query_text string, params []?[]u8) ! {
+	c.check_submit(query_frame_len(query_text, params))!
 	c.reset_scratch()
 	write_parse(mut c.submit_scratch, '', query_text)
 	write_bind(mut c.submit_scratch, '', '', params)
 	write_describe_portal(mut c.submit_scratch, '')
 	write_execute(mut c.submit_scratch, '', 0)
 	write_sync(mut c.submit_scratch)
-	return c.submit_scratch_frame()
+	return c.queue_scratch()
 }
 
 // submit_batch is async_submit_batch with the reason for a refusal, as
@@ -176,6 +201,7 @@ pub fn (mut c PgConn) submit_batch(stmts []Stmt) ! {
 	if stmts.len == 0 {
 		return err_batch_empty
 	}
+	c.check_submit(batch_frame_len(stmts))!
 	c.reset_scratch()
 	for s in stmts {
 		write_parse(mut c.submit_scratch, '', s.sql)
@@ -184,17 +210,14 @@ pub fn (mut c PgConn) submit_batch(stmts []Stmt) ! {
 		write_execute(mut c.submit_scratch, '', 0)
 	}
 	write_sync(mut c.submit_scratch)
-	return c.submit_scratch_frame()
+	return c.queue_scratch()
 }
 
-// submit_scratch_frame queues the frame serialized in submit_scratch, or
-// says why it cannot: the shared tail of submit and submit_batch.
-fn (mut c PgConn) submit_scratch_frame() ! {
-	if c.submit_scratch.len > send_buf_cap {
-		return FrameTooLarge{
-			len: c.submit_scratch.len
-			cap: send_buf_cap
-		}
+// check_submit says why a frame of `frame_len` bytes cannot be queued now,
+// in submit's order, or nothing when it can.
+fn (c &PgConn) check_submit(frame_len int) ! {
+	if frame_len > send_buf_cap {
+		return err_frame_too_large
 	}
 	if c.state != .ready {
 		return ConnBroken{
@@ -204,8 +227,16 @@ fn (mut c PgConn) submit_scratch_frame() ! {
 	if c.inflight.len >= c.inflight_limit() {
 		return err_shed_pipeline_full
 	}
-	if !c.append_send(c.submit_scratch) {
+	if c.send_room() < frame_len {
 		return err_shed_send_buffer_full
+	}
+}
+
+// queue_scratch appends the frame serialized in submit_scratch, which
+// check_submit found room for, and pushes its query onto the in-flight FIFO.
+fn (mut c PgConn) queue_scratch() ! {
+	if !c.append_send(c.submit_scratch) {
+		return err_shed_send_buffer_full // not reached: check_submit saw the room
 	}
 	c.push_inflight()
 }
@@ -223,27 +254,18 @@ fn (mut c PgConn) submit_scratch_frame() ! {
 //     already what this call did: every connection was looked at.
 //   - FrameTooLarge: frame_len is larger than max_frame_len, so no
 //     connection will ever take it.
-// Shedding allocates nothing.
+// Refusing allocates nothing.
 pub fn (mut p PgPool) acquire_pipelined_for(frame_len int) !int {
 	if frame_len > send_buf_cap {
-		return FrameTooLarge{
-			len: frame_len
-			cap: send_buf_cap
-		}
+		return err_frame_too_large
 	}
 	mut best := -1
 	mut best_depth := 0
 	mut full_buffer := false // a connection had a pipeline slot but no room for the frame
 	mut full_pipeline := false // a live candidate was at its max_inflight
 	for i in 0 .. p.conns.len {
-		if !p.idle[i] && (p.conns[i].rollback_deadline == 0 || !p.finish_rollback(i)) {
-			continue // held by acquire() (its borrower may be mid-transaction), or rolling back
-		}
-		if p.conns[i].state != .ready && !p.conns[i].redial(p.cfg) {
+		if !p.pipelinable(i) {
 			continue
-		}
-		if p.conns[i].ready_status != tx_idle {
-			continue // in a transaction: whatever is pipelined here would run inside it
 		}
 		d := p.conns[i].inflight_count()
 		if d >= p.conns[i].inflight_limit() {

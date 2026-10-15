@@ -191,7 +191,13 @@ different answer, so the refusal is typed (`shed.v`):
   per shed would leak.
 - **`FrameTooLarge`** — the frame is larger than the 64 KiB send buffer
   (`max_frame_len`): no connection will ever take it. It is checked before
-  anything else, so it is the same answer on every connection.
+  anything else, so it is the same answer on every connection, and from the
+  frame's computed size, so an oversized frame is never serialized. A
+  constant too: when the size comes from the request, a client drives this
+  path.
+- The constants are built by a function call (`shed_error`): V 2f94b87
+  emits a const `IError(Struct{...})` of plain fields as a zero C
+  initializer, which panics on `msg()`.
 - **`ConnBroken`** — the connection is lost. `acquire_pipelined_for` never
   returns one, so only a caller that took a connection some other way sees it.
 
@@ -213,11 +219,19 @@ and `except(idx)` would not be enough anyway: with three or more connections
 the second choice can lack room too, which needs an exclusion set — what
 `acquire_pipelined_for` already computes in one pass.
 
-**`max_inflight` is configurable** (`ConnConfig.max_inflight`, 1..1024,
-default 8). Each slot keeps a 16 KiB reply accumulator for the life of the
-connection. Measured (1 worker, 2 connections, PostgreSQL 18 in Docker on
-loopback, `wrk -t4 -d8s`, `bench/pg_async/e2e_server` with
-`PG_MAX_INFLIGHT`, Ryzen 7 5800H):
+**`max_inflight` is configurable** (`ConnConfig.max_inflight`, 1..256,
+default 8). Each slot keeps a reply accumulator for the life of the
+connection: 16 KiB, grown to the largest reply it held (`pop_front` writes
+the grown buffer back), so the cost is at least `max_inflight × 16 KiB` per
+connection. The limit is 256, not more: the in-flight FIFO pops with
+`delete(0)`, which moves the queries behind the front, so a pop costs about
+2.4 µs more at depth 1024 than at 8 (a review microbenchmark, `-prod`).
+Measured (1 worker, 2 connections, PostgreSQL 18 in Docker on loopback,
+`wrk -t4 -d8s`, Ryzen 7 5800H), with `bench/pg_async/e2e_server` and
+`PG_MAX_INFLIGHT`, its pipelined handler switched to
+`acquire_pipelined_for` + `submit` (the committed one still uses
+`acquire_pipelined` + `async_submit`; for these 3-row queries both shed at
+the same points, since no send buffer fills):
 
 | path | wrk conns | max_inflight | 200/s | shed % | p50 | p99 | RSS peak |
 |---|---|---|---|---|---|---|---|
@@ -249,8 +263,9 @@ loopback, `wrk -t4 -d8s`, `bench/pg_async/e2e_server` with
 - RSS barely moves with depth: +0.5 MiB at idle from 4 to 64 on 2
   connections, against 1.9 MiB of accumulators allocated. They are touched
   only as far as the replies reach (3 rows here); replies that fill them make
-  the whole `max_inflight × 16 KiB` per connection resident. The HTTP
-  connections, not the depth, move peak RSS.
+  the whole `max_inflight × 16 KiB` per connection resident, and larger
+  replies grow them for good. The HTTP connections, not the depth, move peak
+  RSS.
 
 So the default stays 8: raise it for cheap, round-trip-bound queries, and
 bound the latency it adds with a park deadline (`Limits.park_timeout_ms`).
