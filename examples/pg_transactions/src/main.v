@@ -214,10 +214,11 @@ fn on_reply(mut out []u8, ready_fd int, _ bool, watch_payload voidptr, worker_st
 // on_backoff runs when the wait before attempt number `watch_payload` is
 // over, and runs it. The timer (ready_fd) is the request's. Once the attempt
 // parks on a connection, its on_reply closes the timer, after the runtime has
-// taken it out of the event loop. Closing it here would be correct too (the
-// runtime leaves a number the continuation freed alone, vanilla#337); closing
-// it later keeps the number the timer's until that detach, so the detach
-// never has to tell the timer from a connection accepted on its number.
+// taken it out of the event loop. Closing it here would be correct too: the
+// runtime only detaches a stepped-away fd whose number is still an app's open
+// fd, never a connection accepted on it (vanilla#337). Closing it later keeps
+// the number the timer's until that detach, so the detach never has to tell
+// the two apart.
 fn on_backoff(mut out []u8, ready_fd int, _ bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut st := unsafe { &TxState(worker_state) }
 	step := run_attempt(mut st, int(usize(watch_payload)), ready_fd, mut out, mut event_loop)

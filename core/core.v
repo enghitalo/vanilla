@@ -75,10 +75,13 @@ pub enum WatchInterest {
 //   watch_payload  — the value handed to watch_fd() by whoever armed the watch
 //   worker_state   — this worker thread's make_state value (nil if unset)
 // It may append the response to `response` and returns the next Step.
-// A request-owned ready_fd (watch_fd, watch_fd_deadline) is the
-// continuation's to close once it is done with it: before it returns .done,
-// or before or after it watches another fd and returns .suspend. The runtime
-// closes it only for a request it will not resume (the client left).
+// A parked request's ready_fd from watch_fd / watch_fd_deadline (other than
+// its client's own socket) is the continuation's to close once it is done
+// with it: before it returns .done, or before or after it watches another fd
+// and returns .suspend. If the client leaves while the request is parked,
+// the runtime closes it instead. A clientless continuation (WorkerStartFn,
+// watch_fd_background) must not close ready_fd when it returns .done/.close:
+// the runtime does.
 //
 // It also runs, ONCE, when the watch's deadline passes first
 // (Limits.park_timeout_ms, watch_fd_deadline): then event_loop.timed_out() is
@@ -254,9 +257,10 @@ pub fn (mut event_loop EventLoop) watch_fd_persistent_deadline(fd int, interest 
 // it stops waiting on:
 //   - request-owned (watch_fd, watch_fd_deadline): the runtime forgets it and
 //     takes the fd out of the event loop before the continuation runs, so a
-//     readiness that comes later wakes nothing, and the runtime does not
-//     touch the fd again. The fd is still the continuation's: close it there,
-//     whatever the continuation returns, or watch it again to keep waiting.
+//     readiness that comes later wakes nothing. The fd is still the
+//     continuation's: close it there (then answer, or watch another fd), or
+//     watch it again to keep waiting. A watch on the client's own socket only
+//     gives the socket its registration back: never close that one.
 //   - caller-owned (watch_fd_persistent*): the reply still due must not reach
 //     the next request on that fd, so the watch becomes a tombstone, as when
 //     a parked client disconnects: when the reply arrives (or the fd fails),
