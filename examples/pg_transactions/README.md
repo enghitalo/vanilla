@@ -119,10 +119,12 @@ instead of 10–16%: transfers that collided collided again.
   connection), not in the connection's state: the request may get another
   connection after a wait.
 - **Who closes the timer.** `on_reply` closes the timer of the wait its
-  attempt came from (`TxState.timers`), not `on_backoff`: the runtime takes
-  the timer out of the event loop only once `on_backoff` has returned, and a
-  number closed before then could already be a connection another thread
-  just accepted, which would be taken out instead and never served.
+  attempt came from (`TxState.timers`), once the runtime has taken it out of
+  the event loop after `on_backoff` stepped away from it. `on_backoff` could
+  close it itself: the runtime leaves a number a continuation freed alone
+  (vanilla#337). Closing it later keeps the number the timer's until that
+  detach, so the detach never has to tell the timer from a connection
+  accepted on its number.
 - **A client that leaves ends the transfer.** While it waits on the timer,
   the runtime closes the timer and drops the request. While its batch is in
   flight, the runtime still runs `on_reply` for the reply, to keep the

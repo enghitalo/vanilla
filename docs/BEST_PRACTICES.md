@@ -423,11 +423,10 @@ kqueue a deadline watch is a plain watch, and `cancel` fails.
   sleeping on the worker: `release()` the connection, park on
   `policy.park_backoff(attempt, ...)` (a timerfd armed for
   `backoff_ms(attempt)`), and acquire a connection again when it fires, with
-  the attempt number in `watch_payload`. Close that timer in the next
-  continuation, not in the one that steps away from it: the runtime takes it
-  out of the event loop only after that one returns, and by then its number
-  may be a newly accepted connection
-  ([examples/pg_transactions](../examples/pg_transactions/src/main.v)).
+  the attempt number in `watch_payload`. Close that timer once it has fired,
+  in the continuation it wakes or a later one
+  ([examples/pg_transactions](../examples/pg_transactions/src/main.v) closes
+  it in the attempt's reply).
   Aurora DSQL also caps a transaction at 3,000 modified rows, 10 MiB written
   and 5 minutes, and keeps DDL and DML apart (`pg_async/tx.v`).
 - Call third-party HTTP APIs through `http1_1.upstream`, the same shape for

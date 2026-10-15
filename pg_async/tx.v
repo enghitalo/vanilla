@@ -134,13 +134,8 @@ pub fn (r TxRetry) backoff_ms(attempt int) int {
 // the wait is over. Return .suspend after it. Release the connection first:
 // other requests can use it meanwhile, and if the client is gone nothing
 // else hands it back (below). The timer is the request's to close
-// (os.fd_close), but not from the continuation that parks on a connection
-// again: the runtime takes a fd a continuation steps away from out of the
-// event loop only once the continuation has returned, and a number closed
-// before then can already be a connection another thread just accepted,
-// which would be taken out instead and never served. Close it in the next
-// continuation (the attempt's reply), or in this one if it answers without
-// a watch (examples/pg_transactions). The runtime closes it itself when the
+// (os.fd_close), in `continuation` or a later one (examples/pg_transactions
+// closes it in the attempt's reply). The runtime closes it itself when the
 // client disconnects during the wait (the continuation never runs), and
 // when the client was already gone (a tombstone draining its reply), whose
 // request the runtime never resumes after this step: its retries end here.
