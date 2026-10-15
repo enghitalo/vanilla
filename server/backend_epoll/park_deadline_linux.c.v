@@ -206,10 +206,13 @@ fn fire_timers(h core.Handler, mut reactor Reactor, epoll_fd int, limits core.Li
 // on_park_timeout runs the continuation of connection fd's park, whose
 // deadline passed, with the timeout reason (event_loop.timed_out()): the
 // watched fd is not ready. What it returns is handled as for a readiness
-// resume (resume_step). The watch it stops waiting on is retired first
-// (retire_watch), so a readiness that comes later never runs it for this
-// request again.
-@[direct_array_access; manualfree]
+// resume (resume_step). The watch it stops waiting on is retired, so a
+// readiness that comes later never runs it for this request again: a
+// request-owned one before the continuation runs, which may then close the
+// fd (#337), any other once it has returned (retire_watch). Out of line,
+// like run_tombstone: a park times out rarely, and the worker loop, into
+// which fire_timers is inlined, then carries none of this cold code.
+@[direct_array_access; manualfree; noinline]
 fn on_park_timeout(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) {
 	// Held across the continuation, as by on_watch_ready: the park's own count
 	// goes at the unpark below, and a .done response counts only while it is
@@ -224,11 +227,13 @@ fn on_park_timeout(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, li
 	// deadline).
 	mut cont := core.WakeFn(unsafe { nil })
 	mut udata := voidptr(unsafe { nil })
+	mut owned := false // a request-owned single watch on another fd than the client's
 	if ext_fd >= 0 && ext_fd < reactor.watches.len && reactor.watches[ext_fd].active {
 		if reactor.watches[ext_fd].queue.len == 0 {
 			if reactor.watches[ext_fd].client_fd == fd {
 				cont = reactor.watches[ext_fd].cont
 				udata = reactor.watches[ext_fd].udata
+				owned = ext_fd != fd && !reactor.watches[ext_fd].persistent
 			}
 		} else {
 			for i in 0 .. reactor.watches[ext_fd].queue.len {
@@ -248,18 +253,30 @@ fn on_park_timeout(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, li
 		return
 	}
 	unpark_conn(mut st, mut cs)
+	if owned {
+		// A request-owned watch leaves the epoll set BEFORE the continuation
+		// runs (#337): the fd is the continuation's, and its timed_out() branch
+		// may close it. A DEL after that, by number, could only hit whatever has
+		// the number by then, maybe a connection the accept thread just
+		// registered here. Detached first, the number is never touched again:
+		// the continuation may close the fd, keep it, or watch it again (a new
+		// registration, as for any fd: register_watch).
+		reactor.reactor_clear(ext_fd)
+		epoll.detach_fd_from_epoll(epoll_fd, ext_fd)
+	}
 	mut event_loop := conn_loop(mut reactor, epoll_fd, fd)
 	event_loop.reason = .timeout
-	// The watch stays in place while the continuation runs, so a re-arm of the
-	// same fd (keep waiting, with a new deadline) updates it in place.
+	// Any other watch stays in place while the continuation runs, so a re-arm
+	// of the same fd (keep waiting, with a new deadline) updates it in place:
+	// a slot in a pipelined queue, a caller-owned fd, the client's own socket.
 	core.set_queue_file_allowed(false) // no file from a continuation (on_watch_ready)
 	step := cont(mut cs.write_buf, ext_fd, false, udata, state, mut event_loop)
 	core.set_queue_file_allowed(true)
-	if step != .suspend || event_loop.last_watched != ext_fd {
+	if !owned && (step != .suspend || event_loop.last_watched != ext_fd) {
 		retire_watch(mut reactor, epoll_fd, ext_fd, fd)
 	}
-	resume_step(h, mut reactor, epoll_fd, ext_fd, fd, step, mut event_loop, limits, active_conns, mut
-		st, mut cs, state)
+	resume_step(h, mut reactor, epoll_fd, if owned { -1 } else { ext_fd }, fd, step, mut
+		event_loop, limits, active_conns, mut st, mut cs, state)
 }
 
 // retire_watch takes connection fd's timed-out park off ext_fd once its
@@ -270,10 +287,10 @@ fn on_park_timeout(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, li
 //     reply still due belongs to this request, so its slot becomes a
 //     tombstone, as on a client disconnect (close_client): drain_pipelined
 //     runs the continuation against the scratch buffer when that reply
-//     arrives, consuming it in order, and the fd stays open for reuse;
-//   - a request-owned single watch: it is cleared and the fd taken out of the
-//     epoll set (never closed: the continuation owns it, as on readiness), so
-//     a late readiness wakes nothing.
+//     arrives, consuming it in order, and the fd stays open for reuse.
+// A request-owned single watch on another fd never gets here:
+// on_park_timeout cleared it and took the fd out of the epoll set before the
+// continuation ran (never closed: the continuation owns it, as on readiness).
 fn retire_watch(mut reactor Reactor, epoll_fd int, ext_fd int, fd int) {
 	if ext_fd < 0 || ext_fd >= reactor.watches.len || !reactor.watches[ext_fd].active {
 		return
@@ -291,7 +308,9 @@ fn retire_watch(mut reactor Reactor, epoll_fd int, ext_fd int, fd int) {
 		return
 	}
 	if !reactor.reactor_orphan_single(ext_fd, fd) {
+		// Not reached by a park that timed out request-owned (see above); like
+		// every detach after a continuation, it goes through the guard.
 		reactor.reactor_clear(ext_fd)
-		epoll.detach_fd_from_epoll(epoll_fd, ext_fd)
+		reactor.detach_watch_fd(epoll_fd, ext_fd)
 	}
 }

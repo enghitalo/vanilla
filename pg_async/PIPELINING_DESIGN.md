@@ -169,10 +169,11 @@ ROLLBACK undoes it, and after a failed statement every one of them fails with
   (vanilla#247). A client that disconnected ends its retries at that step:
   the runtime closes the timer once the draining run returns and never
   resumes the request, so the release before the step is what returns the
-  connection. The timer is closed by the next continuation (the attempt's
-  reply), not by the one that steps away from it: the runtime detaches a
-  stepped-away fd after that continuation returns, and a number closed
-  before then can already be a connection the acceptor just registered.
+  connection. The example closes the timer in the next continuation (the
+  attempt's reply), after the runtime detached it; the continuation that
+  steps away from it may close it as well: before it detaches a
+  stepped-away fd, the runtime checks that the number is still an app's open
+  fd and not a connection accepted on it (vanilla#337).
   (Before #247 a step after a DB reply lost the FIFO alignment, so the
   example re-ran each attempt at once on the held connection.)
 
