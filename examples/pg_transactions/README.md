@@ -121,10 +121,10 @@ instead of 10–16%: transfers that collided collided again.
 - **Who closes the timer.** `on_reply` closes the timer of the wait its
   attempt came from (`TxState.timers`), once the runtime has taken it out of
   the event loop after `on_backoff` stepped away from it. `on_backoff` could
-  close it itself: the runtime only detaches a stepped-away fd whose number
-  is still an app's open fd, never a connection accepted on it
-  (vanilla#337). Closing it later keeps the number the timer's until that
-  detach, so the detach never has to tell the two apart.
+  close it itself: before it detaches a stepped-away fd, the runtime checks
+  that the number is still an app's open fd and not a connection accepted
+  on it (vanilla#337). Closing it later keeps the number the timer's until
+  that detach, so the check has nothing to tell apart.
 - **A client that leaves ends the transfer.** While it waits on the timer,
   the runtime closes the timer and drops the request. While its batch is in
   flight, the runtime still runs `on_reply` for the reply, to keep the

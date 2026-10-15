@@ -791,16 +791,20 @@ fn (st &PlainState) leftover_fd(fd int) bool {
 }
 
 // accepted_stream reports whether fd is a stream socket that is not
-// listening, as one accept returns is.
+// listening, as one accept returns is. A failed getsockopt (the number was
+// closed meanwhile) counts as accepted: the caller then leaves it alone.
 @[noinline]
 fn accepted_stream(fd int) bool {
 	mut v := i32(0)
 	mut l := u32(4)
-	if C.getsockopt(fd, C.SOL_SOCKET, C.SO_TYPE, &v, &l) != 0 || v != C.SOCK_STREAM {
+	if C.getsockopt(fd, C.SOL_SOCKET, C.SO_TYPE, &v, &l) != 0 {
+		return true
+	}
+	if v != C.SOCK_STREAM {
 		return false
 	}
 	l = 4
-	return C.getsockopt(fd, C.SOL_SOCKET, C.SO_ACCEPTCONN, &v, &l) == 0 && v == 0
+	return C.getsockopt(fd, C.SOL_SOCKET, C.SO_ACCEPTCONN, &v, &l) != 0 || v == 0
 }
 
 // sock_local reads fd's local address (getsockname): its family (-1 when fd

@@ -638,7 +638,9 @@ fn test_epoll_tombstone_continuation_closing_its_fd() {
 }
 
 // udp_on_loopback returns a UDP socket bound to 127.0.0.1:port, and a second
-// one that has sent it a datagram, so the first is readable until read.
+// one that has sent it a datagram, so the first is readable until read; or
+// -1, -1 when the UDP port is taken (the TCP listener's port comes from the
+// ephemeral range, where another UDP socket may already have it).
 fn udp_on_loopback(port int) (int, int) {
 	mut a := [16]u8{}
 	unsafe {
@@ -650,7 +652,8 @@ fn udp_on_loopback(port int) (int, int) {
 	a[7] = 1
 	fd := C.socket(C.AF_INET, C.SOCK_DGRAM | C.SOCK_CLOEXEC, 0)
 	if C.bind(fd, voidptr(&a[0]), 16) != 0 {
-		panic('bind failed')
+		C.close(fd)
+		return -1, -1
 	}
 	peer := C.socket(C.AF_INET, C.SOCK_DGRAM | C.SOCK_CLOEXEC, 0)
 	C.sendto(peer, c'x', 1, 0, voidptr(&a[0]), 16)
@@ -671,6 +674,10 @@ fn test_epoll_step_away_from_an_app_socket_on_the_listener_port() {
 		h.stop()
 	}
 	udp, peer := udp_on_loopback(h.port())
+	if udp < 0 {
+		eprintln('[udp on the listener port] skipped: UDP port ${h.port()} is taken')
+		return
+	}
 	mut p := unsafe { rp }
 	stdatomic.store_i64(&p.shared_fd, udp)
 	c1 := tcp_socket()
@@ -688,6 +695,8 @@ fn test_epoll_step_away_from_an_app_socket_on_the_listener_port() {
 	cpu_us := C.clock() - cpu0
 	eprintln('[udp on the listener port, kept open] still in the worker epoll: ${still}; process CPU in 300 ms: ${cpu_us} us')
 	assert !still, 'the app socket was left in the worker epoll'
+	// The check above decides; this one only shows the symptom (a worker
+	// spinning on a loaded runner may get too little CPU to cross it).
 	assert cpu_us < 100_000, 'the worker spun on a readable app socket left registered: ${cpu_us} us of CPU in 300 ms'
 }
 

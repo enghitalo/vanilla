@@ -78,8 +78,9 @@ pub enum WatchInterest {
 // A parked request's ready_fd from watch_fd / watch_fd_deadline (other than
 // its client's own socket) is the continuation's to close once it is done
 // with it: before it returns .done, or before or after it watches another fd
-// and returns .suspend. If the client leaves while the request is parked,
-// the runtime closes it instead. A clientless continuation (WorkerStartFn,
+// and returns .suspend. The runtime closes it instead if the client leaves
+// while the request is parked, or if the continuation watches it again but
+// returns .done/.close. A clientless continuation (WorkerStartFn,
 // watch_fd_background) must not close ready_fd when it returns .done/.close:
 // the runtime does.
 //
