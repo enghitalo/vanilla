@@ -175,3 +175,17 @@ jobs:
         run: |
           v -cc gcc -no-parallel test transport/
           v -cc gcc -no-parallel -gc none test transport/
+      # socket/: peer_cred, including from inside a PID namespace that cannot
+      # see the peer — the container case (#329). That test needs an
+      # unprivileged user namespace, which Ubuntu's AppArmor default refuses:
+      # lift it here, and VANILLA_REQUIRE_USERNS=1 turns the test's skip into
+      # a failure, so the case cannot pass unexercised.
+      - name: 'Run socket module tests (peer_cred across a PID namespace, #329)'
+        shell: bash
+        env:
+          VANILLA_REQUIRE_USERNS: '1'
+        run: |
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          v -cc gcc -no-parallel test socket/

@@ -357,6 +357,16 @@ Linux, `getpeereid` + `LOCAL_PEERPID` on macOS — the sibling of `peer_ipv4`:
 one `getsockopt` when a handler asks, `none` on a TCP socket
 ([`socket/peer_cred_linux.c.v`](../socket/peer_cred_linux.c.v)).
 
+**Across containers** the kernel translates the ids into the *reader's*
+namespaces. A peer in a PID namespace the server cannot see — a reverse proxy
+in its own container, sharing the socket through a volume — reads as pid **0**,
+while its uid and gid are still the kernel's (#329); a uid the server's user
+namespace does not map reads as the overflow id (65534). So authorize by
+uid/gid, not by pid, and never grant access to the overflow id: every
+unmapped peer reads as it. `peer_cred` answers `none` only when the kernel
+recorded no credentials at all (TCP, a unix socket with no peer), never
+because the pid is 0.
+
 **Abstract namespace** (Linux-only, `@name` convention → `sun_path[0] = '\0'`):
 no filesystem entry, auto-cleanup when the last fd closes — ideal for test
 suites (no stale files, no unlink dance). The catch: **file permissions do not
@@ -432,7 +442,9 @@ would be a natural `ServerConfig.listener_fd` follow-up.
 - **Containers**: bind-mounting a socket across a VM boundary (Docker Desktop
   on macOS/Windows) is unreliable; on Linux it works and is the standard
   sidecar wiring — but remember mounting a privileged socket (docker.sock)
-  into a container hands over its full authority.
+  into a container hands over its full authority. A peer in another
+  container's PID namespace reaches `peer_cred` with its uid/gid and pid 0
+  (§6).
 
 ## 9. Sources
 
