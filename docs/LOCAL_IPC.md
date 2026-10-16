@@ -362,9 +362,10 @@ namespaces. A peer in a PID namespace the server cannot see — a reverse proxy
 in its own container, sharing the socket through a volume — reads as pid **0**,
 while its uid and gid are still the kernel's (#329); a uid the server's user
 namespace does not map reads as the overflow id (65534). So authorize by
-uid/gid, not by pid. `peer_cred` answers `none` only when the kernel recorded
-no credentials at all (TCP, a unix socket with no peer), never because the
-pid is 0.
+uid/gid, not by pid, and never grant access to the overflow id: every
+unmapped peer reads as it. `peer_cred` answers `none` only when the kernel
+recorded no credentials at all (TCP, a unix socket with no peer), never
+because the pid is 0.
 
 **Abstract namespace** (Linux-only, `@name` convention → `sun_path[0] = '\0'`):
 no filesystem entry, auto-cleanup when the last fd closes — ideal for test

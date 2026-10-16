@@ -27,7 +27,8 @@ fn C.getsockopt(fd int, level int, optname int, optval voidptr, optlen &u32) int
 // runs in a PID namespace this process cannot see (a proxy in another
 // container sharing the socket through a volume, #329) — uid and gid are
 // still the kernel's — and an id with no mapping in this user namespace reads
-// as the overflow id (65534, /proc/sys/kernel/overflowuid).
+// as the overflow id (65534, /proc/sys/kernel/overflowuid). Every unmapped
+// peer shares that id, so it names no one: never grant access to it.
 pub struct PeerCred {
 pub:
 	pid int
@@ -36,7 +37,8 @@ pub:
 }
 
 // peer_cred returns the peer's credentials for a connected AF_UNIX socket,
-// or none for non-unix sockets and errors. `client_fd` is the handler's
+// or none when the kernel recorded none (a non-unix socket, a unix socket
+// with no peer) and on errors. `client_fd` is the handler's
 // parameter — accepted UDS connections on every backend qualify.
 pub fn peer_cred(fd int) ?PeerCred {
 	mut cred := C.ucred{}
