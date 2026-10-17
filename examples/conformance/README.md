@@ -31,6 +31,8 @@ checks in [`src/validate.v`](src/validate.v):
 | `HEAD` returns headers with no body | RFC 9110 §9.3.2 | 200, empty body |
 | Unimplemented method | RFC 9110 §15.5.6 | 405 + `Allow` |
 | Error responses are self-delimiting + `Connection: close` | RFC 9110 §6.3, RFC 9112 §9.6 | — |
+| `Connection: close` closes after the response (`wants_close` in [`src/main.v`](src/main.v)) | RFC 9112 §9.6 | `.close` |
+| HTTP/1.0 closes unless it sends `Connection: keep-alive` (this example's choice: vanilla does not support HTTP/1.0) | RFC 9112 §9.3 | `.close` |
 
 Malformed requests reach the handler already framed by
 `frame_request_length_lim`, which rejects the grossest framing errors (missing

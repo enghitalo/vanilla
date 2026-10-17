@@ -38,6 +38,8 @@ fn handle_request(request []u8, mut response []u8, client_fd int, worker_state v
 	// single send — never free or keep it. Return `.done` when the
 	// response is complete, `.close` to flush-and-drop the connection, or
 	// `.suspend` after parking the request via `event_loop.watch_fd(...)`.
+	// The server never reads `Connection`: return `.close` when the
+	// request says `Connection: close`.
 	core.append_str(mut response, 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok')
 	return .done
 }
