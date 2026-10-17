@@ -35,7 +35,10 @@ fn worker_count() int {
 
 // Step is what a handler / continuation returns to the worker:
 //   .done    — the response is complete in `res`; the worker sends it (and, for
-//              a resumed continuation, unparks the connection)
+//              a resumed continuation, unparks the connection) and keeps the
+//              connection open. The worker never reads `Connection`: when the
+//              request says `Connection: close`, return .close instead
+//              (RFC 9112 §9.6)
 //   .suspend — the handler/continuation registered a watch
 //              (event_loop.watch_fd); the connection stays parked until that
 //              fd is ready or the park's deadline passes (park_timeout_ms,

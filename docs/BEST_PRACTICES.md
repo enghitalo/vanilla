@@ -53,6 +53,8 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
   the core batch and send it.
 - Keep all framing decisions (Content-Length, chunking) in the core, not in
   the handler.
+- Return `.close` after the response when the client asked to close
+  (`Connection: close`, §7): the core never reads `Connection`.
 
 **Don't**
 
@@ -568,6 +570,17 @@ vanilla targets [RFC 9112](https://datatracker.ietf.org/doc/rfc9112/) and the
   guess.
 - Return correct status codes and reason phrases.
 - Treat header names case-insensitively when matching.
+- Close the connection when the client asks. A request whose `Connection`
+  lists `close` MUST have its connection closed after its response (RFC 9112
+  §9.6). Neither the core nor the library reads `Connection` for you: like
+  every other header, the handler reads it from the raw request and decides.
+  Say `Connection: close` in the response (a SHOULD) and return `.close`.
+  [examples/conformance](../examples/conformance/src/main.v)'s `wants_close`
+  is one way to read it. vanilla does not support HTTP/1.0, so nothing applies
+  its close-by-default (RFC 9112 §9.3); a handler that accepts HTTP/1.0
+  decides that itself, as conformance does. The other examples skip this
+  check, as most skip `validate_http1()`: each shows one feature, and
+  conformance is the one written to be correct.
 
 **Don't**
 
