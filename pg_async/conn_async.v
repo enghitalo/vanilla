@@ -25,10 +25,12 @@ fn C.fcntl(fd int, cmd int, arg int) int
 // complete. The caller sheds when a connection is full (Shed, shed.v).
 const max_inflight = 8
 
-// send_buf_cap is the fixed per-connection send-buffer size. Allocated once and
-// never reallocated, so a pipelined send in flight never sees its backing store
-// move. 64 KiB holds hundreds of the small extended-
-// protocol queries vanilla issues; append_send sheds if a frame won't fit.
+// send_buf_cap is the default per-connection send-buffer size
+// (ConnConfig.send_buf_cap). Each connection's buffer is allocated once, when
+// the connection is made, and never reallocated, so a pipelined send in
+// flight never sees its backing store move. 64 KiB holds hundreds of the
+// small extended-protocol queries vanilla issues; append_send sheds if a
+// frame won't fit.
 const send_buf_cap = 64 * 1024
 
 // frame_buf_cap is the per-accumulator reply-buffer size in the per-connection
@@ -136,7 +138,7 @@ pub:
 
 const err_batch_empty = error('pg: async_submit_batch: the batch has no statement')
 
-const err_batch_too_large = error('pg: async_submit_batch: the batch is larger than the send buffer (send_buf_cap) and can never be sent')
+const err_batch_too_large = error('pg: async_submit_batch: the batch is larger than the send buffer (ConnConfig.send_buf_cap) and can never be sent')
 
 // async_submit_batch submits `stmts` as ONE pipelined query: each statement's
 // Parse/Bind/Describe/Execute, then a single Sync. Everything up to a Sync runs
@@ -158,8 +160,9 @@ const err_batch_too_large = error('pg: async_submit_batch: the batch is larger t
 // Returns false, submitting nothing, when the connection cannot take it now —
 // broken, its pipeline full, or its send buffer too full — exactly as
 // async_submit: the caller sheds. Returns an error for a batch that can never
-// be sent, on any connection: an empty one, or one larger than the send
-// buffer (max_frame_len) on its own. It allocates what async_submit does.
+// be sent: an empty one, or one larger than the connection's send buffer
+// (max_frame_len(), ConnConfig.send_buf_cap) on its own. It allocates what
+// async_submit does.
 pub fn (mut c PgConn) async_submit_batch(stmts []Stmt) !bool {
 	if stmts.len == 0 {
 		return err_batch_empty
@@ -174,7 +177,7 @@ pub fn (mut c PgConn) async_submit_batch(stmts []Stmt) !bool {
 		write_execute(mut c.submit_scratch, '', 0)
 	}
 	write_sync(mut c.submit_scratch)
-	if c.submit_scratch.len > send_buf_cap {
+	if c.submit_scratch.len > c.max_frame_len() {
 		return err_batch_too_large
 	}
 	if c.state != .ready || c.inflight.len >= c.inflight_limit() || !c.append_send(c.submit_scratch) {
@@ -231,11 +234,13 @@ fn (mut c PgConn) push_inflight() {
 
 // append_send copies one serialized query frame into the fixed-capacity send
 // buffer, compacting the unsent region to the front first so the buffer never
-// marches forward. The buffer is allocated once and
-// never reallocated. Returns false if the frame will not fit — the connection is
-// saturated and the caller must shed.
+// marches forward. The buffer is allocated once, when the connection is made
+// (ConnConfig.send_buf_cap), and never reallocated. Returns false if the frame
+// will not fit — the connection is saturated and the caller must shed.
 fn (mut c PgConn) append_send(frame []u8) bool {
-	if c.send_buf.len < send_buf_cap {
+	if c.send_buf.len == 0 {
+		// A connection made without connect (a test, a benchmark): the
+		// default buffer, from its first submit on.
 		c.send_buf = []u8{len: send_buf_cap}
 		c.send_off = 0
 		c.send_len = 0
@@ -254,7 +259,7 @@ fn (mut c PgConn) append_send(frame []u8) bool {
 		c.send_off = 0
 		c.send_len = n
 	}
-	if c.send_len + frame.len > send_buf_cap {
+	if c.send_len + frame.len > c.send_buf.len {
 		return false
 	}
 	for i in 0 .. frame.len {

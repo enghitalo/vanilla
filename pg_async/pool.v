@@ -75,18 +75,22 @@ pub fn PgPool.connect(cfg ConnConfig, size int) !PgPool {
 	}
 	check_startup_params(cfg.params) or { return error('pg pool: ${err}') }
 	check_max_inflight(cfg.max_inflight) or { return error('pg pool: ${err}') }
+	check_send_buf_cap(cfg.send_buf_cap) or { return error('pg pool: ${err}') }
 	mut tls_cfg := &tls.Config(unsafe { nil })
 	if cfg.ssl_mode != .disable {
 		tls_cfg = new_tls_config(&cfg) or { return error('pg pool: ${err}') }
 	}
 	mut conns := []PgConn{cap: size}
 	scram := &ScramCache{}
+	too_large := frame_too_large_error(cfg.send_buf_cap) // every connection's buffer is that size
 	for i in 0 .. size {
 		mut c := PgConn{
-			recv_buf:     []u8{cap: 16 * 1024}
-			scram_cache:  scram
-			tls_cfg:      tls_cfg
-			inflight_cap: cfg.max_inflight
+			recv_buf:        []u8{cap: 16 * 1024}
+			send_buf:        []u8{len: cfg.send_buf_cap}
+			scram_cache:     scram
+			tls_cfg:         tls_cfg
+			inflight_cap:    cfg.max_inflight
+			frame_too_large: too_large
 		}
 		c.bring_up(&cfg) or {
 			c.teardown()

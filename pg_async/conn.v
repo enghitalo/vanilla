@@ -285,6 +285,18 @@ pub:
 	// So raising it costs at least max_inflight × 16 KiB per connection, per
 	// worker. 1..max_inflight_limit (256).
 	max_inflight int = max_inflight
+	// send_buf_cap is the size of each connection's send buffer, and so the
+	// largest frame (query_frame_len, batch_frame_len) the pipelined path can
+	// send on it (PgConn.max_frame_len): a larger one is FrameTooLarge from
+	// submit, submit_batch and acquire_pipelined_for (async_submit returns
+	// false, async_submit_batch an error). The blocking query() builds its own
+	// frame and has no such bound. The buffer is allocated once, when the
+	// connection is made, and kept across re-dials, so the pool costs
+	// connections × workers × send_buf_cap, on top of max_inflight's reply
+	// buffers. Size it for the largest statement and parameters the app
+	// sends (a jsonb document, a batch of rows).
+	// min_send_buf_cap..max_send_buf_cap (16 KiB..16 MiB).
+	send_buf_cap int = send_buf_cap
 }
 
 // check_startup_params refuses run-time parameters the StartupMessage cannot
@@ -359,7 +371,7 @@ mut:
 	// frames replies (Postgres returns them in submit order) into the front
 	// PendingQuery and pops it at ReadyForQuery. One query in flight is just the
 	// degenerate N=1 case.
-	send_buf []u8 // fixed-capacity (send_buf_cap), allocated once, never realloc'd
+	send_buf []u8 // ConnConfig.send_buf_cap bytes (max_frame_len), allocated at connect, never realloc'd
 	send_off int  // [0, send_off) already sent
 	send_len int  // [send_off, send_len) written, still to send
 	inflight []PendingQuery
@@ -431,6 +443,10 @@ mut:
 	// (max_lifetime_ms, monotonic ns; max_u64 = never), set each time it
 	// comes up (lifetime_deadline).
 	expires_at u64 = max_u64
+	// frame_too_large is the FrameTooLarge naming this connection's send
+	// buffer, boxed when the connection is made, so that refusing a frame
+	// too large for it allocates nothing.
+	frame_too_large IError = err_frame_too_large
 }
 
 struct Msg {
@@ -451,9 +467,12 @@ struct Msg {
 pub fn PgConn.connect(cfg ConnConfig) !PgConn {
 	check_startup_params(cfg.params)!
 	check_max_inflight(cfg.max_inflight)!
+	check_send_buf_cap(cfg.send_buf_cap)!
 	mut c := PgConn{
-		recv_buf:     []u8{cap: 16 * 1024}
-		inflight_cap: cfg.max_inflight
+		recv_buf:        []u8{cap: 16 * 1024}
+		send_buf:        []u8{len: cfg.send_buf_cap}
+		inflight_cap:    cfg.max_inflight
+		frame_too_large: frame_too_large_error(cfg.send_buf_cap)
 	}
 	if cfg.ssl_mode != .disable {
 		c.tls_cfg = new_tls_config(&cfg)!

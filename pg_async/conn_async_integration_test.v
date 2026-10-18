@@ -170,6 +170,68 @@ fn test_async_pipeline_against_live_pg() {
 	assert !c.is_busy()
 }
 
+// Live-Postgres test of ConnConfig.send_buf_cap (vanilla#355): a 100 KiB
+// parameter is FrameTooLarge on the default 64 KiB send buffer, and is sent
+// and answered on a 128 KiB one (in the TLS lane, as several TLS records).
+// Skipped unless PGHOST is set.
+fn test_async_large_frame_against_live_pg() {
+	host := os.getenv('PGHOST')
+	if host == '' {
+		eprintln('pg_async: skipping large-frame test (no PGHOST)')
+		return
+	}
+	port_env := os.getenv('PGPORT')
+	cfg := ConnConfig{
+		host:          host
+		port:          if port_env != '' { port_env.int() } else { 5432 }
+		user:          os.getenv('PGUSER')
+		password:      os.getenv('PGPASSWORD')
+		database:      os.getenv('PGDATABASE')
+		// PGSSLMODE=verify-full + PGSSLROOTCERT: the TLS lane of pg_async.yml
+		ssl_mode:      SslMode.from_string(os.getenv('PGSSLMODE').replace('-', '_')) or { SslMode.disable }
+		ssl_root_cert: os.getenv('PGSSLROOTCERT')
+	}
+	sql := r'select length($1::text)'
+	params := [?[]u8([]u8{len: 100 * 1024, init: `x`})]
+	n := query_frame_len(sql, params)
+	mut narrow := PgPool.connect(cfg, 1)!
+	defer {
+		narrow.close()
+	}
+	if i := narrow.acquire_pipelined_for(n) {
+		assert false, 'a 64 KiB send buffer took a 100 KiB frame on connection ${i}'
+	} else {
+		assert err is FrameTooLarge, err.msg()
+	}
+	mut wide := PgPool.connect(ConnConfig{
+		...cfg
+		send_buf_cap: 128 * 1024
+	}, 1)!
+	defer {
+		wide.close()
+	}
+	mut c := wide.conn(wide.acquire_pipelined_for(n)!)
+	c.submit(sql, params)!
+	deadline := time.sys_mono_now() + 30 * u64(time.second)
+	for !c.async_flush()! {
+		assert time.sys_mono_now() < deadline, 'the 100 KiB frame was not sent'
+		C.pg_async_wait(c.fd, C.POLLOUT, 100)
+	}
+	mut got := ?Result(none)
+	for time.sys_mono_now() < deadline {
+		poll := c.async_on_readable()!
+		if poll.ready {
+			got = poll.result
+			break
+		}
+		C.pg_async_wait(c.fd, C.POLLIN, 100)
+	}
+	res := got or { panic('the 100 KiB query did not complete') }
+	mut it := res.rows()
+	row := it.next() or { panic('expected a row') }
+	assert row.int4(0)! == 100 * 1024
+}
+
 // pump_int submits one query on a non-blocking connection, pumps it to
 // completion and returns its single int4 column, or the query's error.
 fn pump_int(mut c PgConn, query string) !int {

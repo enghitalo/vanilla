@@ -23,12 +23,34 @@ fn shed_pool(port int, size int, depth int) !&PgPool {
 	}, size)
 }
 
+// buf_cfg is the fake server's config with a send buffer of `cap` bytes
+// (ConnConfig.send_buf_cap).
+fn buf_cfg(port int, cap int) ConnConfig {
+	return ConnConfig{
+		host:         '127.0.0.1'
+		port:         port
+		user:         'vanilla'
+		password:     'secret'
+		database:     'vanilla'
+		send_buf_cap: cap
+	}
+}
+
 // shed_reason is the reason of a Shed error, or fails the test.
 fn shed_reason(err IError) ShedReason {
 	if err is Shed {
 		return err.reason
 	}
 	panic('expected a Shed, got ${err.type_name()}: ${err.msg()}')
+}
+
+// too_large_cap is the send-buffer size a FrameTooLarge error names, or
+// fails the test.
+fn too_large_cap(err IError) int {
+	if err is FrameTooLarge {
+		return err.cap
+	}
+	panic('expected a FrameTooLarge, got ${err.type_name()}: ${err.msg()}')
 }
 
 // submit_err is the error submit returns, or fails the test.
@@ -340,6 +362,204 @@ fn test_a_frame_larger_than_the_send_buffer_is_an_error() {
 	assert e3 !is FrameTooLarge && e3 !is Shed, e3.msg()
 }
 
+// echo_len pumps the front query to completion and returns the length of the
+// text it echoed.
+fn echo_len(mut c PgConn) !int {
+	res := pump_one(mut c)!
+	mut it := res.rows()
+	row := it.next() or { return error('expected the echo') }
+	return row.col(0)!.bytes.len
+}
+
+// ConnConfig.send_buf_cap sizes each connection's send buffer, and so the
+// largest frame it takes (vanilla#355). A 100 KiB frame is FrameTooLarge on
+// the default 64 KiB buffer; on a 128 KiB one it is sent and answered on
+// every submit path, and the bound is 128 KiB to the byte.
+fn test_send_buf_cap_sets_the_largest_frame() {
+	if !testkit.fake_pg_available() {
+		return
+	}
+	mut fake := testkit.start_fake_pg([])!
+	defer {
+		fake.stop()
+	}
+	sql := 'select \$1::text'
+	p100 := echo_param(100 * 1024)
+	n100 := query_frame_len(sql, p100)
+	mut narrow := shed_pool(fake.port, 1, 8)!
+	defer {
+		narrow.close()
+	}
+	assert narrow.conn(0).max_frame_len() == max_frame_len
+	if i := narrow.acquire_pipelined_for(n100) {
+		assert false, 'acquire_pipelined_for returned ${i} for 100 KiB on a 64 KiB send buffer'
+	} else {
+		assert too_large_cap(err) == max_frame_len
+	}
+	assert too_large_cap(submit_err(mut narrow.conn(0), sql, p100)) == max_frame_len
+	assert !narrow.conn(0).async_submit(sql, p100)
+
+	wide_cap := 128 * 1024
+	mut wide := new_pool(buf_cfg(fake.port, wide_cap), 1)!
+	defer {
+		wide.close()
+	}
+	mut c := wide.conn(wide.acquire_pipelined_for(n100)!)
+	assert c.max_frame_len() == wide_cap
+	c.submit(sql, p100)!
+	assert echo_len(mut c)! == 100 * 1024
+	assert c.async_submit(sql, p100)
+	assert echo_len(mut c)! == 100 * 1024
+	assert c.async_submit_batch([Stmt{ sql: sql, params: p100 }])!
+	assert echo_len(mut c)! == 100 * 1024
+	// A frame of exactly 128 KiB is taken; one byte more is FrameTooLarge,
+	// naming the connection's own buffer.
+	room := wide_cap - query_frame_len(sql, echo_param(0))
+	exact := echo_param(room)
+	assert query_frame_len(sql, exact) == wide_cap
+	assert wide.acquire_pipelined_for(wide_cap)! == 0
+	c.submit(sql, exact)!
+	assert echo_len(mut c)! == room
+	over := echo_param(room + 1)
+	if i := wide.acquire_pipelined_for(wide_cap + 1) {
+		assert false, 'acquire_pipelined_for returned ${i} past the 128 KiB buffer'
+	} else {
+		assert too_large_cap(err) == wide_cap
+	}
+	assert too_large_cap(submit_err(mut c, sql, over)) == wide_cap
+	assert too_large_cap(batch_err(mut c, [Stmt{ sql: sql, params: over }])) == wide_cap
+	if _ := c.async_submit_batch([Stmt{ sql: sql, params: over }]) {
+		assert false, 'async_submit_batch took a batch past the 128 KiB buffer'
+	}
+	assert c.inflight.len == 0, 'nothing past the buffer was submitted'
+}
+
+// send_buf_cap defaults to max_frame_len (64 KiB). A value out of
+// min_send_buf_cap..max_send_buf_cap is refused before anything is dialed,
+// as max_inflight is.
+fn test_send_buf_cap_defaults_to_max_frame_len_and_is_bounded() {
+	cfg := ConnConfig{}
+	assert cfg.send_buf_cap == max_frame_len
+	if !testkit.fake_pg_available() {
+		return
+	}
+	mut fake := testkit.start_fake_pg([])!
+	defer {
+		fake.stop()
+	}
+	for bad in [0, -1, min_send_buf_cap - 1, max_send_buf_cap + 1] {
+		if mut p := new_pool(buf_cfg(fake.port, bad), 1) {
+			p.close()
+			assert false, 'send_buf_cap ${bad} was accepted'
+		} else {
+			assert err.msg().contains('send_buf_cap'), err.msg()
+		}
+		if mut one := PgConn.connect(buf_cfg(fake.port, bad)) {
+			one.close()
+			assert false, 'PgConn.connect took send_buf_cap ${bad}'
+		} else {
+			assert err.msg().contains('send_buf_cap'), err.msg()
+		}
+	}
+	assert fake.stat('accepted') == 0, 'a refused send_buf_cap dialed the server'
+	for good in [min_send_buf_cap, max_send_buf_cap] {
+		mut p := new_pool(buf_cfg(fake.port, good), 1)!
+		mut pc := p.conn(0)
+		assert pc.max_frame_len() == good
+		pc.submit('select 1', []?[]u8{})!
+		drain_all(mut pc)!
+		assert pc.max_frame_len() == good, 'a submit swapped the send buffer'
+		p.close()
+		mut one := PgConn.connect(buf_cfg(fake.port, good))!
+		assert one.max_frame_len() == good
+		one.close()
+	}
+}
+
+// open_conn connects to the fake server as a pool does: brought up, then
+// non-blocking.
+fn open_conn(cfg ConnConfig) !PgConn {
+	mut c := PgConn.connect(cfg)!
+	c.set_nonblocking() or {
+		c.close()
+		return err
+	}
+	return c
+}
+
+// acquire_pipelined_for measures a frame against each connection's own send
+// buffer (vanilla#355): the room is what a 128 KiB buffer has left, and in a
+// pool whose buffers differ a frame goes only to a connection it fits. It
+// sheds while such a connection is busy, and is FrameTooLarge, naming the
+// largest buffer, only when it fits none.
+fn test_acquire_pipelined_for_sheds_by_each_connection_s_own_capacity() {
+	if !testkit.fake_pg_available() {
+		return
+	}
+	mut fake := testkit.start_fake_pg([])!
+	defer {
+		fake.stop()
+	}
+	wide_cap := 128 * 1024
+	sql := 'select \$1::text'
+	p60 := echo_param(60 * 1024)
+	n60 := query_frame_len(sql, p60)
+	mut pool := new_pool(buf_cfg(fake.port, wide_cap), 2)!
+	defer {
+		pool.close()
+	}
+	pool.conn(0).submit(sql, p60)! // depth 1: 68 KiB of room left (4 KiB in a 64 KiB buffer)
+	pool.conn(1).submit('select 1', []?[]u8{})!
+	pool.conn(1).submit('select 2', []?[]u8{})! // depth 2
+	assert pool.conn(0).send_room() == wide_cap - n60
+	assert pool.acquire_pipelined_for(n60)! == 0, 'the shortest pipeline has room for 60 KiB more'
+	pool.conn(0).submit(sql, p60)! // 8 KiB of room left
+	assert pool.acquire_pipelined_for(n60)! == 1
+	pool.conn(1).submit(sql, p60)!
+	pool.conn(1).submit(sql, p60)! // under 8 KiB left on either
+	if i := pool.acquire_pipelined_for(n60) {
+		assert false, 'acquire_pipelined_for returned ${i} with no room for 60 KiB'
+	} else {
+		assert shed_reason(err) == .send_buffer_full
+	}
+	for i in 0 .. 2 {
+		drain_all(mut pool.conn(i))!
+	}
+
+	// A 64 KiB and a 128 KiB connection in one pool.
+	mut mixed := PgPool{
+		conns: [open_conn(buf_cfg(fake.port, max_frame_len))!,
+			open_conn(buf_cfg(fake.port, wide_cap))!]
+		idle:  [true, true]
+		cfg:   buf_cfg(fake.port, max_frame_len)
+	}
+	defer {
+		mixed.close()
+	}
+	p100 := echo_param(100 * 1024)
+	n100 := query_frame_len(sql, p100)
+	mixed.conn(1).submit('select 1', []?[]u8{})! // the wide connection is the deeper one
+	assert mixed.acquire_pipelined_for(n100)! == 1, '100 KiB goes to the 128 KiB buffer, never the idle 64 KiB one'
+	assert mixed.acquire_pipelined_for(query_frame_len('select 2', []?[]u8{}))! == 0
+	mixed.conn(1).submit(sql, p60)! // 68 KiB of room left in the wide buffer
+	if i := mixed.acquire_pipelined_for(n100) {
+		assert false, 'acquire_pipelined_for returned ${i} with no room for 100 KiB'
+	} else {
+		// The wide buffer takes it once it drains: a shed, not FrameTooLarge.
+		assert shed_reason(err) == .send_buffer_full
+	}
+	if i := mixed.acquire_pipelined_for(wide_cap + 1) {
+		assert false, 'acquire_pipelined_for returned ${i} for a frame no buffer holds'
+	} else {
+		assert too_large_cap(err) == wide_cap, 'FrameTooLarge names the largest buffer'
+	}
+	drain_all(mut mixed.conn(1))!
+	i := mixed.acquire_pipelined_for(n100)!
+	assert i == 1
+	mixed.conn(i).submit(sql, p100)!
+	assert echo_len(mut mixed.conn(i))! == 100 * 1024
+}
+
 // A connection held by acquire() is never chosen; with every connection held
 // the frame sheds with .no_connection.
 fn test_a_connection_held_by_acquire_is_never_chosen() {
@@ -456,7 +676,9 @@ fn test_submit_on_a_lost_connection_is_conn_broken() {
 }
 
 // Refusing allocates nothing: the Shed and FrameTooLarge errors are
-// constants, and an oversized frame is never serialized.
+// constants, and an oversized frame is never serialized. A connection with a
+// send buffer of its own size (send_buf_cap) has its FrameTooLarge boxed when
+// it is made, so it refuses for nothing too.
 fn test_shedding_allocates_nothing() {
 	mut c := PgConn{}
 	c.state = .ready
@@ -466,6 +688,17 @@ fn test_shedding_allocates_nothing() {
 		conns: [c]
 		idle:  [true]
 	}
+	wide_cap := 128 * 1024
+	mut wide := PgConn{
+		send_buf:        []u8{len: wide_cap}
+		frame_too_large: frame_too_large_error(wide_cap)
+	}
+	wide.state = .ready
+	mut wide_pool := PgPool{
+		conns: [wide]
+		idle:  [true]
+	}
+	wide_huge := echo_param(wide_cap)
 	n := query_frame_len('select 1', []?[]u8{})
 	huge := echo_param(max_frame_len)
 	mut sheds := 0
@@ -494,12 +727,23 @@ fn test_shedding_allocates_nothing() {
 				}
 				-1
 			}
+			wide_pool.conns[0].submit('select \$1::text', wide_huge) or {
+				if err is FrameTooLarge && err.cap == wide_cap {
+					sheds++
+				}
+			}
+			_ := wide_pool.acquire_pipelined_for(wide_cap + 1) or {
+				if err is FrameTooLarge && err.cap == wide_cap {
+					sheds++
+				}
+				-1
+			}
 		}
 		grown := gc_heap_usage().bytes_since_gc - before
 		if round == 1 {
-			assert grown == 0, 'refusing allocated ${grown} bytes over 4000 refusals'
+			assert grown == 0, 'refusing allocated ${grown} bytes over 6000 refusals'
 		}
 	}
-	assert sheds == 8000
+	assert sheds == 12000
 	pool.conns[0].inflight.clear()
 }
