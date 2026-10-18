@@ -8,26 +8,40 @@ module pg_async
 //                  for the frame now, or no connection is free. Nothing was
 //                  sent. Answer 503 with Retry-After (never a 200 for a write
 //                  that did not happen, nor a 4xx: the request was fine).
-//   FrameTooLarge  the query's wire frame is larger than a connection's send
-//                  buffer (max_frame_len): it can never be sent, on any
-//                  connection, now or later. A bug or an input to bound:
-//                  answer 500 (or 413 when the size comes from the request).
-//                  Nothing is serialized before the size is checked.
+//   FrameTooLarge  the query's wire frame is larger than the connection's
+//                  send buffer (PgConn.max_frame_len, ConnConfig.send_buf_cap):
+//                  it can never be sent there, now or later; from
+//                  acquire_pipelined_for, on no connection of the pool. A bug
+//                  or an input to bound: answer 500 (or 413 when the size
+//                  comes from the request). Nothing is serialized before the
+//                  size is checked.
 //   ConnBroken     the connection chosen is lost (PgConn.is_broken). The pool
 //                  re-dials it on its own; acquire_pipelined_for never
 //                  returns one, so this reaches only a caller that submits on
 //                  a connection it took some other way.
 //
 // Test with `err is Shed`, `err is FrameTooLarge`, `err is ConnBroken`. Shed
-// and FrameTooLarge are constants: refusing allocates nothing, which matters
-// under -gc none, where the shed path is the hot path of an overload and a
+// is a constant, and each connection's FrameTooLarge is boxed when the
+// connection is made: refusing allocates nothing, which matters under
+// -gc none, where the shed path is the hot path of an overload and a
 // request-sized frame is a path a client drives. ConnBroken carries the loss's
 // reason and is boxed per call: a lost connection is rare.
 
 // max_frame_len is the largest wire frame (a query or a batch, as
-// query_frame_len and batch_frame_len count it) that a connection can ever
-// send: the size of its fixed send buffer.
+// query_frame_len and batch_frame_len count it) that a connection can send
+// by default: the size of its send buffer when ConnConfig.send_buf_cap is
+// left at its default, 64 KiB. A connection's own is PgConn.max_frame_len().
 pub const max_frame_len = send_buf_cap
+
+// min_send_buf_cap is the smallest ConnConfig.send_buf_cap, 16 KiB: as much
+// as one pipeline slot's reply buffer (frame_buf_cap), so a smaller send
+// buffer would save next to nothing.
+pub const min_send_buf_cap = 16 * 1024
+
+// max_send_buf_cap is the largest ConnConfig.send_buf_cap, 16 MiB. It bounds
+// memory, since every connection keeps its buffer for life: 16 MiB on 4
+// connections and 16 workers is already 1 GiB.
+pub const max_send_buf_cap = 16 * 1024 * 1024
 
 // max_inflight_limit bounds ConnConfig.max_inflight. Each pipeline slot
 // keeps a reply accumulator of at least frame_buf_cap bytes (16 KiB) for the
@@ -66,9 +80,11 @@ pub fn (e Shed) msg() string {
 }
 
 // FrameTooLarge is the error for a query or batch whose wire frame is larger
-// than a connection's send buffer (`cap`, max_frame_len): it can never be
-// sent, on any connection. The frame's size is what the caller passed or can
-// count (query_frame_len, batch_frame_len).
+// than a connection's send buffer: it can never be sent there. `cap` is that
+// buffer's size (PgConn.max_frame_len): the connection's own from submit and
+// submit_batch, the largest of the pool's from acquire_pipelined_for. The
+// frame's size is what the caller passed or can count (query_frame_len,
+// batch_frame_len).
 pub struct FrameTooLarge {
 	Error
 pub:
@@ -102,7 +118,10 @@ pub fn (e ConnBroken) msg() string {
 const err_shed_no_connection = shed_error(.no_connection)
 const err_shed_pipeline_full = shed_error(.pipeline_full)
 const err_shed_send_buffer_full = shed_error(.send_buffer_full)
-const err_frame_too_large = frame_too_large_error()
+// err_frame_too_large names the default send buffer: what a PgConn made
+// without connect (a test, a benchmark) refuses with. A connection that is
+// connected boxes the error of its own buffer (PgConn.frame_too_large).
+const err_frame_too_large = frame_too_large_error(send_buf_cap)
 
 fn shed_error(reason ShedReason) IError {
 	return Shed{
@@ -110,9 +129,9 @@ fn shed_error(reason ShedReason) IError {
 	}
 }
 
-fn frame_too_large_error() IError {
+fn frame_too_large_error(cap int) IError {
 	return FrameTooLarge{
-		cap: send_buf_cap
+		cap: cap
 	}
 }
 
@@ -161,11 +180,20 @@ pub fn (c &PgConn) inflight_limit() int {
 	return if c.inflight_cap > 0 { c.inflight_cap } else { max_inflight }
 }
 
+// max_frame_len is the largest wire frame (query_frame_len, batch_frame_len)
+// this connection can send: the size of its send buffer, ConnConfig.send_buf_cap
+// as the connection was opened with (max_frame_len, 64 KiB, by default). A
+// larger frame is FrameTooLarge here; a smaller one sheds only while the
+// buffer still holds unsent bytes (send_buffer_full).
+pub fn (c &PgConn) max_frame_len() int {
+	return if c.send_buf.len > 0 { c.send_buf.len } else { send_buf_cap }
+}
+
 // send_room is how many more frame bytes the send buffer can take now: its
 // capacity less what is written and not yet sent.
 @[inline]
 fn (c &PgConn) send_room() int {
-	return send_buf_cap - (c.send_len - c.send_off)
+	return c.max_frame_len() - (c.send_len - c.send_off)
 }
 
 // check_max_inflight refuses a ConnConfig.max_inflight out of
@@ -176,11 +204,20 @@ fn check_max_inflight(n int) ! {
 	}
 }
 
+// check_send_buf_cap refuses a ConnConfig.send_buf_cap out of
+// min_send_buf_cap..max_send_buf_cap.
+fn check_send_buf_cap(n int) ! {
+	if n < min_send_buf_cap || n > max_send_buf_cap {
+		return error('pg: send_buf_cap must be in ${min_send_buf_cap}..${max_send_buf_cap}, got ${n}')
+	}
+}
+
 // submit is async_submit with the reason for a refusal: it serializes the
 // query, appends it to the send buffer and pushes it onto the in-flight FIFO,
 // or returns why it did not, submitting nothing:
-//   - FrameTooLarge when the frame is larger than the send buffer (checked
-//     first, so it is the same answer on every connection);
+//   - FrameTooLarge when the frame is larger than the send buffer
+//     (max_frame_len; checked first, so the answer does not depend on what
+//     is in flight);
 //   - ConnBroken when the connection is lost;
 //   - Shed (.pipeline_full) when max_inflight queries are already in flight;
 //   - Shed (.send_buffer_full) when the send buffer has no room for it now.
@@ -220,8 +257,8 @@ pub fn (mut c PgConn) submit_batch(stmts []Stmt) ! {
 // check_submit says why a frame of `frame_len` bytes cannot be queued now,
 // in submit's order, or nothing when it can.
 fn (c &PgConn) check_submit(frame_len int) ! {
-	if frame_len > send_buf_cap {
-		return err_frame_too_large
+	if frame_len > c.max_frame_len() {
+		return c.frame_too_large
 	}
 	if c.state != .ready {
 		return ConnBroken{
@@ -250,24 +287,33 @@ fn (mut c PgConn) queue_scratch() ! {
 // the shortest pipeline among those whose send buffer can take the frame
 // now, so a submit of that frame on it succeeds. It shares a connection the
 // same way acquire_pipelined does, and skips the same ones (held by
-// acquire(), in a transaction, rolling back, or broken).
+// acquire(), in a transaction, rolling back, or broken), and those whose
+// send buffer is smaller than the frame (max_frame_len).
 //
 // The error says why there is none:
 //   - Shed: no connection can take the frame now (see ShedReason). The caller
 //     answers 503 with Retry-After. A retry on "another connection" is
 //     already what this call did: every connection was looked at.
-//   - FrameTooLarge: frame_len is larger than max_frame_len, so no
-//     connection will ever take it.
+//   - FrameTooLarge: frame_len is larger than every connection's
+//     max_frame_len (ConnConfig.send_buf_cap), so no connection will ever
+//     take it.
 // Refusing allocates nothing.
 pub fn (mut p PgPool) acquire_pipelined_for(frame_len int) !int {
-	if frame_len > send_buf_cap {
-		return err_frame_too_large
-	}
 	mut best := -1
 	mut best_depth := 0
+	mut fits := false // the frame fits some connection's send buffer
+	mut widest := -1 // the largest send buffer of those it does not fit
 	mut full_buffer := false // a connection had a pipeline slot but no room for the frame
 	mut full_pipeline := false // a live candidate was at its max_inflight
 	for i in 0 .. p.conns.len {
+		if frame_len > p.conns[i].max_frame_len() {
+			// This connection can never take the frame.
+			if widest < 0 || p.conns[i].max_frame_len() > p.conns[widest].max_frame_len() {
+				widest = i
+			}
+			continue
+		}
+		fits = true
 		if !p.pipelinable(i) {
 			continue
 		}
@@ -290,6 +336,9 @@ pub fn (mut p PgPool) acquire_pipelined_for(frame_len int) !int {
 	}
 	if best >= 0 {
 		return best
+	}
+	if !fits && widest >= 0 {
+		return p.conns[widest].frame_too_large
 	}
 	if full_buffer {
 		return err_shed_send_buffer_full

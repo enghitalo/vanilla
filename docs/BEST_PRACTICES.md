@@ -418,13 +418,14 @@ kqueue a deadline watch is a plain watch, and `cancel` fails.
   | error | meaning | answer |
   |---|---|---|
   | `pg_async.Shed` (`.reason`: `no_connection`, `pipeline_full`, `send_buffer_full`) | momentarily full; nothing was sent | `503` with `Retry-After` (a second or two), and count it |
-  | `pg_async.FrameTooLarge` | the frame is larger than `max_frame_len` (the 64 KiB send buffer): no connection will ever take it | `500`, or `413` when the size comes from the request; bound that input |
+  | `pg_async.FrameTooLarge` | the frame is larger than the send buffer (`ConnConfig.send_buf_cap`, 64 KiB by default; `conn.max_frame_len()`): no connection will ever take it | `500`, or `413` when the size comes from the request; bound that input |
   | `pg_async.ConnBroken` | the connection was lost; the pool re-dials it | `503` (or retry once on a fresh `acquire_pipelined_for`) |
 
   `acquire_pipelined_for` already looked at every connection: a shed from it
   is final for this request, and a submit on the connection it returned
-  succeeds. Refusing allocates nothing (`Shed` and `FrameTooLarge` are
-  constants, and an oversized frame is never serialized).
+  succeeds. Refusing allocates nothing (`Shed` is a constant, each
+  connection's `FrameTooLarge` is boxed when it is made, and an oversized
+  frame is never serialized).
   `acquire_pipelined()` / `async_submit()` keep their `none` / `false`, which
   do not say why. `ConnConfig.max_inflight` (default 8, up to 256) is the
   pipeline depth per connection: each slot keeps a reply buffer for the life
@@ -432,6 +433,16 @@ kqueue a deadline watch is a plain watch, and `cancel` fails.
   least `max_inflight × 16 KiB` per connection per worker. A deeper pipeline
   helps cheap queries and turns a slow one's sheds into latency
   ([pg_async/PIPELINING_DESIGN.md](../pg_async/PIPELINING_DESIGN.md)).
+  `ConnConfig.send_buf_cap` (default 64 KiB, 16 KiB to 16 MiB) is each
+  connection's send buffer, allocated once at connect, and so the largest
+  query frame the pipelined path sends: it costs
+  `connections × workers × send_buf_cap`. Once frames near that size are
+  sent, each connection's serialization scratch has doubled up to match and
+  stays that size: count twice `send_buf_cap`, three times for a size that
+  is not a power of two (under `-gc none`, plus the smaller scratches it
+  outgrew, about as much again, once). Size it for the largest statement with its
+  parameters (a large `jsonb` document, a batch of many rows), or lower it
+  when every query is small.
 - Keep the pool sized to the worker/thread model.
 - Expect pooled connections to die (restart, failover, `pg_terminate_backend`,
   idle or lifetime caps): the pool skips a broken connection and re-dials it

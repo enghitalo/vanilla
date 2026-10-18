@@ -148,8 +148,8 @@ ROLLBACK undoes it, and after a failed statement every one of them fails with
   EmptyQueryResponse (views, no allocation); a failure is the PgError of the
   failing statement with its index in `PgError.statement` (the batch's length
   when the commit at the Sync failed). A batch that can never fit the fixed
-  send buffer (`send_buf_cap`), or an empty one, is an error on every
-  connection; a momentarily full connection returns false, a shed (#51;
+  send buffer (`ConnConfig.send_buf_cap`), or an empty one, is an error on
+  every connection; a momentarily full connection returns false, a shed (#51;
   `submit_batch` returns the typed `Shed` / `FrameTooLarge`, shed.v). A
   batch without BEGIN is as pipeline-safe as one query; one that opens an
   explicit transaction leaves the session in `T` (or `E`) after its Sync and
@@ -189,12 +189,15 @@ different answer, so the refusal is typed (`shed.v`):
   three `Shed` values are constants, so a shed allocates nothing: under
   overload the shed path is the hot path, and under `-gc none` a boxed error
   per shed would leak.
-- **`FrameTooLarge`** — the frame is larger than the 64 KiB send buffer
-  (`max_frame_len`): no connection will ever take it. It is checked before
-  anything else, so it is the same answer on every connection, and from the
-  frame's computed size, so an oversized frame is never serialized. A
-  constant too: when the size comes from the request, a client drives this
-  path.
+- **`FrameTooLarge`** — the frame is larger than the connection's send
+  buffer (`PgConn.max_frame_len()`: `ConnConfig.send_buf_cap`, 64 KiB by
+  default): it can never be sent there. `submit` checks it before anything
+  else, so the answer does not depend on what is in flight;
+  `acquire_pipelined_for` answers it only when the frame fits no
+  connection's buffer. It is checked from the frame's computed size, so an
+  oversized frame is never serialized, and it allocates nothing (each
+  connection boxes its own when it is made): when the size comes from the
+  request, a client drives this path.
 - The constants are built by a function call (`shed_error`): V 2f94b87
   emits a const `IError(Struct{...})` of plain fields as a zero C
   initializer, which panics on `msg()`.
@@ -203,7 +206,7 @@ different answer, so the refusal is typed (`shed.v`):
 
 `acquire_pipelined_for(frame_len)` returns the shortest pipeline among the
 connections whose send buffer has room for `frame_len` bytes now
-(`send_buf_cap - (send_len - send_off)`), skipping exactly what
+(`max_frame_len() - (send_len - send_off)`), skipping exactly what
 `acquire_pipelined()` skips. `query_frame_len` / `batch_frame_len` give the
 size without serializing. `submit` / `submit_batch` are `async_submit` /
 `async_submit_batch` with the reason as a typed error. A worker is single
@@ -269,6 +272,26 @@ the same points, since no send buffer fills):
 
 So the default stays 8: raise it for cheap, round-trip-bound queries, and
 bound the latency it adds with a park deadline (`Limits.park_timeout_ms`).
+
+**`send_buf_cap` is configurable** (`ConnConfig.send_buf_cap`, 16 KiB..16 MiB,
+default 64 KiB, #355): each connection's send buffer, and so the largest
+frame the pipelined path sends (`PgConn.max_frame_len()`; the public
+`max_frame_len` const is the default). The buffer is still fixed, so
+invariant 1 holds at any size: allocated once at connect, kept across
+re-dials, never grown. It costs `connections × workers × send_buf_cap`, on
+top of the reply accumulators, and the serialization scratch
+(`submit_scratch`) doubles up to the largest frame sent and stays there: up
+to the power of two at or above `send_buf_cap` per connection, since every
+submit path sizes its frame before it serializes it. `acquire_pipelined_for`
+measures the frame against each connection's own buffer: it skips a
+connection the frame does not fit, sheds while one it fits has no room, and
+says `FrameTooLarge` (naming the largest buffer) only when it fits none.
+`append_send` copies with `memcpy` and slides the unsent bytes to the front
+(`memmove`) only when the frame has no room behind them: the buffer still
+never marches forward (invariant 2), and a small query queued while a large
+frame is being sent copies only itself, not that frame's unsent tail. Over
+TLS the size changes nothing: a flush hands Mbed TLS the unsent bytes, which
+it takes one record (16 KiB) per call.
 
 **A bounded wait queue (proposal, not implemented).** Instead of shedding, a
 request would wait, in a per-pool FIFO bounded in length and in time, for a
