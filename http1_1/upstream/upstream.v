@@ -117,10 +117,14 @@ pub:
 	// allow_unresolved lets Pool.new start the pool with no address when the
 	// host does not resolve (its DNS is down at boot), instead of failing: one
 	// provider's outage then fails that provider's calls, not the server's
-	// start. Until a refresh resolves it, each exchange fails at once with
-	// .dns, without dialing, and asks the pool's Resolver for that refresh.
-	// The pool must follow a Resolver (start_maintenance refuses it
-	// otherwise). false: Pool.new fails, so a typo fails fast.
+	// start. The start still waits for the lookup to give up: with the DNS
+	// unreachable, make_state waits out the system resolver's timeout
+	// (resolv.conf's timeout and attempts) for each such origin, and its
+	// worker serves nothing meanwhile. Until a refresh resolves the host, each
+	// exchange fails at once with .dns, without dialing, and asks the pool's
+	// Resolver for that refresh. The pool must follow a Resolver
+	// (start_maintenance refuses it otherwise; an IP literal needs none).
+	// false: Pool.new fails, so a typo fails fast.
 	allow_unresolved bool
 }
 
@@ -251,12 +255,12 @@ mut:
 
 // Pool.new builds an origin's pool for this worker: validates the origin,
 // resolves it (blocking — make_state runs before the worker serves; a Resolver
-// refreshes it later off the worker), and allocates every slot's buffers. A
-// host that does not resolve fails it, unless the origin sets
-// allow_unresolved: then the pool starts with no address (with the DNS down,
-// after the system resolver's timeout: the wait is the same). `tls_cfg` is the
-// client TLS config for an HTTPS origin (tls.new_client), and may be shared by
-// every worker's pools: it is only read. nil for plain HTTP.
+// refreshes it later off the worker), and allocates every slot's buffers. It
+// fails when the host does not resolve, unless the origin sets
+// allow_unresolved: then the pool starts with no address, once the lookup has
+// given up. `tls_cfg` is the client TLS config for an HTTPS origin
+// (tls.new_client), and may be shared by every worker's pools: it is only
+// read. nil for plain HTTP.
 pub fn Pool.new(o Origin, tls_cfg &tls.Config) !&Pool {
 	if !valid_host(o.host) {
 		return error('upstream: invalid host "${o.host}"')

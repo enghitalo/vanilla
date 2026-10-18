@@ -34,8 +34,9 @@ import transport
 // refresh_gap_ms spaces the refreshes pools ask for: while an origin fails
 // every exchange (its DNS is down, or every address refuses), each failing
 // exchange asks, and the asks of a whole burst cost one resolution per origin
-// per gap, however fast the DNS fails, instead of one per exchange. At most
-// interval_ms, so an ask never waits past the next periodic refresh.
+// per gap, however fast the DNS fails, instead of one per exchange. The gap
+// is min(refresh_gap_ms, interval_ms), so an ask never waits past the next
+// periodic refresh.
 const refresh_gap_ms = 1000
 
 // Resolver is the resolver thread and the pools that follow it.
@@ -126,7 +127,7 @@ pub fn (mut r Resolver) start() {
 // stop ends the resolver thread for good and waits for it (through a
 // resolution in flight, or the rest of a refresh gap): a stopped Resolver
 // does not start again. Pools keep the addresses they have (none, for a pool
-// that started unresolved), and their workers stop watching the pipes it
+// that has not resolved yet), and their workers stop watching the pipes it
 // closes.
 pub fn (mut r Resolver) stop() {
 	if !r.started {
@@ -172,9 +173,10 @@ pub fn (mut p Pool) follow(mut r Resolver) ! {
 	r.mu.unlock()
 }
 
-// request_resolve asks the resolver for a refresh now (every address failed,
-// or there is none yet): at once, or refresh_gap_ms after the last one. One
-// byte on its wake pipe; a full pipe means one is pending already.
+// request_resolve asks the resolver for a refresh (every address failed, or
+// there is none yet), which comes at once, or one gap (refresh_gap_ms) after
+// the last refresh. One byte on its wake pipe; a full pipe means one is
+// pending already.
 fn (mut p Pool) request_resolve() {
 	if p.resolver == unsafe { nil } {
 		return

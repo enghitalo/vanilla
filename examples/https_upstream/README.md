@@ -85,13 +85,15 @@ return .done
 - **Limits:** `max_conns` per worker (then `acquire()` sheds: 503),
   `max_request_bytes`, `max_response_bytes` (`.too_large`).
 - **DNS:** resolved once at startup (a typo fails fast); a `Resolver` thread
-  re-resolves every interval (and sooner when every address fails, at most once
-  a second however many calls fail) and hands the answer to each worker over a
-  pipe — no `getaddrinfo`, no lock and no shared mutable state on a worker.
-  `allow_unresolved: true` starts an origin whose DNS is down at boot with no
-  address instead, so one provider's outage does not stop the server: its
-  calls fail at once with `.dns` (nothing is dialed) until the `Resolver`,
-  which such a pool must follow, resolves it.
+  re-resolves every interval (and sooner when every address fails: at most
+  once a second, or once per interval if that is shorter, however many calls
+  fail) and hands the answer to each worker over a pipe — no `getaddrinfo`, no
+  lock and no shared mutable state on a worker. `allow_unresolved: true`
+  starts an origin whose DNS is down at boot with no address instead, so one
+  provider's outage does not stop the server: its calls fail at once with
+  `.dns` (nothing is dialed) until the `Resolver`, which such a pool must
+  follow, resolves it. The start still waits for the lookup to give up: with
+  the DNS unreachable, the system resolver's timeout, per such origin.
 - **No allocation per exchange** once the slot buffers reached their
   high-water mark (checked under `-gc none`).
 

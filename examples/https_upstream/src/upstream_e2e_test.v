@@ -1006,16 +1006,16 @@ mut:
 	slow i64
 }
 
-// Dns is a provider's DNS for the test resolver: down (no address) or the
-// fake's port, and how often it was asked and answered (atomics: the
-// resolver thread and the workers' make_state call it).
+// Dns is a provider's DNS for the test resolver: down (no address, after
+// slow_ms: a DNS that times out) or the fake's port, and how often it was
+// asked (atomics: the resolver thread and the workers' make_state call it).
 @[heap]
 struct Dns {
 mut:
-	port     i64
-	down     i64
-	calls    i64
-	answered i64
+	port    i64
+	down    i64
+	slow_ms i64
+	calls   i64
 }
 
 // unresolved_origin is an origin whose name only `d` resolves, allowed to
@@ -1029,10 +1029,13 @@ fn unresolved_origin(d &Dns) upstream.Origin {
 		resolve:          fn [d] (host string, port int) []transport.Addr {
 			stdatomic.add_i64(&d.calls, 1)
 			if stdatomic.load_i64(&d.down) != 0 {
+				slow := stdatomic.load_i64(&d.slow_ms)
+				if slow > 0 {
+					time.sleep(time.Duration(slow) * time.millisecond)
+				}
 				return []
 			}
 			a := transport.ip_addr('127.0.0.1', int(stdatomic.load_i64(&d.port))) or { return [] }
-			stdatomic.add_i64(&d.answered, 1)
 			return [a]
 		}
 	}
@@ -1050,18 +1053,21 @@ fn wait_for(counter &i64, n i64, ms i64) bool {
 	return stdatomic.load_i64(counter) >= n
 }
 
-// A provider's DNS is down when the edge boots (#348): with allow_unresolved
-// the edge starts anyway, and each call fails at once with .dns, without
-// dialing (the fake accepts nothing). Once the DNS answers, the refresh the
-// failing calls ask for fills the pool, and the next call succeeds.
+// A provider's DNS is down when the edge boots (#348), and every lookup waits
+// 300 ms for nothing: with allow_unresolved the edge starts anyway, once its
+// boot lookup has given up, and each call fails at once with .dns, without
+// dialing (the fake accepts nothing) or waiting for the DNS. Once the DNS
+// answers, the refresh the failing calls ask for fills the pool, and calls
+// succeed.
 fn test_unresolved_origin_fills_once_it_resolves() {
 	mut f := start_fake('', '') or { panic(err) }
 	defer {
 		f.stop()
 	}
 	mut dns := &Dns{
-		port: f.port
-		down: 1
+		port:    f.port
+		down:    1
+		slow_ms: 300
 	}
 	origin := unresolved_origin(dns)
 	// No periodic refresh while the test runs: only the failing calls ask.
@@ -1083,6 +1089,9 @@ fn test_unresolved_origin_fills_once_it_resolves() {
 		h.stop()
 	}
 	p := h.port()
+	// The worker serves once make_state's lookup has given up.
+	hr, _ := call(p, 'GET /health HTTP/1.1\r\nHost: edge\r\n\r\n', 5000)
+	assert status_of(hr) == 200, hr
 	for _ in 0 .. 3 {
 		r1, ms := call(p, 'GET /up/ok HTTP/1.1\r\nHost: edge\r\n\r\n', 5000)
 		assert status_of(r1) == 502 && failure_of(r1) == 'dns', r1
@@ -1090,14 +1099,19 @@ fn test_unresolved_origin_fills_once_it_resolves() {
 	}
 	assert f.stat('accepted') == 0
 	assert wait_for(&dns.calls, 2, 2000 * slack()), 'the failing calls asked for no refresh'
-	// The DNS is back. One more failing call asks; the refresh answers, and
-	// its update reaches the worker.
+	// The DNS is back: a refresh the failing calls ask for (one gap after the
+	// last) answers, and its update reaches the worker.
 	stdatomic.store_i64(&dns.down, 0)
-	get(p, '/ok')
-	assert wait_for(&dns.answered, 1, 3000 * slack()), 'no refresh after the DNS came back'
-	time.sleep(50 * slack() * time.millisecond)
-	r2 := get(p, '/ok')
-	assert status_of(r2) == 200, r2
+	mut r2 := ''
+	sw := time.new_stopwatch()
+	for sw.elapsed().milliseconds() < 3000 * slack() {
+		r2 = get(p, '/ok')
+		if status_of(r2) == 200 {
+			break
+		}
+		time.sleep(10 * time.millisecond)
+	}
+	assert status_of(r2) == 200, 'no call succeeded once the DNS was back: ${r2}'
 	assert status_of(get(p, '/ok')) == 200
 	assert f.stat('accepted') == 1
 }

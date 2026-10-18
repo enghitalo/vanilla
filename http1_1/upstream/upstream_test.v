@@ -205,43 +205,53 @@ fn no_address(_ string, _ int) []transport.Addr {
 
 // An origin that may start unresolved must follow a Resolver, or nothing ever
 // fills its table: start_maintenance refuses it, whether or not the name
-// resolved at this boot, so the mistake shows at the first boot, not as .dns
-// for good during an outage. A pool without the flag needs no Resolver.
+// resolved at this boot, and arms nothing, so the mistake shows at the first
+// boot, not as .dns for good during an outage. A zoned IPv6 literal is
+// resolved like a name: refused too. An IP literal (dialed as is, never
+// empty) and a pool without the flag need no Resolver.
 fn test_unresolved_origin_needs_a_resolver() {
 	a := transport.ip_addr('127.0.0.1', 80) or { panic('addr') }
 	one_address := fn [a] (host string, port int) []transport.Addr {
 		return [a]
 	}
-	for resolve in [no_address, one_address] {
-		mut p := plain_pool(Origin{
-			host:             'provider.test'
-			allow_unresolved: true
-			resolve:          resolve
-		})
+	for host in ['provider.test', 'fe80::1%no-such-interface'] {
+		for resolve in [no_address, one_address] {
+			mut p := plain_pool(Origin{
+				host:             host
+				allow_unresolved: true
+				resolve:          resolve
+			})
+			mut el := core.EventLoop{
+				register: record_watch
+			}
+			if _ := p.start_maintenance(mut el) {
+				assert false, '${host}: started without a Resolver'
+			} else {
+				assert err.msg().contains('Resolver'), err.msg()
+			}
+			assert p.timer_fd == -1 && el.last_watched == -1, host // nothing armed
+			mut r := Resolver.new(60_000) or { panic(err) } // never started
+			p.follow(mut r) or { panic(err) }
+			p.start_maintenance(mut el) or { panic(err) }
+			assert p.timer_fd >= 0 && el.last_watched == p.feed_fd, host
+			for fd in [p.timer_fd, p.feed_fd, r.subs[0].fd, r.wake_r, r.wake_w] {
+				C.close(fd)
+			}
+		}
+	}
+	for o in [Origin{
+		host:             '127.0.0.1'
+		allow_unresolved: true
+	}, Origin{
+		host: '127.0.0.1'
+	}] {
+		mut q := plain_pool(o)
 		mut el := core.EventLoop{
 			register: record_watch
 		}
-		if _ := p.start_maintenance(mut el) {
-			assert false, 'started without a Resolver'
-		} else {
-			assert err.msg().contains('Resolver'), err.msg()
-		}
-		assert p.timer_fd == -1 && el.last_watched == -1 // nothing armed
-		mut r := Resolver.new(60_000) or { panic(err) } // never started
-		p.follow(mut r) or { panic(err) }
-		p.start_maintenance(mut el) or { panic(err) }
-		assert p.timer_fd >= 0 && el.last_watched == p.feed_fd
-		C.close(p.timer_fd)
-		C.close(p.feed_fd)
+		q.start_maintenance(mut el) or { panic(err) }
+		C.close(q.timer_fd)
 	}
-	mut q := plain_pool(Origin{
-		host: '127.0.0.1'
-	})
-	mut el := core.EventLoop{
-		register: record_watch
-	}
-	q.start_maintenance(mut el) or { panic(err) }
-	C.close(q.timer_fd)
 }
 
 // acquire hands out at most max_conns exchanges; release gives the slot back.
