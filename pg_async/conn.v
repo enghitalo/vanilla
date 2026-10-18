@@ -4,15 +4,11 @@ import tls
 import time
 import transport
 
-// PgConn is a single PostgreSQL connection: the TCP socket (optionally TLS over
-// it, see SslMode) plus the v3 startup / SCRAM-SHA-256 handshake and
-// extended-query execution.
-//
-// This is the BLOCKING form. It is used for pool bring-up (connecting + auth
-// happen once, before the worker starts serving) and to validate the protocol
-// and SCRAM layers against a live server. The non-blocking, reactor-driven
-// query path that the async worker uses is built on the same wire encoding
-// (protocol.v) — only the I/O pump differs.
+// The connection itself (PgConn), its config (ConnConfig), and its BLOCKING
+// half: the dial, the v3 startup / authentication handshake, and query(). The
+// pool brings its connections up with it, once, before the worker starts
+// serving. The non-blocking, reactor-driven query path (conn_async.v) is built
+// on the same wire encoding (protocol.v) — only the I/O pump differs.
 
 // pg_async deliberately does NOT import V's `net`: `net` declares `C.socket`
 // with TYPED enum params on some V versions, and V merges C declarations
@@ -178,11 +174,29 @@ pub enum SslMode {
 // ConnConfig.password_fn).
 pub type PasswordFn = fn () !string
 
+// ConnConfig is how to reach and log in to a PostgreSQL server, and how its
+// connections behave. PgConn.connect and PgPool.connect take it, and a pool
+// keeps its copy to re-dial lost connections. Every field has a working
+// default but user (and password or password_fn, unless the server trusts the
+// client). Both connect calls refuse bad params or max_inflight before
+// dialing.
 pub struct ConnConfig {
 pub:
-	host     string = 'localhost'
-	port     int    = 5432
-	user     string
+	// host is the server's host name or IP address; TCP only (a Unix-socket
+	// directory is not supported). It is resolved (getaddrinfo) on every
+	// dial, and the addresses are tried in turn. A pool's re-dial resolves it
+	// on the worker thread, so a slow DNS lookup stalls the worker: an IP
+	// address needs none (vanilla#351). Over TLS, .verify_full checks the
+	// certificate against it (SslMode).
+	host string = 'localhost'
+	// port is the server's TCP port.
+	port int = 5432
+	// user is the role to log in as. Required: PostgreSQL refuses a startup
+	// without one.
+	user string
+	// password authenticates user: by SCRAM-SHA-256, or as a cleartext
+	// password over TLS when allowed_auth lists it. Ignored when password_fn
+	// is set. A pool keeps it for its re-dials: never log a ConnConfig.
 	password string
 	// password_fn, when set, is asked for the password on every connection
 	// attempt instead of reading `password`: once per connection a pool brings
@@ -195,7 +209,9 @@ pub:
 	// across workers needs a lock or atomics. An error fails the attempt, and
 	// a pool retries after its backoff.
 	password_fn PasswordFn = unsafe { nil }
-	database    string
+	// database is the database to connect to; '' = the server's default, the
+	// database named like user.
+	database string
 	// params are run-time parameters sent in the StartupMessage, the session's
 	// defaults: {'application_name': 'orders-api'} names the sessions in
 	// pg_stat_activity. A name or value holding a NUL, an empty name, and
@@ -227,17 +243,27 @@ pub:
 	// segment per query flush instead of coalesced ones: a few µs of server CPU
 	// per request under deep pipelining on loopback.
 	tcp_nodelay bool = true
-	// TCP keepalive: after tcp_keepalive_idle_s seconds without traffic, probe
-	// every tcp_keepalive_interval_s; tcp_keepalive_count unanswered probes
-	// drop the connection, so an idle pooled connection whose server vanished
-	// (no FIN/RST: a host down, a NAT or firewall that forgot it) is found
-	// broken instead of swallowing the next query. idle 0 = keepalive off.
-	tcp_keepalive_idle_s     int = 30
+	// tcp_keepalive_idle_s turns TCP keepalive on: after this many seconds
+	// without traffic the kernel probes the server every
+	// tcp_keepalive_interval_s, and drops the connection once the probes go
+	// unanswered (tcp_keepalive_count; on Linux, tcp_user_timeout_ms when set:
+	// with the defaults, about 40 s after the server went silent). So an idle
+	// pooled connection whose server vanished (no FIN/RST: a host down, a NAT
+	// or firewall that forgot it) is found broken instead of swallowing the
+	// next query. 0 = keepalive off.
+	tcp_keepalive_idle_s int = 30
+	// tcp_keepalive_interval_s is the time between two keepalive probes, in
+	// seconds (0 = the OS default).
 	tcp_keepalive_interval_s int = 10
-	tcp_keepalive_count      int = 3
+	// tcp_keepalive_count is how many unanswered keepalive probes drop the
+	// connection (0 = the OS default). On Linux tcp_user_timeout_ms overrides
+	// it unless that is 0 (tcp(7)).
+	tcp_keepalive_count int = 3
 	// tcp_user_timeout_ms (Linux): how long sent data may stay unacknowledged
 	// before the kernel drops the connection. 0 = the OS default (~15 min of
-	// retransmissions).
+	// retransmissions). With keepalive on, it also decides when unanswered
+	// probes drop an idle connection: once this long has passed without
+	// traffic and a probe went unanswered, whatever tcp_keepalive_count says.
 	tcp_user_timeout_ms int = 30_000
 	// max_lifetime_ms (PgPool) recycles a pooled connection once it has been
 	// up this long: it is taken out of the pool, its pipelined queries drain,
@@ -306,6 +332,19 @@ enum LinkState {
 	starting      // re-dial: StartupMessage sent, authenticating until ReadyForQuery
 }
 
+// PgConn is one PostgreSQL connection: a TCP socket (TLS over it unless
+// ssl_mode is .disable, see SslMode), authenticated, and the queries in flight
+// on it. PgConn.connect opens a standalone one; a PgPool owns pooled ones
+// (PgPool.conn). Two query paths share one wire encoding (protocol.v):
+//   - query() blocks the calling thread until the reply is in: start-up code
+//     and tools, on a standalone connection;
+//   - submit / submit_batch (or async_submit / async_submit_batch) queue a
+//     query without blocking, async_flush sends it and async_on_readable
+//     reads its reply, as the socket becomes ready: up to max_inflight
+//     queries pipelined on the connection. A vanilla handler parks the
+//     request on the pooled fd (event_loop.watch_fd_persistent; see PgPool
+//     for the backends that run it).
+// One thread drives a connection: the worker whose pool holds it.
 pub struct PgConn {
 mut:
 	fd       int = -1 // the raw socket fd
@@ -402,7 +441,13 @@ struct Msg {
 // PgConn.connect opens a TCP connection — TLS over it unless ssl_mode is
 // .disable — and runs the startup and authentication (SCRAM-SHA-256, or a
 // cleartext password over TLS: allowed_auth), returning once the server
-// reports ReadyForQuery.
+// reports ReadyForQuery. It blocks the calling thread (connect_timeout_ms
+// bounds each connect, and over TLS the handshake and authentication too), so
+// call it at start-up or off the workers, never from a handler. It fails on
+// bad params or max_inflight, or a failing password_fn (all before dialing);
+// when host does not resolve or no address accepts the connect; and when TLS,
+// the startup or the authentication fails. What it opened is then closed.
+// Call set_nonblocking before driving it with the async path.
 pub fn PgConn.connect(cfg ConnConfig) !PgConn {
 	check_startup_params(cfg.params)!
 	check_max_inflight(cfg.max_inflight)!
@@ -668,8 +713,15 @@ fn (mut c PgConn) send_password(password string) ! {
 }
 
 // query runs one extended-protocol query (Parse/Bind/Describe/Execute/Sync,
-// binary results) and returns the collected Result. Blocking. Parameters are
-// text-format and bind to $1, $2, … (a null option element is SQL NULL).
+// binary results) and returns the collected Result, which owns its frames.
+// Blocking, and it allocates per call: for start-up code and tools on a
+// standalone connection (PgConn.connect), never on a worker's request path
+// nor on a connection the async path drives (a pooled one). Parameters are
+// text-format and bind to $1, $2, … (a null option element is SQL NULL). A
+// failed statement returns its PgError and leaves the connection usable (but a
+// FATAL or PANIC one ends the session); a failed read marks the connection
+// lost (is_broken) and returns why. A failed send returns its error but does
+// not mark the connection lost: close it.
 pub fn (mut c PgConn) query(query_text string, params []?[]u8) !Result {
 	mut out := []u8{}
 	write_parse(mut out, '', query_text)

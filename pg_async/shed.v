@@ -53,7 +53,7 @@ pub enum ShedReason {
 pub struct Shed {
 	Error
 pub:
-	reason ShedReason
+	reason ShedReason // what was full
 }
 
 // msg says what was full.
@@ -72,7 +72,7 @@ pub fn (e Shed) msg() string {
 pub struct FrameTooLarge {
 	Error
 pub:
-	cap int
+	cap int // the send buffer's size in bytes: max_frame_len
 }
 
 // msg gives the send buffer's size.
@@ -85,6 +85,9 @@ pub fn (e FrameTooLarge) msg() string {
 pub struct ConnBroken {
 	Error
 pub:
+	// reason is why the connection was lost ('connection closed by server',
+	// …); '' once its pool has started re-dialing it, or after close() ended
+	// a live connection.
 	reason string
 }
 
@@ -183,7 +186,8 @@ fn check_max_inflight(n int) ! {
 //   - Shed (.send_buffer_full) when the send buffer has no room for it now.
 // The frame is sized (query_frame_len) and checked before it is serialized,
 // so a refusal costs no serialization and never grows the submit scratch.
-// Pair with async_flush and async_on_readable, as async_submit.
+// Pair with async_flush and async_on_readable, as async_submit. It allocates
+// what async_submit does; a refusal allocates nothing, but for ConnBroken.
 pub fn (mut c PgConn) submit(query_text string, params []?[]u8) ! {
 	c.check_submit(query_frame_len(query_text, params))!
 	c.reset_scratch()

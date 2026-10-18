@@ -3,11 +3,21 @@ module pg_async
 import tls
 import time
 
+// rollback_timeout bounds the wait for the ROLLBACK release() queues: a
+// server that does not answer one within it is treated as lost, and the
+// connection is re-dialed.
+const rollback_timeout = u64(5 * time.second)
+
 // PgPool is a per-worker pool of PostgreSQL connections. Each worker owns its
-// own pool — no cross-worker sharing, so no locks (the make_state model). The
-// connections are brought up (connect + SCRAM) blocking at init, then flipped to
-// non-blocking for the reactor-driven query path. v1: one in-flight query per
-// connection (no pipelining-while-busy), so a query needs a fully idle slot.
+// own pool — no cross-worker sharing, so no locks (the make_state model): only
+// that worker's thread touches it. The connections are brought up (connect +
+// authentication) blocking at init, then flipped to non-blocking for the
+// reactor-driven query path. A request takes a connection one of two ways:
+//   - acquire(): exclusively, until release(). An explicit BEGIN … COMMIT
+//     goes on such a connection (tx.v), and release() rolls back one left in
+//     a transaction before anyone else gets it;
+//   - acquire_pipelined() / acquire_pipelined_for(): shared, several parked
+//     requests pipelining up to ConnConfig.max_inflight queries on it.
 //
 // A connection the server closes (restart, failover, pg_terminate_backend, an
 // idle or lifetime timeout) breaks (PgConn.is_broken): acquire() and
@@ -20,16 +30,14 @@ import time
 // that long, before the server's own cap closes them under a query: one at a
 // time, out of the idle set, so no request ever waits on its re-dial
 // (maintenance.v).
-
-// Transactions (tx.v): an explicit BEGIN … COMMIT goes on a connection taken
-// with acquire(), never acquire_pipelined(); release() rolls back a
-// connection left in a transaction before anyone else gets it.
-
-// rollback_timeout bounds the wait for the ROLLBACK release() queues: a
-// server that does not answer one within it is treated as lost, and the
-// connection is re-dialed.
-const rollback_timeout = u64(5 * time.second)
-
+//
+// Backends: a request parks on its pooled fd with
+// event_loop.watch_fd_persistent, several requests on one fd when they
+// pipeline. The epoll worker (plain HTTP and HTTPS) and io_uring keep such an
+// fd open when a parked client leaves, and run every request parked on it.
+// kqueue does neither (it closes the fd, and keeps one watch per fd), and IOCP
+// and poll cannot park a request. start_maintenance, park deadlines and
+// PgConn.cancel need the epoll worker.
 pub struct PgPool {
 mut:
 	conns []PgConn
@@ -57,7 +65,10 @@ mut:
 }
 
 // PgPool.connect brings up `size` connections (size >= 1) and returns a ready
-// pool. On any failure it closes whatever it already opened.
+// pool. On any failure it closes whatever it already opened. Each connection
+// comes up as PgConn.connect brings one up, blocking, one after the other: call
+// it from make_state (new_pool), not from a handler. The trusted CAs are parsed
+// once, for the whole pool.
 pub fn PgPool.connect(cfg ConnConfig, size int) !PgPool {
 	if size < 1 {
 		return error('pg pool: size must be >= 1')
@@ -127,8 +138,9 @@ pub fn (p &PgPool) size() int {
 }
 
 // idx_of_fd maps a socket fd back to its connection index — used by a resume
-// continuation to find which connection woke it (ac.ready_fd) without threading
-// the index through udata.
+// continuation to find which connection woke it (its ready_fd) without
+// threading the index through watch_payload. A linear scan; none when no
+// connection holds that fd (a re-dial moves a connection to another socket).
 pub fn (p &PgPool) idx_of_fd(fd int) ?int {
 	for i in 0 .. p.conns.len {
 		if p.conns[i].fd == fd {
@@ -141,7 +153,8 @@ pub fn (p &PgPool) idx_of_fd(fd int) ?int {
 // acquire returns the index of an idle, live connection (marking it busy), or
 // none if every connection is busy or broken (the caller sheds load — e.g. 503
 // — or queues). An idle broken slot it passes gets its re-dial advanced one
-// non-blocking step, and is taken the moment it is ready again.
+// non-blocking step (name resolution aside: ConnConfig.host), and is taken the
+// moment it is ready again.
 //
 // A connection that still carries pipelined queries (acquire_pipelined) is
 // not idle for acquire(), even though nobody holds it exclusively: the
@@ -152,7 +165,9 @@ pub fn (p &PgPool) idx_of_fd(fd int) ?int {
 //
 // acquire() is the borrow for an explicit transaction (BEGIN … COMMIT across
 // park/resume): the connection is the borrower's alone until release(), and
-// acquire_pipelined() never shares it.
+// acquire_pipelined() never shares it. It allocates only off the common path:
+// in a re-dial step it advances, or for the error of a release-time ROLLBACK
+// that failed.
 pub fn (mut p PgPool) acquire() ?int {
 	for i in 0 .. p.conns.len {
 		if !p.idle[i] && (p.conns[i].rollback_deadline == 0 || !p.finish_rollback(i)) {
@@ -168,10 +183,13 @@ pub fn (mut p PgPool) acquire() ?int {
 	return none
 }
 
-// release returns a connection to the idle set (call once its query completes,
-// successfully or not). A connection released with a query still in flight —
-// the borrower gave up on it, e.g. after a failed or partial flush — is retired
-// instead of reused: its late reply would go to the next borrower. It is
+// release returns a connection taken with acquire() to the idle set (call once
+// its query completes, successfully or not). A connection from
+// acquire_pipelined*() is shared and is not released: release() would retire
+// it if other requests' queries were in flight on it (below). A connection
+// released with a query still in flight — the borrower gave up on it, e.g.
+// after a failed or partial flush — is retired instead of reused: its late
+// reply would go to the next borrower. It is
 // re-dialed like a lost one. A connection past its max_lifetime_ms (as of the
 // last maintain() tick) is kept by the pool instead, and recycled by
 // maintain() before anyone takes it again.
@@ -363,12 +381,15 @@ fn (mut p PgPool) pipelinable(i int) bool {
 
 // conn returns a mutable reference to connection `idx`. The connection array is
 // fixed after connect(), so the reference stays valid for the pool's lifetime.
+// idx is an index acquire*() or idx_of_fd gave: out of range panics.
 pub fn (mut p PgPool) conn(idx int) &PgConn {
 	return &p.conns[idx]
 }
 
 // fd returns the raw socket fd of connection `idx` — what the reactor registers
-// and watches for readiness.
+// and watches for readiness. A re-dial closes it and opens another socket,
+// whose number may differ (-1 while a failed attempt waits to retry): read it
+// again after each acquire*(). Out of range panics.
 pub fn (p &PgPool) fd(idx int) int {
 	return p.conns[idx].fd
 }

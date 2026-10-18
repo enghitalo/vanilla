@@ -10,8 +10,8 @@ import time
 // arrive in BINARY — no text int/float parsing on the hot path (this is one of
 // the reasons a native client beats a text-format libpq round-trip). Each
 // decoder takes the raw column bytes already split out of the DataRow by
-// Row.col(); the slice borrows the connection recv buffer and is valid only for
-// the duration of the resume callback.
+// Row.col(); the slice is a view into the Result's frames, valid as long as
+// they are (see Result).
 //
 // The bytes come from the server: every decoder checks every width and header
 // field before it indexes, and rejects what PostgreSQL never sends. Nothing
@@ -20,33 +20,63 @@ import time
 
 // Type OIDs (pg_type.oid) of the built-in types the decoders read — compare
 // them with Columns.type_oid.
+
+// oid_bool is bool's type OID (Row.boolean).
 pub const oid_bool = u32(16)
+// oid_bytea is bytea's type OID (Row.text gives the raw bytes).
 pub const oid_bytea = u32(17)
+// oid_int8 is int8's (bigint) type OID (Row.int8).
 pub const oid_int8 = u32(20)
+// oid_int2 is int2's (smallint) type OID (Row.int2).
 pub const oid_int2 = u32(21)
+// oid_int4 is int4's (integer) type OID (Row.int4).
 pub const oid_int4 = u32(23)
+// oid_text is text's type OID (Row.text).
 pub const oid_text = u32(25)
+// oid_float4 is float4's (real) type OID (Row.float4).
 pub const oid_float4 = u32(700)
+// oid_float8 is float8's (double precision) type OID (Row.float8).
 pub const oid_float8 = u32(701)
+// oid_name is name's type OID, the type of the system catalogs' identifiers
+// (Row.text).
 pub const oid_name = u32(19)
+// oid_bpchar is bpchar's (char(n)) type OID (Row.text).
 pub const oid_bpchar = u32(1042)
+// oid_varchar is varchar's type OID (Row.text).
 pub const oid_varchar = u32(1043)
+// oid_date is date's type OID (Row.date_days, Row.date).
 pub const oid_date = u32(1082)
+// oid_timestamp is the type OID of timestamp without time zone
+// (Row.timestamp_us, Row.time).
 pub const oid_timestamp = u32(1114)
+// oid_timestamptz is timestamptz's type OID (Row.timestamp_us, Row.time).
 pub const oid_timestamptz = u32(1184)
+// oid_numeric is numeric's type OID (Row.numeric_text_into,
+// Row.numeric_i64_scaled).
 pub const oid_numeric = u32(1700)
+// oid_uuid is uuid's type OID (Row.uuid, Row.uuid_into).
 pub const oid_uuid = u32(2950)
+// oid_jsonb is jsonb's type OID (jsonb_text of Row.text).
 pub const oid_jsonb = u32(3802)
+// oid_int4_array is int4[]'s type OID (Row.int4_array_into, Row.array_iter).
 pub const oid_int4_array = u32(1007)
+// oid_text_array is text[]'s type OID (Row.text_array_into, Row.array_iter).
 pub const oid_text_array = u32(1009)
+// oid_int8_array is int8[]'s type OID (Row.array_iter, decode_int8 on each
+// element).
 pub const oid_int8_array = u32(1016)
 
 // The ±infinity sentinels of timestamp / timestamptz (decode_timestamp_us) and
 // date (decode_date_days): PostgreSQL's own encoding of 'infinity' and
 // '-infinity'.
+
+// timestamp_infinity is 'infinity' as decode_timestamp_us returns it.
 pub const timestamp_infinity = max_i64
+// timestamp_neg_infinity is '-infinity' as decode_timestamp_us returns it.
 pub const timestamp_neg_infinity = min_i64
+// date_infinity is 'infinity' as decode_date_days returns it.
 pub const date_infinity = max_i32
+// date_neg_infinity is '-infinity' as decode_date_days returns it.
 pub const date_neg_infinity = min_i32
 
 // pg_epoch_unix_s is 2000-01-01T00:00:00Z, PostgreSQL's date/time epoch, as
@@ -76,6 +106,8 @@ const err_array_dims = error('pg: array: only one-dimensional arrays are support
 const err_array_null = error('pg: array: NULL element (read it with Row.array_iter)')
 const err_array_elem_type = error('pg: array: element type does not match the accessor')
 
+// decode_int2 decodes a binary int2 (2 bytes, big-endian); an error when b is
+// not 2 bytes. No allocation, errors included.
 @[inline]
 pub fn decode_int2(b []u8) !i16 {
 	if b.len != 2 {
@@ -84,6 +116,8 @@ pub fn decode_int2(b []u8) !i16 {
 	return i16(binary.big_endian_u16(b))
 }
 
+// decode_int4 decodes a binary int4 (4 bytes, big-endian); an error when b is
+// not 4 bytes. No allocation, errors included.
 @[inline]
 pub fn decode_int4(b []u8) !i32 {
 	if b.len != 4 {
@@ -92,6 +126,8 @@ pub fn decode_int4(b []u8) !i32 {
 	return i32(binary.big_endian_u32(b))
 }
 
+// decode_int8 decodes a binary int8 (8 bytes, big-endian); an error when b is
+// not 8 bytes. No allocation, errors included.
 @[inline]
 pub fn decode_int8(b []u8) !i64 {
 	if b.len != 8 {
@@ -100,6 +136,8 @@ pub fn decode_int8(b []u8) !i64 {
 	return i64(binary.big_endian_u64(b))
 }
 
+// decode_bool decodes a binary bool (1 byte, true unless 0); an error when b is
+// not 1 byte. No allocation, errors included.
 @[inline]
 pub fn decode_bool(b []u8) !bool {
 	if b.len != 1 {
@@ -108,6 +146,9 @@ pub fn decode_bool(b []u8) !bool {
 	return b[0] != 0
 }
 
+// decode_float4 decodes a binary float4 (IEEE 754 single precision,
+// big-endian; NaN and ±Infinity too); an error when b is not 4 bytes. No
+// allocation, errors included.
 @[inline]
 pub fn decode_float4(b []u8) !f32 {
 	if b.len != 4 {
@@ -116,6 +157,9 @@ pub fn decode_float4(b []u8) !f32 {
 	return math.f32_from_bits(binary.big_endian_u32(b))
 }
 
+// decode_float8 decodes a binary float8 (IEEE 754 double precision,
+// big-endian; NaN and ±Infinity too); an error when b is not 8 bytes. No
+// allocation, errors included.
 @[inline]
 pub fn decode_float8(b []u8) !f64 {
 	if b.len != 8 {
@@ -125,8 +169,8 @@ pub fn decode_float8(b []u8) !f64 {
 }
 
 // decode_text returns the bytes as-is (PG text / varchar / numeric-as-text, and
-// the body of a JSONB value once its 1-byte version prefix is stripped). The
-// slice borrows the recv buffer — copy it if it must outlive the continuation.
+// the body of a JSONB value once its 1-byte version prefix is stripped). It is
+// b itself, not a copy — copy it if it must outlive the continuation.
 @[inline]
 pub fn decode_text(b []u8) []u8 {
 	return b

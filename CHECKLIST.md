@@ -500,14 +500,14 @@ concatenates, interpolates or allocates per request. The
 
 ## 📖 Documentation
 
-### 42. Complete API Documentation — ✅ RESOLVED (`tls/`, `server/`)
+### 42. Complete API Documentation — ✅ RESOLVED (`tls/`, `server/`, `pg_async/`)
 - **Resolution:** every `pub fn` / `struct` / `enum` / `const` / `type` in
-  `tls/` and `server/` (with `server/backend_epoll` and `backend_poll`) has a
-  doc comment that starts with its name, and so does every pub field. The
-  comments give what the symbol returns and how it errors, plus allocation,
-  threading and backend support where they matter: `Server.run` per backend,
-  `Session.read_into` / `write_from` retry rules, and which `Config` setters
-  are atomic. `v doc tls` renders the default build's stub
+  `tls/`, `server/` (with `server/backend_epoll` and `backend_poll`) and
+  `pg_async/` has a doc comment that starts with its name, and so does every
+  pub field. The comments give what the symbol returns and how it errors,
+  plus allocation, threading and backend support where they matter:
+  `Server.run` per backend, `Session.read_into` / `write_from` retry rules,
+  and which `Config` setters are atomic. `v doc tls` renders the default build's stub
   (`tls_stub_notd_vanilla_tls.c.v`), so the stub carries the user-facing
   contract, followed by what it does without `-d vanilla_tls`.
 - **Measured** with `scripts/doc_coverage.sh` (`-v` lists what is missing; a
@@ -529,9 +529,21 @@ concatenates, interpolates or allocates per request. The
     silently merges a 5th protocol into the 4th.
   - [#298](https://github.com/enghitalo/vanilla/issues/298): kqueue's `run()`
     returns silently when a kqueue cannot be created.
-- **Next modules** (same style, outside this item): `socket/` (62%) and
-  `pg_async/` (62%); then the lowest, `kqueue` (0%), `http1_1/response` (10%),
-  `poll` (14%), `epoll` (36%), `websocket` (39%) and `io_uring` (42%). The
+- **`pg_async/`** ([#360](https://github.com/enghitalo/vanilla/issues/360)):
+  the same, checked against the code, its callers and its tests. `PgPool`
+  says which backends run its reactor path (the epoll worker and io_uring;
+  `start_maintenance`, park deadlines and `PgConn.cancel` the epoll worker
+  only), `Result` what its views borrow and for how long, `release()` that it
+  is for `acquire()` alone, and `ConnConfig.host` that a re-dial resolves the
+  name on the worker. Measured against origin/main 86688fa:
+
+  | module | before | after |
+  |---|---|---|
+  | `pg_async` | 124/189 (66%), 4 loose; fields 23/48 | 189/189 (100%); fields 48/48 |
+  | whole repo | 508/707 (72%); fields 155/285 | 573/707 (81%); fields 180/285 |
+- **Next modules** (same style, outside this item), by undocumented
+  declarations: `io_uring` (32), `http2` (23), `websocket` (14), `socket`
+  (12) and `kqueue` (11); then `http1_1/response` (9) and `epoll` (7). The
   style follows the parser's:
   ```v
   // frame_request_length_lim_idx returns the length of the first complete
@@ -642,7 +654,7 @@ Open and partial items only.
 - [x] #41 - Benchmarks
 
 ### Phase 6: Documentation
-- [x] #42 - API docs (`tls/`, `server/`)
+- [x] #42 - API docs (`tls/`, `server/`, `pg_async/`)
 - [x] #43 - Architecture doc
 - [ ] #44 - SECURITY.md
 - [x] #45 - Performance tuning page

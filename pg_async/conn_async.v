@@ -83,8 +83,8 @@ pub fn (c &PgConn) is_busy() bool {
 	return c.inflight.len > 0
 }
 
-// inflight_count is the current pipeline depth (submitted, not yet drained). The
-// reactor uses it for shortest-queue routing across a small pool.
+// inflight_count is the current pipeline depth (submitted, not yet drained).
+// acquire_pipelined routes by it, shortest queue first.
 pub fn (c &PgConn) inflight_count() int {
 	return c.inflight.len
 }
@@ -104,6 +104,10 @@ pub fn (c &PgConn) can_submit() bool {
 // buffer cannot fit the frame — or broken (is_broken), so the caller must shed.
 // false does not say which: submit (shed.v) returns the reason as a typed error.
 // Pair with async_flush (on writable) and async_on_readable (on readable).
+// Allocates nothing once the connection is warm: its first submit allocates
+// the send buffer, max_inflight reply buffers of 16 KiB and the serialization
+// scratch, the in-flight queue grows as the pipeline first gets deeper, and a
+// frame larger than any before grows the scratch.
 pub fn (mut c PgConn) async_submit(query_text string, params []?[]u8) bool {
 	if c.state != .ready || c.inflight.len >= c.inflight_limit() {
 		return false
@@ -126,8 +130,8 @@ pub fn (mut c PgConn) async_submit(query_text string, params []?[]u8) bool {
 // none element is SQL NULL).
 pub struct Stmt {
 pub:
-	sql    string
-	params []?[]u8
+	sql    string  // the statement's SQL text
+	params []?[]u8 // its parameters' text-format values, for $1, $2, …
 }
 
 const err_batch_empty = error('pg: async_submit_batch: the batch has no statement')
@@ -155,7 +159,7 @@ const err_batch_too_large = error('pg: async_submit_batch: the batch is larger t
 // broken, its pipeline full, or its send buffer too full — exactly as
 // async_submit: the caller sheds. Returns an error for a batch that can never
 // be sent, on any connection: an empty one, or one larger than the send
-// buffer (send_buf_cap) on its own.
+// buffer (max_frame_len) on its own. It allocates what async_submit does.
 pub fn (mut c PgConn) async_submit_batch(stmts []Stmt) !bool {
 	if stmts.len == 0 {
 		return err_batch_empty
@@ -311,8 +315,8 @@ pub fn (mut c PgConn) async_flush() !bool {
 // complete result. (V has no `!?T`, so completion is a flag, not an Option.)
 pub struct QueryPoll {
 pub:
-	ready  bool
-	result Result
+	ready  bool   // the front query completed: result holds its reply
+	result Result // the completed query's Result, when ready
 }
 
 // not_ready is the singleton returned on the (very common) not-ready path. A fresh
@@ -342,6 +346,10 @@ const not_ready = QueryPoll{}
 // terminating connection due to administrator command) when the server sent
 // one, else 'pg: connection closed by server'. A broken connection never
 // reports not-ready, so a caller never re-arms a watch on a dead socket.
+//
+// It allocates nothing on the way to a result, except to grow the receive
+// buffer, or a reply buffer for a reply larger than it held before (the growth
+// is kept); an error carries strings.
 pub fn (mut c PgConn) async_on_readable() !QueryPoll {
 	// Everything received so far has been framed → reset the cursor to the front so
 	// recv_buf doesn't ratchet upward (the common between-edges state).

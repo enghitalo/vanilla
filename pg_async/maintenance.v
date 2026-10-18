@@ -95,8 +95,8 @@ fn (mut c PgConn) probe_idle() {
 // acquire_pipelined(), which nobody will release) gets the same ROLLBACK — so
 // a pipelined sender that keeps a transaction open across a maintenance tick
 // loses it. A connection due for recycling while its ROLLBACK is in flight is
-// recycled at a later tick, once the ROLLBACK is answered. Never blocks on the
-// network.
+// recycled at a later tick, once the ROLLBACK is answered. Never waits on the
+// server (a re-dial's name resolution aside: ConnConfig.host).
 pub fn (mut p PgPool) maintain() int {
 	mut next := maintenance_idle_ms
 	now := time.sys_mono_now()

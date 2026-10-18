@@ -12,6 +12,9 @@ import encoding.base64
 // expects. All primitives come from V's stdlib (crypto.{sha256,hmac,pbkdf2},
 // encoding.base64), so there is no external crypto dependency.
 
+// scram_sha_256 is the SASL mechanism pg_async answers AuthenticationSASL with
+// (write_sasl_initial): SCRAM-SHA-256 without channel binding, never the -PLUS
+// variant.
 pub const scram_sha_256 = 'SCRAM-SHA-256'
 
 const gs2_header = 'n,,' // no channel binding, no authorization identity
