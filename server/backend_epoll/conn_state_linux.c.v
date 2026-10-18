@@ -177,6 +177,10 @@ mut:
 	// protocol state, handed back on every call, never inspected here.
 	takeover       core.ConnHandler = unsafe { nil }
 	takeover_state voidptr
+	// conn_id is the connection's identity (core.EventLoop.conn_id), drawn
+	// when its state is made (state_create): read once per burst, beside the
+	// hot fields.
+	conn_id u64
 	// The reaping fields below sit after the hot ones and leave the per-burst
 	// layout alone: with idle_timeout_ms off the request path never reads
 	// them (the per-recv idle check is gated on the worker's idle budget).
@@ -279,6 +283,36 @@ mut:
 	// tls_cfg is the server's TLS config, nil for plain HTTP. An HTTPS
 	// server's connections start with their handshake (state_create).
 	tls_cfg &tls.Config = unsafe { nil }
+	// The connection identities this worker hands out (take_conn_id):
+	// next_conn_id up to end_conn_id, a block of conn_ids.
+	next_conn_id u64
+	end_conn_id  u64
+}
+
+// conn_ids is where every epoll worker of every server in the process takes
+// its connection identities (core.EventLoop.conn_id), conn_id_block at a
+// time: they are unique in the process, and this shared counter costs one
+// atomic add per conn_id_block connections a worker makes.
+const conn_ids = &core.Counter{}
+
+const conn_id_block = 1 << 16
+
+// take_conn_id is the identity of a connection whose state is being made:
+// the next of this worker's block, never 0. A worker whose block is used up
+// takes the next one from conn_ids. Only state_create calls it, once per
+// connection, never per request.
+@[inline]
+fn (mut st PlainState) take_conn_id() u64 {
+	if st.next_conn_id == st.end_conn_id {
+		mut ids := unsafe { conn_ids }
+		// The new total: this block is the conn_id_block values up to it.
+		end := u64(stdatomic.add_i64(&ids.n, conn_id_block)) + 1
+		st.next_conn_id = end - u64(conn_id_block)
+		st.end_conn_id = end
+	}
+	id := st.next_conn_id
+	st.next_conn_id++
+	return id
 }
 
 // birth_queue_cap is the capacity of a worker's BirthQueue (a power of two).
@@ -512,6 +546,7 @@ fn state_create(mut st PlainState, fd int) &ConnState {
 		if st.tls_cfg != unsafe { nil } {
 			cs.tls = tls_handshake // HTTPS: the handshake comes first
 		}
+		cs.conn_id = st.take_conn_id()
 		st.conns[fd] = cs
 	}
 	return st.conns[fd]
@@ -1044,7 +1079,8 @@ fn close_conn(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainStat
 			cs.body_drain = 0
 			cs.drain_off = 0
 			// awaiting_fd and park_timer are already -1 (unpark_conn above),
-			// wake_fn, sub_state and wake_timer reset (queue_closed)
+			// wake_fn, sub_state and wake_timer reset (queue_closed); the next
+			// connection gets a conn_id of its own (state_create)
 			cs.close_after_flush = false
 			cs.sent_100 = false
 			cs.takeover = unsafe { nil }
