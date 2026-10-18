@@ -439,7 +439,8 @@ kqueue a deadline watch is a plain watch, and `cancel` fails.
   `connections × workers × send_buf_cap`. Once frames near that size are
   sent, each connection's serialization scratch has doubled up to match and
   stays that size: count twice `send_buf_cap`, three times for a size that
-  is not a power of two. Size it for the largest statement with its
+  is not a power of two (under `-gc none`, plus the smaller scratches it
+  outgrew, about as much again, once). Size it for the largest statement with its
   parameters (a large `jsonb` document, a batch of many rows), or lower it
   when every query is small.
 - Keep the pool sized to the worker/thread model.

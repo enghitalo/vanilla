@@ -613,6 +613,14 @@ fn test_a_refused_frame_never_grows_the_scratch() {
 	c.submit(sql, huge) or {}
 	c.submit_batch([Stmt{ sql: sql, params: huge }]) or {}
 	assert c.submit_scratch.cap == scratch, 'a refused frame grew the scratch to ${c.submit_scratch.cap} bytes'
+	// A frame the buffer holds, but not with 60 KiB still unsent: a shed,
+	// refused before it is serialized too.
+	c.send_len = 60 * 1024
+	mid := echo_param(10 * 1024)
+	assert query_frame_len(sql, mid) > c.send_room()
+	assert !c.async_submit(sql, mid)
+	assert c.async_submit_batch([Stmt{ sql: sql, params: mid }])! == false
+	assert c.submit_scratch.cap == scratch, 'a shed frame grew the scratch to ${c.submit_scratch.cap} bytes'
 	assert c.inflight.len == 1
 	c.inflight.clear()
 }
