@@ -550,16 +550,22 @@ is a first-class guarantee — keep it that way.
   your registries keyed by handle, and drop a handle in the wake fn's
   `.closed` (see [examples/websocket_chat](../examples/websocket_chat/src/main.v)
   and [examples/sse](../examples/sse/src/main.v)).
-- Cache per-connection state (peer credentials read once with
-  `socket.peer_cred`, an auth context for a keep-alive connection, a
-  counter) under `event_loop.conn_id()`, never under `client_fd` alone. The
-  kernel gives the fd number to the next connection as soon as this one
-  closes, maybe on another worker; the id is never given to another
-  connection in the process. A per-worker table indexed by fd that keeps the
-  id beside the value needs no eviction: a slot whose id is not the current
-  one is an earlier connection's, so overwrite it. An id of 0 means unknown
-  (no client, or a backend other than the epoll worker): don't cache then
+- Cache what belongs to a connection (peer credentials read once with
+  `socket.peer_cred`, the peer's address, a request count) under
+  `event_loop.conn_id()`, never under `client_fd` alone. The kernel gives
+  the fd number to the next connection as soon as this one closes, maybe on
+  another worker; the id is never given to another connection in the
+  process. Nothing tells a handler that its HTTP/1.1 connection closed, so
+  keep such state in a per-worker table indexed by fd, with the id beside
+  the value: a slot whose id is not the current one is an earlier
+  connection's, so overwrite it (a map keyed by the id would only grow). An
+  id of 0 means unknown (no client, a tombstone's run, or a backend other
+  than the epoll worker): don't cache then
   ([vanilla#350](https://github.com/enghitalo/vanilla/issues/350)).
+- Never cache per connection what a request's own headers establish
+  (`Authorization`, a session cookie): a reverse proxy's pooled upstream
+  connection carries many users' requests, and a server must not assume two
+  requests on one connection come from the same user agent (RFC 9110 §3.3).
 
 **Don't**
 

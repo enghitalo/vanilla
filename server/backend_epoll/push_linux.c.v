@@ -23,10 +23,12 @@ import sync.stdatomic
 // write buffer without bound — no write timeout is armed by default.
 const push_default_watermark = 1024 * 1024
 
-// ClosedNote is a .closed notification due: the subscription that ended.
+// ClosedNote is a .closed notification due: the subscription that ended, and
+// its connection's id (core.EventLoop.conn_id).
 struct ClosedNote {
 	wake_fn   core.WakeFn = unsafe { nil }
 	sub_state voidptr
+	conn_id   u64
 }
 
 // LateShutdown is a connection that subscribed after its worker delivered
@@ -270,6 +272,7 @@ fn (mut st PlainState) queue_closed(mut cs ConnState) {
 	st.closed_q << ClosedNote{
 		wake_fn:   cs.wake_fn
 		sub_state: cs.sub_state
+		conn_id:   cs.conn_id
 	}
 	cs.wake_fn = unsafe { nil }
 	cs.sub_state = unsafe { nil }
@@ -277,8 +280,8 @@ fn (mut st PlainState) queue_closed(mut cs ConnState) {
 
 // notify_closed runs the .closed notifications queued this iteration, after
 // every close of it: each wake fn exactly once, with a scratch response, no
-// connection (ready_fd -1) and no watches. Called before the worker waits
-// again.
+// connection (ready_fd -1, but the closed connection's conn_id) and no
+// watches. Called before the worker waits again.
 @[direct_array_access]
 fn notify_closed(mut reactor Reactor, epoll_fd int, mut st PlainState, state voidptr) {
 	for i := 0; i < st.closed_q.len; i++ {
@@ -291,6 +294,7 @@ fn notify_closed(mut reactor Reactor, epoll_fd int, mut st PlainState, state voi
 			reactor:  unsafe { voidptr(&reactor) }
 			register: core.reject_register
 			reason:   .closed
+			conn_id:  note.conn_id
 		}
 		core.set_queue_file_allowed(false)
 		note.wake_fn(mut reactor.scratch, -1, false, note.sub_state, state, mut el)

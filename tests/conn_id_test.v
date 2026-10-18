@@ -1,19 +1,21 @@
 // vtest build: linux
 // A connection identity for plain HTTP/1.1 handlers (vanilla#350):
 // event_loop.conn_id() names the connection a handler or continuation
-// serves, so per-connection state (peer credentials read once, an auth
-// context, a counter) can be cached under it rather than under client_fd,
-// whose number the next connection gets once this one closes.
+// serves, so what belongs to the connection (peer credentials read once, the
+// peer's address) can be cached under it rather than under client_fd, whose
+// number the next connection gets once this one closes.
 //
 // The checks follow the issue's list: connections in a row that get the same
 // fd number get different ids, with accept-time births off and on; a
 // keep-alive connection keeps one id across its requests, pipelined ones
 // too, and their continuations (a resumed park, a timed-out park, a streamed
 // upload's head), and a taken-over connection keeps its upgrade request's id
-// in its ConnHandler and wake fn; and no two connections share an id, across
-// two workers or two servers in one process. Off the epoll worker the id is
-// 0, unknown (io_uring here). Takeover is inert under tcc (#173): run with
-// gcc.
+// in its ConnHandler and wake fn, .closed included; two requests parked on
+// one shared fd and resumed from one edge each get their own; and no two
+// connections share an id, across two workers or two servers in one
+// process. The id is 0, unknown, where there is no connection (on_worker_start,
+// a tombstone's run) and off the epoll worker (io_uring here). Takeover is
+// inert under tcc (#173): run with gcc.
 import server
 import core
 import sync.stdatomic
@@ -22,6 +24,7 @@ import transport
 import vtest
 
 #include <sys/socket.h>
+#include <fcntl.h>
 
 fn C.send(__fd int, __buf voidptr, __n usize, __flags int) int
 fn C.recv(__fd int, __buf voidptr, __n usize, __flags int) int
@@ -29,6 +32,7 @@ fn C.pipe(fds &i32) int
 fn C.write(fd int, buf voidptr, count usize) int
 fn C.read(fd int, buf voidptr, count usize) int
 fn C.close(fd int) int
+fn C.fcntl(fd int, cmd int, arg int) int
 
 const ci_head = 'HTTP/1.1 200 OK\r\nContent-Length: '
 
@@ -43,9 +47,19 @@ struct CiWorker {
 	idx int
 }
 
+// CiShared is what the handlers, hooks and the test thread share: atomics.
 struct CiShared {
 mut:
 	next_worker i64
+	parked      i64 // requests parked on the shared pipe (GET /queue, GET /orphan)
+	pipe_r      i64 = -1 // the shared pipe: its read end, which those park on
+	pipe_w      i64 = -1 // and its write end, the test's
+	start_runs  i64 // on_worker_start calls
+	start_id    i64 = -1 // conn_id() in the last of them
+	closed_runs i64 // .closed wakes
+	closed_id   i64 = -1 // conn_id() in the last of them
+	dead_runs   i64 // runs of GET /orphan's continuation
+	dead_id     i64 = -1 // conn_id() in the last of them
 }
 
 const ci = &CiShared{}
@@ -57,10 +71,30 @@ fn ci_state() voidptr {
 	})
 }
 
-// ci_reset numbers the next server's workers from 0.
+// ci_reset numbers the next server's workers from 0 and clears what the
+// hooks recorded.
 fn ci_reset() {
 	mut s := unsafe { ci }
 	stdatomic.store_i64(&s.next_worker, 0)
+	stdatomic.store_i64(&s.parked, 0)
+	stdatomic.store_i64(&s.start_runs, 0)
+	stdatomic.store_i64(&s.start_id, -1)
+	stdatomic.store_i64(&s.closed_runs, 0)
+	stdatomic.store_i64(&s.closed_id, -1)
+	stdatomic.store_i64(&s.dead_runs, 0)
+	stdatomic.store_i64(&s.dead_id, -1)
+}
+
+// ci_until waits until the counter at p reaches want, for at most ms, and
+// returns it.
+fn ci_until(p &i64, want i64, ms int) i64 {
+	for _ in 0 .. ms {
+		if stdatomic.load_i64(p) >= want {
+			break
+		}
+		time.sleep(time.millisecond)
+	}
+	return stdatomic.load_i64(p)
 }
 
 fn ci_prefix(b []u8, p string) bool {
@@ -112,8 +146,8 @@ fn ci_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 		mut fds := [2]i32{}
 		C.pipe(&fds[0])
 		one := u8(1)
-		C.write(fds[1], &one, 1)
-		C.close(fds[1])
+		C.write(int(fds[1]), &one, 1)
+		C.close(int(fds[1]))
 		event_loop.watch_fd(int(fds[0]), .readable, ci_resumed, unsafe { nil })
 		return .suspend
 	}
@@ -124,6 +158,16 @@ fn ci_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 		C.pipe(&fds[0])
 		event_loop.watch_fd_deadline(int(fds[0]), .readable, ci_timed_out, voidptr(isize(fds[1])),
 			20)
+		return .suspend
+	}
+	if ci_prefix(req, 'GET /queue ') || ci_prefix(req, 'GET /orphan ') {
+		// Park on the shared pipe, as requests share a pooled connection
+		// (watch_fd_persistent): a second park on it queues behind the first.
+		mut s := unsafe { ci }
+		cont := if ci_prefix(req, 'GET /queue ') { ci_queued } else { ci_orphaned }
+		event_loop.watch_fd_persistent(int(stdatomic.load_i64(&s.pipe_r)), .readable, cont,
+			unsafe { nil })
+		stdatomic.add_i64(&s.parked, 1)
 		return .suspend
 	}
 	if ci_prefix(req, 'GET /up ') {
@@ -138,10 +182,17 @@ fn ci_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 		core.append_str(mut out, '#\n')
 		return .done
 	}
-	// GET /id, GET /bye (answered, then closed) and POST /big (its head: the
-	// body is drained after the handler returns).
-	return ci_report(mut out, if ci_prefix(req, 'POST ') { 'big' } else { 'handler' },
-		event_loop.conn_id(), client_fd, w.idx, ci_prefix(req, 'GET /bye '))
+	// GET /id, GET /bye (answered, then closed) and POST /big: `big` only when
+	// the handler saw the head alone, its body to be drained after it returns.
+	label := if !ci_prefix(req, 'POST ') {
+		'handler'
+	} else if req.len < ci_big_len {
+		'big'
+	} else {
+		'buffered'
+	}
+	return ci_report(mut out, label, event_loop.conn_id(), client_fd, w.idx, ci_prefix(req,
+		'GET /bye '))
 }
 
 // ci_resumed is GET /park's continuation.
@@ -158,6 +209,41 @@ fn ci_timed_out(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload v
 	C.close(int(isize(watch_payload)))
 	return ci_report(mut out, if event_loop.timed_out() { 'timeout' } else { 'ready' },
 		event_loop.conn_id(), -1, 0, false)
+}
+
+// ci_take reads one byte of the shared pipe: a parked request's reply.
+fn ci_take(fd int) bool {
+	mut b := u8(0)
+	return C.read(fd, &b, 1) == 1
+}
+
+// ci_queued is GET /queue's continuation: it takes its byte and reports.
+fn ci_queued(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	if !ci_take(ready_fd) {
+		event_loop.watch_fd_persistent(ready_fd, .readable, ci_queued, unsafe { nil })
+		return .suspend
+	}
+	return ci_report(mut out, 'queued', event_loop.conn_id(), -1, 0, false)
+}
+
+// ci_orphaned is GET /orphan's continuation. Its client leaves while it is
+// parked, so it runs as a tombstone, to take its byte: it records its id.
+fn ci_orphaned(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	if !ci_take(ready_fd) {
+		event_loop.watch_fd_persistent(ready_fd, .readable, ci_orphaned, unsafe { nil })
+		return .suspend
+	}
+	mut s := unsafe { ci }
+	stdatomic.store_i64(&s.dead_id, i64(event_loop.conn_id()))
+	stdatomic.add_i64(&s.dead_runs, 1)
+	return ci_report(mut out, 'orphaned', event_loop.conn_id(), -1, 0, false)
+}
+
+// ci_on_start records the id on_worker_start sees: it has no client.
+fn ci_on_start(worker_state voidptr, mut event_loop core.EventLoop) {
+	mut s := unsafe { ci }
+	stdatomic.store_i64(&s.start_id, i64(event_loop.conn_id()))
+	stdatomic.add_i64(&s.start_runs, 1)
 }
 
 // ci_lines is GET /up's protocol: `wait` arms wake_after (its wake fn
@@ -185,23 +271,35 @@ fn ci_lines(buf []u8, mut out []u8, client_fd int, takeover_state voidptr, worke
 	return consumed, core.Step.done
 }
 
-// ci_wake is the subscription's wake fn: its wake_after timer reports the id.
+// ci_wake is the subscription's wake fn: its wake_after timer reports the
+// id, and .closed records it.
 fn ci_wake(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if event_loop.reason() == .timeout {
 		core.append_str(mut out, 'wake id=')
 		ci_dec(mut out, event_loop.conn_id())
 		core.append_str(mut out, '#\n')
+	} else if event_loop.reason() == .closed {
+		mut s := unsafe { ci }
+		stdatomic.store_i64(&s.closed_id, i64(event_loop.conn_id()))
+		stdatomic.add_i64(&s.closed_runs, 1)
 	}
 	return .done
 }
 
 fn ci_config(backend server.IOBackend, workers int, limits server.Limits) server.ServerConfig {
-	return server.ServerConfig{
+	cfg := server.ServerConfig{
 		io_multiplexing: backend
 		workers:         workers
 		handler:         ci_handler
 		make_state:      ci_state
 		limits:          limits
+	}
+	if backend != .epoll {
+		return cfg // on_worker_start is the epoll worker's
+	}
+	return server.ServerConfig{
+		...cfg
+		on_worker_start: ci_on_start
 	}
 }
 
@@ -368,7 +466,8 @@ fn test_epoll_conn_id_differs_on_a_reused_fd() ! {
 // pipelined in one write, a park resumed by its fd and one ended by its
 // deadline (their continuations), a streamed upload's head, and a request
 // after all of them. A connection that upgrades keeps its upgrade request's
-// id in its ConnHandler and its wake fn, and it is not the first one's.
+// id in its ConnHandler and its wake fn, .closed included, and it is not the
+// first one's.
 fn test_epoll_conn_id_is_one_per_keep_alive_connection() ! {
 	ci_reset()
 	mut h := vtest.start(ci_config(.epoll, 1, server.Limits{}))!
@@ -406,9 +505,6 @@ fn test_epoll_conn_id_is_one_per_keep_alive_connection() ! {
 		return
 	}
 	mut u := ci_dial(h.port())!
-	defer {
-		u.close()
-	}
 	u.send(ci_get('/up'))!
 	assert u.reports(1, 3000).len == 1, u.acc.bytestr()
 	u.send('id\n')!
@@ -423,6 +519,79 @@ fn test_epoll_conn_id_is_one_per_keep_alive_connection() ! {
 		assert id == ups[0], 'one taken-over connection, two ids: ${up}'
 	}
 	assert ups[0] != ids[0], 'two connections, one id: ${got} / ${up}'
+	// Its last call names it too: drop what is kept under the id there.
+	u.close()
+	s := unsafe { ci }
+	assert ci_until(&s.closed_runs, 1, 3000) == 1, 'no .closed'
+	assert u64(stdatomic.load_i64(&s.closed_id)) == ups[0], '.closed names the connection that closed'
+}
+
+// Requests parked on one shared fd, as on a pooled database connection
+// (watch_fd_persistent): the worker resumes them in order from one readiness
+// edge (drain_pipelined), and each continuation gets its own connection's id.
+// A client that leaves while parked there still has its reply taken, by a
+// tombstone's run, which has no connection: 0. And on_worker_start, with no
+// client at all, sees 0.
+fn test_epoll_conn_id_in_queued_and_tombstone_runs() ! {
+	ci_reset()
+	mut fds := [2]i32{}
+	assert C.pipe(&fds[0]) == 0
+	C.fcntl(int(fds[0]), C.F_SETFL, C.O_NONBLOCK) // a continuation that finds no byte re-parks
+	mut s := unsafe { ci }
+	stdatomic.store_i64(&s.pipe_r, i64(fds[0]))
+	stdatomic.store_i64(&s.pipe_w, i64(fds[1]))
+	mut h := vtest.start(ci_config(.epoll, 1, server.Limits{}))!
+	defer {
+		h.stop()
+		C.close(int(fds[0]))
+		C.close(int(fds[1]))
+	}
+	assert ci_until(&s.start_runs, 1, 3000) == 1
+	assert stdatomic.load_i64(&s.start_id) == 0, 'on_worker_start has no connection'
+	mut a := ci_dial(h.port())!
+	defer {
+		a.close()
+	}
+	mut b := ci_dial(h.port())!
+	defer {
+		b.close()
+	}
+	a.send(ci_get('/id'))!
+	b.send(ci_get('/id'))!
+	assert a.reports(1, 3000).len == 1, a.acc.bytestr()
+	assert b.reports(1, 3000).len == 1, b.acc.bytestr()
+	// a parks first, b queues behind it; one write is both replies.
+	a.send(ci_get('/queue'))!
+	assert ci_until(&s.parked, 1, 3000) == 1
+	b.send(ci_get('/queue'))!
+	assert ci_until(&s.parked, 2, 3000) == 2
+	two := [u8(`a`), `b`]!
+	assert C.write(int(fds[1]), &two[0], 2) == 2
+	qa := a.reports(2, 3000)
+	qb := b.reports(2, 3000)
+	got := a.acc.bytestr() + ' / ' + b.acc.bytestr()
+	assert qa.len == 2 && qb.len == 2 && got.count('queued id=') == 2, got
+	assert qa[0] != 0 && qa[1] == qa[0], 'a queued continuation got another id: ${got}'
+	assert qb[0] != 0 && qb[1] == qb[0], 'a queued continuation got another id: ${got}'
+	assert qa[0] != qb[0], got
+	// c parks on the pipe and leaves: its watch becomes a tombstone, which
+	// runs when its reply comes.
+	mut c := ci_dial(h.port())!
+	c.send(ci_get('/orphan'))!
+	assert ci_until(&s.parked, 3, 3000) == 3
+	c.close()
+	srv := h.server_ref()
+	for _ in 0 .. 3000 {
+		if stdatomic.load_i64(&srv.active_conns.n) <= 2 {
+			break // c is closed, its watch a tombstone
+		}
+		time.sleep(time.millisecond)
+	}
+	assert stdatomic.load_i64(&srv.active_conns.n) == 2
+	one := u8(`c`)
+	assert C.write(int(fds[1]), &one, 1) == 1
+	assert ci_until(&s.dead_runs, 1, 3000) == 1, 'the tombstone did not run'
+	assert stdatomic.load_i64(&s.dead_id) == 0, 'a tombstone run has no connection'
 }
 
 // Two workers: accept round-robins, so a number one worker's connection

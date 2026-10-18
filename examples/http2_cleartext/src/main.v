@@ -320,6 +320,7 @@ fn serve_http2_request(mut bridge BridgeState, req http2.Http2Request, mut out [
 		client_fd: client_fd
 		reactor:   unsafe { voidptr(&capture) }
 		register:  capture_register
+		conn_id:   event_loop.conn_id()
 	}
 	step := handle(req_bytes, mut bridge.h1_res, client_fd, worker_state, mut probe_loop)
 	if step == .suspend {
@@ -382,6 +383,7 @@ fn bridge_wake(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload vo
 		client_fd: event_loop.client_fd
 		reactor:   unsafe { voidptr(&capture) }
 		register:  capture_register
+		conn_id:   event_loop.conn_id()
 	}
 	step := bridge.park_cont(mut bridge.park_res, ready_fd, ready_fd_error, bridge.park_udata,
 		worker_state, mut probe_loop)

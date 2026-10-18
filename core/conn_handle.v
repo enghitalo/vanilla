@@ -17,7 +17,8 @@ module core
 //               1001, and return .close;
 //   .closed   — the LAST call: the connection is gone, for whatever reason
 //               (peer, error, timeout, pending-write cap, shutdown). `response`
-//               is scratch. Unsubscribe from your registries and free the
+//               is scratch; event_loop.conn_id() still names the connection.
+//               Unsubscribe from your registries and free the
 //               subscription's state here: nothing references it after.
 //
 // The wake fn's parameters, as a WakeFn: ready_fd is the connection's fd,
@@ -106,7 +107,7 @@ pub type WakeAfterFn = fn (mut event_loop EventLoop, ms int) bool
 // one of its continuations. A connection that is not (being) taken over
 // cannot subscribe: HTTP/1.1 bytes pushed between responses would corrupt the
 // stream. (To tell such a connection from the next one on its fd number,
-// read EventLoop.conn_id.) Subscribing again replaces the wake fn and its
+// read event_loop.conn_id().) Subscribing again replaces the wake fn and its
 // state (same handle).
 // Returns the nil handle where subscriptions are not supported.
 pub fn (mut event_loop EventLoop) subscribe(wake_fn WakeFn, sub_state voidptr) ConnHandle {

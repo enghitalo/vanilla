@@ -203,18 +203,28 @@ pub mut:
 // conn_id names the connection a handler or continuation serves, client_fd's:
 // a value no other connection of this process has had or will get, the same
 // for each request of a keep-alive connection, for their continuations, and
-// for its ConnHandler and wake fn once it is taken over. Cache
-// per-connection state under it (peer credentials read once, an auth
-// context, a counter), never under client_fd alone: the kernel gives the
-// number to the next connection as soon as this one closes, maybe on another
-// worker, and a cache keyed by it would serve that client this one's entry.
-// A field load: nothing is allocated, nothing is subscribed.
+// for its ConnHandler and wake fn once it is taken over (.closed included:
+// drop what you keep under it there). A field load: nothing is allocated,
+// nothing is subscribed.
+//
+// Cache what belongs to the connection itself under it (peer credentials
+// read once, the peer's address, a request count), never under client_fd
+// alone: the kernel gives the number to the next connection as soon as this
+// one closes, maybe on another worker, and a cache keyed by it would serve
+// that client this one's entry. Never cache what a request's own headers
+// establish (Authorization, a session cookie): a proxy's pooled upstream
+// connection carries many users' requests (RFC 9110 §3.3). Nothing tells a
+// handler that its HTTP/1.1 connection closed, so keep such state where the
+// next connection overwrites it: a per-worker table indexed by client_fd,
+// with the id beside the value (a slot whose id differs is an earlier
+// connection's). A map keyed by the id would only grow.
 //
 // 0 means unknown, so do not cache: there is no client (on_worker_start, a
-// clientless or background watch, a wake fn's .closed), or it is gone (a
-// tombstone's run, whose client_fd may be another connection's by now), or
-// the backend does not track connections. The epoll worker does, plain HTTP
-// and HTTPS alike; io_uring, kqueue, poll and IOCP always give 0.
+// clientless or background watch), the call is a tombstone's run (it drains
+// a reply no request waits for any more, after its client left or its park
+// timed out; its client_fd may be another connection's by now), or the
+// backend does not track connections. The epoll worker does, plain HTTP and
+// HTTPS alike; io_uring, kqueue, poll and IOCP always give 0.
 @[inline]
 pub fn (event_loop &EventLoop) conn_id() u64 {
 	return event_loop.conn_id
