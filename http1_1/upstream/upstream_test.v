@@ -155,6 +155,95 @@ fn test_origin_validation() {
 	}
 }
 
+// never_woken is the continuation of an exchange that never parks.
+fn never_woken(mut _ []u8, _ int, _ bool, _ voidptr, _ voidptr, mut _ core.EventLoop) core.Step {
+	return .done
+}
+
+// The #348 repro, through the system resolver: provider.invalid never
+// resolves (RFC 6761). Without allow_unresolved Pool.new fails as it always
+// did (a typo fails fast). With it, the pool starts with no address, and
+// every exchange fails at once with .dns: nothing is dialed or parked.
+fn test_unresolved_origin_starts_empty() {
+	if resolve_system('provider.invalid', 80).len > 0 {
+		eprintln('upstream: this resolver answers provider.invalid; skipping')
+		return
+	}
+	o := Origin{
+		host:  'provider.invalid'
+		port:  80
+		https: false
+	}
+	if _ := Pool.new(o, unsafe { nil }) {
+		assert false, 'Pool.new resolved provider.invalid'
+	} else {
+		assert err.msg() == 'upstream: cannot resolve provider.invalid:80'
+	}
+	mut p := Pool.new(Origin{
+		...o
+		allow_unresolved: true
+	}, unsafe { nil }) or { panic(err) }
+	assert p.addrs.len == 0
+	mut el := core.EventLoop{
+		register: record_watch
+	}
+	for method in ['GET', 'POST'] {
+		mut x := p.acquire() or { panic('slot') }
+		assert x.request(method, '/v1/charges')
+		assert x.send(mut el, never_woken, unsafe { nil }) == .failed, method
+		assert x.failure() == .dns, method
+		assert x.fd == -1, method
+		x.release()
+	}
+	assert p.stats.dials == 0
+	assert el.last_watched == -1 // nothing parked
+}
+
+fn no_address(_ string, _ int) []transport.Addr {
+	return []
+}
+
+// An origin that may start unresolved must follow a Resolver, or nothing ever
+// fills its table: start_maintenance refuses it, whether or not the name
+// resolved at this boot, so the mistake shows at the first boot, not as .dns
+// for good during an outage. A pool without the flag needs no Resolver.
+fn test_unresolved_origin_needs_a_resolver() {
+	a := transport.ip_addr('127.0.0.1', 80) or { panic('addr') }
+	one_address := fn [a] (host string, port int) []transport.Addr {
+		return [a]
+	}
+	for resolve in [no_address, one_address] {
+		mut p := plain_pool(Origin{
+			host:             'provider.test'
+			allow_unresolved: true
+			resolve:          resolve
+		})
+		mut el := core.EventLoop{
+			register: record_watch
+		}
+		if _ := p.start_maintenance(mut el) {
+			assert false, 'started without a Resolver'
+		} else {
+			assert err.msg().contains('Resolver'), err.msg()
+		}
+		assert p.timer_fd == -1 && el.last_watched == -1 // nothing armed
+		mut r := Resolver.new(60_000) or { panic(err) } // never started
+		p.follow(mut r) or { panic(err) }
+		p.start_maintenance(mut el) or { panic(err) }
+		assert p.timer_fd >= 0 && el.last_watched == p.feed_fd
+		C.close(p.timer_fd)
+		C.close(p.feed_fd)
+	}
+	mut q := plain_pool(Origin{
+		host: '127.0.0.1'
+	})
+	mut el := core.EventLoop{
+		register: record_watch
+	}
+	q.start_maintenance(mut el) or { panic(err) }
+	C.close(q.timer_fd)
+}
+
 // acquire hands out at most max_conns exchanges; release gives the slot back.
 fn test_acquire_sheds_past_max_conns() {
 	mut p := plain_pool(Origin{

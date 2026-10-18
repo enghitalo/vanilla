@@ -1006,6 +1006,158 @@ mut:
 	slow i64
 }
 
+// Dns is a provider's DNS for the test resolver: down (no address) or the
+// fake's port, and how often it was asked and answered (atomics: the
+// resolver thread and the workers' make_state call it).
+@[heap]
+struct Dns {
+mut:
+	port     i64
+	down     i64
+	calls    i64
+	answered i64
+}
+
+// unresolved_origin is an origin whose name only `d` resolves, allowed to
+// start unresolved.
+fn unresolved_origin(d &Dns) upstream.Origin {
+	return upstream.Origin{
+		host:             'provider.test'
+		port:             80 // the address carries the fake's port
+		https:            false
+		allow_unresolved: true
+		resolve:          fn [d] (host string, port int) []transport.Addr {
+			stdatomic.add_i64(&d.calls, 1)
+			if stdatomic.load_i64(&d.down) != 0 {
+				return []
+			}
+			a := transport.ip_addr('127.0.0.1', int(stdatomic.load_i64(&d.port))) or { return [] }
+			stdatomic.add_i64(&d.answered, 1)
+			return [a]
+		}
+	}
+}
+
+// wait_for waits up to ms for *counter to reach n.
+fn wait_for(counter &i64, n i64, ms i64) bool {
+	sw := time.new_stopwatch()
+	for sw.elapsed().milliseconds() < ms {
+		if stdatomic.load_i64(counter) >= n {
+			return true
+		}
+		time.sleep(5 * time.millisecond)
+	}
+	return stdatomic.load_i64(counter) >= n
+}
+
+// A provider's DNS is down when the edge boots (#348): with allow_unresolved
+// the edge starts anyway, and each call fails at once with .dns, without
+// dialing (the fake accepts nothing). Once the DNS answers, the refresh the
+// failing calls ask for fills the pool, and the next call succeeds.
+fn test_unresolved_origin_fills_once_it_resolves() {
+	mut f := start_fake('', '') or { panic(err) }
+	defer {
+		f.stop()
+	}
+	mut dns := &Dns{
+		port: f.port
+		down: 1
+	}
+	origin := unresolved_origin(dns)
+	// No periodic refresh while the test runs: only the failing calls ask.
+	mut r := upstream.Resolver.new(60_000) or { panic(err) }
+	r.start()
+	defer {
+		r.stop()
+	}
+	rr := r
+	mut h := vtest.start(server.ServerConfig{
+		handler:         edge
+		workers:         1
+		on_worker_start: on_worker_start
+		make_state:      fn [origin, rr] () voidptr {
+			return new_app(origin, unsafe { nil }, rr)
+		}
+	}) or { panic(err) }
+	defer {
+		h.stop()
+	}
+	p := h.port()
+	for _ in 0 .. 3 {
+		r1, ms := call(p, 'GET /up/ok HTTP/1.1\r\nHost: edge\r\n\r\n', 5000)
+		assert status_of(r1) == 502 && failure_of(r1) == 'dns', r1
+		assert ms < 100 * slack(), '${ms} ms: a call waited for the DNS'
+	}
+	assert f.stat('accepted') == 0
+	assert wait_for(&dns.calls, 2, 2000 * slack()), 'the failing calls asked for no refresh'
+	// The DNS is back. One more failing call asks; the refresh answers, and
+	// its update reaches the worker.
+	stdatomic.store_i64(&dns.down, 0)
+	get(p, '/ok')
+	assert wait_for(&dns.answered, 1, 3000 * slack()), 'no refresh after the DNS came back'
+	time.sleep(50 * slack() * time.millisecond)
+	r2 := get(p, '/ok')
+	assert status_of(r2) == 200, r2
+	assert status_of(get(p, '/ok')) == 200
+	assert f.stat('accepted') == 1
+}
+
+// A provider's DNS down under load (#348): four workers' pools follow one
+// Resolver, 32 connections send 100 calls each, and every call fails at once
+// with .dns. Each failing exchange asks for a refresh, and the DNS fails as
+// fast as it can (a cached negative answer). The asks still coalesce: the
+// Resolver resolves the origin once per refresh gap (1 s), not once per call
+// (3044 resolutions for 3200 calls before the gap).
+fn test_unresolved_origin_coalesces_refreshes() {
+	mut dns := &Dns{
+		down: 1
+	}
+	origin := unresolved_origin(dns)
+	mut r := upstream.Resolver.new(60_000) or { panic(err) }
+	r.start()
+	defer {
+		r.stop()
+	}
+	rr := r
+	mut h := vtest.start(server.ServerConfig{
+		handler:         edge
+		workers:         4
+		on_worker_start: on_worker_start
+		make_state:      fn [origin, rr] () voidptr {
+			return new_app(origin, unsafe { nil }, rr)
+		}
+	}) or { panic(err) }
+	defer {
+		h.stop()
+	}
+	assert wait_for(&dns.calls, 4, 2000 * slack()) // each worker's Pool.new
+	boot := stdatomic.load_i64(&dns.calls)
+	req := 'GET /up/ok HTTP/1.1\r\nHost: edge\r\n\r\n'.bytes()
+	mut rounds := []vtest.Round{}
+	for _ in 0 .. 100 {
+		rounds << vtest.Round{
+			send: req
+		}
+	}
+	sw := time.new_stopwatch()
+	o := h.fire(vtest.repeat(32, vtest.Script{
+		rounds: rounds
+	})) or { panic(err) }
+	ms := sw.elapsed().milliseconds()
+	resolutions := stdatomic.load_i64(&dns.calls) - boot
+	mut failed := 0
+	for c in o.conns {
+		for fr in c.frames {
+			resp := fr.bytestr()
+			assert status_of(resp) == 502 && failure_of(resp) == 'dns', resp
+			failed++
+		}
+	}
+	assert failed == 3200
+	assert resolutions >= 1, 'the failing calls asked for no refresh'
+	assert resolutions <= ms / 1000 + 2, '${resolutions} resolutions for ${failed} failing calls in ${ms} ms'
+}
+
 #include <malloc.h>
 
 struct C.mallinfo2 {

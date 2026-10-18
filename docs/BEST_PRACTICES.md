@@ -462,12 +462,15 @@ kqueue a deadline watch is a plain watch, and `cancel` fails.
   started in `on_worker_start`), `acquire()` / `send()` + `.suspend` in the
   handler, `advance()` in the continuation, `release()` on every path. Shed
   with 503 when `acquire()` has nothing, answer 502 / 504 from `failure()`
-  with `.done`. Its views (`body_view`, `header_value`) borrow the exchange's
-  buffer until `release()`. Request heads are validated (a CR/LF/NUL in a
-  target or a header fails the exchange instead of injecting a line); share one
-  `tls.new_client` config across workers. An HTTPS origin may be an IP
-  address: its certificate must then carry it as an `IP:` SAN, as for a
-  database (below). See
+  with `.done`. `Pool.new` fails for an origin that does not resolve, so one
+  provider's DNS outage at boot stops the server: `allow_unresolved` (with a
+  `Resolver`) starts that pool empty instead, and its calls fail at once with
+  `.dns` until the name resolves. Its views (`body_view`, `header_value`)
+  borrow the exchange's buffer until `release()`. Request heads are validated
+  (a CR/LF/NUL in a target or a header fails the exchange instead of injecting
+  a line); share one `tls.new_client` config across workers. An HTTPS origin
+  may be an IP address: its certificate must then carry it as an `IP:` SAN, as
+  for a database (below). See
   [examples/https_upstream](../examples/https_upstream/src/main.v).
 - Talk TLS to any database that is not on the same host: `ssl_mode:
   .verify_full` (with `ssl_root_cert` for a private CA; the system bundle

@@ -21,10 +21,15 @@ fn C.read(fd int, buf voidptr, count usize) int
 //   }
 //
 // Without it, nothing enforces the deadlines and expiry: a silent upstream
-// holds its exchange (and the client parked on it) for good.
+// holds its exchange (and the client parked on it) for good. It refuses an
+// origin that sets allow_unresolved when the pool follows no Resolver, even
+// when the name resolved this time: nothing would ever fill an empty table.
 pub fn (mut p Pool) start_maintenance(mut el core.EventLoop) ! {
 	if p.timer_fd >= 0 {
 		return error('upstream: maintenance is already running')
+	}
+	if p.origin.allow_unresolved && p.resolver == unsafe { nil } {
+		return error('upstream: ${p.origin.host} sets allow_unresolved, so its pool must follow a Resolver (follow), or nothing ever fills its addresses')
 	}
 	fd := C.timerfd_create(C.CLOCK_MONOTONIC, C.TFD_NONBLOCK | C.TFD_CLOEXEC)
 	if fd < 0 {

@@ -114,6 +114,14 @@ pub:
 	// resolve maps host:port to addresses, at Pool.new and on a Resolver's
 	// thread (never on a worker); nil: the system resolver (getaddrinfo).
 	resolve ResolveFn = unsafe { nil }
+	// allow_unresolved lets Pool.new start the pool with no address when the
+	// host does not resolve (its DNS is down at boot), instead of failing: one
+	// provider's outage then fails that provider's calls, not the server's
+	// start. Until a refresh resolves it, each exchange fails at once with
+	// .dns, without dialing, and asks the pool's Resolver for that refresh.
+	// The pool must follow a Resolver (start_maintenance refuses it
+	// otherwise). false: Pool.new fails, so a typo fails fast.
+	allow_unresolved bool
 }
 
 // ResolveFn resolves host:port to the addresses to dial, in order: empty when
@@ -243,9 +251,12 @@ mut:
 
 // Pool.new builds an origin's pool for this worker: validates the origin,
 // resolves it (blocking — make_state runs before the worker serves; a Resolver
-// refreshes it later off the worker), and allocates every slot's buffers.
-// `tls_cfg` is the client TLS config for an HTTPS origin (tls.new_client), and
-// may be shared by every worker's pools: it is only read. nil for plain HTTP.
+// refreshes it later off the worker), and allocates every slot's buffers. A
+// host that does not resolve fails it, unless the origin sets
+// allow_unresolved: then the pool starts with no address (with the DNS down,
+// after the system resolver's timeout: the wait is the same). `tls_cfg` is the
+// client TLS config for an HTTPS origin (tls.new_client), and may be shared by
+// every worker's pools: it is only read. nil for plain HTTP.
 pub fn Pool.new(o Origin, tls_cfg &tls.Config) !&Pool {
 	if !valid_host(o.host) {
 		return error('upstream: invalid host "${o.host}"')
@@ -279,7 +290,7 @@ pub fn Pool.new(o Origin, tls_cfg &tls.Config) !&Pool {
 				p.addrs << a
 			}
 		}
-		if p.addrs.len == 0 {
+		if p.addrs.len == 0 && !o.allow_unresolved {
 			return error('upstream: cannot resolve ${o.host}:${o.port}')
 		}
 	}
