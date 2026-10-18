@@ -2,6 +2,7 @@ module upstream
 
 import core
 import time
+import transport
 
 #include <sys/timerfd.h>
 #include <time.h>
@@ -21,10 +22,18 @@ fn C.read(fd int, buf voidptr, count usize) int
 //   }
 //
 // Without it, nothing enforces the deadlines and expiry: a silent upstream
-// holds its exchange (and the client parked on it) for good.
+// holds its exchange (and the client parked on it) for good. It refuses an
+// origin that sets allow_unresolved when the pool follows no Resolver, even
+// when the name resolved this time: nothing would ever fill an empty table.
+// An IP literal is exempt: it is dialed as is, so its pool is never empty.
 pub fn (mut p Pool) start_maintenance(mut el core.EventLoop) ! {
 	if p.timer_fd >= 0 {
 		return error('upstream: maintenance is already running')
+	}
+	if p.origin.allow_unresolved && p.resolver == unsafe { nil } {
+		_ := transport.ip_addr(p.origin.host, p.origin.port) or {
+			return error('upstream: ${p.origin.host} sets allow_unresolved, so its pool must follow a Resolver (follow), or nothing ever fills its addresses')
+		}
 	}
 	fd := C.timerfd_create(C.CLOCK_MONOTONIC, C.TFD_NONBLOCK | C.TFD_CLOEXEC)
 	if fd < 0 {

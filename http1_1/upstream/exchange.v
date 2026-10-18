@@ -93,8 +93,9 @@ pub fn (mut x Exchange) advance(ready_fd_error bool, mut el core.EventLoop, cont
 
 // dial starts a connect to the origin's next untried address, on the slot's
 // fd number when it has one (the retry and the next-address cases). Out of
-// addresses (or time), the exchange fails with .connect, and a following
-// Resolver is asked for fresh ones.
+// addresses (or time), the exchange fails with .connect (.dns when there is
+// none: an origin that has not resolved yet), and a following Resolver is
+// asked for fresh ones.
 fn (mut x Exchange) dial(mut el core.EventLoop, cont core.WakeFn, payload voidptr) Poll {
 	mut p := x.pool
 	now := time.sys_mono_now()

@@ -3,19 +3,24 @@ module upstream
 import core
 import sync
 import sync.stdatomic
+import time
 import transport
 
 // Name resolution off the workers.
 //
 // Pool.new resolves its origin once, at startup (blocking: make_state runs
-// before the worker serves, and a typo fails fast). A Resolver keeps the
+// before the worker serves, and a typo fails fast). An origin that sets
+// allow_unresolved starts with no address instead when its name does not
+// resolve (its DNS is down at boot): each exchange then fails at once with
+// .dns, without dialing, until a refresh fills the table. A Resolver keeps the
 // addresses fresh afterwards: one thread re-resolves every followed origin
-// every interval_ms (getaddrinfo gives no TTL), and at once when a pool runs
-// out of addresses to try, then hands the answer to each worker over that
-// pool's own pipe. A worker never resolves, never waits, and shares no mutable
-// state with the thread: the pipe carries fixed-size address records (one
-// write each, under PIPE_BUF, so atomic), and the worker copies them into its
-// pool's table on its own thread (a clientless watch, start_maintenance).
+// every interval_ms (getaddrinfo gives no TTL), and sooner when a pool runs
+// out of addresses to try or has none (at once, or refresh_gap_ms after the
+// last refresh), then hands the answer to each worker over that pool's own
+// pipe. A worker never resolves, never waits, and shares no mutable state with
+// the thread: the pipe carries fixed-size address records (one write each,
+// under PIPE_BUF, so atomic), and the worker copies them into its pool's table
+// on its own thread (a clientless watch, start_maintenance).
 //
 //   resolver := upstream.Resolver.new(30_000)!   // before new_server
 //   resolver.start()
@@ -25,6 +30,14 @@ import transport
 //
 // Connections already open keep their address until max_lifetime_ms retires
 // them; new dials use the new table.
+
+// refresh_gap_ms spaces the refreshes pools ask for: while an origin fails
+// every exchange (its DNS is down, or every address refuses), each failing
+// exchange asks, and the asks of a whole burst cost one resolution per origin
+// per gap, however fast the DNS fails, instead of one per exchange. The gap
+// is min(refresh_gap_ms, interval_ms), so an ask never waits past the next
+// periodic refresh.
+const refresh_gap_ms = 1000
 
 // Resolver is the resolver thread and the pools that follow it.
 @[heap]
@@ -111,9 +124,11 @@ pub fn (mut r Resolver) start() {
 	r.th = spawn r.run()
 }
 
-// stop ends the resolver thread for good and waits for it: a stopped
-// Resolver does not start again. Pools keep the addresses they have, and
-// their workers stop watching the pipes it closes.
+// stop ends the resolver thread for good and waits for it (through a
+// resolution in flight, or the rest of a refresh gap): a stopped Resolver
+// does not start again. Pools keep the addresses they have (none, for a pool
+// that has not resolved yet), and their workers stop watching the pipes it
+// closes.
 pub fn (mut r Resolver) stop() {
 	if !r.started {
 		return
@@ -158,8 +173,10 @@ pub fn (mut p Pool) follow(mut r Resolver) ! {
 	r.mu.unlock()
 }
 
-// request_resolve asks the resolver for a refresh now (every address failed).
-// One byte on its wake pipe; a full pipe means one is pending already.
+// request_resolve asks the resolver for a refresh (every address failed, or
+// there is none yet), which comes at once, or one gap (refresh_gap_ms) after
+// the last refresh. One byte on its wake pipe; a full pipe means one is
+// pending already.
 fn (mut p Pool) request_resolve() {
 	if p.resolver == unsafe { nil } {
 		return
@@ -173,14 +190,26 @@ fn (mut r Resolver) run() {
 	// A write to the pipe of a pool the worker closed meets no reader: EPIPE,
 	// not a process-killing SIGPIPE (the signal goes to the writing thread).
 	C.upstream_block_sigpipe()
+	gap := ms_ns(if r.interval_ms < refresh_gap_ms { r.interval_ms } else { refresh_gap_ms })
 	mut drain := [64]u8{}
+	mut last := u64(0) // when the last refresh started
 	for {
 		C.upstream_wait(r.wake_r, r.interval_ms)
 		if stdatomic.load_i64(&r.stop_flag) != 0 {
 			return
 		}
+		// Asked again within the gap: wait it out. The asks that come in the
+		// meanwhile wait in the pipe, and the one refresh answers them all.
+		since := time.sys_mono_now() - last
+		if last > 0 && since < gap {
+			time.sleep(time.Duration(gap - since))
+			if stdatomic.load_i64(&r.stop_flag) != 0 {
+				return
+			}
+		}
 		for C.read(r.wake_r, &drain[0], usize(drain.len)) > 0 {
 		}
+		last = time.sys_mono_now()
 		r.refresh()
 	}
 }
