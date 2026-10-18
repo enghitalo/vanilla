@@ -109,9 +109,10 @@ pub fn (c &PgConn) can_submit() bool {
 // costs no serialization and never grows the submit scratch.
 // Pair with async_flush (on writable) and async_on_readable (on readable).
 // Allocates nothing once the connection is warm: its first submit allocates
-// the send buffer, max_inflight reply buffers of 16 KiB and the serialization
-// scratch, the in-flight queue grows as the pipeline first gets deeper, and a
-// frame larger than any before grows the scratch.
+// max_inflight reply buffers of 16 KiB and the serialization scratch (the
+// send buffer comes with the connection), the in-flight queue grows as the
+// pipeline first gets deeper, and a frame larger than any before grows the
+// scratch.
 pub fn (mut c PgConn) async_submit(query_text string, params []?[]u8) bool {
 	if c.state != .ready || c.inflight.len >= c.inflight_limit()
 		|| c.send_room() < query_frame_len(query_text, params) {

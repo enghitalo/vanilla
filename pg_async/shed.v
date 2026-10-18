@@ -33,12 +33,14 @@ module pg_async
 // left at its default, 64 KiB. A connection's own is PgConn.max_frame_len().
 pub const max_frame_len = send_buf_cap
 
-// min_send_buf_cap and max_send_buf_cap bound ConnConfig.send_buf_cap. The
-// floor, 16 KiB, is as much as one pipeline slot's reply buffer
-// (frame_buf_cap): a smaller send buffer would save next to nothing. The
-// ceiling bounds memory, since every connection keeps its buffer for life:
-// 16 MiB on 4 connections and 16 workers is already 1 GiB.
+// min_send_buf_cap is the smallest ConnConfig.send_buf_cap, 16 KiB: as much
+// as one pipeline slot's reply buffer (frame_buf_cap), so a smaller send
+// buffer would save next to nothing.
 pub const min_send_buf_cap = 16 * 1024
+
+// max_send_buf_cap is the largest ConnConfig.send_buf_cap, 16 MiB. It bounds
+// memory, since every connection keeps its buffer for life: 16 MiB on 4
+// connections and 16 workers is already 1 GiB.
 pub const max_send_buf_cap = 16 * 1024 * 1024
 
 // max_inflight_limit bounds ConnConfig.max_inflight. Each pipeline slot
