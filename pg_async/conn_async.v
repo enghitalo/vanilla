@@ -105,13 +105,16 @@ pub fn (c &PgConn) can_submit() bool {
 // nothing) when the connection is saturated — the ring is full or the send
 // buffer cannot fit the frame — or broken (is_broken), so the caller must shed.
 // false does not say which: submit (shed.v) returns the reason as a typed error.
+// The frame is sized (query_frame_len) before it is serialized, so a refusal
+// costs no serialization and never grows the submit scratch.
 // Pair with async_flush (on writable) and async_on_readable (on readable).
 // Allocates nothing once the connection is warm: its first submit allocates
 // the send buffer, max_inflight reply buffers of 16 KiB and the serialization
 // scratch, the in-flight queue grows as the pipeline first gets deeper, and a
 // frame larger than any before grows the scratch.
 pub fn (mut c PgConn) async_submit(query_text string, params []?[]u8) bool {
-	if c.state != .ready || c.inflight.len >= c.inflight_limit() {
+	if c.state != .ready || c.inflight.len >= c.inflight_limit()
+		|| c.send_room() < query_frame_len(query_text, params) {
 		return false
 	}
 	c.reset_scratch()
@@ -167,8 +170,16 @@ pub fn (mut c PgConn) async_submit_batch(stmts []Stmt) !bool {
 	if stmts.len == 0 {
 		return err_batch_empty
 	}
-	// Serialized before the shed checks, so a batch that can never fit fails
-	// the same way on every connection, never as a shed (vanilla#51).
+	// Sized before the shed checks, so a batch that can never fit fails the
+	// same way on every connection, never as a shed (vanilla#51), and before
+	// it is serialized, so a refused one never grows the submit scratch.
+	n := batch_frame_len(stmts)
+	if n > c.max_frame_len() {
+		return err_batch_too_large
+	}
+	if c.state != .ready || c.inflight.len >= c.inflight_limit() || c.send_room() < n {
+		return false
+	}
 	c.reset_scratch()
 	for s in stmts {
 		write_parse(mut c.submit_scratch, '', s.sql)
@@ -177,11 +188,8 @@ pub fn (mut c PgConn) async_submit_batch(stmts []Stmt) !bool {
 		write_execute(mut c.submit_scratch, '', 0)
 	}
 	write_sync(mut c.submit_scratch)
-	if c.submit_scratch.len > c.max_frame_len() {
-		return err_batch_too_large
-	}
-	if c.state != .ready || c.inflight.len >= c.inflight_limit() || !c.append_send(c.submit_scratch) {
-		return false
+	if !c.append_send(c.submit_scratch) {
+		return false // not reached: the room was checked
 	}
 	c.push_inflight()
 	return true
@@ -192,7 +200,9 @@ pub fn (mut c PgConn) async_submit_batch(stmts []Stmt) !bool {
 // keeps send_buf's backing pinned (write_* append via `<<`, which would
 // reallocate send_buf) and (2) is reused across submits — a fresh
 // `[]u8{cap: 256}` per submit would leak under -gc none. It grows to a
-// high-water mark if a query frame ever exceeds 512 bytes.
+// high-water mark if a query frame ever exceeds 512 bytes; never past
+// max_frame_len (rounded up by doubling), since every submit sizes its frame
+// before it serializes it.
 @[inline]
 fn (mut c PgConn) reset_scratch() {
 	if c.submit_scratch.cap == 0 {
@@ -233,10 +243,13 @@ fn (mut c PgConn) push_inflight() {
 }
 
 // append_send copies one serialized query frame into the fixed-capacity send
-// buffer, compacting the unsent region to the front first so the buffer never
-// marches forward. The buffer is allocated once, when the connection is made
-// (ConnConfig.send_buf_cap), and never reallocated. Returns false if the frame
-// will not fit — the connection is saturated and the caller must shed.
+// buffer, behind the bytes still unsent. Only when there is no room behind
+// them does it first slide them to the front, so the buffer never marches
+// forward: a small frame queued while a large one is being sent copies itself,
+// not the large one's unsent tail. The buffer is allocated once, when the
+// connection is made (ConnConfig.send_buf_cap), and never reallocated. Returns
+// false if the frame will not fit (send_room) — the connection is saturated
+// and the caller must shed.
 fn (mut c PgConn) append_send(frame []u8) bool {
 	if c.send_buf.len == 0 {
 		// A connection made without connect (a test, a benchmark): the
@@ -249,22 +262,19 @@ fn (mut c PgConn) append_send(frame []u8) bool {
 		// Fully drained — reset to the front.
 		c.send_off = 0
 		c.send_len = 0
-	} else if c.send_off > 0 {
-		// Slide the still-unsent tail [send_off, send_len) down to the front. A
-		// forward byte copy is overlap-safe (dst index <= src index).
-		n := c.send_len - c.send_off
-		for i in 0 .. n {
-			c.send_buf[i] = c.send_buf[c.send_off + i]
-		}
-		c.send_off = 0
-		c.send_len = n
 	}
 	if c.send_len + frame.len > c.send_buf.len {
-		return false
+		unsent := c.send_len - c.send_off
+		if unsent + frame.len > c.send_buf.len {
+			return false
+		}
+		// Slide the still-unsent tail [send_off, send_len) down to the front
+		// (the two ranges may overlap).
+		unsafe { vmemmove(c.send_buf.data, &u8(c.send_buf.data) + c.send_off, unsent) }
+		c.send_off = 0
+		c.send_len = unsent
 	}
-	for i in 0 .. frame.len {
-		c.send_buf[c.send_len + i] = frame[i]
-	}
+	unsafe { vmemcpy(&u8(c.send_buf.data) + c.send_len, frame.data, frame.len) }
 	c.send_len += frame.len
 	return true
 }

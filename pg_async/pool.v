@@ -85,12 +85,10 @@ pub fn PgPool.connect(cfg ConnConfig, size int) !PgPool {
 	too_large := frame_too_large_error(cfg.send_buf_cap) // every connection's buffer is that size
 	for i in 0 .. size {
 		mut c := PgConn{
-			recv_buf:        []u8{cap: 16 * 1024}
-			send_buf:        []u8{len: cfg.send_buf_cap}
-			scram_cache:     scram
-			tls_cfg:         tls_cfg
-			inflight_cap:    cfg.max_inflight
-			frame_too_large: too_large
+			recv_buf:     []u8{cap: 16 * 1024}
+			scram_cache:  scram
+			tls_cfg:      tls_cfg
+			inflight_cap: cfg.max_inflight
 		}
 		c.bring_up(&cfg) or {
 			c.teardown()
@@ -104,6 +102,9 @@ pub fn PgPool.connect(cfg ConnConfig, size int) !PgPool {
 			free_tls_config(tls_cfg)
 			return error('pg pool: set_nonblocking on connection ${i} failed: ${err}')
 		}
+		// Once it is up, as PgConn.connect does: a failed bring-up allocates none.
+		c.send_buf = []u8{len: cfg.send_buf_cap}
+		c.frame_too_large = too_large
 		c.expires_at = c.lifetime_deadline(&cfg, time.sys_mono_now())
 		conns << c
 	}

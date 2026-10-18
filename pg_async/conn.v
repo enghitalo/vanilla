@@ -291,11 +291,15 @@ pub:
 	// submit, submit_batch and acquire_pipelined_for (async_submit returns
 	// false, async_submit_batch an error). The blocking query() builds its own
 	// frame and has no such bound. The buffer is allocated once, when the
-	// connection is made, and kept across re-dials, so the pool costs
+	// connection comes up, and kept across re-dials, so the pool costs
 	// connections × workers × send_buf_cap, on top of max_inflight's reply
-	// buffers. Size it for the largest statement and parameters the app
-	// sends (a jsonb document, a batch of rows).
-	// min_send_buf_cap..max_send_buf_cap (16 KiB..16 MiB).
+	// buffers. Each frame is serialized into a scratch first, which keeps the
+	// size it doubled to for the largest frame sent: once frames near
+	// send_buf_cap are sent, up to the power of two at or above it, per
+	// connection (under -gc none, plus the smaller scratches it outgrew).
+	// Size it for the largest statement and parameters the app sends (a jsonb
+	// document, a batch of rows). min_send_buf_cap..max_send_buf_cap
+	// (16 KiB..16 MiB).
 	send_buf_cap int = send_buf_cap
 }
 
@@ -469,10 +473,8 @@ pub fn PgConn.connect(cfg ConnConfig) !PgConn {
 	check_max_inflight(cfg.max_inflight)!
 	check_send_buf_cap(cfg.send_buf_cap)!
 	mut c := PgConn{
-		recv_buf:        []u8{cap: 16 * 1024}
-		send_buf:        []u8{len: cfg.send_buf_cap}
-		inflight_cap:    cfg.max_inflight
-		frame_too_large: frame_too_large_error(cfg.send_buf_cap)
+		recv_buf:     []u8{cap: 16 * 1024}
+		inflight_cap: cfg.max_inflight
 	}
 	if cfg.ssl_mode != .disable {
 		c.tls_cfg = new_tls_config(&cfg)!
@@ -482,6 +484,11 @@ pub fn PgConn.connect(cfg ConnConfig) !PgConn {
 		c.teardown()
 		return err
 	}
+	// The send buffer only once the connection is up (the bring-up sends
+	// without it): a connect that fails allocates none, which under -gc none
+	// nothing would free.
+	c.send_buf = []u8{len: cfg.send_buf_cap}
+	c.frame_too_large = frame_too_large_error(cfg.send_buf_cap)
 	return c
 }
 

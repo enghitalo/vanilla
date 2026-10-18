@@ -554,10 +554,67 @@ fn test_acquire_pipelined_for_sheds_by_each_connection_s_own_capacity() {
 		assert too_large_cap(err) == wide_cap, 'FrameTooLarge names the largest buffer'
 	}
 	drain_all(mut mixed.conn(1))!
+	// The only connection the frame fits is in a transaction: a shed, not
+	// FrameTooLarge.
+	mixed.conns[1].ready_status = tx_in_block
+	if i := mixed.acquire_pipelined_for(n100) {
+		assert false, 'acquire_pipelined_for returned ${i} with the 128 KiB connection in a transaction'
+	} else {
+		assert shed_reason(err) == .no_connection
+	}
+	mixed.conns[1].ready_status = tx_idle
 	i := mixed.acquire_pipelined_for(n100)!
 	assert i == 1
 	mixed.conn(i).submit(sql, p100)!
 	assert echo_len(mut mixed.conn(i))! == 100 * 1024
+}
+
+// append_send slides the unsent bytes to the front only when the frame has no
+// room behind them: a small frame queued while a large one is partly sent
+// copies only itself (vanilla#355). When they must move, they move intact and
+// in order, and a frame that does not fit even then moves nothing.
+fn test_append_moves_the_unsent_bytes_only_when_the_frame_needs_the_room() {
+	mut c := PgConn{
+		send_buf: []u8{len: min_send_buf_cap}
+	}
+	c.state = .ready
+	big := []u8{len: 12 * 1024, init: u8(index)}
+	assert c.append_send(big)
+	c.send_off = 10 * 1024 // the socket took 10 KiB of it
+	small := []u8{len: 100, init: `s`}
+	assert c.append_send(small)
+	assert c.send_off == 10 * 1024, 'there was room behind the unsent bytes: nothing moves'
+	assert c.send_len == big.len + small.len
+	assert !c.append_send([]u8{len: c.send_room() + 1}), 'no room even in front'
+	assert c.send_off == 10 * 1024, 'a refused frame moves nothing'
+	mid := []u8{len: 5 * 1024, init: `m`} // 3.9 KiB left behind, 13.9 KiB in all
+	assert c.append_send(mid)
+	assert c.send_off == 0
+	mut want := big[10 * 1024..].clone()
+	want << small
+	want << mid
+	assert c.send_buf[..c.send_len] == want
+}
+
+// A frame too large for the send buffer is refused before it is serialized,
+// on every submit path: the submit scratch does not grow to its size, as it
+// would for a request-sized parameter that is refused anyway.
+fn test_a_refused_frame_never_grows_the_scratch() {
+	mut c := PgConn{}
+	c.state = .ready
+	assert c.async_submit('select 1', []?[]u8{})
+	scratch := c.submit_scratch.cap
+	sql := 'select \$1::text'
+	huge := echo_param(1024 * 1024)
+	assert !c.async_submit(sql, huge)
+	if _ := c.async_submit_batch([Stmt{ sql: sql, params: huge }]) {
+		assert false, 'async_submit_batch took 1 MiB on a 64 KiB send buffer'
+	}
+	c.submit(sql, huge) or {}
+	c.submit_batch([Stmt{ sql: sql, params: huge }]) or {}
+	assert c.submit_scratch.cap == scratch, 'a refused frame grew the scratch to ${c.submit_scratch.cap} bytes'
+	assert c.inflight.len == 1
+	c.inflight.clear()
 }
 
 // A connection held by acquire() is never chosen; with every connection held

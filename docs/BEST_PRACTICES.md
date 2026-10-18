@@ -436,9 +436,12 @@ kqueue a deadline watch is a plain watch, and `cancel` fails.
   `ConnConfig.send_buf_cap` (default 64 KiB, 16 KiB to 16 MiB) is each
   connection's send buffer, allocated once at connect, and so the largest
   query frame the pipelined path sends: it costs
-  `connections × workers × send_buf_cap`. Size it for the largest statement
-  with its parameters (a large `jsonb` document, a batch of many rows), or
-  lower it when every query is small.
+  `connections × workers × send_buf_cap`. Once frames near that size are
+  sent, each connection's serialization scratch has doubled up to match and
+  stays that size: count twice `send_buf_cap`, three times for a size that
+  is not a power of two. Size it for the largest statement with its
+  parameters (a large `jsonb` document, a batch of many rows), or lower it
+  when every query is small.
 - Keep the pool sized to the worker/thread model.
 - Expect pooled connections to die (restart, failover, `pg_terminate_backend`,
   idle or lifetime caps): the pool skips a broken connection and re-dials it

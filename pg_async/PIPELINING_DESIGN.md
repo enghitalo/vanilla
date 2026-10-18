@@ -279,12 +279,19 @@ frame the pipelined path sends (`PgConn.max_frame_len()`; the public
 `max_frame_len` const is the default). The buffer is still fixed, so
 invariant 1 holds at any size: allocated once at connect, kept across
 re-dials, never grown. It costs `connections × workers × send_buf_cap`, on
-top of the reply accumulators. `acquire_pipelined_for` measures the frame
-against each connection's own buffer: it skips a connection the frame does
-not fit, sheds while one it fits has no room, and says `FrameTooLarge`
-(naming the largest buffer) only when it fits none. Over TLS the size
-changes nothing: a flush hands Mbed TLS the unsent bytes, which it takes
-one record (16 KiB) per call.
+top of the reply accumulators, and the serialization scratch
+(`submit_scratch`) doubles up to the largest frame sent and stays there: up
+to the power of two at or above `send_buf_cap` per connection, since every
+submit path sizes its frame before it serializes it. `acquire_pipelined_for`
+measures the frame against each connection's own buffer: it skips a
+connection the frame does not fit, sheds while one it fits has no room, and
+says `FrameTooLarge` (naming the largest buffer) only when it fits none.
+`append_send` copies with `memcpy` and slides the unsent bytes to the front
+(`memmove`) only when the frame has no room behind them: the buffer still
+never marches forward (invariant 2), and a small query queued while a large
+frame is being sent copies only itself, not that frame's unsent tail. Over
+TLS the size changes nothing: a flush hands Mbed TLS the unsent bytes, which
+it takes one record (16 KiB) per call.
 
 **A bounded wait queue (proposal, not implemented).** Instead of shedding, a
 request would wait, in a per-pool FIFO bounded in length and in time, for a
