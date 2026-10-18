@@ -1612,7 +1612,11 @@ fn run_tombstone(mut reactor Reactor, epoll_fd int, ext_fd int, slot ParkSlot, r
 		loop_fd:   epoll_fd
 		reactor:   unsafe { voidptr(&reactor) }
 		register:  register_watch
-		reason:    .orphaned
+	}
+	// A request's tombstone runs orphaned. A clientless slot (a background
+	// watch queued on the fd) is no request's: it keeps .ready.
+	if client_fd >= 0 {
+		dead_loop.reason = .orphaned
 	}
 	// rearming_dead: a re-arm from this tombstone's continuation updates
 	// only this head slot (continuation, udata) and re-arms ext_fd; a

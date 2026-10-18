@@ -15,7 +15,11 @@
 //   * the issue's repro: the run of a client that stays sees .ready, the run
 //     of a client that left sees .orphaned;
 //   * a timed-out watch_fd_persistent_deadline park: the timeout run sees
-//     .timeout, the run that drains its late reply sees .orphaned;
+//     .timeout, the run that drains its late reply sees .orphaned; also when
+//     the timeout run moved the request to another fd, where it lives on and
+//     its run is a live one;
+//   * a live run behind an orphaned one, in the same pass over a pipelined
+//     queue, sees .ready;
 //   * an orphaned run that steps to another persistent fd (#231, #257), then
 //     re-arms that one: each later run is orphaned too;
 //   * a park the handler rejects (.close after the watch): the runtime keeps
@@ -50,6 +54,10 @@ const or_get = 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'
 // or_step in a watch_payload: once its reply is read, the run steps to the
 // second pooled connection (up0) instead of answering.
 const or_step = usize(1)
+
+// or_move in a watch_payload: on timeout, the run moves the request to the
+// second pooled connection (it waits there) instead of answering 504.
+const or_move = usize(2)
 
 // OrState holds the pooled fds the requests park on and what each
 // continuation run saw. The handlers run on the worker thread, the checks on
@@ -159,6 +167,12 @@ fn or_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 			150)
 		return .suspend
 	}
+	if or_has_prefix(req, 'GET /move ') {
+		stdatomic.add_i64(&s.parks, 1)
+		event_loop.watch_fd_persistent_deadline(db, .readable, or_reply, voidptr(or_move),
+			150)
+		return .suspend
+	}
 	if or_has_prefix(req, 'GET /step ') {
 		stdatomic.add_i64(&s.parks, 1)
 		event_loop.watch_fd_persistent(db, .readable, or_reply, voidptr(or_step))
@@ -178,12 +192,19 @@ fn or_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 
 // or_reply is the pooled "DB" continuation: one byte is one reply. It notes
 // what its run saw, consumes the reply and answers 200 with the byte (into a
-// discarded buffer when the run is orphaned). On timeout it answers 504 and
-// leaves the reply alone: the tombstone's run consumes it. With or_step it
-// steps to the second pooled connection once its reply is read.
+// discarded buffer when the run is orphaned). On timeout it answers 504, or
+// with or_move waits on the second pooled connection instead, and leaves the
+// reply alone: the tombstone's run consumes it. With or_step it steps to the
+// second pooled connection once its reply is read.
 fn or_reply(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	or_record(event_loop.reason(), event_loop.timed_out())
 	if event_loop.timed_out() {
+		if usize(watch_payload) == or_move {
+			s := unsafe { ors }
+			event_loop.watch_fd_persistent(int(or_load(&s.up0)), .readable, or_second,
+				voidptr(usize(1)))
+			return .suspend
+		}
 		core.append_str(mut out, or_504)
 		return .done
 	}
@@ -202,9 +223,10 @@ fn or_reply(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidp
 	return .done
 }
 
-// or_second is the step's continuation, on the second pooled connection: its
-// first reply re-arms that fd (a two-step exchange there), its second one
-// ends the request.
+// or_second is the continuation on the second pooled connection. With a nil
+// payload (a step) its first reply re-arms that fd (a two-step exchange
+// there), and its second one ends the request; with any other, the first
+// reply does.
 fn or_second(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	or_record(event_loop.reason(), event_loop.timed_out())
 	mut b := [1]u8{}
@@ -342,6 +364,38 @@ fn test_epoll_drain_after_a_timed_out_park_is_orphaned() ! {
 	assert !or_timed(2)
 	assert testkit.fd_read_until(fd, '\r\n\r\n', 200) == '', 'the drain answered the client a second time'
 	assert or_round_trip(fd), 'the client was not served after the drain'
+	mut b := [1]u8{}
+	assert C.read(int(or_load(&s.db0)), &b[0], 1) < 0, 'the late reply was left on the pooled fd'
+}
+
+// A timeout run that moves the request to another fd (it waits on the second
+// pooled connection instead of answering): the reply still due on the first
+// one goes to a tombstone, whose run is orphaned although the request lives
+// on there. The run on the second connection is a live one, and the client
+// gets its answer, and only that one.
+fn test_epoll_drain_after_a_timeout_run_moved_on_is_orphaned() ! {
+	path := or_uds('move')
+	or_open()
+	mut h := vtest.start(or_config(.epoll, path))!
+	defer {
+		h.stop()
+		or_close()
+	}
+	s := unsafe { ors }
+	fd := or_send(path, 'GET /move HTTP/1.1\r\nHost: x\r\n\r\n')!
+	defer {
+		transport.close_fd(fd)
+	}
+	assert or_until(&s.runs, 1) == 1, 'the park did not time out'
+	assert or_saw(1) == 'timeout', 'the deadline run saw ${or_saw(1)}'
+	or_write(&s.db1, 'D') // the late reply, on the fd the request left
+	assert or_until(&s.runs, 2) == 2, 'the late reply was not drained'
+	assert or_saw(2) == 'orphaned', 'the drain of the fd the request left saw ${or_saw(2)}'
+	or_write(&s.up1, 'U') // the reply the request waits for now
+	got := testkit.fd_read_until(fd, '\r\n\r\nU', 3000)
+	assert got == or_ok_head + 'U', 'the request did not get its own answer, alone: ${got}'
+	assert or_load(&s.runs) == 3
+	assert or_saw(3) == 'ready', 'the run on the fd the request moved to saw ${or_saw(3)}'
 }
 
 // --- a step away (#231, #257) ---------------------------------------------------
@@ -378,6 +432,42 @@ fn test_epoll_orphaned_run_that_steps_stays_orphaned() ! {
 		assert !or_timed(k)
 	}
 	assert or_round_trip(barrier), 'the barrier was not served after the step'
+}
+
+// --- a pipelined queue -----------------------------------------------------------
+
+// A parks on the pooled fd first, B behind it, then A leaves. One readiness
+// edge brings both replies: A's tombstone runs orphaned, and B's run, after
+// it in the same pass over the queue, is a live one that gets B's reply.
+fn test_epoll_live_run_behind_an_orphaned_one_is_ready() ! {
+	path := or_uds('queue')
+	or_open()
+	mut h := vtest.start(or_config(.epoll, path))!
+	defer {
+		h.stop()
+		or_close()
+	}
+	s := unsafe { ors }
+	barrier := or_send(path, or_get)!
+	defer {
+		transport.close_fd(barrier)
+	}
+	assert testkit.fd_read_until(barrier, '\r\n\r\nok', 3000).ends_with('ok'), 'the barrier was not served'
+	a := or_send(path, 'GET /park HTTP/1.1\r\nHost: x\r\n\r\n')!
+	assert or_until(&s.parks, 1) == 1, 'A did not park'
+	b := or_send(path, 'GET /park HTTP/1.1\r\nHost: x\r\n\r\n')!
+	defer {
+		transport.close_fd(b)
+	}
+	assert or_until(&s.parks, 2) == 2, 'B did not park'
+	transport.close_fd(a)
+	assert or_round_trip(barrier), 'the barrier was not served after the hangup'
+	or_write(&s.db1, 'AB') // both replies, in order
+	got := testkit.fd_read_until(b, '\r\n\r\nB', 3000)
+	assert got == or_ok_head + 'B', 'B did not get its own reply: ${got}'
+	assert or_load(&s.runs) == 2
+	assert or_saw(1) == 'orphaned', "A's tombstone saw ${or_saw(1)}"
+	assert or_saw(2) == 'ready', "B's run, behind A's tombstone, saw ${or_saw(2)}"
 }
 
 // --- a rejected park, epoll and io_uring -----------------------------------------

@@ -37,7 +37,8 @@ module server
 //     queued as dead, so its in-flight reply is still consumed in order
 //     against a scratch buffer — and a new client that reuses the released
 //     slot and fd number is never resumed with the stale continuation. So
-//     here only such a tombstone runs with event_loop.orphaned(): the
+//     here only the runtime's own tombstones run with event_loop.orphaned()
+//     (this one, a rejected park's, and the steps they take): the
 //     continuation of a client that left while parked runs as a live one.
 //
 // Parked-connection deadlines: read/write deadlines are cleared at park (no
