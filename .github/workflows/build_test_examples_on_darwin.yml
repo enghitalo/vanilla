@@ -65,16 +65,10 @@ jobs:
           - examples/video_stream/src # no V4L2 on macOS: /webcam reports unavailable, and the tests never touch the camera
     steps:
       - uses: actions/checkout@v4
-      # Cache the V toolchain so setup-v restores a prebuilt compiler instead of
-      # rebuilding V from source (make fresh_vc/fresh_tcc, ~40s) on every job.
-      - name: Cache V toolchain
-        uses: actions/cache@v4
-        with:
-          path: ~/hostedtoolcache/v
-          key: v-toolchain-${{ runner.os }}-${{ runner.arch }}
       - name: Set up V
         uses: vlang/setup-v@v1.7
         with:
+          version-file: .v-version
           clean: false
       - name: Remove Vlang folder to avoid conflicts
         shell: bash
@@ -112,14 +106,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Cache V toolchain
-        uses: actions/cache@v4
-        with:
-          path: ~/hostedtoolcache/v
-          key: v-toolchain-${{ runner.os }}-${{ runner.arch }}
       - name: Set up V
         uses: vlang/setup-v@v1.7
         with:
+          version-file: .v-version
           clean: false
       - name: Remove Vlang folder to avoid conflicts
         shell: bash

@@ -63,7 +63,8 @@ registry.
 
 **Always run `v fmt -w .` from the repo root and include the resulting changes
 in the commit.** CI gates merges on `v fmt -verify .`
-(`.github/workflows/pretty_fmt_checker.yml`) using the latest V, so an
+(`.github/workflows/pretty_fmt_checker.yml`) using the V commit pinned in
+`.v-version` (every workflow builds that one; see CONTRIBUTING.md), so an
 unformatted file — even a pre-existing one that a newer V formatter rule now
 rewrites — fails the whole PR.
 

@@ -45,7 +45,7 @@ on:
         required: false
         default: 'HEAD~1'
       v_version:
-        description: 'V version for setup-v (blank = latest). Set to compare toolchains.'
+        description: 'V version for setup-v (blank = the commit in .v-version). Set to compare toolchains.'
         required: false
         default: ''
 
@@ -70,7 +70,10 @@ jobs:
       - name: Set up V
         uses: vlang/setup-v@v1.7
         with:
-          version: ${{ github.event.inputs.v_version }}   # empty on push -> latest
+          # A dispatch's v_version overrides .v-version. setup-v reads
+          # version-file even when version is set, so it is blanked then.
+          version: ${{ github.event.inputs.v_version }}
+          version-file: ${{ !github.event.inputs.v_version && '.v-version' || '' }}
           clean: false # cleaning races ::add-matcher:: (vlang/setup-v#118, #370)
       - name: Remove Vlang folder to avoid conflicts
         shell: bash
