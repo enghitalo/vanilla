@@ -1029,7 +1029,7 @@ fn serve_takeover_conn(mut reactor Reactor, epoll_fd int, fd int, limits core.Li
 // on_watch_ready, exactly like a parked h1 request).
 @[direct_array_access; manualfree]
 fn drain_takeover(mut reactor Reactor, epoll_fd int, fd int, limits core.Limits, active_conns &core.Counter, mut st PlainState, mut cs ConnState, state voidptr) bool {
-	mut event_loop := conn_loop(mut reactor, epoll_fd, fd)
+	mut event_loop := conn_loop(mut reactor, epoll_fd, fd, cs.conn_id)
 	for cs.read_buf.len > 0 {
 		event_loop.last_watched = -1
 		// A ConnHandler runs with the sendfile gate closed, as a continuation
@@ -1140,6 +1140,7 @@ fn start_body_drain(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, l
 		loop_fd:   epoll_fd
 		reactor:   unsafe { voidptr(&reactor) }
 		register:  register_watch
+		conn_id:   cs.conn_id
 	}
 	// The reply appended here is held until the body drains; while it is, the
 	// sweep may answer a stalled body with a 408 in its place (sweep_timeouts).
@@ -1225,7 +1226,7 @@ fn drain_requests(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, lim
 	mut pos := 0
 	// ONE EventLoop handle per burst, not per request: every field is
 	// loop-invariant; only last_watched is reset before each handler call below.
-	mut event_loop := conn_loop(mut reactor, epoll_fd, fd)
+	mut event_loop := conn_loop(mut reactor, epoll_fd, fd, cs.conn_id)
 	for pos < cs.read_buf.len && cs.awaiting_fd < 0 {
 		// _idx twin: plain int, no per-request !int boxing. The error sentinel is
 		// the negated HTTP status, so `-total` recovers the old err.code() value.
@@ -1474,7 +1475,7 @@ fn on_watch_ready(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int,
 		return
 	}
 	unpark_conn(mut st, mut cs) // this call's own count (above) covers the continuation
-	mut event_loop := conn_loop(mut reactor, epoll_fd, client_fd)
+	mut event_loop := conn_loop(mut reactor, epoll_fd, client_fd, cs.conn_id)
 	core.set_queue_file_allowed(false) // no file from a continuation (see above)
 	cont_step := cont(mut cs.write_buf, ext_fd, ready_err, entry_udata, state, mut event_loop)
 	core.set_queue_file_allowed(true)
@@ -1702,7 +1703,7 @@ fn drain_pipelined(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int
 		}
 		mut cs := st.conns[client_fd]
 		unpark_conn(mut st, mut cs)
-		mut event_loop := conn_loop(mut reactor, epoll_fd, client_fd)
+		mut event_loop := conn_loop(mut reactor, epoll_fd, client_fd, cs.conn_id)
 		core.set_queue_file_allowed(false) // no file from a continuation (on_watch_ready)
 		pipelined_step := slot.cont(mut cs.write_buf, ext_fd, ready_err, slot.udata, state, mut
 			event_loop)

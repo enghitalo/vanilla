@@ -355,7 +355,11 @@ authenticate. Kernel ≥ 6.5 adds `SO_PEERPIDFD` for a race-free process handle.
 vanilla exposes it as `socket.peer_cred(fd) ?PeerCred` — `SO_PEERCRED` on
 Linux, `getpeereid` + `LOCAL_PEERPID` on macOS — the sibling of `peer_ipv4`:
 one `getsockopt` when a handler asks, `none` on a TCP socket
-([`socket/peer_cred_linux.c.v`](../socket/peer_cred_linux.c.v)).
+([`socket/peer_cred_linux.c.v`](../socket/peer_cred_linux.c.v)). The
+credentials are fixed at connect time, so a handler may read them once per
+connection and cache them under `event_loop.conn_id()`, never under the fd,
+whose number the next client gets
+([BEST_PRACTICES §6](BEST_PRACTICES.md#6-concurrency-no-shared-mutable-state-without-protection)).
 
 **Across containers** the kernel translates the ids into the *reader's*
 namespaces. A peer in a PID namespace the server cannot see — a reverse proxy

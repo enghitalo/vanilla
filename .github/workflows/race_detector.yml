@@ -143,6 +143,12 @@ jobs:
           v -race -cc "$RACE_CC" -no-parallel test examples/websocket_chat/src
           v -race -cc "$RACE_CC" -no-parallel test examples/sse/src
           v -race -cc "$RACE_CC" -no-parallel test examples/async_sse
+      # Connection identities come from one process-wide counter that every
+      # epoll worker of every server takes a block from (vanilla#350).
+      - name: 'conn_id_test.v (epoll: one id per connection, never shared across workers or servers, #350)'
+        shell: bash
+        run: |
+          v -race -cc "$RACE_CC" -no-parallel -run-only 'test_epoll_*' test tests/conn_id_test.v
       - name: 'close_flush_test.v (epoll: every .close sends all its bytes, then closes, #171)'
         shell: bash
         run: |

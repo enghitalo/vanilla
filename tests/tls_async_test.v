@@ -18,7 +18,9 @@
 //   * a request pipelined behind a large file the worker could not send at
 //     once is held until the file is out (no read deadline meanwhile), and
 //     an Expect: 100-continue head held so, or read while parked, gets its
-//     100 once it is its turn.
+//     100 once it is its turn;
+//   * event_loop.conn_id (vanilla#350): one id per connection, in its
+//     requests and their continuations, and another for the next one.
 // Each case runs over userspace Mbed TLS (set_ktls(false)) and, when the
 // `tls` kernel module is loaded, over kTLS.
 //
@@ -130,6 +132,16 @@ fn ta_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 		event_loop.watch_fd(efd, .readable, ta_park_done, unsafe { nil })
 		return .suspend
 	}
+	if ta_prefix(req, 'GET /parkid ') {
+		// GET /park whose continuation reports the connection's id.
+		efd := C.eventfd(1, C.EFD_CLOEXEC | C.EFD_NONBLOCK)
+		event_loop.watch_fd(efd, .readable, ta_parked_id, unsafe { nil })
+		return .suspend
+	}
+	if ta_prefix(req, 'GET /id ') {
+		ta_id_report(mut out, event_loop.conn_id(), client_fd)
+		return .done
+	}
 	if ta_prefix(req, 'GET /hang ') {
 		s := unsafe { ta }
 		event_loop.watch_fd(int(stdatomic.load_i64(&s.hang_r)), .readable, ta_hang_done,
@@ -209,6 +221,31 @@ fn ta_park_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload v
 	stdatomic.add_i64(&s.resumes, 1)
 	core.append_str(mut out, ta_parked)
 	return .done
+}
+
+fn ta_parked_id(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	mut tmp := [8]u8{}
+	C.read(ready_fd, &tmp[0], 8)
+	C.close(ready_fd) // the request owns it
+	ta_id_report(mut out, event_loop.conn_id(), -1)
+	return .done
+}
+
+// ta_id_report appends a response whose body is `id=<conn_id> fd=<fd>#` (no
+// fd for a continuation's).
+fn ta_id_report(mut out []u8, id u64, fd int) {
+	mut body := []u8{cap: 48}
+	core.append_str(mut body, 'id=')
+	ta_dec(mut body, i64(id))
+	if fd >= 0 {
+		core.append_str(mut body, ' fd=')
+		ta_dec(mut body, fd)
+	}
+	body << `#`
+	core.append_str(mut out, ta_count_head)
+	ta_dec(mut out, body.len)
+	core.append_str(mut out, '\r\n\r\n')
+	out << body
 }
 
 fn ta_wait_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
@@ -693,6 +730,66 @@ fn test_tls_large_upload_and_expect_100() ! {
 		c.write_string('GET / HTTP/1.1\r\nHost: x\r\n\r\n')!
 		assert ta_read_n(mut c, ta_ok.len) == ta_ok
 		c.shutdown() or {}
+		h.stop()
+	}
+}
+
+// ta_ids reads until `n` id reports (`#`-terminated) arrived, or the
+// connection ends, and returns the ids and the fds in them, in order.
+fn ta_ids(mut c openssl.SSLConn, n int) ([]u64, []u64, string) {
+	mut acc := []u8{}
+	mut buf := []u8{len: 4096}
+	for acc.bytestr().count('#') < n {
+		k := c.read(mut buf) or { break }
+		if k <= 0 {
+			break
+		}
+		acc << buf[..k]
+	}
+	s := acc.bytestr()
+	mut ids := []u64{}
+	mut fds := []u64{}
+	for part in s.split('#') {
+		if part.contains('id=') {
+			ids << part.all_after('id=').all_before(' ').u64()
+		}
+		if part.contains(' fd=') {
+			fds << part.all_after(' fd=').u64()
+		}
+	}
+	return ids, fds, s
+}
+
+// The connection identity (vanilla#350) over TLS, on the worker's one
+// connection table: a keep-alive connection's requests, and the continuation
+// of the one that parked between them, report one id, never 0; the next
+// connection, whose fd is likely the number the first one freed, another.
+fn test_tls_conn_id_names_the_connection() ! {
+	for ktls in ta_ktls_runs() {
+		mut h := ta_start(ktls, 1, server.Limits{})!
+		mut first := u64(0)
+		mut first_fd := u64(0)
+		for round in 0 .. 2 {
+			mut c := ta_dial(h.port())!
+			c.write_string('GET /id HTTP/1.1\r\nHost: x\r\n\r\nGET /parkid HTTP/1.1\r\nHost: x\r\n\r\nGET /id HTTP/1.1\r\nHost: x\r\n\r\n')!
+			ids, fds, got := ta_ids(mut c, 3)
+			c.shutdown() or {}
+			assert ids.len == 3 && fds.len == 2, 'ktls=${ktls} round ${round}: ${got}'
+			assert ids[0] != 0, 'ktls=${ktls}: the epoll worker knows its TLS connections: ${got}'
+			assert ids[1] == ids[0] && ids[2] == ids[0], 'ktls=${ktls}: one connection, two ids: ${got}'
+			if round == 0 {
+				first, first_fd = ids[0], fds[0]
+				// Wait for the server to close it, so its number is free.
+				for _ in 0 .. 3000 {
+					if ta_active(mut h) == 0 {
+						break
+					}
+					time.sleep(time.millisecond)
+				}
+			} else {
+				assert ids[0] != first, 'ktls=${ktls}: two connections (fds ${first_fd} and ${fds[0]}), one id: ${got}'
+			}
+		}
 		h.stop()
 	}
 }

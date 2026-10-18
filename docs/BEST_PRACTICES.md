@@ -550,6 +550,16 @@ is a first-class guarantee — keep it that way.
   your registries keyed by handle, and drop a handle in the wake fn's
   `.closed` (see [examples/websocket_chat](../examples/websocket_chat/src/main.v)
   and [examples/sse](../examples/sse/src/main.v)).
+- Cache per-connection state (peer credentials read once with
+  `socket.peer_cred`, an auth context for a keep-alive connection, a
+  counter) under `event_loop.conn_id()`, never under `client_fd` alone. The
+  kernel gives the fd number to the next connection as soon as this one
+  closes, maybe on another worker; the id is never given to another
+  connection in the process. A per-worker table indexed by fd that keeps the
+  id beside the value needs no eviction: a slot whose id is not the current
+  one is an earlier connection's, so overwrite it. An id of 0 means unknown
+  (no client, or a backend other than the epoll worker): don't cache then
+  ([vanilla#350](https://github.com/enghitalo/vanilla/issues/350)).
 
 **Don't**
 

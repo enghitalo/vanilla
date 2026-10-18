@@ -38,9 +38,9 @@ struct LateShutdown {
 }
 
 // conn_loop is the EventLoop a handler, ConnHandler, continuation or wake fn
-// of connection fd runs with.
+// of connection fd runs with; conn_id is the connection's (ConnState).
 @[inline]
-fn conn_loop(mut reactor Reactor, epoll_fd int, fd int) core.EventLoop {
+fn conn_loop(mut reactor Reactor, epoll_fd int, fd int, conn_id u64) core.EventLoop {
 	return core.EventLoop{
 		client_fd:       fd
 		loop_fd:         epoll_fd
@@ -48,6 +48,7 @@ fn conn_loop(mut reactor Reactor, epoll_fd int, fd int) core.EventLoop {
 		register:        register_watch
 		subscribe_hook:  subscribe_conn
 		wake_after_hook: wake_after_conn
+		conn_id:         conn_id
 	}
 }
 
@@ -144,7 +145,7 @@ fn deliver_wake(mut reactor Reactor, epoll_fd int, fd int, reason core.WakeReaso
 		stdatomic.add_i64(&counter.n, -1)
 	}
 	parked_flush := cs.write_off < cs.write_buf.len
-	mut el := conn_loop(mut reactor, epoll_fd, fd)
+	mut el := conn_loop(mut reactor, epoll_fd, fd, cs.conn_id)
 	el.reason = reason
 	el.post_tag = tag
 	el.post_ptr = data

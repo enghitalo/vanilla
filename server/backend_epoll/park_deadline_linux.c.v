@@ -264,7 +264,7 @@ fn on_park_timeout(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, li
 		reactor.reactor_clear(ext_fd)
 		epoll.detach_fd_from_epoll(epoll_fd, ext_fd)
 	}
-	mut event_loop := conn_loop(mut reactor, epoll_fd, fd)
+	mut event_loop := conn_loop(mut reactor, epoll_fd, fd, cs.conn_id)
 	event_loop.reason = .timeout
 	// Any other watch stays in place while the continuation runs, so a re-arm
 	// of the same fd (keep waiting, with a new deadline) updates it in place:

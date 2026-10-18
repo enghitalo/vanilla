@@ -156,11 +156,12 @@ pub type RegisterFn = fn (mut event_loop EventLoop, ext_fd int, interest WatchIn
 //   event_loop.subscribe(wake_fn, sub_state) // server push (conn_handle.v)
 //   event_loop.wake_after(ms)
 //   event_loop.reason() / post_tag() / post_data() // in a wake fn
+//   event_loop.conn_id() // which connection: never reused, 0 = unknown
 //
 // Everything else (client_fd — whose request parks, loop_fd, reactor,
-// last_watched, persistent, timeout_ms, reason, register, the hooks and the
-// post fields) is plumbing filled by the backend; handlers never touch the
-// fields. It is the layering bridge:
+// last_watched, persistent, timeout_ms, reason, register, the hooks, the
+// post fields and conn_id) is plumbing filled by the backend; handlers never
+// touch the fields. It is the layering bridge:
 // `core` owns the type and the handler contract, each backend owns the
 // registration logic (installed via the `register` fn pointer), so `core`
 // stays backend-free.
@@ -194,6 +195,29 @@ pub mut:
 	post_tag        u64
 	post_ptr        voidptr
 	post_len        int
+	// conn_id: plumbing, client_fd's connection identity (conn_id()); 0 =
+	// none, or the backend does not track it.
+	conn_id u64
+}
+
+// conn_id names the connection a handler or continuation serves, client_fd's:
+// a value no other connection of this process has had or will get, the same
+// for each request of a keep-alive connection, for their continuations, and
+// for its ConnHandler and wake fn once it is taken over. Cache
+// per-connection state under it (peer credentials read once, an auth
+// context, a counter), never under client_fd alone: the kernel gives the
+// number to the next connection as soon as this one closes, maybe on another
+// worker, and a cache keyed by it would serve that client this one's entry.
+// A field load: nothing is allocated, nothing is subscribed.
+//
+// 0 means unknown, so do not cache: there is no client (on_worker_start, a
+// clientless or background watch, a wake fn's .closed), or it is gone (a
+// tombstone's run, whose client_fd may be another connection's by now), or
+// the backend does not track connections. The epoll worker does, plain HTTP
+// and HTTPS alike; io_uring, kqueue, poll and IOCP always give 0.
+@[inline]
+pub fn (event_loop &EventLoop) conn_id() u64 {
+	return event_loop.conn_id
 }
 
 // watch_fd parks the current request and asks the worker to run `continuation`

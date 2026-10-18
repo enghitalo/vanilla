@@ -89,6 +89,15 @@ per-request allocation.
   every handler call on that worker receives the value as the
   **`worker_state`** parameter (e.g. a per-thread DB connection — no shared
   pool, no mutex).
+- **Connection identity** — `event_loop.conn_id()` names the connection a
+  handler, continuation, `ConnHandler` or wake fn serves: one value for every
+  request of a keep-alive connection, never given to another connection in
+  the process (other workers and other servers included). Cache
+  per-connection state under it, not under `client_fd`, whose number the
+  next connection gets. It is a field load; each worker takes ids from one
+  process-wide counter 65,536 at a time, when a connection's state is made.
+  Epoll worker only (plain HTTP and HTTPS); elsewhere, and where there is no
+  client, it is 0: unknown, don't cache.
 
 `on_worker_start` arms clientless background watches (e.g. a periodic timerfd that
 refreshes per-worker state with no extra thread). Linux/epoll, plain HTTP or

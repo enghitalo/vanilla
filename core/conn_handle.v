@@ -105,7 +105,9 @@ pub type WakeAfterFn = fn (mut event_loop EventLoop, ms int) bool
 // after core.queue_takeover, or later from the connection's ConnHandler or
 // one of its continuations. A connection that is not (being) taken over
 // cannot subscribe: HTTP/1.1 bytes pushed between responses would corrupt the
-// stream. Subscribing again replaces the wake fn and its state (same handle).
+// stream. (To tell such a connection from the next one on its fd number,
+// read EventLoop.conn_id.) Subscribing again replaces the wake fn and its
+// state (same handle).
 // Returns the nil handle where subscriptions are not supported.
 pub fn (mut event_loop EventLoop) subscribe(wake_fn WakeFn, sub_state voidptr) ConnHandle {
 	if event_loop.subscribe_hook == unsafe { nil } || wake_fn == unsafe { nil } {
