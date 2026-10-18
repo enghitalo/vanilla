@@ -530,8 +530,9 @@ fn test_epoll_conn_id_is_one_per_keep_alive_connection() ! {
 // (watch_fd_persistent): the worker resumes them in order from one readiness
 // edge (drain_pipelined), and each continuation gets its own connection's id.
 // A client that leaves while parked there still has its reply taken, by a
-// tombstone's run, which has no connection: 0. And on_worker_start, with no
-// client at all, sees 0.
+// tombstone's run, which has no connection: 0, even when its old fd number
+// is a live connection's by then. And on_worker_start, with no client at
+// all, sees 0.
 fn test_epoll_conn_id_in_queued_and_tombstone_runs() ! {
 	ci_reset()
 	mut fds := [2]i32{}
@@ -575,8 +576,13 @@ fn test_epoll_conn_id_in_queued_and_tombstone_runs() ! {
 	assert qb[0] != 0 && qb[1] == qb[0], 'a queued continuation got another id: ${got}'
 	assert qa[0] != qb[0], got
 	// c parks on the pipe and leaves: its watch becomes a tombstone, which
-	// runs when its reply comes.
+	// runs when its reply comes. By then d has c's fd number: the run's
+	// client_fd names a live connection that is not its own.
 	mut c := ci_dial(h.port())!
+	c.send(ci_get('/id'))!
+	cr := c.reports(1, 3000)
+	c_fd := ci_fields(c.acc.bytestr(), ' fd=')
+	assert cr.len == 1 && c_fd.len == 1, c.acc.bytestr()
 	c.send(ci_get('/orphan'))!
 	assert ci_until(&s.parked, 3, 3000) == 3
 	c.close()
@@ -588,10 +594,23 @@ fn test_epoll_conn_id_in_queued_and_tombstone_runs() ! {
 		time.sleep(time.millisecond)
 	}
 	assert stdatomic.load_i64(&srv.active_conns.n) == 2
+	mut d := ci_dial(h.port())!
+	defer {
+		d.close()
+	}
+	d.send(ci_get('/id'))!
+	dr := d.reports(1, 3000)
+	d_fd := ci_fields(d.acc.bytestr(), ' fd=')
+	assert dr.len == 1 && d_fd.len == 1, d.acc.bytestr()
+	assert d_fd[0] == c_fd[0], 'd did not get the number c freed: nothing was checked'
+	assert dr[0] != cr[0]
 	one := u8(`c`)
 	assert C.write(int(fds[1]), &one, 1) == 1
 	assert ci_until(&s.dead_runs, 1, 3000) == 1, 'the tombstone did not run'
-	assert stdatomic.load_i64(&s.dead_id) == 0, 'a tombstone run has no connection'
+	assert stdatomic.load_i64(&s.dead_id) == 0, 'a tombstone run has no connection, even on a live number'
+	// d is untouched: same id, and its answer is its own.
+	d.send(ci_get('/id'))!
+	assert d.reports(2, 3000) == [dr[0], dr[0]], d.acc.bytestr()
 }
 
 // Two workers: accept round-robins, so a number one worker's connection

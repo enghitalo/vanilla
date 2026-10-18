@@ -360,7 +360,8 @@ credentials are fixed at connect time, so a handler on the epoll worker may
 read them once per connection and cache them under `event_loop.conn_id()`,
 never under the fd, whose number the next client gets
 ([BEST_PRACTICES §6](BEST_PRACTICES.md#6-concurrency-no-shared-mutable-state-without-protection)).
-Elsewhere (kqueue on macOS) the id is 0: read them per request there.
+Elsewhere (io_uring, poll, kqueue on macOS) the id is 0: read them per
+request there.
 
 **Across containers** the kernel translates the ids into the *reader's*
 namespaces. A peer in a PID namespace the server cannot see — a reverse proxy

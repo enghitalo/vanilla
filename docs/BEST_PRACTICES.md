@@ -562,10 +562,6 @@ is a first-class guarantee — keep it that way.
   id of 0 means unknown (no client, a tombstone's run, or a backend other
   than the epoll worker): don't cache then
   ([vanilla#350](https://github.com/enghitalo/vanilla/issues/350)).
-- Never cache per connection what a request's own headers establish
-  (`Authorization`, a session cookie): a reverse proxy's pooled upstream
-  connection carries many users' requests, and a server must not assume two
-  requests on one connection come from the same user agent (RFC 9110 §3.3).
 
 **Don't**
 
@@ -575,6 +571,10 @@ is a first-class guarantee — keep it that way.
   registry by fd number: the write races the worker's own flush and skips its
   backpressure, and a number the kernel reused after a disconnect delivers to
   another client.
+- Cache per connection what a request's own headers establish
+  (`Authorization`, a session cookie): a reverse proxy's pooled upstream
+  connection carries many users' requests, and a server must not assume two
+  requests on one connection come from the same user agent (RFC 9110 §3.3).
 
 ---
 

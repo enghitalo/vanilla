@@ -195,17 +195,18 @@ pub mut:
 	post_tag        u64
 	post_ptr        voidptr
 	post_len        int
-	// conn_id: plumbing, client_fd's connection identity (conn_id()); 0 =
-	// none, or the backend does not track it.
+	// conn_id: plumbing, the identity of the connection the call serves
+	// (conn_id()); 0 = none, or the backend does not track it.
 	conn_id u64
 }
 
-// conn_id names the connection a handler or continuation serves, client_fd's:
-// a value no other connection of this process has had or will get, the same
-// for each request of a keep-alive connection, for their continuations, and
-// for its ConnHandler and wake fn once it is taken over (.closed included:
-// drop what you keep under it there). A field load: nothing is allocated,
-// nothing is subscribed.
+// conn_id names the connection a handler or continuation serves: client_fd's,
+// or in a wake fn's .closed (where client_fd is -1) the one that closed. It
+// is a value no other connection of this process has had or will get, the
+// same for each request of a keep-alive connection, for their continuations,
+// and for its ConnHandler and wake fn once it is taken over (.closed
+// included: drop what you keep under it there). A field load: nothing is
+// allocated, nothing is subscribed.
 //
 // Cache what belongs to the connection itself under it (peer credentials
 // read once, the peer's address, a request count), never under client_fd
