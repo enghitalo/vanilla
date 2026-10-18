@@ -71,6 +71,7 @@ jobs:
         uses: vlang/setup-v@v1.7
         with:
           version: ${{ github.event.inputs.v_version }}   # empty on push -> latest
+          clean: false # cleaning races ::add-matcher:: (vlang/setup-v#118, #370)
       - name: Remove Vlang folder to avoid conflicts
         shell: bash
         run: |
