@@ -90,7 +90,9 @@ pub enum WatchInterest {
 // It also runs, ONCE, when the watch's deadline passes first
 // (Limits.park_timeout_ms, watch_fd_deadline): then event_loop.timed_out() is
 // true, ready_fd is the watched fd, which is NOT ready (do not read it), and
-// ready_fd_error is false. See EventLoop.timed_out for the contract.
+// ready_fd_error is false. See EventLoop.timed_out for the contract. And it
+// runs as a tombstone, with event_loop.orphaned() true, when its request is
+// over but a caller-owned fd still owes it a reply: see EventLoop.orphaned.
 pub type WakeFn = fn (mut response []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop EventLoop) Step
 
 // WakeReason is why a continuation runs (EventLoop.reason; ask
@@ -102,6 +104,7 @@ pub enum WakeReason {
 	posted   // a wake fn: a post reached the connection's ConnHandle (post_tag, post_data)
 	closed   // a wake fn's last call: the connection is gone, `response` is scratch
 	shutdown // a wake fn: Server.shutdown() was called
+	orphaned // a tombstone's run: the fd is ready, or failed, but its request is over and `response` is discarded (EventLoop.orphaned)
 }
 
 // Handler is THE request handler contract — one signature for every use case:
@@ -152,6 +155,7 @@ pub type RegisterFn = fn (mut event_loop EventLoop, ext_fd int, interest WatchIn
 //   event_loop.watch_fd_deadline(fd, .readable, continuation, watch_payload, timeout_ms)
 //   event_loop.watch_fd_persistent_deadline(fd, .readable, continuation, watch_payload, timeout_ms)
 //   event_loop.timed_out() // in a continuation: woken by the deadline, not the fd
+//   event_loop.orphaned()  // in a continuation: a tombstone's run, its request is over
 //   event_loop.watch_fd_background(fd, .readable, continuation, watch_payload)
 //   event_loop.subscribe(wake_fn, sub_state) // server push (conn_handle.v)
 //   event_loop.wake_after(ms)
@@ -210,7 +214,9 @@ pub fn (mut event_loop EventLoop) watch_fd(fd int, interest WatchInterest, conti
 // requests (a pooled connection): if the parked client disconnects before the
 // fd is ready, the runtime drops the request but leaves the fd OPEN for reuse,
 // instead of closing it (which on a pooled DB connection would force a reconnect
-// and a fresh auth handshake). Use it only for fds whose lifetime you manage;
+// and a fresh auth handshake), and the continuation still runs when the fd is
+// ready, with event_loop.orphaned() true, to consume the reply (see
+// EventLoop.orphaned). Use it only for fds whose lifetime you manage;
 // per-request fds (timerfd, pipe) must use watch_fd() so they are closed on
 // disconnect and do not leak.
 pub fn (mut event_loop EventLoop) watch_fd_persistent(fd int, interest WatchInterest, continuation WakeFn, watch_payload voidptr) {
@@ -242,8 +248,9 @@ pub fn (mut event_loop EventLoop) watch_fd_deadline(fd int, interest WatchIntere
 // watch_fd_deadline. On timeout the parked request is answered by the
 // continuation, but the reply still due on the caller-owned fd is drained IN
 // ORDER: the watch stays as a tombstone, and when that reply arrives the
-// continuation runs once more against a discarded response buffer, exactly as
-// after a client disconnect (see EventLoop.timed_out).
+// continuation runs once more, with event_loop.orphaned() true, against a
+// discarded response buffer, exactly as after a client disconnect (see
+// EventLoop.timed_out and EventLoop.orphaned).
 pub fn (mut event_loop EventLoop) watch_fd_persistent_deadline(fd int, interest WatchInterest, continuation WakeFn, watch_payload voidptr, timeout_ms int) {
 	event_loop.timeout_ms = timeout_ms
 	event_loop.persistent = true
@@ -268,10 +275,11 @@ pub fn (mut event_loop EventLoop) watch_fd_persistent_deadline(fd int, interest 
 //   - caller-owned (watch_fd_persistent*): the reply still due must not reach
 //     the next request on that fd, so the watch becomes a tombstone, as when
 //     a parked client disconnects: when the reply arrives (or the fd fails),
-//     the continuation runs again with timed_out() false, against a discarded
-//     response buffer, to consume it in order. So in the timeout branch do NOT
-//     consume the fd's reply and do NOT hand the connection back to its pool:
-//     the draining run does that. To get the reply sooner, ask the server to
+//     the continuation runs again, with orphaned() true and timed_out()
+//     false, against a discarded response buffer, to consume it in order
+//     (see EventLoop.orphaned). So in the timeout branch do NOT consume the
+//     fd's reply and do NOT hand the connection back to its pool: the
+//     draining run does that. To get the reply sooner, ask the server to
 //     abandon the work (pg_async: PgConn.cancel); to give up on the
 //     connection, shutdown(2) its socket (the tombstone then drains on the
 //     hangup).
@@ -280,6 +288,36 @@ pub fn (mut event_loop EventLoop) watch_fd_persistent_deadline(fd int, interest 
 @[inline]
 pub fn (event_loop &EventLoop) timed_out() bool {
 	return event_loop.reason == .timeout
+}
+
+// orphaned reports, inside a continuation, that it runs as a tombstone: its
+// request is over, but the caller-owned fd it parked on (watch_fd_persistent*)
+// still owes it a reply, which must not reach the next request on that fd.
+// The request is over when its client disconnected while it was parked, when
+// the park's deadline passed (the timed_out() run answered it), or when the
+// park was rejected (.done/.close after the watch). The runtime then keeps the
+// watch, and runs the continuation when the fd is ready (or failed:
+// ready_fd_error) against a `response` that is discarded. event_loop.client_fd
+// is no longer this request's: the number may be another connection's by now.
+// The run still owes what keeps the fd in sync: consume the reply, in order
+// (or give up on the connection), and hand the connection back to its pool.
+// It may skip the rest of the request's work: don't send a transaction's next
+// statement or its COMMIT (pg_async's release() rolls an open transaction
+// back), don't start a call whose answer nobody will read. Every later run of
+// the request is orphaned too: a re-arm, or a step to another caller-owned fd
+// (a tombstone there, with no deadline). A request-owned fd it watches
+// (watch_fd: a backoff timer) is closed once it returns, and it is never
+// resumed.
+//
+// The epoll worker runs every tombstone so. On io_uring, a client that
+// disconnects while parked is noticed only when its request resumes, so that
+// run is a live one (.ready) whose answer fails to send, and no park times
+// out (deadlines are the epoll worker's); a park rejected there, or a
+// pipelined one that suspends without a watch, runs orphaned. kqueue keeps no
+// tombstones. Always false outside a continuation.
+@[inline]
+pub fn (event_loop &EventLoop) orphaned() bool {
+	return event_loop.reason == .orphaned
 }
 
 // watch_fd_background arms a CLIENTLESS watch on this worker's event loop from

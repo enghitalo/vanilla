@@ -1595,11 +1595,12 @@ fn resume_step(h core.Handler, mut reactor Reactor, epoll_fd int, ext_fd int, cl
 // run_tombstone runs the continuation of the tombstone at the head of
 // ext_fd's queue (a client that disconnected mid-pipeline), against a
 // throwaway buffer, purely to CONSUME its in-flight result in order (keeping
-// the queue aligned with the connection's FIFO), then discards it. Returns
-// false when the tombstone stays at the head (its result is not ready yet),
-// true when it was popped. Out of line, like grow_watches: tombstones are
-// rare, and the worker loop, into which drain_pipelined is inlined, then
-// carries none of this cold code (#257).
+// the queue aligned with the connection's FIFO), then discards it. The run
+// is told so: event_loop.orphaned() (#349). Returns false when the tombstone
+// stays at the head (its result is not ready yet), true when it was popped.
+// Out of line, like grow_watches: tombstones are rare, and the worker loop,
+// into which drain_pipelined is inlined, then carries none of this cold code
+// (#257).
 @[direct_array_access; noinline]
 fn run_tombstone(mut reactor Reactor, epoll_fd int, ext_fd int, slot ParkSlot, ready_err bool, mut st PlainState, state voidptr) bool {
 	client_fd := slot.client_fd
@@ -1611,6 +1612,7 @@ fn run_tombstone(mut reactor Reactor, epoll_fd int, ext_fd int, slot ParkSlot, r
 		loop_fd:   epoll_fd
 		reactor:   unsafe { voidptr(&reactor) }
 		register:  register_watch
+		reason:    .orphaned
 	}
 	// rearming_dead: a re-arm from this tombstone's continuation updates
 	// only this head slot (continuation, udata) and re-arms ext_fd; a

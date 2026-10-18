@@ -48,7 +48,9 @@ per-request allocation.
   requests (a pooled DB or upstream connection) parks with
   `event_loop.watch_fd_persistent(...)` instead, so a client that disconnects
   mid-wait does not close it (epoll and io_uring; the kqueue runtime does not
-  honor it yet). Linux epoll (plain HTTP and HTTPS) + io_uring and
+  honor it yet). On epoll the continuation still runs when that fd is ready,
+  with `event_loop.orphaned()` true, to drain the reply (its answer is
+  discarded). Linux epoll (plain HTTP and HTTPS) + io_uring and
   macOS/kqueue; on Windows/IOCP a `.suspend` closes the connection (no watch
   reactor there yet).
 - **Bounding a wait** — a park lasts as long as its fd takes, unless it has a
@@ -59,7 +61,8 @@ per-request allocation.
   fd is not ready): answer 504 and return `.done`, or re-arm to keep waiting.
   The watch it stops waiting on is retired — a request-owned fd leaves the
   event loop; a persistent fd keeps a tombstone that consumes the reply still
-  due, in order (see `core.EventLoop.timed_out`). The epoll worker
+  due, in order, in a run that sees `event_loop.orphaned()` (see
+  `core.EventLoop.timed_out`, `core.EventLoop.orphaned`). The epoll worker
   enforces it, with or without TLS; on io_uring and kqueue a deadline watch is
   a plain watch.
   `event_loop.watch_fd_background(...)` arms a clientless watch from a handler

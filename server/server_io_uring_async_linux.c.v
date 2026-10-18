@@ -36,7 +36,9 @@ module server
 //     pipelined head released because it suspended without re-arming stays
 //     queued as dead, so its in-flight reply is still consumed in order
 //     against a scratch buffer — and a new client that reuses the released
-//     slot and fd number is never resumed with the stale continuation.
+//     slot and fd number is never resumed with the stale continuation. So
+//     here only such a tombstone runs with event_loop.orphaned(): the
+//     continuation of a client that left while parked runs as a live one.
 //
 // Parked-connection deadlines: read/write deadlines are cleared at park (no
 // client op is armed, so neither timeout applies — nor the idle one: a parked
@@ -848,11 +850,12 @@ fn (env &IouEnv) iou_is_live_conn_fd(fd int) bool {
 // iou_run_tombstone runs the continuation of the tombstone (or released or
 // reused slot) at the head of ext_fd's queue, against a throwaway buffer,
 // purely to CONSUME its in-flight query result in order (keeping the queue
-// aligned with the DB connection's FIFO), then discards it. Returns false
-// when the tombstone stays at the head (its result is not ready yet), true
-// when it was popped. Out of line, like epoll's run_tombstone: the worker
-// loop, into which drain_pipelined_iou is inlined, carries none of this cold
-// code (#257).
+// aligned with the DB connection's FIFO), then discards it. The run is told
+// so: event_loop.orphaned() (#349), as on epoll. Returns false when the
+// tombstone stays at the head (its result is not ready yet), true when it was
+// popped. Out of line, like epoll's run_tombstone: the worker loop, into
+// which drain_pipelined_iou is inlined, carries none of this cold code
+// (#257).
 @[direct_array_access; noinline]
 fn iou_run_tombstone(mut env IouEnv, ext_fd int, slot IouParkSlot, ready_err bool) bool {
 	conn := slot.conn
@@ -860,6 +863,7 @@ fn iou_run_tombstone(mut env IouEnv, ext_fd int, slot IouParkSlot, ready_err boo
 		env.scratch.len = 0
 	}
 	mut dead_loop := iou_event_loop(mut env, slot.client_fd)
+	dead_loop.reason = .orphaned
 	// rearming_dead: a re-arm from this tombstone's continuation updates
 	// only this head slot (continuation, udata) and re-queues the oneshot
 	// poll; a watch on another fd is a step away (dead_fd). See

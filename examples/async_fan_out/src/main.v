@@ -98,17 +98,16 @@ const body_end = '}'
 // its group.
 struct Group {
 mut:
-	idx      int // position in FanState.groups
-	next     int // free-list link; -1 ends the list
-	agg      int = -1 // the aggregator (an epoll fd)
-	n        int              // members started
-	left     int              // members not finished yet
-	done     int              // members that finished before the answer
-	ms       int              // the slowest member's delay
-	budget   int              // ms for the whole fan-out; 0 = Limits.park_timeout_ms
-	start    i64              // now_ms() when the handler ran
-	answered bool             // the client got its answer: wakes only drain and close
-	fds      [max_members]i32 // member fds; -1 once closed
+	idx    int // position in FanState.groups
+	next   int // free-list link; -1 ends the list
+	agg    int = -1 // the aggregator (an epoll fd)
+	n      int              // members started
+	left   int              // members not finished yet
+	done   int              // members that finished (the answer reports how many)
+	ms     int              // the slowest member's delay
+	budget int              // ms for the whole fan-out; 0 = Limits.park_timeout_ms
+	start  i64              // now_ms() when the handler ran
+	fds    [max_members]i32 // member fds; -1 once closed
 }
 
 // FanState is one worker's make_state value: its groups, as a free list, and
@@ -209,7 +208,6 @@ fn (mut g Group) launch(n int, ms int, budget int) bool {
 	g.done = 0
 	g.ms = ms
 	g.budget = budget
-	g.answered = false
 	g.start = now_ms()
 	g.agg = C.fan_open()
 	if g.agg < 0 {
@@ -244,9 +242,7 @@ fn (mut g Group) drain(mut st FanState) {
 		C.close(g.fds[i])
 		g.fds[i] = -1
 		g.left--
-		if !g.answered {
-			g.done++
-		}
+		g.done++
 	}
 }
 
@@ -394,10 +390,11 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
 }
 
 // on_ready runs when the aggregator is readable (one member or more
-// finished), or once when the budget runs out first. It also runs when the
-// client is gone: on epoll the watch is then a tombstone, `out` is discarded,
-// and this function still drains and closes every member, then the
-// aggregator. It cannot tell, and does not need to.
+// finished), or once when the budget runs out first. It also runs once the
+// request is over, after its 504 or with its client gone: on epoll the watch
+// is then a tombstone, the run is orphaned (event_loop.orphaned()) and `out`
+// is discarded, and this function only drains and closes every member, then
+// the aggregator, and answers no one.
 fn on_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut st := unsafe { &FanState(worker_state) }
 	mut g := unsafe { &Group(watch_payload) }
@@ -412,7 +409,6 @@ fn on_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidp
 			}
 		}
 		answer(mut out, resp_504_head, g)
-		g.answered = true
 		return .done
 	}
 	if !ready_fd_error {
@@ -424,14 +420,15 @@ fn on_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidp
 			}
 		}
 	}
+	orphaned := event_loop.orphaned()
 	if g.left > 0 {
 		// The aggregator failed, or could not be watched again (then nothing
 		// would resume the request): give up on every member.
 		g.close_members()
-		if !g.answered {
+		if !orphaned {
 			core.append_str(mut out, resp_502)
 		}
-	} else if !g.answered {
+	} else if !orphaned {
 		answer(mut out, resp_200_head, g)
 	}
 	st.release(mut g)

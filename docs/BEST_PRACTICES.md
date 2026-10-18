@@ -317,20 +317,25 @@ per-worker pool and **cross-request pipelining** (`max_inflight` queries per
 connection). Pool connections are **persistent**: park on a pooled fd with
 `event_loop.watch_fd_persistent(...)`, never `watch_fd`. Then a client
 disconnecting mid-query tombstones the parked request rather than closing the
-connection. The continuation still runs when the reply arrives (its response is
-discarded), so it drains the reply and releases the slot, and the pooled conn
-(and its SCRAM handshake) survives client churn. That draining run may step to
-another fd like any continuation: a `watch_fd_persistent` fd runs it the same
-way when ready. After a `watch_fd` step (a backoff timer), the runtime closes
-that fd once the run returns and the run is never resumed, and a continuation
-cannot tell that its client is gone: release the pool slot before such a
-step. Nor is a run resumed after a watch the runtime refuses, such as a
-`watch_fd` on the departed client's fd number. A `watch_fd_persistent` on
-that number is refused only while the runtime holds the number for the run
-or it is a connection of this worker; otherwise it is taken as a pooled
-connection that has the number now, which may also be another worker's
-connection. Watching a client fd stored in the payload from such a run is
-misuse. Watch one fd per step:
+connection. The continuation still runs when the reply arrives, with
+`event_loop.orphaned()` true (its response is discarded), so it drains the
+reply and releases the slot, and the pooled conn (and its SCRAM handshake)
+survives client churn. An orphaned run may skip the rest of the request's
+work: a transaction's next statement and its COMMIT (`release()` rolls the
+transaction back), another query or upstream call whose answer nobody will
+read. (That is the epoll worker. io_uring notices a client that left only
+when its request resumes: that run is a live one, whose answer fails to
+send.) The draining run may also step to another fd like any continuation:
+a `watch_fd_persistent` fd runs it the same way when ready, orphaned too.
+After a `watch_fd` step (a backoff timer), the runtime closes that fd once
+the run returns and the run is never resumed: release the pool slot before
+such a step (an orphaned run need not take it). Nor is a run resumed after
+a watch the runtime refuses, such as a `watch_fd` on the departed client's
+fd number. A `watch_fd_persistent` on that number is refused only while the
+runtime holds the number for the run or it is a connection of this worker;
+otherwise it is taken as a pooled connection that has the number now, which
+may also be another worker's connection. Watching a client fd stored in the
+payload from such a run is misuse. Watch one fd per step:
 a second watch on the same fd replaces the first, but a run that moves on to
 another fd and back leaves a slot on both. With a plain `watch_fd` the
 runtime closes the pooled fd and the continuation never runs: the slot leaks,
@@ -369,13 +374,14 @@ each watch arms a fresh deadline, so pass the time left to bound a multi-step
 request). When the deadline passes first, the continuation runs once with
 `event_loop.timed_out()` true: answer 504 and return `.done`. On a pooled fd
 the reply is still due, and the park's tombstone consumes it in order (the
-continuation runs again, against a discarded buffer, when it arrives), so in
-the timeout branch don't read the fd and don't release the connection:
+continuation runs again, against a discarded buffer, when it arrives, with
+`event_loop.orphaned()` true), so in the timeout branch don't read the fd and
+don't release the connection:
 
 ```v
 if event_loop.timed_out() {
     // pg_async: the server abandons the query, its 57014 comes back at once,
-    // and the tombstone run consumes it (and releases the slot).
+    // and the orphaned run consumes it (and releases the slot).
     st.pool.conn(idx).cancel(mut event_loop) or {}
     core.append_str(mut out, resp_504)
     return .done
