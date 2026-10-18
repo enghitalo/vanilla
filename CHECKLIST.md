@@ -541,6 +541,10 @@ concatenates, interpolates or allocates per request. The
   |---|---|---|
   | `pg_async` | 124/189 (66%), 4 loose; fields 23/48 | 189/189 (100%); fields 48/48 |
   | whole repo | 508/707 (72%); fields 155/285 | 573/707 (81%); fields 180/285 |
+- **Kept there by CI:** on every pull request, `architecture.yml` runs
+  `scripts/doc_coverage_gate.sh` against the base. It fails when a module at
+  100% there (every declaration documented, as `doc_coverage.sh` counts) drops
+  below it, or leaves a pub field undocumented when all of them had a comment.
 - **Next modules** (same style, outside this item), by undocumented
   declarations: `io_uring` (32), `http2` (23), `websocket` (14), `socket`
   (12) and `kqueue` (11); then `http1_1/response` (9) and `epoll` (7). The
