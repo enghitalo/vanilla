@@ -54,9 +54,15 @@ import time
 //   - one DDL statement per transaction.
 
 // The transaction status byte of a ReadyForQuery (tx_status).
-pub const tx_idle = u8(`I`) // not in a transaction block
-pub const tx_in_block = u8(`T`) // in a transaction block (after BEGIN)
-pub const tx_failed = u8(`E`) // in a failed transaction block: every statement fails (25P02) until ROLLBACK
+
+// tx_idle ('I') is the status of a session not in a transaction block.
+pub const tx_idle = u8(`I`)
+// tx_in_block ('T') is the status of a session in a transaction block (after
+// BEGIN).
+pub const tx_in_block = u8(`T`)
+// tx_failed ('E') is the status of a session in a failed transaction block:
+// every statement fails (25P02) until ROLLBACK.
+pub const tx_failed = u8(`E`)
 
 // tx_status is the transaction status the server reported with the
 // ReadyForQuery of the last query to complete: tx_idle, tx_in_block or
@@ -94,7 +100,7 @@ pub fn is_serialization_failure(err IError) bool {
 // allocation-free.
 //
 //   poll := conn.async_on_readable() or {
-//       pool.release(idx) // on every path, and before the step below
+//       pool.release(idx) // from acquire(): on every path, and before the step below
 //       if policy.retry(attempt, err) {
 //           if policy.park_backoff(attempt, mut event_loop, on_backoff, voidptr(usize(attempt + 1))) {
 //               return .suspend // on_backoff: acquire, submit it all again
@@ -104,9 +110,14 @@ pub fn is_serialization_failure(err IError) bool {
 //   }
 pub struct TxRetry {
 pub:
-	max_attempts    int = 5
+	// max_attempts is how many runs a transaction gets in all, the first
+	// included: 1 never retries.
+	max_attempts int = 5
+	// base_backoff_ms caps the wait after the first attempt; each later
+	// attempt doubles the cap (backoff_ms).
 	base_backoff_ms int = 10
-	max_backoff_ms  int = 500
+	// max_backoff_ms is the most the cap ever grows to.
+	max_backoff_ms int = 500
 }
 
 // retry reports whether a transaction whose attempt number `attempt` (1 for
@@ -131,9 +142,10 @@ pub fn (r TxRetry) backoff_ms(attempt int) int {
 // attempt, without blocking the worker: it arms a one-shot timerfd and
 // watches it (event_loop.watch_fd_deadline, the timer its own deadline), so
 // `continuation` runs, with the timer as ready_fd and `watch_payload`, once
-// the wait is over. Return .suspend after it. Release the connection first:
-// other requests can use it meanwhile, and if the client is gone nothing
-// else hands it back (below). The timer is the request's to close
+// the wait is over. Return .suspend after it. Release the connection first
+// (one taken with acquire(); a pipelined one is not held): other requests can
+// use it meanwhile, and if the client is gone nothing else hands it back
+// (below). The timer is the request's to close
 // (os.fd_close), in `continuation` or a later one (examples/pg_transactions
 // closes it in the attempt's reply). The runtime closes it itself when the
 // client disconnects during the wait (the continuation never runs), and

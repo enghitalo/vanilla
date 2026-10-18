@@ -5,32 +5,68 @@ import time
 
 // PostgreSQL frontend/backend wire protocol v3 — framing, message builders, and
 // result iteration. Pure and I/O-free: builders append bytes to a caller-owned
-// buffer, parsers read borrowed slices. The connection state machine (client.v)
+// buffer, parsers read borrowed slices. The connection (conn.v, conn_async.v)
 // and the async integration sit on top of this layer.
 //
 // Message format: every message is type(1 byte) + length(Int32, big-endian,
 // INCLUDES the 4 length bytes but NOT the type byte) + payload. The only
 // exception is StartupMessage / SSLRequest, which have no type byte.
 
-// Backend message type bytes — the first byte of each backend message. (Module
-// constants rather than an enum: V enum values must be integer literals, and
-// these read most clearly as their wire characters.)
+// Backend message type bytes — the first byte of each backend message, as
+// MsgHeader.typ and Frame.typ hold it. (Module constants rather than an enum:
+// V enum values must be integer literals, and these read most clearly as their
+// wire characters.) A message pg_async does not act on (a notice, a
+// ParameterStatus after startup, a notification) stays among the frames of
+// the reply it arrived with, or of the next one, where rows() skips it.
+
+// bt_authentication ('R') is a step of the startup's authentication: a request
+// for credentials, or AuthenticationOk. Its sub-code (auth_subtype, AuthType)
+// says which.
 pub const bt_authentication = u8(`R`)
+// bt_backend_key_data ('K') is the session's process id and secret key, sent
+// at startup: what PgConn.cancel sends back (PgConn.backend_pid).
 pub const bt_backend_key_data = u8(`K`)
+// bt_bind_complete ('2') is a successful Bind.
 pub const bt_bind_complete = u8(`2`)
+// bt_close_complete ('3') is a successful Close. pg_async sends no Close.
 pub const bt_close_complete = u8(`3`)
+// bt_command_complete ('C') ends a statement's reply; its tag ('SELECT 5',
+// 'INSERT 0 3') carries the row count (parse_command_complete).
 pub const bt_command_complete = u8(`C`)
+// bt_data_row ('D') is one row of a result (Row, RowIter).
 pub const bt_data_row = u8(`D`)
+// bt_empty_query_response ('I') answers an empty query string, in place of
+// CommandComplete.
 pub const bt_empty_query_response = u8(`I`)
+// bt_error_response ('E') is an error (parse_error_response, PgError); a FATAL
+// or PANIC one ends the session.
 pub const bt_error_response = u8(`E`)
+// bt_no_data ('n') answers Describe for a statement that returns no rows, in
+// place of RowDescription.
 pub const bt_no_data = u8(`n`)
+// bt_notice_response ('N') is a notice or a warning. pg_async does not surface
+// notices.
 pub const bt_notice_response = u8(`N`)
+// bt_notification_response ('A') is a NOTIFY on a channel the session LISTENs
+// to. pg_async does not deliver notifications.
 pub const bt_notification_response = u8(`A`)
+// bt_parameter_description ('t') answers Describe of a prepared statement with
+// its parameter types. pg_async describes portals only, so it gets none.
 pub const bt_parameter_description = u8(`t`)
+// bt_parameter_status ('S') reports a run-time parameter's value (TimeZone,
+// server_version, …): at startup, and whenever one changes. pg_async reads
+// none of them.
 pub const bt_parameter_status = u8(`S`)
+// bt_parse_complete ('1') is a successful Parse.
 pub const bt_parse_complete = u8(`1`)
+// bt_portal_suspended ('s') says Execute stopped at its row limit. pg_async's
+// queries execute with no limit, so they get none.
 pub const bt_portal_suspended = u8(`s`)
+// bt_ready_for_query ('Z') ends a reply (after Sync) or the startup; its status
+// byte is tx_idle, tx_in_block or tx_failed (PgConn.tx_status).
 pub const bt_ready_for_query = u8(`Z`)
+// bt_row_description ('T') gives the result's column names and types, before
+// its rows (Result.columns).
 pub const bt_row_description = u8(`T`)
 
 // AuthType is the Int32 sub-code carried by an Authentication ('R') message.
@@ -59,14 +95,16 @@ pub fn auth_subtype(payload []u8) u32 {
 // MsgHeader describes the first complete message in a buffer.
 pub struct MsgHeader {
 pub:
-	typ   u8
+	typ   u8  // the message type: a bt_* constant
 	total int // bytes to consume for this message: 1 + length
 }
 
 // next_message returns the header of the first COMPLETE backend message in buf,
 // or none if a full message is not buffered yet. The connection read loop uses
-// it to frame messages off the recv buffer without copying. A length < 4 is a
-// protocol violation; the caller drops the connection.
+// it to frame messages off the recv buffer without copying. A length below 4
+// (a protocol violation) is none too, which a reader cannot tell from a short
+// read: pg_async's readers then wait for bytes that never frame, and nothing
+// drops the connection for it. No allocation.
 pub fn next_message(buf []u8) ?MsgHeader {
 	if buf.len < 5 {
 		return none
@@ -85,9 +123,10 @@ pub fn next_message(buf []u8) ?MsgHeader {
 	}
 }
 
-// next_message_at is next_message starting at offset `pos` — for an advancing read
-// cursor over a buffer appended-to at the tail and consumed from the front WITHOUT
-// memmove per message. Returns none if a full message is not buffered at pos.
+// next_message_at is next_message starting at offset `pos` (>= 0) — for an
+// advancing read cursor over a buffer appended-to at the tail and consumed from
+// the front WITHOUT memmove per message. Returns none if a full message is not
+// buffered at pos, or its length is below 4 (as next_message).
 @[direct_array_access]
 pub fn next_message_at(buf []u8, pos int) ?MsgHeader {
 	if buf.len - pos < 5 {
@@ -110,8 +149,8 @@ pub fn next_message_at(buf []u8, pos int) ?MsgHeader {
 // Frame is one parsed backend message (type + borrowed payload).
 pub struct Frame {
 pub:
-	typ     u8
-	payload []u8
+	typ     u8   // the message type: a bt_* constant
+	payload []u8 // the body after the type and length: a view into the iterated buffer
 }
 
 // FrameIter walks complete backend messages in a region (e.g. one op's frames
@@ -122,6 +161,9 @@ mut:
 	pos int
 }
 
+// FrameIter.new returns an iterator over the complete backend messages in buf,
+// from its start (next). Its frames are views into buf: nothing is copied or
+// allocated.
 pub fn FrameIter.new(buf []u8) FrameIter {
 	return FrameIter{
 		buf: buf
@@ -152,15 +194,29 @@ pub fn (mut it FrameIter) next() ?Frame {
 
 // ── result rows ─────────────────────────────────────────────────────────────
 
-// Result is one completed query's frames (ParseComplete..CommandComplete) plus
-// the rows-affected count parsed from the CommandComplete tag. Rows borrow the
-// recv buffer and are valid only inside the resume callback.
+// Result is one completed query's reply: its frames, plus the rows-affected
+// count parsed from the last CommandComplete tag. Read it with rows(),
+// columns() and, for a batch, statement(i). A Result from
+// async_on_readable borrows one of the connection's reply buffers, which a
+// later query on that connection reuses: read it in the continuation that got
+// it, and copy what must outlive that. One from the blocking query() owns its
+// frames.
 pub struct Result {
 pub:
-	frames        []u8
+	// frames are the backend messages as received (type byte and length
+	// included): any the server sent unasked before the reply (a notice, a
+	// ParameterStatus) first, then the reply from ParseComplete on. What
+	// FrameIter walks.
+	frames []u8
+	// rows_affected is the count in the last CommandComplete tag
+	// (parse_command_complete): the rows a SELECT returned or a write changed;
+	// 0 for a tag without one (BEGIN, CREATE TABLE).
 	rows_affected u64
 }
 
+// rows returns an iterator over the result's DataRows, in order: for a batch,
+// every statement's (statement(i) splits them). It borrows the frames and
+// allocates nothing.
 pub fn (res &Result) rows() RowIter {
 	return RowIter{
 		frames: FrameIter.new(res.frames)
@@ -226,6 +282,8 @@ mut:
 	frames FrameIter
 }
 
+// next returns the next DataRow, or none after the last. The Row is a view
+// into the result's frames: nothing is copied or allocated.
 pub fn (mut it RowIter) next() ?Row {
 	for {
 		frame := it.frames.next() or { return none }
@@ -242,8 +300,20 @@ pub fn (mut it RowIter) next() ?Row {
 // each access (columns are few, so O(n) is fine at handler scale). All values
 // are binary (Bind requests result-format-code 1 for every column). To read a
 // column by name, look its index up once per result (Result.columns()).
+//
+// The typed accessors (int4, text, uuid_into, time, numeric_i64_scaled, …)
+// decode in place and allocate nothing, errors included (they are constants);
+// the _into ones append to a buffer the caller owns. Each fails on SQL NULL
+// (read a nullable column with col and test is_null), on an index out of
+// range or a malformed row, and on a value it cannot decode: the fixed-size
+// types check its size (4 bytes for an int4). They check the bytes, not the
+// column's type: when the query does not fix the types, compare
+// Columns.type_oid with the oid_* constants once per result. col, text and
+// text_array_into give views into the result's frames, not copies.
 pub struct Row {
 pub:
+	// payload is the DataRow message body: the column count, then each
+	// column's length (-1 for NULL) and bytes.
 	payload []u8
 }
 
@@ -251,8 +321,8 @@ pub:
 // bytes (V has no `!?T`, so NULL is a flag rather than an Option).
 pub struct DataValue {
 pub:
-	is_null bool
-	bytes   []u8
+	is_null bool // SQL NULL: bytes is then empty
+	bytes   []u8 // the value's binary encoding: a view, not a copy
 }
 
 const err_row_short = error('pg: datarow: short payload')
@@ -310,30 +380,46 @@ fn (r Row) require(i int) ![]u8 {
 	return dv.bytes
 }
 
+// int2 returns column i, an int2 (smallint); an error for SQL NULL or a value
+// that is not 2 bytes (see Row). No allocation.
 pub fn (r Row) int2(i int) !i16 {
 	return decode_int2(r.require(i)!)
 }
 
+// int4 returns column i, an int4 (integer); an error for SQL NULL or a value
+// that is not 4 bytes (see Row). No allocation.
 pub fn (r Row) int4(i int) !i32 {
 	return decode_int4(r.require(i)!)
 }
 
+// int8 returns column i, an int8 (bigint); an error for SQL NULL or a value
+// that is not 8 bytes (see Row). No allocation.
 pub fn (r Row) int8(i int) !i64 {
 	return decode_int8(r.require(i)!)
 }
 
+// boolean returns column i, a bool; an error for SQL NULL or a value that is
+// not 1 byte (see Row). No allocation.
 pub fn (r Row) boolean(i int) !bool {
 	return decode_bool(r.require(i)!)
 }
 
+// float4 returns column i, a float4 (real); an error for SQL NULL or a value
+// that is not 4 bytes (see Row). No allocation.
 pub fn (r Row) float4(i int) !f32 {
 	return decode_float4(r.require(i)!)
 }
 
+// float8 returns column i, a float8 (double precision); an error for SQL NULL
+// or a value that is not 8 bytes (see Row). No allocation.
 pub fn (r Row) float8(i int) !f64 {
 	return decode_float8(r.require(i)!)
 }
 
+// text returns column i's bytes as they are: a text, varchar, bpchar or name
+// value, a bytea's raw bytes, or a jsonb with its version byte (jsonb_text
+// strips it). A view into the result's frames, not a copy; an error only for
+// SQL NULL, an index out of range or a malformed row (see Row).
 pub fn (r Row) text(i int) ![]u8 {
 	return decode_text(r.require(i)!)
 }
@@ -414,7 +500,7 @@ pub fn (r Row) int4_array_into(i int, mut out []i32) ! {
 }
 
 // text_array_into appends a text[] (or varchar[], bpchar[], name[]) column's
-// elements to `out`, as views that borrow the receive buffer. A NULL element,
+// elements to `out`, as views into the result's frames. A NULL element,
 // or another element type, is an error, and then nothing is appended (walk
 // such arrays with array_iter).
 @[direct_array_access]
@@ -669,6 +755,8 @@ pub:
 	statement int
 }
 
+// msg is the error's text, "pg: query failed: <message> (SQLSTATE <code>)".
+// It builds the string on every call: branch on sqlstate, not on this text.
 pub fn (e PgError) msg() string {
 	return 'pg: query failed: ${e.message} (SQLSTATE ${e.sqlstate})'
 }
@@ -761,8 +849,10 @@ fn put_cstr_s(mut buf []u8, s string) {
 
 // write_startup appends a StartupMessage (protocol 3.0): no type byte, Int32
 // length, Int32 protocol version, then user/database and the `params`
-// key-value pairs (run-time parameters such as application_name; checked by
-// check_startup_params: no NUL, no empty name) and a terminating 0 byte.
+// key-value pairs (run-time parameters such as application_name) and a
+// terminating 0 byte. It checks nothing (PgConn.connect and PgPool.connect check
+// params before dialing): a NUL in a name or value, or an empty name, would
+// corrupt the message.
 pub fn write_startup(mut buf []u8, user string, database string, params map[string]string) {
 	lenpos := buf.len
 	buf << [u8(0), 0, 0, 0]

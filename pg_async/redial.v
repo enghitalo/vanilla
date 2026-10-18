@@ -76,7 +76,8 @@ fn (mut c PgConn) redial(cfg ConnConfig) bool {
 
 // redial_start drops the lost socket and starts a non-blocking connect on a new
 // one, resetting the per-connection state in place: the buffers are kept, so a
-// reconnect allocates nothing that leaks under -gc none.
+// reconnect does not reallocate them (its name resolution and SCRAM exchange do
+// allocate, once per attempt).
 fn (mut c PgConn) redial_start(cfg ConnConfig) ! {
 	if cfg.ssl_mode != .disable && c.tls_cfg == unsafe { nil } {
 		return error('pg: the connection was closed') // close() freed its TLS

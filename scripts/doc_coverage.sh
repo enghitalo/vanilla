@@ -16,7 +16,10 @@
 #   scripts/doc_coverage.sh tls server      # these trees (sub-modules included)
 #   scripts/doc_coverage.sh -v tls          # also list what is undocumented
 #
-# A module is one directory; `_test.v` files are skipped.
+# A module is one directory; `_test.v` files are skipped. On pull requests,
+# CI fails when a module that was at 100% at the base drops below it, or
+# leaves a pub field undocumented when all of them had a comment
+# (scripts/doc_coverage_gate.sh).
 
 set -u
 
@@ -31,9 +34,10 @@ if [ $# -eq 0 ]; then
         ! -path './.git/*' -exec dirname {} \; | sed 's|^\./||' | cut -d/ -f1 | sort -u)
 fi
 
+# A file is counted once, even under two roots given (a module and its parent).
 files=$(for root in "$@"; do
     find "$root" -name '*.v' ! -name '*_test.v' | sort
-done)
+done | awk '!seen[$0]++')
 [ -n "$files" ] || { echo "no .v files under: $*" >&2; exit 1; }
 
 # shellcheck disable=SC2086 # file names are split on purpose (no spaces in the tree)

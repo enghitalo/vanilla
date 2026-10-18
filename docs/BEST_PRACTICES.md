@@ -435,8 +435,10 @@ kqueue a deadline watch is a plain watch, and `cancel` fails.
 - Keep the pool sized to the worker/thread model.
 - Expect pooled connections to die (restart, failover, `pg_terminate_backend`,
   idle or lifetime caps): the pool skips a broken connection and re-dials it
-  without blocking, so `release` it on every path, error or not. Decide retries
-  on the typed error — `err is pg_async.PgError && err.sqlstate == '40001'` —
+  without waiting on the database, so `release` a connection from `acquire()`
+  on every path, error or not (one from `acquire_pipelined*()` is shared: no
+  release, which would retire it under the other requests' queries). Decide
+  retries on the typed error — `err is pg_async.PgError && err.sqlstate == '40001'` —
   and on `conn.is_broken()` for a lost connection, never on the message text.
 - Send a multi-statement write as ONE batch when no statement needs another's
   result: `conn.async_submit_batch(stmts)` ends them with a single Sync, so
