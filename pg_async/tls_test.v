@@ -87,10 +87,14 @@ fn pump(mut c PgConn, ms int) !Result {
 	return error('query did not complete in ${ms} ms')
 }
 
+// int_of unwraps the column into a local before returning it: with the `or`
+// inside the return, V copies `res` to the heap on every call, which
+// test_tls_queries_do_not_grow_the_heap would count (vlang/v#30856).
 fn int_of(res Result) int {
 	mut it := res.rows()
 	row := it.next() or { panic('expected a row') }
-	return int(row.int4(0) or { panic(err) })
+	v := row.int4(0) or { panic(err) }
+	return int(v)
 }
 
 fn expect_connect_error(cfg ConnConfig, want string) {

@@ -183,6 +183,23 @@ on V 0.5.2 `5516000` (2026-10-09), after the upstream fixes they led to.
   request, in five examples until #279. The same view taken from the
   handler's own `req_buffer` parameter (or from `buf := req.buffer`) keeps
   `req` on the stack.
+- **By-value parameters are moved too**, since vlang/v `1fc4cbe0`
+  (vlang/v#30856). A parameter or receiver that the escape analysis above
+  flags is copied to the heap at function entry: the C renames it
+  `__heap_value_param_N` and starts with `memdup(&__esc_1, sizeof(T))`.
+  `-warn-about-allocs` does not report it. Three shapes hit vanilla (#369):
+  - **A view returned from a by-value `req`:** `fn f(req HttpRequest) string`
+    returning `tos(&req.buffer[i], n)`. Take the view from
+    `buf := req.buffer`.
+  - **A Result returned straight from a call through an interface field:**
+    `return p.repo.list()` in `fn (p UseCase)`. Take the receiver by `&`;
+    unwrapping into a local does not help here.
+  - **A Result call inside the return expression:**
+    `return int(row.int4(0) or { panic(err) })` copies the by-value parameter
+    that `row` came from, although an `int` carries no address. Unwrap into a
+    local first, then return it.
+
+  Grep the emitted C for `__heap_value_param`.
 - **Forwarding a `mut` parameter in a comptime call works** since
   vlang/v#29404: `app.$method(req, p, mut out)`.
 - **Methods are values** since vlang/v#29551: `App.one` and `T.$method` are

@@ -31,17 +31,20 @@ fn require_auth(req HttpRequest) ?User {
 
 // bearer_token returns the token of `Authorization: Bearer <token>`, or '' if
 // there is none. The prefix is compared in place and the token is a `tos` view
-// into the request buffer, not a copy: match on it, never store it.
+// into the request buffer, not a copy: match on it, never store it. The view
+// is taken through `buf`: `&req.buffer[i]` would make V copy `req` to the heap
+// on every call (docs/V_PERF_TOOLBOX.md, vlang/v#30856).
 fn bearer_token(req HttpRequest) string {
 	s := req.get_header_value_slice('Authorization') or { return '' }
 	if s.len <= bearer_prefix.len {
 		return ''
 	}
+	buf := req.buffer
 	unsafe {
-		if tos(&req.buffer[s.start], bearer_prefix.len) != bearer_prefix {
+		if tos(&buf[s.start], bearer_prefix.len) != bearer_prefix {
 			return ''
 		}
-		return tos(&req.buffer[s.start + bearer_prefix.len], s.len - bearer_prefix.len)
+		return tos(&buf[s.start + bearer_prefix.len], s.len - bearer_prefix.len)
 	}
 }
 

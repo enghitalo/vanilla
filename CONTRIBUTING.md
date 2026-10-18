@@ -14,6 +14,16 @@ move stays a pure import-line change. The one-direction dependency rule between
 modules is documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and
 enforced by CI.
 
+## The V version CI uses
+
+Every workflow builds V at the commit in [`.v-version`](.v-version) (setup-v's
+`version-file`), so a regression on V master can't turn every PR red. To move
+CI to another V, change that one line: a commit SHA, or a release tag once a
+release builds vanilla (0.5.2 does not; vanilla needs the V3 compiler of V
+master). setup-v caches each version per OS, so the first run after a change
+builds V again. The bench workflow's `v_version` input overrides the file for
+one run.
+
 ## Sending Raw HTTP Requests for Testing
 
 You can test your server by sending raw HTTP requests directly using tools like `nc` (netcat), `telnet`, or `socat`. This is useful for debugging, learning, or end-to-end testing.

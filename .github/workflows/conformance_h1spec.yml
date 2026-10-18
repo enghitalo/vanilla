@@ -76,6 +76,7 @@ jobs:
       - name: Set up V
         uses: vlang/setup-v@v1.7
         with:
+          version-file: .v-version
           clean: false # cleaning races ::add-matcher:: (vlang/setup-v#118, #370)
       - name: Remove Vlang folder to avoid conflicts
         shell: bash
