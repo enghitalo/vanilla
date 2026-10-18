@@ -109,7 +109,11 @@ Reach for the bytes you already have before allocating new ones.
   moves the whole `HttpRequest` to the heap, a `memdup` on every request, even
   on routes that never reach the view. Take it from the handler's own
   `req_buffer` parameter (or `buf := req.buffer` first). `-warn-about-allocs`
-  reports it as "local moved to the heap: its address escapes".
+  reports it as "local moved to the heap: its address escapes". Since vlang/v
+  `1fc4cbe0` the same goes for an `HttpRequest` taken by value as a parameter:
+  the function copies it to the heap on every call, and `-warn-about-allocs`
+  says nothing (vlang/v#30856; more shapes in
+  [V_PERF_TOOLBOX.md](V_PERF_TOOLBOX.md)).
 - Build intermediate `string`s in a loop — concatenation reallocates.
 - Build a lookup key with a slice expression like `route[8..]` — V `string.substr`
   does `malloc_noscan(len+1)` + `memcpy`, a fresh heap string **every request**

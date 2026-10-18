@@ -270,14 +270,17 @@ fn slice_eq(buf []u8, s request_parser.Slice, lit string) bool {
 // session_id returns the request's `sid` cookie as a zero-copy `tos` VIEW into
 // the request buffer, or none when the header or the cookie is absent/empty.
 // The view is only valid while the buffer is: pass it to lookups that never
-// retain the key (Store.get / Store.delete), never store it.
+// retain the key (Store.get / Store.delete), never store it. It is taken
+// through `buf`: `&req.buffer[i]` would make V copy `req` to the heap on every
+// call (docs/V_PERF_TOOLBOX.md, vlang/v#30856).
 fn session_id(req request_parser.HttpRequest) ?string {
 	c := req.get_header_value_slice('Cookie') or { return none }
-	vstart, vlen := cookie_value(req.buffer, c.start, c.len, 'sid')
+	buf := req.buffer
+	vstart, vlen := cookie_value(buf, c.start, c.len, 'sid')
 	if vlen <= 0 { // absent or empty sid — also guards &buf[vstart] below
 		return none
 	}
-	return unsafe { tos(&req.buffer[vstart], vlen) }
+	return unsafe { tos(&buf[vstart], vlen) }
 }
 
 fn handle(req_buffer []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut _event_loop core.EventLoop, mut store Store) core.Step {
