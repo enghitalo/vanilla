@@ -909,7 +909,7 @@ fn test_resolver_follows_changes_off_the_worker() {
 	assert b.stat('requests') == 1, 'the new address was not used'
 	// A slow resolver: /health on the worker is not held up.
 	stdatomic.store_i64(&sw.slow, 1)
-	time.sleep(150 * time.millisecond) // the resolver thread is now in the 2 s resolve
+	time.sleep(150 * time.millisecond) // a lookup thread is now in the 2 s resolve
 	mut worst := i64(0)
 	for _ in 0 .. 20 {
 		hr, ms := call(p, 'GET /health HTTP/1.1\r\nHost: edge\r\n\r\n', 2000)
@@ -924,7 +924,7 @@ fn test_resolver_follows_changes_off_the_worker() {
 
 // Four workers, each with its own pool following one Resolver that refreshes
 // every 10 ms, under concurrent calls: every call answers, and (run with
-// `v -race`) no data race between the workers and the resolver thread.
+// `v -race`) no data race between the workers and the resolver's threads.
 fn test_workers_and_resolver_churn() {
 	for https in variants() {
 		mut f := start_fake(if https { testkit.test_certs() or { panic(err) } } else { '' },
@@ -997,8 +997,8 @@ fn test_workers_and_resolver_churn() {
 	}
 }
 
-// Switch is the test resolver's answer: written by the test, read by the
-// resolver thread (atomics).
+// Switch is the test resolver's answer: written by the test, read by a
+// lookup thread (atomics).
 @[heap]
 struct Switch {
 mut:
@@ -1008,7 +1008,7 @@ mut:
 
 // Dns is a provider's DNS for the test resolver: down (no address, after
 // slow_ms: a DNS that times out) or the fake's port, and how often it was
-// asked (atomics: the resolver thread and the workers' make_state call it).
+// asked (atomics: a lookup thread and the workers' make_state call it).
 @[heap]
 struct Dns {
 mut:

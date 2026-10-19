@@ -7,8 +7,8 @@
 // handler parks on the pooled socket and the worker keeps serving; the
 // continuation relays the answer. One TLS client config (the trusted CAs) is
 // shared by every worker. The pool's maintenance timer (on_worker_start)
-// enforces the deadlines and closes idle connections; a Resolver thread
-// follows DNS changes.
+// enforces the deadlines and closes idle connections; a Resolver follows DNS
+// changes, off the workers.
 //
 // Failures answer 502 (504 for a timeout) with `X-Upstream-Failure: <why>`,
 // and 503 when this worker's connections are all busy. (Naming the failure to

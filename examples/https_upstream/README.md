@@ -84,12 +84,15 @@ return .done
   reach another exchange: the connection is closed.
 - **Limits:** `max_conns` per worker (then `acquire()` sheds: 503),
   `max_request_bytes`, `max_response_bytes` (`.too_large`).
-- **DNS:** resolved once at startup (a typo fails fast); a `Resolver` thread
-  re-resolves every interval (and sooner when every address fails: at most
-  once a second, or once per interval if that is shorter, however many calls
-  fail) and hands the answer to each worker over a pipe — no `getaddrinfo`, no
-  lock and no shared mutable state on a worker. (`upstream.Resolver` is
-  `transport.Resolver`: `pg_async` pools can follow the same one.) `allow_unresolved: true`
+- **DNS:** resolved once at startup (a typo fails fast); a `Resolver`
+  re-resolves each origin every interval (and sooner when every address of
+  that origin fails: that origin alone, at most once a second, or once per
+  interval if that is shorter, however many calls fail) and hands the answer
+  to each worker over a pipe — no `getaddrinfo`, no lock and no shared mutable
+  state on a worker. Each origin is looked up on its own, on a few lookup
+  threads, so one provider's slow DNS delays no other provider's refreshes.
+  (`upstream.Resolver` is `transport.Resolver`: `pg_async` pools can follow
+  the same one.) `allow_unresolved: true`
   starts an origin whose DNS is down at boot with no address instead, so one
   provider's outage does not stop the server: its calls fail at once with
   `.dns` (nothing is dialed) until the `Resolver`, which such a pool must
