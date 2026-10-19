@@ -172,9 +172,6 @@ const io_eof = -2 // the peer closed (over TLS: see Exchange.close_notify)
 const io_failed = -3 // reset, or a TLS error
 const io_answered = -4 // write_some: the server answered before the request was sent
 
-// max_addrs bounds the addresses an origin keeps (a resolver answer's tail is dropped).
-const max_addrs = 16
-
 // Stats counts what a pool did, for tests and metrics.
 pub struct Stats {
 pub mut:
@@ -190,21 +187,16 @@ pub mut:
 @[heap]
 pub struct Pool {
 mut:
-	origin    Origin
-	tls_cfg   &tls.Config = unsafe { nil }
-	host_hdr  []u8 // 'Host: <host>[:<port>]\r\n', built once
-	slots     []&Exchange
-	addrs     []transport.Addr // the addresses to dial, max_addrs capacity
-	cursor    int              // where the next dial starts in addrs
-	staging   []transport.Addr // a resolver update being received
-	stage_seq u32
+	origin   Origin
+	tls_cfg  &tls.Config = unsafe { nil }
+	host_hdr []u8 // 'Host: <host>[:<port>]\r\n', built once
+	slots    []&Exchange
+	addrs    []transport.Addr // the addresses to dial, transport.max_addrs capacity
+	cursor   int              // where the next dial starts in addrs
 	// maintenance (maintenance_*.c.v) and the resolver hand-off (resolver.v)
 	timer_fd  int = -1
-	timer_due u64 // monotonic ns the timer is armed for (0: not armed)
-	feed_fd   int = -1 // the resolver pipe's read end (follow)
-	feed_rec  Record // the record on_feed reads into, reused
-	resolver  &Resolver = unsafe { nil }
-	sub_id    int       = -1
+	timer_due u64            // monotonic ns the timer is armed for (0: not armed)
+	feed      transport.Feed // the resolver's updates (follow); feed.fd -1: none
 	closed    bool
 pub mut:
 	stats Stats
@@ -277,8 +269,7 @@ pub fn Pool.new(o Origin, tls_cfg &tls.Config) !&Pool {
 	mut p := &Pool{
 		origin:  o
 		tls_cfg: unsafe { tls_cfg } // read-only, outlives the pool (the caller's)
-		addrs:   []transport.Addr{cap: max_addrs}
-		staging: []transport.Addr{cap: max_addrs}
+		addrs:   []transport.Addr{cap: transport.max_addrs}
 	}
 	if a := transport.ip_addr(o.host, o.port) {
 		p.addrs << a
@@ -290,7 +281,7 @@ pub fn Pool.new(o Origin, tls_cfg &tls.Config) !&Pool {
 				o.port)
 		}
 		for a in found {
-			if p.addrs.len < max_addrs {
+			if p.addrs.len < transport.max_addrs {
 				p.addrs << a
 			}
 		}

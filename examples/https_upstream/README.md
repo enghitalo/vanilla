@@ -88,7 +88,8 @@ return .done
   re-resolves every interval (and sooner when every address fails: at most
   once a second, or once per interval if that is shorter, however many calls
   fail) and hands the answer to each worker over a pipe — no `getaddrinfo`, no
-  lock and no shared mutable state on a worker. `allow_unresolved: true`
+  lock and no shared mutable state on a worker. (`upstream.Resolver` is
+  `transport.Resolver`: `pg_async` pools can follow the same one.) `allow_unresolved: true`
   starts an origin whose DNS is down at boot with no address instead, so one
   provider's outage does not stop the server: its calls fail at once with
   `.dns` (nothing is dialed) until the `Resolver`, which such a pool must

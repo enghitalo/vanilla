@@ -30,7 +30,7 @@ pub fn (mut p Pool) start_maintenance(mut el core.EventLoop) ! {
 	if p.timer_fd >= 0 {
 		return error('upstream: maintenance is already running')
 	}
-	if p.origin.allow_unresolved && p.resolver == unsafe { nil } {
+	if p.origin.allow_unresolved && !p.feed.followed() {
 		_ := transport.ip_addr(p.origin.host, p.origin.port) or {
 			return error('upstream: ${p.origin.host} sets allow_unresolved, so its pool must follow a Resolver (follow), or nothing ever fills its addresses')
 		}
@@ -46,9 +46,9 @@ pub fn (mut p Pool) start_maintenance(mut el core.EventLoop) ! {
 	}
 	p.timer_fd = fd
 	p.arm(maintenance_idle_ms)
-	if p.feed_fd >= 0 {
-		el.watch_fd(p.feed_fd, .readable, on_feed, voidptr(p))
-		if el.last_watched != p.feed_fd {
+	if p.feed.fd >= 0 {
+		el.watch_fd(p.feed.fd, .readable, on_feed, voidptr(p))
+		if el.last_watched != p.feed.fd {
 			return error('upstream: this event loop cannot watch the resolver pipe')
 		}
 	}
