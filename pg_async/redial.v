@@ -1,6 +1,7 @@
 module pg_async
 
 import time
+import transport
 
 // Re-dialing a lost pooled connection, without blocking the worker.
 //
@@ -24,17 +25,23 @@ import time
 //                   own, re-armed: no allocation), then the
 //                   StartupMessage over it                                → .starting
 //
-// so the worker never waits on the network; name resolution, password_fn (a
-// fresh credential for every attempt) and the TLS handshake's crypto steps do
-// run inline, once per attempt. The SCRAM key derivation (PBKDF2) does not:
-// the pool's ScramCache already holds it, unless the server changed the
-// salt. A connection recycled for max_lifetime_ms takes the same path, driven
-// by maintain() alone (maintenance.v). A failed attempt
-// (refused, closed, authentication error, or redial_timeout) closes its socket
-// and is retried after redial_backoff, starting at the next resolved address
-// (addr_cursor), so a dead one is not retried first forever. The first attempt starts on the first
-// acquire after the loss, so with steady traffic a slot is back within a few
-// requests while its siblings keep serving.
+// so the worker never waits on the network. A pool that follows a
+// transport.Resolver (PgPool.follow) dials from the address table that
+// thread keeps fresh, so name resolution never runs on the worker either; a
+// pool that follows none resolves ConnConfig.host at every attempt, inline
+// (getaddrinfo: as long as the DNS takes). password_fn (a fresh credential
+// for every attempt) and the TLS handshake's crypto steps do run inline, once
+// per attempt. The SCRAM key derivation (PBKDF2) does not: the pool's
+// ScramCache already holds it, unless the server changed the salt. A
+// connection recycled for max_lifetime_ms takes the same path, driven by
+// maintain() alone (maintenance.v), so a recycle follows DNS changes through
+// the table too. A failed attempt (refused, closed, authentication error, or
+// redial_timeout) closes its socket and is retried after redial_backoff,
+// starting at the next address (addr_cursor), so a dead one is not retried
+// first forever; a pool that follows a Resolver also asks it for a refresh
+// (PgPool.redial). The first attempt starts on the first acquire after the
+// loss, so with steady traffic a slot is back within a few requests while its
+// siblings keep serving.
 
 // redial_backoff is the pause after a failed attempt (server down or
 // restarting) before the next one, so a dead server costs one connect per
@@ -46,11 +53,12 @@ const redial_backoff = u64(time.second)
 const redial_timeout = u64(10 * time.second)
 
 // redial advances a non-ready connection's re-dial by one non-blocking step and
-// reports whether it is ready to serve. Never inlined: it is the cold path of
-// acquire*(), and inlined into a request handler it would crowd the hot code
-// around it.
+// reports whether it is ready to serve. An attempt dials from `table` (the
+// pool's addresses, kept fresh by a Resolver), or resolves cfg.host itself
+// when `table` is empty. Never inlined: it is the cold path of acquire*(),
+// and inlined into a request handler it would crowd the hot code around it.
 @[noinline]
-fn (mut c PgConn) redial(cfg ConnConfig) bool {
+fn (mut c PgConn) redial(cfg ConnConfig, table []transport.Addr) bool {
 	if c.state == .ready {
 		return true
 	}
@@ -59,7 +67,7 @@ fn (mut c PgConn) redial(cfg ConnConfig) bool {
 		if c.inflight.len > 0 || now < c.retry_at {
 			return false // requests still parked on the old socket, or backing off
 		}
-		c.redial_start(cfg) or {
+		c.redial_start(cfg, table) or {
 			c.redial_failed(now)
 			return false
 		}
@@ -75,10 +83,11 @@ fn (mut c PgConn) redial(cfg ConnConfig) bool {
 }
 
 // redial_start drops the lost socket and starts a non-blocking connect on a new
-// one, resetting the per-connection state in place: the buffers are kept, so a
-// reconnect does not reallocate them (its name resolution and SCRAM exchange do
-// allocate, once per attempt).
-fn (mut c PgConn) redial_start(cfg ConnConfig) ! {
+// one, to an address of `table`, or of cfg.host resolved here when `table` is
+// empty, resetting the per-connection state in place: the buffers are kept,
+// so a reconnect does not reallocate them (its SCRAM exchange and, without a
+// table, its name resolution do allocate, once per attempt).
+fn (mut c PgConn) redial_start(cfg ConnConfig, table []transport.Addr) ! {
 	if cfg.ssl_mode != .disable && c.tls_cfg == unsafe { nil } {
 		return error('pg: the connection was closed') // close() freed its TLS
 	}
@@ -101,7 +110,11 @@ fn (mut c PgConn) redial_start(cfg ConnConfig) ! {
 	c.ready_status = tx_idle // a new session is in no transaction
 	c.rollback_deadline = 0
 	c.start_auth(cfg)!
-	c.fd = dial(&cfg, true, c.addr_cursor)!
+	c.fd = if table.len > 0 {
+		dial_addrs(table, &cfg, true, c.addr_cursor)!
+	} else {
+		dial(&cfg, true, c.addr_cursor)!
+	}
 	c.state = .connecting
 	c.dial_deadline = time.sys_mono_now() + if cfg.connect_timeout_ms > 0 {
 		u64(cfg.connect_timeout_ms) * u64(time.millisecond)

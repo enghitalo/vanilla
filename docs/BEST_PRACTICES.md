@@ -457,6 +457,18 @@ kqueue a deadline watch is a plain watch, and `cancel` fails.
   release, which would retire it under the other requests' queries). Decide
   retries on the typed error — `err is pg_async.PgError && err.sqlstate == '40001'` —
   and on `conn.is_broken()` for a lost connection, never on the message text.
+- Have a pool that reaches its database by name follow a
+  `transport.Resolver`. Otherwise each re-dial attempt resolves
+  `ConnConfig.host` again, on the worker: getaddrinfo takes as long as the DNS
+  does, exactly when the database is in trouble (a failover, a DNS change).
+  Build the Resolver before `new_server` (`transport.Resolver.new(30_000)`,
+  `start()`), call `pool.follow(mut resolver)` in `make_state` after
+  `new_pool`, and run `start_maintenance`, whose ticks take its updates.
+  Re-dials and `max_lifetime_ms` recycles then dial the addresses its thread
+  keeps fresh, and a failed attempt asks it for a refresh. One Resolver serves
+  every worker's pools, `http1_1.upstream`'s too
+  ([vanilla#351](https://github.com/enghitalo/vanilla/issues/351)). An IP
+  address needs none.
 - Send a multi-statement write as ONE batch when no statement needs another's
   result: `conn.async_submit_batch(stmts)` ends them with a single Sync, so
   they commit or roll back together in one round trip, and a batch without

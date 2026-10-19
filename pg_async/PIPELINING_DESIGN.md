@@ -93,7 +93,10 @@ connection desyncs or corrupts:
    skipped by `acquire*()` and re-dialed non-blocking once its in-flight
    queries have drained with their errors — `redial.v`, vanilla#191. That
    drain is why the FIFO contract also binds a request whose flush failed: it
-   still parks and consumes its error, or its slot never comes back.)
+   still parks and consumes its error, or its slot never comes back. A pool
+   that follows a `transport.Resolver` (`PgPool.follow`, vanilla#351)
+   re-dials from the address table that thread keeps fresh, so no re-dial
+   resolves the host on the worker.)
 7. **A park that times out keeps its queue position.** With a park deadline
    (`Limits.park_timeout_ms`, `watch_fd_persistent_deadline`, vanilla#200)
    any slot can time out, not only the head: its continuation runs once with

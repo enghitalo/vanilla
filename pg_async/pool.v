@@ -2,6 +2,7 @@ module pg_async
 
 import tls
 import time
+import transport
 
 // rollback_timeout bounds the wait for the ROLLBACK release() queues: a
 // server that does not answer one within it is treated as lost, and the
@@ -30,6 +31,10 @@ const rollback_timeout = u64(5 * time.second)
 // that long, before the server's own cap closes them under a query: one at a
 // time, out of the idle set, so no request ever waits on its re-dial
 // (maintenance.v).
+//
+// A re-dial resolves ConnConfig.host again, on the worker, unless the pool
+// follows a transport.Resolver (follow): its re-dials and recycles then dial
+// from an address table that thread keeps fresh (vanilla#351).
 //
 // Backends: a request parks on its pooled fd with
 // event_loop.watch_fd_persistent, several requests on one fd when they
@@ -62,6 +67,11 @@ mut:
 	// none): the pool holds it out of the idle set until maintain() has
 	// re-dialed it.
 	recycling int = -1
+	// addrs is the address table re-dials dial from once the pool follows a
+	// Resolver (follow), empty before: maintain() takes the Resolver's updates
+	// into it from feed.
+	addrs []transport.Addr
+	feed  transport.Feed
 }
 
 // PgPool.connect brings up `size` connections (size >= 1) and returns a ready
@@ -137,6 +147,52 @@ pub fn new_pool(cfg ConnConfig, size int) !&PgPool {
 	return &pool
 }
 
+// follow has the pool's re-dials dial from an address table that the
+// Resolver `r` keeps fresh on its own thread, so the worker never resolves
+// ConnConfig.host after startup (vanilla#351): a lost connection's re-dial
+// and a max_lifetime_ms recycle both dial the addresses r found last, and a
+// failed attempt asks r for a refresh (PgPool.redial). Call it in make_state,
+// after new_pool: it resolves the host once more to fill the table
+// (blocking, with ConnConfig.resolve when set), then follows r, whose thread
+// re-resolves it with the same resolve. maintain() takes r's updates into the
+// table: run start_maintenance (or maintain() from your own timer). One
+// Resolver can serve every pool of every worker, and http1_1.upstream's pools
+// too. Without follow, each re-dial attempt resolves the host on the worker.
+pub fn (mut p PgPool) follow(mut r transport.Resolver) ! {
+	if p.feed.followed() {
+		return error('pg pool: the pool already follows a resolver')
+	}
+	found := lookup(&p.cfg) or { return error('pg pool: ${err}') }
+	mut table := []transport.Addr{cap: transport.max_addrs}
+	for a in found {
+		if table.len < transport.max_addrs {
+			table << a
+		}
+	}
+	p.feed = r.follow(p.cfg.host, p.cfg.port, p.cfg.resolve)!
+	p.addrs = table
+}
+
+// redial advances connection i's re-dial by one non-blocking step
+// (PgConn.redial): from the address table when the pool follows a Resolver,
+// else resolving ConnConfig.host on the worker. An attempt that failed (its
+// address refused, timed out or failed the handshake) asks the Resolver for
+// a refresh, in case the server moved: at most one ask per connection per
+// redial_backoff, and the Resolver answers the asks of every pool within its
+// refresh gap with one lookup (transport.Feed.ask). Never inlined: the cold
+// path of acquire*() and maintain().
+@[noinline]
+fn (mut p PgPool) redial(i int) bool {
+	cursor := p.conns[i].addr_cursor
+	if p.conns[i].redial(p.cfg, p.addrs) {
+		return true
+	}
+	if p.conns[i].addr_cursor != cursor {
+		p.feed.ask() // redial_failed moved the cursor: the attempt failed
+	}
+	return false
+}
+
 // size is the number of connections in the pool.
 pub fn (p &PgPool) size() int {
 	return p.conns.len
@@ -158,8 +214,8 @@ pub fn (p &PgPool) idx_of_fd(fd int) ?int {
 // acquire returns the index of an idle, live connection (marking it busy), or
 // none if every connection is busy or broken (the caller sheds load — e.g. 503
 // — or queues). An idle broken slot it passes gets its re-dial advanced one
-// non-blocking step (name resolution aside: ConnConfig.host), and is taken the
-// moment it is ready again.
+// non-blocking step (name resolution aside, unless the pool follows a
+// Resolver: ConnConfig.host), and is taken the moment it is ready again.
 //
 // A connection that still carries pipelined queries (acquire_pipelined) is
 // not idle for acquire(), even though nobody holds it exclusively: the
@@ -179,7 +235,7 @@ pub fn (mut p PgPool) acquire() ?int {
 			continue // held, or its release-time ROLLBACK is still in flight
 		}
 		if p.conns[i].inflight.len == 0
-			&& (p.conns[i].state == .ready || p.conns[i].redial(p.cfg))
+			&& (p.conns[i].state == .ready || p.redial(i))
 			&& p.conns[i].ready_status == tx_idle {
 			p.idle[i] = false
 			return i
@@ -377,7 +433,7 @@ fn (mut p PgPool) pipelinable(i int) bool {
 	if !p.idle[i] && (p.conns[i].rollback_deadline == 0 || !p.finish_rollback(i)) {
 		return false // held by acquire() (its borrower may be mid-transaction), or rolling back
 	}
-	if p.conns[i].state != .ready && !p.conns[i].redial(p.cfg) {
+	if p.conns[i].state != .ready && !p.redial(i) {
 		return false
 	}
 	// In a transaction, whatever is pipelined here would run inside it.
@@ -400,9 +456,15 @@ pub fn (p &PgPool) fd(idx int) int {
 }
 
 // close terminates every connection in the pool, then frees its TLS config.
+// A Resolver it follows stops writing to it.
 pub fn (mut p PgPool) close() {
 	p.closed = true // a running maintenance timer stops at its next tick
 	close_all(mut p.conns)
 	free_tls_config(p.tls_cfg)
 	p.tls_cfg = unsafe { nil }
+	p.feed.unfollow() // the resolver thread closes its end
+	if p.feed.fd >= 0 {
+		C.close(p.feed.fd)
+		p.feed.fd = -1
+	}
 }
