@@ -29,8 +29,11 @@
 //   /echo         200, the request body's length and sha256 (hex)
 //   /cont100      100 Continue right after the head, then as /echo once the body is in
 //   /delay/<ms>   200, after <ms> milliseconds
+//   /late/<ms>    200 with the body "late", after <ms> milliseconds
 //   /big/<n>      200, an n-byte body
 //   /e413         413 + Connection: close right after the head; reads nothing more for 1 s
+//   /stall        reads nothing after the head and answers nothing (an upload
+//                 to it fills the socket), then closes after 10 s
 //
 // The stats file holds key=value lines: accepted, handshakes, held_handshakes
 // (--ticket-delay-ms), tickets (sent), requests, and path:<path>=<count>.
@@ -364,6 +367,11 @@ fn serve(mut a App, fd int) {
 			c.close()
 			return
 		}
+		if path == '/stall' {
+			time.sleep(io_wait_ms * time.millisecond) // reads nothing meanwhile
+			c.close()
+			return
+		}
 		if path == '/cont100' {
 			c.write_str('HTTP/1.1 100 Continue\r\n\r\n')
 		}
@@ -433,6 +441,10 @@ fn serve(mut a App, fd int) {
 			path.starts_with('/delay/') {
 				time.sleep(path.all_after('/delay/').int() * time.millisecond)
 				c.write_str(ok_head + ok_body)
+			}
+			path.starts_with('/late/') {
+				time.sleep(path.all_after('/late/').int() * time.millisecond)
+				c.write_str('HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nlate')
 			}
 			path.starts_with('/big/') {
 				size := path.all_after('/big/').int()

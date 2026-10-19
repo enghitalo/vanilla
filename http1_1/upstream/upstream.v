@@ -55,6 +55,21 @@ module upstream
 // can follow DNS changes, off the workers. Nothing is allocated per exchange
 // once the slot buffers reach their high-water mark.
 //
+// Timeouts: an exchange ends at its own deadline (connect_timeout_ms, then
+// response_timeout_ms) or, for a parked request, at the park's
+// (Limits.park_timeout_ms, armed afresh at each park: it bounds each wait, not
+// the whole exchange), whichever passes first. advance() then answers .failed
+// with .timeout, once (maintenance.v says how). Call advance() in every run of
+// the continuation: in one with event_loop.timed_out() it ends the exchange
+// and answers .pending (return .suspend), and the hangup that follows at once
+// brings the .timeout (or .ready, for an answer complete already). A
+// continuation that answers timed_out() itself must not release() the
+// exchange there: the runtime goes on watching its socket, as a tombstone that
+// drains the reply, and release() would close the fd under that watch (#342).
+// The slot then stays busy until the reply comes or the exchange's own
+// deadline passes (maintain()), and the tombstone's run calls advance() and
+// release() as usual.
+//
 // One exchange per parked request: do not start a second exchange from a
 // continuation (on a client that disconnected meanwhile, the runtime only
 // re-arms the fd the continuation woke on, so a watch on another pool's fd
@@ -98,7 +113,9 @@ pub:
 	max_conns int = 8
 	// connect_timeout_ms bounds the TCP connect plus the TLS handshake;
 	// response_timeout_ms the wait from the connection being ready to the last
-	// byte of the response. Enforced by the maintenance timer.
+	// byte of the response. Enforced by the maintenance timer. A parked
+	// request's Limits.park_timeout_ms ends the exchange first when it passes
+	// first: it bounds each wait, these the whole phase.
 	connect_timeout_ms  int = 3000
 	response_timeout_ms int = 15_000
 	// idle_timeout_ms closes a connection idle this long: keep it below the
@@ -157,7 +174,7 @@ pub enum Failure {
 	send       // the connection failed while the request was being sent
 	closed     // the connection closed before any byte of the response
 	truncated  // the connection closed mid-response (over TLS, also: a close-delimited body without close_notify)
-	timeout    // connect_timeout_ms or response_timeout_ms passed
+	timeout    // connect_timeout_ms or response_timeout_ms passed, or the park's Limits.park_timeout_ms
 	malformed  // the response is not valid HTTP/1.1
 	too_large  // the response is larger than max_response_bytes
 }

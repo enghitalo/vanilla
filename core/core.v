@@ -44,8 +44,9 @@ fn worker_count() int {
 //              fd is ready or the park's deadline passes (park_timeout_ms,
 //              watch_fd_deadline; multi-step chains re-suspend). Supported on Linux
 //              epoll (plain HTTP and HTTPS) + io_uring and macOS kqueue; the
-//              Windows/IOCP worker has no watch reactor yet, so there a
-//              .suspend DROPS the connection (see reject_register).
+//              poll backend (-d vanilla_poll) and the Windows/IOCP worker
+//              have no watch reactor, so there a .suspend DROPS the
+//              connection (see reject_register).
 //   .close   — finish this connection: whatever is in `res` is flushed, then
 //              the connection is closed — from a handler or a continuation
 //              alike. macOS kqueue makes one best-effort write instead,

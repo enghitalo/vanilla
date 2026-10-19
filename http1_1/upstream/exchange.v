@@ -49,8 +49,12 @@ pub fn (mut x Exchange) send(mut el core.EventLoop, cont core.WakeFn, payload vo
 		x.deadline = now + ms_ns(x.pool.origin.response_timeout_ms)
 		r := x.drive(false, mut el, cont, payload)
 		if r == .ready {
-			// Wake the continuation at once (the socket is writable, or hung
-			// up): it finds the exchange .ready, as on every other path.
+			// An early answer, complete before the request was all written:
+			// the connection is done (no_reuse), and its socket may be full,
+			// so it may never turn writable. Shut it down: the hangup wakes
+			// the continuation at once, and it finds the exchange .ready, as
+			// on every other path.
+			C.shutdown(x.fd, C.SHUT_RDWR)
 			return x.park(true, mut el, cont, payload)
 		}
 		return r
@@ -61,8 +65,28 @@ pub fn (mut x Exchange) send(mut el core.EventLoop, cont core.WakeFn, payload vo
 // advance continues the exchange from its continuation (the arguments are the
 // continuation's own: ready_fd_error, event_loop, and the cont / payload to
 // re-arm with). .pending: return .suspend; .ready: read the response, answer,
-// release(); .failed: failure() says why, answer, release().
+// release(); .failed: failure() says why, answer, release(). Call it in every
+// run of the continuation, one woken by the park's deadline
+// (event_loop.timed_out()) or run by a tombstone (event_loop.orphaned())
+// included: it handles both.
 pub fn (mut x Exchange) advance(ready_fd_error bool, mut el core.EventLoop, cont core.WakeFn, payload voidptr) Poll {
+	if el.timed_out() && x.phase != .idle && x.fd >= 0 {
+		// The park's own deadline (Limits.park_timeout_ms) passed. The fd is
+		// not ready: no read, write or connect check on it (SO_ERROR reads 0
+		// while a connect is in flight). This run never ends the exchange,
+		// even one maintain() expired in this same loop iteration (the two
+		// deadlines passed together), or one .ready already (an early answer:
+		// send() shut its socket down, so the hangup normally wakes it first):
+		// ended here, the watch would turn into a tombstone, and release()
+		// would close the fd under it (#342). It shuts the socket down as
+		// maintain() does and keeps watching it: the hangup wakes this
+		// continuation again at once, and that run answers (.timeout below,
+		// or .ready).
+		if !x.timed_out {
+			x.expire()
+		}
+		return x.park(false, mut el, cont, payload)
+	}
 	match x.phase {
 		.ready {
 			return .ready
@@ -471,10 +495,18 @@ fn (mut x Exchange) retry(mut el core.EventLoop, cont core.WakeFn, payload voidp
 fn (mut x Exchange) park(write bool, mut el core.EventLoop, cont core.WakeFn, payload voidptr) Poll {
 	el.watch_fd_persistent(x.fd, if write { .writable } else { .readable }, cont, payload)
 	if el.last_watched != x.fd {
-		return x.fail(.invalid) // this worker cannot park a request (the TLS / IOCP workers)
+		return x.fail(.invalid) // this worker cannot park a request (the poll and IOCP workers)
 	}
 	x.pool.due(x.deadline)
 	return .pending
+}
+
+// expire ends an exchange in flight past a deadline: shutdown(2) wakes the
+// watch parked on its socket as a hangup, and advance() reports .timeout from
+// that run. The socket stays open: release() closes it, after that run.
+fn (mut x Exchange) expire() {
+	x.timed_out = true
+	C.shutdown(x.fd, C.SHUT_RDWR)
 }
 
 fn (mut x Exchange) fail(f Failure) Poll {

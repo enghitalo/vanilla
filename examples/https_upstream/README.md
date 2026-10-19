@@ -41,7 +41,8 @@ x.release()
 core.append_str(mut out, resp_502)
 return .done
 
-// The continuation: advance until .ready or .failed, answer, release.
+// The continuation: advance until .ready or .failed, answer, release. Every
+// run calls advance(), one woken by the park's deadline included.
 mut x := st.pay.exchange_of(ready_fd) or { ... }
 match x.advance(ready_fd_error, mut el, on_charge, payload) {
     .pending { return .suspend }
@@ -78,10 +79,18 @@ return .done
 - **Early answers:** an upstream that answers (a 413) before reading the whole
   request body stops the upload; the answer is relayed, the connection dropped.
 - **Deadlines:** `connect_timeout_ms` (TCP + TLS) and `response_timeout_ms`,
-  enforced by the maintenance timer until parked requests get their own
-  deadline in the runtime (#200): it shuts the socket down, the parked watch
-  wakes, and `advance()` reports `.timeout` (504). The late reply can never
-  reach another exchange: the connection is closed.
+  enforced by the maintenance timer: it shuts the socket down, the parked
+  watch wakes, and `advance()` reports `.timeout` (504). The timer also ends
+  an exchange whose client left (its watch is then a tombstone) and a
+  clientless one, which get no deadline from the runtime. A parked request's
+  `Limits.park_timeout_ms` bounds each wait too (it is armed afresh at each
+  park): when it passes first, the continuation runs with
+  `event_loop.timed_out()`, and `advance()` ends the exchange the same way
+  (`.pending` from that run, `.timeout` from the hangup right after). So call
+  `advance()` in every run; a continuation that answers `timed_out()` itself
+  must not `release()` the exchange there (the runtime still watches its
+  socket, #342). The late reply can never reach another exchange: the
+  connection is closed.
 - **Limits:** `max_conns` per worker (then `acquire()` sheds: 503),
   `max_request_bytes`, `max_response_bytes` (`.too_large`).
 - **DNS:** resolved once at startup (a typo fails fast); a `Resolver`

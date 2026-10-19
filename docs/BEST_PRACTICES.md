@@ -372,11 +372,12 @@ budget with `event_loop.watch_fd_deadline(...)` /
 `watch_fd_persistent_deadline(...)` (`timeout_ms` < 0 exempts a long poll;
 each watch arms a fresh deadline, so pass the time left to bound a multi-step
 request). When the deadline passes first, the continuation runs once with
-`event_loop.timed_out()` true: answer 504 and return `.done`. On a pooled fd
-the reply is still due, and the park's tombstone consumes it in order (the
-continuation runs again, against a discarded buffer, when it arrives, with
-`event_loop.orphaned()` true), so in the timeout branch don't read the fd and
-don't release the connection:
+`event_loop.timed_out()` true: answer 504 and return `.done` (an
+`http1_1.upstream` exchange is the exception: call `advance()`, below). On a
+pooled fd the reply is still due, and the park's tombstone consumes it in
+order (the continuation runs again, against a discarded buffer, when it
+arrives, with `event_loop.orphaned()` true), so in the timeout branch don't
+read the fd and don't release the connection:
 
 ```v
 if event_loop.timed_out() {
@@ -500,7 +501,15 @@ kqueue a deadline watch is a plain watch, and `cancel` fails.
   started in `on_worker_start`), `acquire()` / `send()` + `.suspend` in the
   handler, `advance()` in the continuation, `release()` on every path. Shed
   with 503 when `acquire()` has nothing, answer 502 / 504 from `failure()`
-  with `.done`. `Pool.new` fails for an origin that does not resolve, so one
+  with `.done`. An exchange ends at its own deadline (`connect_timeout_ms`,
+  `response_timeout_ms`, kept by the pool's maintenance timer) or at
+  `Limits.park_timeout_ms`, which bounds each wait, whichever passes first:
+  either way `advance()` answers `.failed` with `.timeout`, once. Call it in
+  every run of the continuation, `event_loop.timed_out()` included, instead
+  of answering the timeout yourself: a `release()` in that run would close
+  the socket while the runtime still watches it
+  ([vanilla#342](https://github.com/enghitalo/vanilla/issues/342)).
+  `Pool.new` fails for an origin that does not resolve, so one
   provider's DNS outage at boot stops the server: `allow_unresolved` (with a
   `Resolver`) starts that pool empty instead, once the lookup gives up, and
   its calls fail at once with `.dns` until the name resolves. An exchange's

@@ -76,9 +76,10 @@ Connection: close
   `resp_async` const and returns `.done`.
 - **`.readable`, not `EPOLLIN`.** `core.WatchInterest` is portable: each
   backend maps `.readable` / `.writable` to its own flag (epoll
-  `EPOLLIN`/`EPOLLOUT`, kqueue `EVFILT_READ`/`EVFILT_WRITE`). The TLS and
-  Windows IOCP workers have no watch reactor, so there a `.suspend` drops the
-  connection; the test is built everywhere but Windows.
+  `EPOLLIN`/`EPOLLOUT`, kqueue `EVFILT_READ`/`EVFILT_WRITE`). The poll
+  backend (`-d vanilla_poll`) and the Windows IOCP worker have no watch
+  reactor, so there a `.suspend` drops the connection (HTTPS has one: it runs
+  on the epoll worker); the test is built everywhere but Windows.
 - **Routing in place.** `route_is` compares the path bytes up to the first
   `?` without copying the request; the replies are consts appended with
   `core.append_str`

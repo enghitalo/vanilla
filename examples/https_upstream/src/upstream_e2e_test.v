@@ -11,6 +11,7 @@ import os
 import time
 import crypto.sha256
 import sync.stdatomic
+import core
 import server
 import tls
 import testkit
@@ -174,6 +175,11 @@ fn setup_limits(https bool, cert string, o upstream.Origin, limits server.Limits
 
 // setup_fake is setup_limits with more fake_upstream options.
 fn setup_fake(https bool, cert string, o upstream.Origin, limits server.Limits, fake_args []string) !Env {
+	return setup_handler(https, cert, o, limits, fake_args, edge)
+}
+
+// setup_handler is setup_fake with the edge's handler.
+fn setup_handler(https bool, cert string, o upstream.Origin, limits server.Limits, fake_args []string, handler core.Handler) !Env {
 	mut e := Env{}
 	if https {
 		e.certs = testkit.test_certs()!
@@ -186,17 +192,21 @@ fn setup_fake(https bool, cert string, o upstream.Origin, limits server.Limits, 
 		port:  e.fake.port
 		https: https
 	}
-	cfg := e.cfg
-	e.h = vtest.start(server.ServerConfig{
-		handler:         edge
+	e.h = start_edge(origin, e.cfg, limits, handler)!
+	return e
+}
+
+// start_edge starts an edge server (one worker) whose pool goes to `origin`.
+fn start_edge(origin upstream.Origin, cfg &tls.Config, limits server.Limits, handler core.Handler) !&vtest.Harness {
+	return vtest.start(server.ServerConfig{
+		handler:         handler
 		workers:         1
 		limits:          limits
 		on_worker_start: on_worker_start
 		make_state:      fn [origin, cfg] () voidptr {
 			return new_app(origin, cfg, unsafe { nil })
 		}
-	})!
-	return e
+	})
 }
 
 fn (mut e Env) stop() {
@@ -554,7 +564,11 @@ fn test_early_response() {
 		assert status_of(get(p, '/ok')) == 200
 		assert e.fake.stat('accepted') == 2
 		// The same on a kept connection, where the handler itself writes the
-		// request and may meet the whole answer before it returns.
+		// request and may meet the whole answer before it returns (send() then
+		// shuts the socket down: upstream_test.v's
+		// test_early_answer_at_send_wakes_at_once). If the answer comes after
+		// the request parked on the full socket, it is read when the upstream
+		// closes, after 1 s here (on CI's runners, that is the usual order).
 		r2, _ := call(p, 'POST /fill/${4 << 20}/e413 HTTP/1.1\r\nHost: edge\r\n\r\n', 10_000)
 		assert status_of(r2) == 413, r2
 	}
@@ -725,10 +739,17 @@ fn test_connect_deadline() {
 // silent_listener listens on 127.0.0.1 and never accepts: connects complete
 // in its backlog, and nothing is ever answered (not even a TLS handshake).
 fn silent_listener() (int, int) {
+	return listener(16)
+}
+
+// listener listens on 127.0.0.1 with `backlog` and never accepts. With
+// backlog 0 the accept queue holds one connection: once it does, the kernel
+// drops the SYN of every later connect, which stays in SYN_SENT.
+fn listener(backlog int) (int, int) {
 	lfd := C.socket(C.AF_INET, C.SOCK_STREAM, 0)
 	a := transport.ip_addr('127.0.0.1', 0) or { panic('addr') }
 	assert C.bind(lfd, voidptr(&a.data[0]), a.len) == 0
-	assert C.listen(lfd, 16) == 0
+	assert C.listen(lfd, backlog) == 0
 	mut sa := transport.Addr{}
 	mut sl := u32(sa.data.len)
 	C.getsockname(lfd, voidptr(&sa.data[0]), &sl)
@@ -789,6 +810,9 @@ fn test_client_disconnect_mid_exchange_frees_the_slot() {
 
 fn C.socket(domain int, typ int, protocol int) int
 fn C.bind(fd int, addr voidptr, len u32) int
+fn C.connect(fd int, addr voidptr, len u32) int
+fn C.dup(fd int) int
+fn C.shutdown(fd int, how int) int
 fn C.getsockname(fd int, addr voidptr, len &u32) int
 fn C.close(fd int) int
 
@@ -1170,6 +1194,531 @@ fn test_unresolved_origin_coalesces_refreshes() {
 	assert failed == 3200
 	assert resolutions >= 1, 'the failing calls asked for no refresh'
 	assert resolutions <= ms / 1000 + 2, '${resolutions} resolutions for ${failed} failing calls in ${ms} ms'
+}
+
+// --- Two deadlines on one park (#322) ----------------------------------------
+//
+// A parked exchange waits under two deadlines: its own (connect_timeout_ms,
+// response_timeout_ms), which the pool's maintenance timer enforces, and the
+// park's (Limits.park_timeout_ms), which the epoll worker enforces by running
+// the continuation with event_loop.timed_out(). Whichever passes first, or
+// both at once, the continuation gets .failed with .timeout once, and the
+// connection is closed only once no watch is left on it.
+
+// Probe counts what probe_cont saw, for one edge: its worker thread writes
+// it and the test reads it (atomics). Each edge has its own, the watch
+// payload of its exchanges: a stopped edge's late runs land in its own.
+@[heap]
+struct Probe {
+mut:
+	timeout_runs  i64 // runs with event_loop.timed_out(): the park's deadline passed
+	orphaned_runs i64 // runs with event_loop.orphaned(): a tombstone's
+	failed        i64 // advance() answered .failed
+	failure       i64 // the failure of the last one (an upstream.Failure)
+	timeout_fd    i64 // ready_fd of the last timed-out run
+	after_timeout i64 // what advance() answered in it (an upstream.Poll)
+	drop_client   i64 // set by the test: a timed-out run shuts its client's socket down
+}
+
+fn new_probe() &Probe {
+	return &Probe{
+		timeout_fd:    -1
+		after_timeout: -1
+	}
+}
+
+// probe_handler is an edge handler counting into p (probe_edge).
+fn probe_handler(p &Probe) core.Handler {
+	return fn [p] (req []u8, mut out []u8, client_fd int, worker_state voidptr, mut el core.EventLoop) core.Step {
+		return probe_edge(req, mut out, client_fd, worker_state, mut el, p)
+	}
+}
+
+// probe_edge relays like edge, with probe_cont as the continuation and p as
+// its payload: GET /up/<path>, or POST /fill/<n>/<path> with n bytes. GET /fd
+// answers the client's own fd number.
+fn probe_edge(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut el core.EventLoop, p &Probe) core.Step {
+	sp1 := index_of(req, 0, ` `)
+	sp2 := if sp1 > 0 { index_of(req, sp1 + 1, ` `) } else { -1 }
+	if sp2 < 0 {
+		core.append_str(mut out, resp_404)
+		return .done
+	}
+	target := view(req, sp1 + 1, sp2 - sp1 - 1)
+	if target == '/fd' {
+		mut digits := []u8{cap: 20}
+		wi(mut digits, client_fd)
+		core.append_str(mut out, 'HTTP/1.1 200 OK\r\nContent-Length: ')
+		wi(mut out, digits.len)
+		core.append_str(mut out, crlf2)
+		wb(mut out, digits)
+		return .done
+	}
+	mut fill := 0
+	mut up_start := sp1 + up_prefix.len
+	if target.starts_with(fill_prefix) {
+		slash := index_of(req, sp1 + 1 + fill_prefix.len, `/`)
+		if slash < 0 || slash > sp2 {
+			core.append_str(mut out, resp_404)
+			return .done
+		}
+		fill = leading_int(req, sp1 + 1 + fill_prefix.len, slash - sp1 - 1 - fill_prefix.len)
+		up_start = slash
+	} else if !target.starts_with(up_prefix) {
+		core.append_str(mut out, resp_404)
+		return .done
+	}
+	mut app := unsafe { &App(worker_state) }
+	mut x := app.up.acquire() or {
+		core.append_str(mut out, resp_503)
+		return .done
+	}
+	x.request(view(req, 0, sp1), view(req, up_start, sp2 - up_start))
+	if fill > 0 {
+		mut b := x.body()
+		unsafe {
+			b.grow_len(fill)
+			vmemset(b.data, `a`, fill)
+		}
+	}
+	if x.send(mut el, probe_cont, voidptr(p)) == .pending {
+		return .suspend
+	}
+	failed(mut out, x.failure())
+	x.release()
+	return .done
+}
+
+// probe_cont is on_upstream, counting what each run saw in its payload, a
+// Probe.
+fn probe_cont(mut out []u8, fd int, fd_err bool, payload voidptr, worker_state voidptr, mut el core.EventLoop) core.Step {
+	mut p := unsafe { &Probe(payload) }
+	timed_out := el.timed_out()
+	if timed_out {
+		stdatomic.add_i64(&p.timeout_runs, 1)
+		stdatomic.store_i64(&p.timeout_fd, i64(fd))
+		if stdatomic.load_i64(&p.drop_client) != 0 {
+			// The client leaves between this run and the hangup's.
+			C.shutdown(el.client_fd, C.SHUT_RDWR)
+		}
+	}
+	if el.orphaned() {
+		stdatomic.add_i64(&p.orphaned_runs, 1)
+	}
+	mut app := unsafe { &App(worker_state) }
+	mut x := app.up.exchange_of(fd) or {
+		failed(mut out, .closed)
+		return .done
+	}
+	r := x.advance(fd_err, mut el, probe_cont, payload)
+	if timed_out {
+		stdatomic.store_i64(&p.after_timeout, i64(int(r)))
+	}
+	match r {
+		.pending {
+			return .suspend
+		}
+		.failed {
+			stdatomic.add_i64(&p.failed, 1)
+			stdatomic.store_i64(&p.failure, i64(int(x.failure())))
+			failed(mut out, x.failure())
+			x.release()
+			return .done
+		}
+		.ready {}
+	}
+	body := x.body_view()
+	core.append_str(mut out, 'HTTP/1.1 ')
+	wi(mut out, x.status())
+	core.append_str(mut out, ' \r\nContent-Length: ')
+	wi(mut out, body.len)
+	core.append_str(mut out, crlf2)
+	wb(mut out, body)
+	x.release()
+	return .done
+}
+
+// Stage is where an exchange waits when its deadline passes.
+enum Stage {
+	connecting // the TCP connect: the origin's accept queue is full, its SYN dropped
+	handshake  // the TLS handshake: the origin accepts (in its backlog), never answers
+	sending    // the request: the upstream stops reading, and an upload fills the socket
+	reading    // the response: the upstream never answers
+}
+
+fn stages(https bool) []Stage {
+	return if https {
+		[Stage.connecting, .handshake, .sending, .reading]
+	} else {
+		[Stage.connecting, .sending, .reading]
+	}
+}
+
+// stall_fill is the upload for the sending stage: far more than loopback
+// holds in flight with Linux's defaults (the sender's buffer grows to
+// tcp_wmem's 4 MiB at most, the receiver's window is ~128 KiB while nobody
+// reads), so the send stops on a full socket.
+const stall_fill = 16 << 20
+
+// TimeoutCase is one call that waits at `stage` until a deadline passes: the
+// park's (park_ms, Limits.park_timeout_ms) and the exchange's own (own_ms,
+// the origin's connect_timeout_ms and response_timeout_ms).
+struct TimeoutCase {
+	https   bool
+	stage   Stage
+	park_ms int
+	own_ms  int
+mut:
+	probe         &Probe = new_probe()
+	resp          string
+	ms            i64
+	next          string // a call made after it (fake stages only)
+	accepted      int    // the fake's connections by then (-1: no fake)
+	timeout_runs  i64
+	orphaned_runs i64
+	failed        i64
+	failure       i64
+	after_timeout i64
+}
+
+const deadline_short_ms = 300
+const deadline_long_ms = 10_000
+
+// deadline_bound is how long a call that times out after deadline_short_ms
+// may take.
+fn deadline_bound() i64 {
+	return i64(deadline_short_ms) + 1200 * slack()
+}
+
+fn (mut c TimeoutCase) run() {
+	o := upstream.Origin{
+		max_conns:           1
+		connect_timeout_ms:  c.own_ms
+		response_timeout_ms: c.own_ms
+		max_request_bytes:   2 * stall_fill
+	}
+	limits := server.Limits{
+		park_timeout_ms: c.park_ms
+	}
+	wait := int(deadline_bound()) + 500
+	c.accepted = -1
+	if c.stage == .connecting || c.stage == .handshake {
+		lfd, port := listener(if c.stage == .connecting { 0 } else { 16 })
+		defer {
+			C.close(lfd)
+		}
+		// Queued, never accepted: with backlog 0 it fills the accept queue.
+		filler := transport.dial_tcp('127.0.0.1', port) or { panic(err) }
+		defer {
+			transport.close_fd(filler)
+		}
+		testkit.fd_wait_writable(filler, 1000)
+		mut certs := ''
+		mut cfg := &tls.Config(unsafe { nil })
+		if c.https {
+			certs = testkit.test_certs() or { panic(err) }
+			cfg = tls.new_client(os.join_path(certs, 'ca.crt'), .full) or { panic(err) }
+		}
+		defer {
+			if certs != '' {
+				os.rmdir_all(certs) or {}
+			}
+		}
+		mut h := start_edge(upstream.Origin{
+			...o
+			host:  '127.0.0.1'
+			port:  port
+			https: c.https
+		}, cfg, limits, probe_handler(c.probe)) or { panic(err) }
+		defer {
+			h.stop()
+		}
+		r, ms := call(h.port(), 'GET /up/ok HTTP/1.1\r\nHost: edge\r\n\r\n', wait)
+		c.resp = r
+		c.ms = ms
+		c.snapshot()
+		return
+	}
+	mut e := setup_handler(c.https, 'server', o, limits, [], probe_handler(c.probe)) or {
+		panic(err)
+	}
+	defer {
+		e.stop()
+	}
+	req := if c.stage == .sending {
+		'POST /fill/${stall_fill}/stall HTTP/1.1\r\nHost: edge\r\n\r\n'
+	} else {
+		'GET /up/slow HTTP/1.1\r\nHost: edge\r\n\r\n'
+	}
+	r, ms := call(e.h.port(), req, wait)
+	c.resp = r
+	c.ms = ms
+	c.snapshot()
+	c.next = get(e.h.port(), '/ok')
+	c.accepted = e.fake.stat('accepted')
+}
+
+fn (mut c TimeoutCase) snapshot() {
+	c.timeout_runs = stdatomic.load_i64(&c.probe.timeout_runs)
+	c.orphaned_runs = stdatomic.load_i64(&c.probe.orphaned_runs)
+	c.failed = stdatomic.load_i64(&c.probe.failed)
+	c.failure = stdatomic.load_i64(&c.probe.failure)
+	c.after_timeout = stdatomic.load_i64(&c.probe.after_timeout)
+}
+
+fn (c &TimeoutCase) name() string {
+	mode := if c.https { 'https' } else { 'http' }
+	return '${mode} ${c.stage}, park ${c.park_ms} ms, own ${c.own_ms} ms'
+}
+
+fn (c &TimeoutCase) summary() string {
+	after := match c.after_timeout {
+		i64(int(upstream.Poll.pending)) { 'pending' }
+		i64(int(upstream.Poll.ready)) { 'ready' }
+		i64(int(upstream.Poll.failed)) { 'failed' }
+		else { '-' }
+	}
+	mut s := '[${c.name()}] ${brief(c.resp)} after ${c.ms} ms; timed-out runs: ${c.timeout_runs} (advance() answered ${after} in the last), .failed: ${c.failed} (${failure_names[int(c.failure)]}), orphaned runs: ${c.orphaned_runs}'
+	if c.accepted >= 0 {
+		s += '; next call: ${brief(c.next)}, upstream connections: ${c.accepted}'
+	}
+	return s
+}
+
+// brief is a response in a few words: its status, then its
+// X-Upstream-Failure or its body.
+fn brief(resp string) string {
+	if resp == '' {
+		return 'no response'
+	}
+	if resp.contains('X-Upstream-Failure: ') {
+		return '${status_of(resp)} ${failure_of(resp)}'
+	}
+	return '${status_of(resp)} "${body_of(resp)}"'
+}
+
+// check asserts what every timed-out call must show: one 504 for .timeout
+// about deadline_short_ms in, one .failed seen by the continuation, no
+// tombstone, and the slot free again for a fresh connection. A timed-out run
+// (the park's deadline first, or with the exchange's) got .pending: it ended
+// the exchange and kept watching its socket, and the .failed came from the
+// run after it (the hangup). The exchange's deadline alone brings none.
+fn (c &TimeoutCase) check() {
+	assert status_of(c.resp) == 504 && failure_of(c.resp) == 'timeout', c.summary()
+	assert c.ms >= i64(deadline_short_ms - 50) && c.ms <= deadline_bound(), c.summary()
+	assert c.failed == 1 && c.failure == i64(int(upstream.Failure.timeout)), c.summary()
+	assert c.orphaned_runs == 0, c.summary()
+	if c.park_ms < c.own_ms {
+		assert c.timeout_runs == 1, c.summary()
+	} else if c.own_ms < c.park_ms {
+		assert c.timeout_runs == 0, c.summary()
+	} else {
+		assert c.timeout_runs <= 1, c.summary()
+	}
+	if c.timeout_runs > 0 {
+		assert c.after_timeout == i64(int(upstream.Poll.pending)), c.summary()
+	}
+	if c.accepted >= 0 {
+		assert status_of(c.next) == 200 && body_of(c.next) == '{"status":"paid"}', c.summary()
+		assert c.accepted == 2, c.summary() // the timed-out connection was not reused
+	}
+}
+
+// run_timeout_cases runs a TimeoutCase in every stage and variant, prints
+// what each saw, then checks them all.
+fn run_timeout_cases(park_ms int, own_ms int) {
+	mut cases := []TimeoutCase{}
+	for https in variants() {
+		for stage in stages(https) {
+			mut c := TimeoutCase{
+				https:   https
+				stage:   stage
+				park_ms: park_ms
+				own_ms:  own_ms
+			}
+			c.run()
+			eprintln(c.summary())
+			cases << c
+		}
+	}
+	for c in cases {
+		c.check()
+	}
+}
+
+// Limits.park_timeout_ms shorter than the origin's timeouts (#322): in each
+// stage the park's deadline ends the exchange. The continuation that runs with
+// event_loop.timed_out() gets .pending from advance(), which shut the socket
+// down and kept watching it; the hangup wakes it at once, and that run gets
+// .failed with .timeout (504).
+fn test_park_deadline_before_the_exchange_deadline() {
+	run_timeout_cases(deadline_short_ms, deadline_long_ms)
+}
+
+// The exchange's own deadline shorter than Limits.park_timeout_ms: the
+// maintenance timer ends it in each stage, as before, and the continuation
+// never sees event_loop.timed_out().
+fn test_exchange_deadline_before_the_park_deadline() {
+	run_timeout_cases(deadline_long_ms, deadline_short_ms)
+}
+
+// Both deadlines equal, as with park_timeout_ms set to an origin's timeout:
+// they can pass in the same loop iteration (the connect and handshake stages
+// do), maintain() (a timerfd event) first, then the timed-out run, which finds
+// the exchange expired already. That run must not end it either: it keeps
+// watching the socket, and the hangup's run gets .timeout. Ended there, the
+// watch became a tombstone on the fd that release() closed (#342): the next
+// exchange, given that number, lost its answer to the tombstone.
+fn test_equal_park_and_exchange_deadlines() {
+	run_timeout_cases(deadline_short_ms, deadline_short_ms)
+}
+
+// A client that leaves between the timed-out run and the hangup's: its watch
+// becomes a tombstone, whose run gets the .timeout and releases the
+// connection (or the hangup's run comes first and does). Either way the
+// exchange ends once, and the slot serves the next call on a fresh connection.
+fn test_client_leaving_after_a_park_deadline() {
+	for https in variants() {
+		mode := if https { 'https' } else { 'http' }
+		pr := new_probe()
+		stdatomic.store_i64(&pr.drop_client, 1)
+		mut e := setup_handler(https, 'server', upstream.Origin{
+			max_conns:           1
+			response_timeout_ms: deadline_long_ms
+		}, server.Limits{
+			park_timeout_ms: deadline_short_ms
+		}, [], probe_handler(pr)) or { panic(err) }
+		defer {
+			e.stop()
+		}
+		p := e.h.port()
+		r1, ms := call(p, 'GET /up/slow HTTP/1.1\r\nHost: edge\r\n\r\n', int(deadline_bound()) + 500)
+		stdatomic.store_i64(&pr.drop_client, 0)
+		// The slot comes back within moments of the hangup, in either order.
+		mut r2 := ''
+		sw := time.new_stopwatch()
+		for sw.elapsed().milliseconds() < 2000 * slack() {
+			r2 = get(p, '/ok')
+			if status_of(r2) != 503 {
+				break
+			}
+			time.sleep(10 * time.millisecond)
+		}
+		failed := stdatomic.load_i64(&pr.failed)
+		failure := stdatomic.load_i64(&pr.failure)
+		orphaned := stdatomic.load_i64(&pr.orphaned_runs)
+		eprintln('[${mode} client leaves] its call: ${brief(r1)} after ${ms} ms; timed-out runs: ${stdatomic.load_i64(&pr.timeout_runs)}, .failed: ${failed} (${failure_names[int(failure)]}), orphaned runs: ${orphaned}; next call: ${brief(r2)}, upstream connections: ${e.fake.stat('accepted')}')
+		assert status_of(r1) != 200, '${mode}: ${r1}' // gone: nothing, or a 504 it never read
+		assert stdatomic.load_i64(&pr.timeout_runs) == 1, mode
+		assert stdatomic.load_i64(&pr.after_timeout) == i64(int(upstream.Poll.pending)), mode
+		assert failed == 1 && failure == i64(int(upstream.Failure.timeout)), mode
+		assert orphaned <= 1, mode
+		assert status_of(r2) == 200 && body_of(r2) == '{"status":"paid"}', '${mode}: ${r2}'
+		assert e.fake.stat('accepted') == 2, mode
+	}
+}
+
+// hold_below takes every free fd number below n (as duplicates of fd), so
+// the next fd this process gets is n, while n is free. Close them after.
+fn hold_below(n int, fd int) []int {
+	mut held := []int{}
+	for {
+		d := C.dup(fd)
+		if d < 0 || d >= n {
+			if d >= 0 {
+				C.close(d)
+			}
+			return held
+		}
+		held << d
+	}
+	return held
+}
+
+// A late reply reaches nobody (#322). The park's deadline (500 ms) passes
+// before the upstream answers (700 ms): the client gets its 504, and the
+// connection that owes the reply is closed, not pooled. With max_conns: 1 the
+// next call dials a fresh connection and gets its own answer while the late
+// one arrives on the old connection, and a call after that reuses the fresh
+// one. A client accepted on the fd number the timed-out exchange freed is
+// served: no watch is left on that number to take its events (#342).
+fn test_late_reply_after_a_park_deadline_reaches_nobody() {
+	for https in variants() {
+		mode := if https { 'https' } else { 'http' }
+		pr := new_probe()
+		mut e := setup_handler(https, 'server', upstream.Origin{
+			max_conns:           1
+			response_timeout_ms: deadline_long_ms
+		}, server.Limits{
+			park_timeout_ms: 500
+		}, [], probe_handler(pr)) or { panic(err) }
+		defer {
+			e.stop()
+		}
+		p := e.h.port()
+		// Connected after the timeout, once every lower fd number is taken: the
+		// edge then accepts one on the number the timed-out exchange freed.
+		// Three, made now: a thread may free a lower number meanwhile (a
+		// stopped edge's worker still runs its maintenance tick), and the
+		// client that gets it holds it for the next try.
+		mut clients := []int{}
+		for _ in 0 .. 3 {
+			s := C.socket(C.AF_INET, C.SOCK_STREAM, 0)
+			assert s >= 0
+			clients << s
+		}
+		defer {
+			for s in clients {
+				C.close(s)
+			}
+		}
+		a := transport.dial_tcp('127.0.0.1', p) or { panic(err) }
+		defer {
+			transport.close_fd(a)
+		}
+		mut acc := []u8{}
+		mut buf := []u8{len: 4096}
+		sw := time.new_stopwatch()
+		testkit.fd_wait_writable(a, 1000)
+		assert testkit.fd_write_all(a, 'GET /up/late/700 HTTP/1.1\r\nHost: edge\r\n\r\n'.bytes(),
+			1000)
+		read_response(a, mut acc, mut buf, 3000)
+		r1 := acc.bytestr()
+		ms := sw.elapsed().milliseconds()
+		eprintln('[${mode} late reply] first call: ${brief(r1)} after ${ms} ms')
+		assert status_of(r1) == 504 && failure_of(r1) == 'timeout', '${mode}: ${r1}'
+		freed := int(stdatomic.load_i64(&pr.timeout_fd))
+		ad := transport.ip_addr('127.0.0.1', p) or { panic('addr') }
+		mut landed := false
+		for s in clients {
+			held := hold_below(freed, s)
+			assert C.connect(s, voidptr(&ad.data[0]), ad.len) == 0
+			assert testkit.fd_write_all(s, 'GET /fd HTTP/1.1\r\nHost: edge\r\n\r\n'.bytes(),
+				1000)
+			read_response(s, mut acc, mut buf, 3000)
+			for fd in held {
+				C.close(fd)
+			}
+			rs := acc.bytestr()
+			eprintln('[${mode} late reply] a client accepted after it: ${brief(rs)} (its fd; the timed-out exchange had ${freed})')
+			assert status_of(rs) == 200, '${mode}: a client accepted after the timeout was not served: ${rs}'
+			if body_of(rs) == freed.str() {
+				landed = true
+				break
+			}
+		}
+		assert landed, '${mode}: no client was accepted on the freed fd ${freed}'
+		r2 := get(p, '/delay/300') // in flight when the late reply comes
+		assert status_of(r2) == 200 && body_of(r2) == '{"status":"paid"}', '${mode}: ${r2}'
+		for sw.elapsed().milliseconds() < 900 {
+			time.sleep(10 * time.millisecond) // the late reply has come and gone
+		}
+		r3 := get(p, '/ok')
+		assert status_of(r3) == 200 && body_of(r3) == '{"status":"paid"}', '${mode}: ${r3}'
+		assert e.fake.stat('accepted') == 2, mode
+		assert stdatomic.load_i64(&pr.failed) == 1, mode
+		assert stdatomic.load_i64(&pr.orphaned_runs) == 0, mode
+	}
 }
 
 #include <malloc.h>
