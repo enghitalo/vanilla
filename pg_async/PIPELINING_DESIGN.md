@@ -95,7 +95,7 @@ connection desyncs or corrupts:
    drain is why the FIFO contract also binds a request whose flush failed: it
    still parks and consumes its error, or its slot never comes back. A pool
    that follows a `transport.Resolver` (`PgPool.follow`, vanilla#351)
-   re-dials from the address table that thread keeps fresh, so no re-dial
+   re-dials from the address table that Resolver keeps fresh, so no re-dial
    resolves the host on the worker.)
 7. **A park that times out keeps its queue position.** With a park deadline
    (`Limits.park_timeout_ms`, `watch_fd_persistent_deadline`, vanilla#200)

@@ -34,7 +34,7 @@ const rollback_timeout = u64(5 * time.second)
 //
 // A re-dial resolves ConnConfig.host again, on the worker, unless the pool
 // follows a transport.Resolver (follow): its re-dials and recycles then dial
-// from an address table that thread keeps fresh (vanilla#351).
+// from an address table that Resolver keeps fresh (vanilla#351).
 //
 // Backends: a request parks on its pooled fd with
 // event_loop.watch_fd_persistent, several requests on one fd when they
@@ -148,16 +148,16 @@ pub fn new_pool(cfg ConnConfig, size int) !&PgPool {
 }
 
 // follow has the pool's re-dials dial from an address table that the
-// Resolver `r` keeps fresh on its own thread, so the worker never resolves
+// Resolver `r` keeps fresh on its own threads, so the worker never resolves
 // ConnConfig.host after startup (vanilla#351): a lost connection's re-dial
 // and a max_lifetime_ms recycle both dial the addresses r found last, and an
 // attempt whose address failed asks r for a refresh (PgPool.redial). Call it
 // in make_state, after new_pool: it resolves the host once more to fill the
 // table (blocking, with ConnConfig.resolve when set), then follows r, whose
-// thread re-resolves it with the same resolve. Each re-dial attempt takes
-// r's updates first, and maintain() takes them at every tick, which keeps the
-// pipe from filling: run start_maintenance (or maintain() from your own
-// timer). One Resolver can serve every pool of every worker, and
+// lookup threads re-resolve it with the same resolve. Each re-dial attempt
+// takes r's updates first, and maintain() takes them at every tick, which
+// keeps the pipe from filling: run start_maintenance (or maintain() from your
+// own timer). One Resolver can serve every pool of every worker, and
 // http1_1.upstream's pools too. Without follow, each re-dial attempt resolves
 // the host on the worker.
 pub fn (mut p PgPool) follow(mut r transport.Resolver) ! {
@@ -180,8 +180,9 @@ pub fn (mut p PgPool) follow(mut r transport.Resolver) ! {
 // taking its latest updates first, else resolving ConnConfig.host on the
 // worker. An attempt whose address failed (no connection) asks the Resolver
 // for a refresh, in case the server moved: at most one ask per connection per
-// redial_backoff, and the Resolver answers the asks of every pool within its
-// refresh gap with one lookup (transport.Feed.ask). Never inlined: the cold
+// redial_backoff, and the Resolver answers the asks of every pool of that
+// host:port with one lookup of that host alone, at once or one refresh gap
+// after its last lookup (transport.Feed.ask). Never inlined: the cold
 // path of acquire*() and maintain(), whose call sites pass only the pool and
 // the index.
 @[noinline]

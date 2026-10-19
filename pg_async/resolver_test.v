@@ -427,9 +427,9 @@ fn silent_listener() (int, transport.Addr) {
 // Only an attempt whose address failed asks for a refresh. One that never
 // dialed (password_fn failed: a token service down) or that connected and
 // then failed (a server that accepts and never answers the startup) asks
-// nothing: the address answered, or was never tried, and an ask would
-// re-resolve every host the Resolver follows (#366). A refused connect then
-// asks.
+// nothing: the address answered, or was never tried, so an ask would cost a
+// lookup of the host for nothing (and, before #366, of every host the
+// Resolver follows). A refused connect then asks.
 fn test_only_an_address_failure_asks_for_a_refresh() {
 	if !testkit.fake_pg_available() {
 		return
