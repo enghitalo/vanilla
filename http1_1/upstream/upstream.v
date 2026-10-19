@@ -52,8 +52,8 @@ module upstream
 // response byte is sent once more on a fresh one. Deadlines (connect + TLS,
 // then the response) and idle / lifetime expiry run from the pool's
 // maintenance timer (start_maintenance, from on_worker_start); a Resolver
-// thread can follow DNS changes. Nothing is allocated per exchange once the
-// slot buffers reach their high-water mark.
+// can follow DNS changes, off the workers. Nothing is allocated per exchange
+// once the slot buffers reach their high-water mark.
 //
 // One exchange per parked request: do not start a second exchange from a
 // continuation (on a client that disconnected meanwhile, the runtime only
@@ -112,7 +112,10 @@ pub:
 	// tcp tunes every dialed socket (TCP_NODELAY, keepalive, TCP_USER_TIMEOUT).
 	tcp transport.TcpOpts
 	// resolve maps host:port to addresses, at Pool.new and on a Resolver's
-	// thread (never on a worker); nil: the system resolver (getaddrinfo).
+	// lookup threads (never on a worker); nil: the system resolver
+	// (getaddrinfo). The pools that follow one host:port (one per worker, and
+	// any other follower of the Resolver) share each lookup of it, made with
+	// the first one's resolve: give them all the same.
 	resolve ResolveFn = unsafe { nil }
 	// allow_unresolved lets Pool.new start the pool with no address when the
 	// host does not resolve (its DNS is down at boot), instead of failing: one
@@ -129,8 +132,11 @@ pub:
 }
 
 // ResolveFn resolves host:port to the addresses to dial, in order: empty when
-// it cannot. It runs at startup and on a Resolver's thread, so it may block
-// and allocate.
+// it cannot. It runs at startup (Pool.new, in each worker's make_state) and on
+// a Resolver's lookup threads, so it may block and allocate, and it may run on
+// several threads at once: the Resolver looks different origins up in
+// parallel (one origin once at a time), next to the workers' Pool.new. Make it
+// thread-safe; one that never returns keeps its lookup thread for good.
 pub type ResolveFn = fn (host string, port int) []transport.Addr
 
 // Poll is where an exchange stands after send() / advance().

@@ -199,7 +199,7 @@ pub:
 	// directory is not supported). It is resolved (getaddrinfo, or resolve)
 	// when a connection comes up, and the addresses are tried in turn. A pool
 	// that follows a transport.Resolver (PgPool.follow) re-dials from the
-	// addresses that thread keeps fresh, so its worker never resolves after
+	// addresses that Resolver keeps fresh, so its worker never resolves after
 	// startup. Any other pool resolves it again at every re-dial attempt, on
 	// the worker thread: a slow DNS lookup stalls the worker then, and an IP
 	// address needs none (vanilla#351). Over TLS, .verify_full checks the
@@ -209,10 +209,10 @@ pub:
 	port int = 5432
 	// resolve maps host:port to the addresses to dial, in order (empty when it
 	// cannot), in place of getaddrinfo: wherever the connection or its pool
-	// resolves host, so on a Resolver's thread when the pool follows one, and
-	// on the worker at each re-dial attempt when it does not. Every worker's
-	// pool and the Resolver can call it at the same time: state it shares
-	// needs atomics or a lock. A Resolver makes one lookup per host:port per
+	// resolves host, so on a Resolver's lookup threads when the pool follows
+	// one, and on the worker at each re-dial attempt when it does not. Every
+	// worker's pool and the Resolver can call it at the same time: state it
+	// shares needs atomics or a lock. A Resolver makes one lookup per host:port per
 	// refresh, for every pool that follows that host:port, with the resolve of
 	// the first one that followed it: give them all the same resolve (the
 	// pools new_pool builds from one ConnConfig do). nil: getaddrinfo.

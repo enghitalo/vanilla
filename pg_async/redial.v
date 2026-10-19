@@ -27,7 +27,7 @@ import transport
 //
 // so the worker never waits on the network. A pool that follows a
 // transport.Resolver (PgPool.follow) dials from the address table that
-// thread keeps fresh, so name resolution never runs on the worker either; a
+// Resolver keeps fresh, so name resolution never runs on the worker either; a
 // pool that follows none resolves ConnConfig.host at every attempt, inline
 // (getaddrinfo: as long as the DNS takes). password_fn (a fresh credential
 // for every attempt) and the TLS handshake's crypto steps do run inline, once

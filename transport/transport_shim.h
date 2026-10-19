@@ -149,8 +149,8 @@ typedef struct {
 
 // transport_resolve resolves host:port (getaddrinfo, TCP) into out[0..max):
 // the count of IPv4 / IPv6 addresses, in getaddrinfo's order, or -1 with the
-// getaddrinfo error in *gai_err. Blocking: call it at startup or on the
-// resolver thread, never on a worker.
+// getaddrinfo error in *gai_err. Blocking: call it at startup or on a
+// resolver's lookup thread, never on a worker.
 static inline int transport_resolve(const char *host, const char *port, transport_resolved *out, int max, int *gai_err) {
 	struct addrinfo hints, *res = NULL, *ai;
 	memset(&hints, 0, sizeof(hints));

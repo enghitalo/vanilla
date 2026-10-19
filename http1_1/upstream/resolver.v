@@ -10,15 +10,19 @@ import transport
 // allow_unresolved starts with no address instead when its name does not
 // resolve (its DNS is down at boot): each exchange then fails at once with
 // .dns, without dialing, until a refresh fills the table. A Resolver keeps the
-// addresses fresh afterwards: one thread re-resolves every followed origin
-// every interval_ms (getaddrinfo gives no TTL), and sooner when a pool runs
-// out of addresses to try or has none (at once, or one refresh gap after the
-// last refresh), then hands the answer to each worker over that pool's own
-// pipe. A worker never resolves, never waits, and shares no mutable state with
-// the thread: the pipe carries fixed-size address records, and the worker
-// copies them into its pool's table on its own thread (a clientless watch,
-// start_maintenance). The Resolver itself is transport.Resolver
-// (transport/resolver_nix.c.v); pg_async's pools can follow the same one.
+// addresses fresh afterwards: it re-resolves each followed origin every
+// interval_ms (getaddrinfo gives no TTL), and sooner when one of the origin's
+// pools runs out of addresses to try or has none (that origin alone, at once
+// or one refresh gap after its last lookup), then hands the answer to each
+// worker over that pool's own pipe. Each origin is looked up on its own, on a
+// few lookup threads, so one provider's slow DNS delays only that provider's
+// refreshes; the pools of one origin (one per worker) share each lookup of it.
+// A worker never resolves, never waits and takes no lock on the request path:
+// the pipe carries fixed-size address records, the worker copies them into its
+// pool's table on its own thread (a clientless watch, start_maintenance), and
+// an ask sets an atomic flag (and writes one wake byte when it sets it). The
+// Resolver itself is transport.Resolver (transport/resolver_nix.c.v);
+// pg_async's pools can follow the same one.
 //
 //   resolver := upstream.Resolver.new(30_000)!   // before new_server
 //   resolver.start()
@@ -43,17 +47,18 @@ pub fn (mut p Pool) follow(mut r Resolver) ! {
 	p.feed = r.follow(p.origin.host, p.origin.port, p.origin.resolve)!
 }
 
-// request_resolve asks the pool's resolver for a refresh (every address
-// failed, or there is none yet), which comes at once, or one gap
-// (refresh_gap_ms) after the last refresh (transport.Feed.ask).
+// request_resolve asks the pool's resolver to refresh its origin (every
+// address failed, or there is none yet), at once or one gap (refresh_gap_ms)
+// after the origin's last lookup (transport.Feed.ask): a flag on the pool's
+// own subscription, and a wake byte only when the flag was clear.
 fn (mut p Pool) request_resolve() {
 	p.feed.ask()
 }
 
 // resolve_system resolves host:port with getaddrinfo: the IPv4 and IPv6
-// addresses in its order, or none. Blocking: at startup or on the resolver
-// thread only. It is transport.resolve_system, kept here for callers of this
-// name.
+// addresses in its order, or none. Blocking: at startup or on a resolver's
+// lookup thread only. It is transport.resolve_system, kept here for callers of
+// this name.
 pub fn resolve_system(host string, port int) []transport.Addr {
 	return transport.resolve_system(host, port)
 }
