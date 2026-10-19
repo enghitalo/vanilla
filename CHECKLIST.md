@@ -535,7 +535,9 @@ concatenates, interpolates or allocates per request. The
   `start_maintenance`, park deadlines and `PgConn.cancel` the epoll worker
   only), `Result` what its views borrow and for how long, `release()` that it
   is for `acquire()` alone, and `ConnConfig.host` that a re-dial resolves the
-  name on the worker. Measured against origin/main 86688fa:
+  name on the worker (since [#351](https://github.com/enghitalo/vanilla/issues/351),
+  only for a pool that follows no `transport.Resolver`). Measured against
+  origin/main 86688fa:
 
   | module | before | after |
   |---|---|---|

@@ -19,7 +19,8 @@ fn C.read(fd int, buf voidptr, count usize) int
 //   }
 //
 // The timer re-arms itself with maintain()'s answer: every few ms while a
-// re-dial is in flight, about once a second otherwise. The pool must outlive
+// re-dial is in flight, about once a second otherwise. Each tick also takes
+// the updates of a Resolver the pool follows (follow). The pool must outlive
 // the worker (new_pool's heap pool held in the worker state); close() stops
 // the timer at its next tick.
 pub fn (mut p PgPool) start_maintenance(mut event_loop core.EventLoop) ! {

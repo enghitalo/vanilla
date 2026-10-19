@@ -95,12 +95,20 @@ fn (mut c PgConn) probe_idle() {
 // acquire_pipelined(), which nobody will release) gets the same ROLLBACK — so
 // a pipelined sender that keeps a transaction open across a maintenance tick
 // loses it. A connection due for recycling while its ROLLBACK is in flight is
-// recycled at a later tick, once the ROLLBACK is answered. Never waits on the
-// server (a re-dial's name resolution aside: ConnConfig.host).
+// recycled at a later tick, once the ROLLBACK is answered. A pool that
+// follows a Resolver (follow) first takes its updates into the address table
+// the re-dials dial from, which also keeps its pipe from filling while no
+// re-dial runs. Never waits on the server (a re-dial's name
+// resolution aside, unless the pool follows a Resolver: ConnConfig.host).
 pub fn (mut p PgPool) maintain() int {
 	mut next := maintenance_idle_ms
 	now := time.sys_mono_now()
 	p.clock = now
+	if p.feed.fd >= 0 {
+		// The Resolver's latest addresses (follow), for the re-dials below and
+		// those acquire() advances. One read when nothing came.
+		p.feed.take(mut p.addrs)
+	}
 	for i in 0 .. p.conns.len {
 		if p.idle[i] && p.conns[i].expires_at <= now && p.conns[i].state == .ready {
 			if p.recycling < 0 {
@@ -136,7 +144,7 @@ pub fn (mut p PgPool) maintain() int {
 			}
 			continue
 		}
-		if p.conns[i].state == .ready || p.conns[i].redial(p.cfg) {
+		if p.conns[i].state == .ready || p.redial(i) {
 			continue
 		}
 		wait := if p.conns[i].state == .broken && p.conns[i].retry_at > now {
@@ -182,7 +190,7 @@ fn (mut p PgPool) recycle_step(now u64) int {
 		c.lose('recycled: max_lifetime_ms reached')
 		c.retry_at = 0
 	}
-	if c.redial(p.cfg) {
+	if p.redial(i) {
 		p.idle[i] = true
 		p.recycling = -1
 		return maintenance_idle_ms

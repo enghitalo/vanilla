@@ -3,6 +3,7 @@ module pg_async
 
 import time
 import testkit
+import transport
 
 #include <netinet/tcp.h>
 
@@ -113,8 +114,8 @@ fn test_dial_falls_over_to_the_next_address() {
 fn test_redial_failure_moves_to_the_next_address() {
 	mut c := PgConn{}
 	assert c.addr_cursor == 0
-	c.redial_failed(time.sys_mono_now())
-	c.redial_failed(time.sys_mono_now())
+	c.redial_failed(time.sys_mono_now(), &transport.Feed{})
+	c.redial_failed(time.sys_mono_now(), &transport.Feed{})
 	assert c.addr_cursor == 2
 	assert c.state == .broken
 }

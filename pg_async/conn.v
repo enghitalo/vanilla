@@ -133,14 +133,27 @@ fn tcp_opts(cfg &ConnConfig) transport.TcpOpts {
 	}
 }
 
-// dial resolves cfg.host:cfg.port and connects to the first address that
-// accepts, starting at address `start` (mod the count) and trying each in
+// lookup resolves cfg.host:cfg.port with cfg.resolve when it is set, else
+// with getaddrinfo (resolve). Blocking: DNS, or whatever cfg.resolve does.
+fn lookup(cfg &ConnConfig) ![]transport.Addr {
+	if cfg.resolve != unsafe { nil } {
+		addrs := cfg.resolve(cfg.host, cfg.port)
+		if addrs.len == 0 {
+			return error('pg: cannot resolve ${cfg.host}:${cfg.port}: ConnConfig.resolve answered no address')
+		}
+		return addrs
+	}
+	return resolve(cfg.host, cfg.port)
+}
+
+// dial resolves cfg.host:cfg.port (lookup) and connects to the first address
+// that accepts, starting at address `start` (mod the count) and trying each in
 // turn. Every socket it returns is tuned (tcp_opts). Blocking (each connect
 // bounded by connect_timeout_ms), unless `nonblocking`: then the first address
 // whose connect() starts is returned with the connect possibly still in
-// flight.
+// flight. The lookup blocks either way.
 fn dial(cfg &ConnConfig, nonblocking bool, start int) !int {
-	addrs := resolve(cfg.host, cfg.port)!
+	addrs := lookup(cfg)!
 	return dial_addrs(addrs, cfg, nonblocking, start)
 }
 
@@ -183,14 +196,27 @@ pub type PasswordFn = fn () !string
 pub struct ConnConfig {
 pub:
 	// host is the server's host name or IP address; TCP only (a Unix-socket
-	// directory is not supported). It is resolved (getaddrinfo) on every
-	// dial, and the addresses are tried in turn. A pool's re-dial resolves it
-	// on the worker thread, so a slow DNS lookup stalls the worker: an IP
+	// directory is not supported). It is resolved (getaddrinfo, or resolve)
+	// when a connection comes up, and the addresses are tried in turn. A pool
+	// that follows a transport.Resolver (PgPool.follow) re-dials from the
+	// addresses that thread keeps fresh, so its worker never resolves after
+	// startup. Any other pool resolves it again at every re-dial attempt, on
+	// the worker thread: a slow DNS lookup stalls the worker then, and an IP
 	// address needs none (vanilla#351). Over TLS, .verify_full checks the
 	// certificate against it (SslMode).
 	host string = 'localhost'
 	// port is the server's TCP port.
 	port int = 5432
+	// resolve maps host:port to the addresses to dial, in order (empty when it
+	// cannot), in place of getaddrinfo: wherever the connection or its pool
+	// resolves host, so on a Resolver's thread when the pool follows one, and
+	// on the worker at each re-dial attempt when it does not. Every worker's
+	// pool and the Resolver can call it at the same time: state it shares
+	// needs atomics or a lock. A Resolver makes one lookup per host:port per
+	// refresh, for every pool that follows that host:port, with the resolve of
+	// the first one that followed it: give them all the same resolve (the
+	// pools new_pool builds from one ConnConfig do). nil: getaddrinfo.
+	resolve transport.ResolveFn = unsafe { nil }
 	// user is the role to log in as. Required: PostgreSQL refuses a startup
 	// without one.
 	user string

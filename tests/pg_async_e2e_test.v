@@ -14,10 +14,13 @@
 // read that stopped at a ticket would strand the reply behind it and hang.
 import os
 import strconv
+import sync.stdatomic
+import time
 import server
 import core
 import pg_async
 import testkit
+import transport
 import vtest
 
 const resp_500 = 'HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n'.bytes()
@@ -241,4 +244,120 @@ fn drive_pipelined(big bool) ! {
 			}
 		}
 	}
+}
+
+// SlowLookup is a scripted ConnConfig.resolve: 127.0.0.1 at `port`, after
+// slow_ms; `calls` counts its calls.
+@[heap]
+struct SlowLookup {
+mut:
+	port    i64 // atomic
+	slow_ms i64 // atomic
+	calls   i64 // atomic
+}
+
+fn pg_e2e_maintenance(worker_state voidptr, mut event_loop core.EventLoop) {
+	mut st := unsafe { &PgE2eState(worker_state) }
+	st.pool.start_maintenance(mut event_loop) or { panic(err) }
+}
+
+// A pool that follows a transport.Resolver re-dials without resolving on the
+// worker (vanilla#351). The fake closes each connection after its first
+// query, so nearly every request meets a lost connection and starts or
+// advances a re-dial, while each lookup the Resolver makes takes 2 s on its
+// thread. Every request still answers within milliseconds: 200, or 503 while
+// both connections are re-dialing, and the re-dials keep completing.
+fn test_pg_async_redial_does_not_wait_for_the_resolver() ! {
+	if !testkit.fake_pg_available() {
+		return
+	}
+	mut fake := testkit.start_fake_pg(['--close', 'immediate'])!
+	defer {
+		fake.stop()
+	}
+	l := &SlowLookup{
+		port: fake.port
+	}
+	cfg := pg_async.ConnConfig{
+		host:     'db.test' // only l resolves it
+		user:     'vanilla'
+		password: 'secret'
+		database: 'vanilla'
+		resolve:  fn [l] (host string, port int) []transport.Addr {
+			stdatomic.add_i64(&l.calls, 1)
+			slow := stdatomic.load_i64(&l.slow_ms)
+			if slow > 0 {
+				time.sleep(time.Duration(slow) * time.millisecond)
+			}
+			a := transport.ip_addr('127.0.0.1', int(stdatomic.load_i64(&l.port))) or { return [] }
+			return [a]
+		}
+	}
+	mut r := transport.Resolver.new(50)!
+	r.start()
+	defer {
+		r.stop() // waits for the lookup in flight
+	}
+	rr := r
+	mut h := vtest.start(server.ServerConfig{
+		handler:         pg_e2e_handler
+		make_state:      fn [cfg, rr] () voidptr {
+			mut pool := pg_async.new_pool(cfg, 2) or { panic('pool bring-up failed: ${err}') }
+			mut res := unsafe { rr }
+			pool.follow(mut res) or { panic(err) }
+			return voidptr(&PgE2eState{
+				pool:   pool
+				params: []?[]u8{len: 1}
+			})
+		}
+		on_worker_start: pg_e2e_maintenance
+		workers:         1
+		io_multiplexing: .epoll
+	})!
+	defer {
+		h.stop()
+	}
+	// The worker serves once make_state's lookups (2 bring-ups and follow,
+	// blocking at startup by design) are done; only then do lookups turn slow.
+	first := h.fire([vtest.Script{
+		rounds: [vtest.Round{
+			send: q(1000)
+		}]
+	}])!
+	assert first.conns[0].frames[0].bytestr().starts_with('HTTP/1.1 200')
+	booted := stdatomic.load_i64(&l.calls)
+	stdatomic.store_i64(&l.slow_ms, 2000)
+	sw := time.new_stopwatch()
+	for sw.elapsed().milliseconds() < 2000 && stdatomic.load_i64(&l.calls) == booted {
+		time.sleep(time.millisecond)
+	}
+	assert stdatomic.load_i64(&l.calls) > booted, 'the resolver thread never looked up'
+	mut worst := i64(0)
+	mut ok := 0
+	for k in 0 .. 40 {
+		t := time.new_stopwatch()
+		o := h.fire([vtest.Script{
+			rounds: [vtest.Round{
+				send: q(k)
+			}]
+		}])!
+		ms := t.elapsed().milliseconds()
+		if ms > worst {
+			worst = ms
+		}
+		got := o.conns[0].frames[0].bytestr()
+		if got.starts_with('HTTP/1.1 200') {
+			assert got.all_after('\r\n\r\n') == k.str(), 'request ${k}: ${got}'
+			ok++
+		} else {
+			// 503: both connections are re-dialing. 500: the query went out on a
+			// connection whose FIN had not arrived yet (it costs that query).
+			assert got.starts_with('HTTP/1.1 503') || got.starts_with('HTTP/1.1 500'), 'request ${k}: ${got}'
+		}
+		time.sleep(5 * time.millisecond)
+	}
+	eprintln('40 requests over re-dials: ${ok} answered 200, the slowest in ${worst} ms, while each lookup takes 2000 ms')
+	assert worst < 500, 'a request waited ${worst} ms: the worker resolved'
+	assert ok >= 10, 'the re-dials did not complete'
+	assert fake.stat('authenticated') >= ok // every query had a connection of its own
 }
