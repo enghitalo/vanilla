@@ -808,6 +808,7 @@ fn C.socket(domain int, typ int, protocol int) int
 fn C.bind(fd int, addr voidptr, len u32) int
 fn C.connect(fd int, addr voidptr, len u32) int
 fn C.dup(fd int) int
+fn C.shutdown(fd int, how int) int
 fn C.getsockname(fd int, addr voidptr, len &u32) int
 fn C.close(fd int) int
 
@@ -1196,9 +1197,9 @@ fn test_unresolved_origin_coalesces_refreshes() {
 // A parked exchange waits under two deadlines: its own (connect_timeout_ms,
 // response_timeout_ms), which the pool's maintenance timer enforces, and the
 // park's (Limits.park_timeout_ms), which the epoll worker enforces by running
-// the continuation with event_loop.timed_out(). Whichever passes first, the
-// continuation gets .failed with .timeout once, and the connection is closed
-// only once no watch is left on it.
+// the continuation with event_loop.timed_out(). Whichever passes first, or
+// both at once, the continuation gets .failed with .timeout once, and the
+// connection is closed only once no watch is left on it.
 
 // Probe counts what probe_cont saw, for one edge: its worker thread writes
 // it and the test reads it (atomics). Each edge has its own, the watch
@@ -1212,6 +1213,7 @@ mut:
 	failure       i64 // the failure of the last one (an upstream.Failure)
 	timeout_fd    i64 // ready_fd of the last timed-out run
 	after_timeout i64 // what advance() answered in it (an upstream.Poll)
+	drop_client   i64 // set by the test: a timed-out run shuts its client's socket down
 }
 
 fn new_probe() &Probe {
@@ -1229,8 +1231,8 @@ fn probe_handler(p &Probe) core.Handler {
 }
 
 // probe_edge relays like edge, with probe_cont as the continuation and p as
-// its payload: GET /up/<path>, or POST /fill/<n>/<path> with n generated
-// bytes. GET /fd answers the client's own fd number.
+// its payload: GET /up/<path>, or POST /fill/<n>/<path> with n bytes. GET /fd
+// answers the client's own fd number.
 fn probe_edge(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut el core.EventLoop, p &Probe) core.Step {
 	sp1 := index_of(req, 0, ` `)
 	sp2 := if sp1 > 0 { index_of(req, sp1 + 1, ` `) } else { -1 }
@@ -1268,9 +1270,12 @@ fn probe_edge(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 		return .done
 	}
 	x.request(view(req, 0, sp1), view(req, up_start, sp2 - up_start))
-	mut b := x.body()
-	for i in 0 .. fill {
-		b << u8(`a` + i % 26)
+	if fill > 0 {
+		mut b := x.body()
+		unsafe {
+			b.grow_len(fill)
+			vmemset(b.data, `a`, fill)
+		}
 	}
 	if x.send(mut el, probe_cont, voidptr(p)) == .pending {
 		return .suspend
@@ -1288,6 +1293,10 @@ fn probe_cont(mut out []u8, fd int, fd_err bool, payload voidptr, worker_state v
 	if timed_out {
 		stdatomic.add_i64(&p.timeout_runs, 1)
 		stdatomic.store_i64(&p.timeout_fd, i64(fd))
+		if stdatomic.load_i64(&p.drop_client) != 0 {
+			// The client leaves between this run and the hangup's.
+			C.shutdown(el.client_fd, C.SHUT_RDWR)
+		}
 	}
 	if el.orphaned() {
 		stdatomic.add_i64(&p.orphaned_runs, 1)
@@ -1329,7 +1338,7 @@ fn probe_cont(mut out []u8, fd int, fd_err bool, payload voidptr, worker_state v
 enum Stage {
 	connecting // the TCP connect: the origin's accept queue is full, its SYN dropped
 	handshake  // the TLS handshake: the origin accepts (in its backlog), never answers
-	sending    // the request: the upstream stops reading, and a 4 MiB upload fills the socket
+	sending    // the request: the upstream stops reading, and an upload fills the socket
 	reading    // the response: the upstream never answers
 }
 
@@ -1341,13 +1350,20 @@ fn stages(https bool) []Stage {
 	}
 }
 
+// stall_fill is the upload for the sending stage: far more than loopback
+// holds in flight with Linux's defaults (the sender's buffer grows to
+// tcp_wmem's 4 MiB at most, the receiver's window is ~128 KiB while nobody
+// reads), so the send stops on a full socket.
+const stall_fill = 16 << 20
+
 // TimeoutCase is one call that waits at `stage` until a deadline passes: the
-// park's (300 ms) before the exchange's own (10 s) when park_first, the other
-// way round otherwise.
+// park's (park_ms, Limits.park_timeout_ms) and the exchange's own (own_ms,
+// the origin's connect_timeout_ms and response_timeout_ms).
 struct TimeoutCase {
-	https      bool
-	stage      Stage
-	park_first bool
+	https   bool
+	stage   Stage
+	park_ms int
+	own_ms  int
 mut:
 	probe         &Probe = new_probe()
 	resp          string
@@ -1371,15 +1387,14 @@ fn deadline_bound() i64 {
 }
 
 fn (mut c TimeoutCase) run() {
-	own := if c.park_first { deadline_long_ms } else { deadline_short_ms }
 	o := upstream.Origin{
 		max_conns:           1
-		connect_timeout_ms:  own
-		response_timeout_ms: own
-		max_request_bytes:   8 << 20
+		connect_timeout_ms:  c.own_ms
+		response_timeout_ms: c.own_ms
+		max_request_bytes:   2 * stall_fill
 	}
 	limits := server.Limits{
-		park_timeout_ms: if c.park_first { deadline_short_ms } else { deadline_long_ms }
+		park_timeout_ms: c.park_ms
 	}
 	wait := int(deadline_bound()) + 500
 	c.accepted = -1
@@ -1427,7 +1442,7 @@ fn (mut c TimeoutCase) run() {
 		e.stop()
 	}
 	req := if c.stage == .sending {
-		'POST /fill/${4 << 20}/stall HTTP/1.1\r\nHost: edge\r\n\r\n'
+		'POST /fill/${stall_fill}/stall HTTP/1.1\r\nHost: edge\r\n\r\n'
 	} else {
 		'GET /up/slow HTTP/1.1\r\nHost: edge\r\n\r\n'
 	}
@@ -1449,12 +1464,7 @@ fn (mut c TimeoutCase) snapshot() {
 
 fn (c &TimeoutCase) name() string {
 	mode := if c.https { 'https' } else { 'http' }
-	first := if c.park_first {
-		'park ${deadline_short_ms} ms < own ${deadline_long_ms} ms'
-	} else {
-		'own ${deadline_short_ms} ms < park ${deadline_long_ms} ms'
-	}
-	return '${mode} ${c.stage}, ${first}'
+	return '${mode} ${c.stage}, park ${c.park_ms} ms, own ${c.own_ms} ms'
 }
 
 fn (c &TimeoutCase) summary() string {
@@ -1485,22 +1495,50 @@ fn brief(resp string) string {
 
 // check asserts what every timed-out call must show: one 504 for .timeout
 // about deadline_short_ms in, one .failed seen by the continuation, no
-// tombstone, and the slot free again for a fresh connection.
+// tombstone, and the slot free again for a fresh connection. A timed-out run
+// (the park's deadline first, or with the exchange's) got .pending: it ended
+// the exchange and kept watching its socket, and the .failed came from the
+// run after it (the hangup). The exchange's deadline alone brings none.
 fn (c &TimeoutCase) check() {
 	assert status_of(c.resp) == 504 && failure_of(c.resp) == 'timeout', c.summary()
 	assert c.ms >= i64(deadline_short_ms - 50) && c.ms <= deadline_bound(), c.summary()
 	assert c.failed == 1 && c.failure == i64(int(upstream.Failure.timeout)), c.summary()
 	assert c.orphaned_runs == 0, c.summary()
-	if c.park_first {
-		// The park's run ended the exchange and kept watching its socket; the
-		// .failed came from the run after (the hangup).
-		assert c.timeout_runs == 1 && c.after_timeout == i64(int(upstream.Poll.pending)), c.summary()
-	} else {
+	if c.park_ms < c.own_ms {
+		assert c.timeout_runs == 1, c.summary()
+	} else if c.own_ms < c.park_ms {
 		assert c.timeout_runs == 0, c.summary()
+	} else {
+		assert c.timeout_runs <= 1, c.summary()
+	}
+	if c.timeout_runs > 0 {
+		assert c.after_timeout == i64(int(upstream.Poll.pending)), c.summary()
 	}
 	if c.accepted >= 0 {
 		assert status_of(c.next) == 200 && body_of(c.next) == '{"status":"paid"}', c.summary()
 		assert c.accepted == 2, c.summary() // the timed-out connection was not reused
+	}
+}
+
+// run_timeout_cases runs a TimeoutCase in every stage and variant, prints
+// what each saw, then checks them all.
+fn run_timeout_cases(park_ms int, own_ms int) {
+	mut cases := []TimeoutCase{}
+	for https in variants() {
+		for stage in stages(https) {
+			mut c := TimeoutCase{
+				https:   https
+				stage:   stage
+				park_ms: park_ms
+				own_ms:  own_ms
+			}
+			c.run()
+			eprintln(c.summary())
+			cases << c
+		}
+	}
+	for c in cases {
+		c.check()
 	}
 }
 
@@ -1510,43 +1548,69 @@ fn (c &TimeoutCase) check() {
 // down and kept watching it; the hangup wakes it at once, and that run gets
 // .failed with .timeout (504).
 fn test_park_deadline_before_the_exchange_deadline() {
-	mut cases := []TimeoutCase{}
-	for https in variants() {
-		for stage in stages(https) {
-			mut c := TimeoutCase{
-				https:      https
-				stage:      stage
-				park_first: true
-			}
-			c.run()
-			eprintln(c.summary())
-			cases << c
-		}
-	}
-	for c in cases {
-		c.check()
-	}
+	run_timeout_cases(deadline_short_ms, deadline_long_ms)
 }
 
 // The exchange's own deadline shorter than Limits.park_timeout_ms: the
 // maintenance timer ends it in each stage, as before, and the continuation
 // never sees event_loop.timed_out().
 fn test_exchange_deadline_before_the_park_deadline() {
-	mut cases := []TimeoutCase{}
+	run_timeout_cases(deadline_long_ms, deadline_short_ms)
+}
+
+// Both deadlines equal, as with park_timeout_ms set to an origin's timeout:
+// they pass in the same loop iteration, maintain() (a timerfd event) first,
+// then the timed-out run, which finds the exchange expired already. That run
+// must not end it either: it keeps watching the socket, and the hangup's run
+// gets .timeout. Ended there, the watch became a tombstone on the fd that
+// release() closed (#342): the next exchange, given that number, lost its
+// answer to the tombstone.
+fn test_equal_park_and_exchange_deadlines() {
+	run_timeout_cases(deadline_short_ms, deadline_short_ms)
+}
+
+// A client that leaves between the timed-out run and the hangup's: its watch
+// becomes a tombstone, whose run gets the .timeout and releases the
+// connection (or the hangup's run comes first and does). Either way the
+// exchange ends once, and the slot serves the next call on a fresh connection.
+fn test_client_leaving_after_a_park_deadline() {
 	for https in variants() {
-		for stage in stages(https) {
-			mut c := TimeoutCase{
-				https:      https
-				stage:      stage
-				park_first: false
-			}
-			c.run()
-			eprintln(c.summary())
-			cases << c
+		mode := if https { 'https' } else { 'http' }
+		pr := new_probe()
+		stdatomic.store_i64(&pr.drop_client, 1)
+		mut e := setup_handler(https, 'server', upstream.Origin{
+			max_conns:           1
+			response_timeout_ms: deadline_long_ms
+		}, server.Limits{
+			park_timeout_ms: deadline_short_ms
+		}, [], probe_handler(pr)) or { panic(err) }
+		defer {
+			e.stop()
 		}
-	}
-	for c in cases {
-		c.check()
+		p := e.h.port()
+		r1, ms := call(p, 'GET /up/slow HTTP/1.1\r\nHost: edge\r\n\r\n', int(deadline_bound()) + 500)
+		stdatomic.store_i64(&pr.drop_client, 0)
+		// The slot comes back within moments of the hangup, in either order.
+		mut r2 := ''
+		sw := time.new_stopwatch()
+		for sw.elapsed().milliseconds() < 2000 * slack() {
+			r2 = get(p, '/ok')
+			if status_of(r2) != 503 {
+				break
+			}
+			time.sleep(10 * time.millisecond)
+		}
+		failed := stdatomic.load_i64(&pr.failed)
+		failure := stdatomic.load_i64(&pr.failure)
+		orphaned := stdatomic.load_i64(&pr.orphaned_runs)
+		eprintln('[${mode} client leaves] its call: ${brief(r1)} after ${ms} ms; timed-out runs: ${stdatomic.load_i64(&pr.timeout_runs)}, .failed: ${failed} (${failure_names[int(failure)]}), orphaned runs: ${orphaned}; next call: ${brief(r2)}, upstream connections: ${e.fake.stat('accepted')}')
+		assert status_of(r1) != 200, '${mode}: ${r1}' // gone: nothing, or a 504 it never read
+		assert stdatomic.load_i64(&pr.timeout_runs) == 1, mode
+		assert stdatomic.load_i64(&pr.after_timeout) == i64(int(upstream.Poll.pending)), mode
+		assert failed == 1 && failure == i64(int(upstream.Failure.timeout)), mode
+		assert orphaned <= 1, mode
+		assert status_of(r2) == 200 && body_of(r2) == '{"status":"paid"}', '${mode}: ${r2}'
+		assert e.fake.stat('accepted') == 2, mode
 	}
 }
 
@@ -1588,12 +1652,21 @@ fn test_late_reply_after_a_park_deadline_reaches_nobody() {
 			e.stop()
 		}
 		p := e.h.port()
-		// Connected after the timeout, once every lower fd number is taken:
-		// the edge then accepts it on the number the timed-out exchange freed.
-		s := C.socket(C.AF_INET, C.SOCK_STREAM, 0)
-		assert s >= 0
+		// Connected after the timeout, once every lower fd number is taken: the
+		// edge then accepts one on the number the timed-out exchange freed.
+		// Three, made now: a thread may free a lower number meanwhile (a
+		// stopped edge's worker still runs its maintenance tick), and the
+		// client that gets it holds it for the next try.
+		mut clients := []int{}
+		for _ in 0 .. 3 {
+			s := C.socket(C.AF_INET, C.SOCK_STREAM, 0)
+			assert s >= 0
+			clients << s
+		}
 		defer {
-			C.close(s)
+			for s in clients {
+				C.close(s)
+			}
 		}
 		a := transport.dial_tcp('127.0.0.1', p) or { panic(err) }
 		defer {
@@ -1611,18 +1684,26 @@ fn test_late_reply_after_a_park_deadline_reaches_nobody() {
 		eprintln('[${mode} late reply] first call: ${brief(r1)} after ${ms} ms')
 		assert status_of(r1) == 504 && failure_of(r1) == 'timeout', '${mode}: ${r1}'
 		freed := int(stdatomic.load_i64(&pr.timeout_fd))
-		held := hold_below(freed, s)
 		ad := transport.ip_addr('127.0.0.1', p) or { panic('addr') }
-		assert C.connect(s, voidptr(&ad.data[0]), ad.len) == 0
-		assert testkit.fd_write_all(s, 'GET /fd HTTP/1.1\r\nHost: edge\r\n\r\n'.bytes(), 1000)
-		read_response(s, mut acc, mut buf, 3000)
-		rs := acc.bytestr()
-		for fd in held {
-			C.close(fd)
+		mut landed := false
+		for s in clients {
+			held := hold_below(freed, s)
+			assert C.connect(s, voidptr(&ad.data[0]), ad.len) == 0
+			assert testkit.fd_write_all(s, 'GET /fd HTTP/1.1\r\nHost: edge\r\n\r\n'.bytes(),
+				1000)
+			read_response(s, mut acc, mut buf, 3000)
+			for fd in held {
+				C.close(fd)
+			}
+			rs := acc.bytestr()
+			eprintln('[${mode} late reply] a client accepted after it: ${brief(rs)} (its fd; the timed-out exchange had ${freed})')
+			assert status_of(rs) == 200, '${mode}: a client accepted after the timeout was not served: ${rs}'
+			if body_of(rs) == freed.str() {
+				landed = true
+				break
+			}
 		}
-		eprintln('[${mode} late reply] a client accepted after it: ${brief(rs)} (its fd; the timed-out exchange had ${freed})')
-		assert status_of(rs) == 200, '${mode}: a client accepted on the freed fd ${freed} was not served: ${rs}'
-		assert body_of(rs) == freed.str(), '${mode}: the edge accepted the client on fd ${body_of(rs)}, not on the freed ${freed}'
+		assert landed, '${mode}: no client was accepted on the freed fd ${freed}'
 		r2 := get(p, '/delay/300') // in flight when the late reply comes
 		assert status_of(r2) == 200 && body_of(r2) == '{"status":"paid"}', '${mode}: ${r2}'
 		for sw.elapsed().milliseconds() < 900 {

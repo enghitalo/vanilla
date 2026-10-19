@@ -515,3 +515,56 @@ fn test_advance_after_the_park_deadline() {
 	}
 	assert p.stats.timeouts == 3
 }
+
+// A timed-out run never ends the exchange itself, in the two cases where it
+// finds the exchange done already. maintain() (a timerfd event, handled
+// before the loop's timers) expired it in the same iteration: the park's
+// deadline and the exchange's passed together, as when park_timeout_ms equals
+// an origin timeout. Or an early answer was complete at send(), and the
+// exchange waits on a full socket, .ready. Ended in that run, the watch would
+// turn into a tombstone and release() would close the fd under it (#342): the
+// run watches the socket again (.pending), and the next one answers.
+fn test_timed_out_run_never_ends_the_exchange() {
+	mut p := plain_pool(Origin{
+		host: '127.0.0.1'
+	})
+	for ready in [false, true] {
+		mut x := p.acquire() or { panic('slot') }
+		assert x.request('GET', '/v1/slow')
+		x.head << '\r\n'.bytes()
+		x.off = x.head.len
+		mut fds := [2]i32{}
+		assert C.socketpair(C.AF_UNIX, C.SOCK_STREAM | C.SOCK_NONBLOCK, 0, &fds[0]) == 0
+		x.fd = int(fds[0])
+		if ready {
+			x.phase = .ready
+			x.no_reuse = true
+		} else {
+			x.phase = .reading
+			x.deadline = time.sys_mono_now() - 1
+			p.maintain()
+			assert x.timed_out // expired by maintain() first
+		}
+		mut el := core.EventLoop{
+			register: record_watch
+			reason:   .timeout
+		}
+		first := x.advance(false, mut el, never_woken, unsafe { nil })
+		rearmed := el.last_watched == x.fd
+		hung_up := C.upstream_peek(int(fds[1])) == 0 // the peer reads our FIN
+		el.reason = .ready
+		el.last_watched = -1
+		second := x.advance(true, mut el, never_woken, unsafe { nil })
+		eprintln('${if ready { 'ready' } else { 'expired by maintain()' }}: the timed-out run got ${first} (watched again ${rearmed}, shut down ${hung_up}); the next run got ${second} (${x.failure()})')
+		assert first == .pending && rearmed && hung_up
+		if ready {
+			assert second == .ready
+		} else {
+			assert second == .failed && x.failure() == .timeout
+		}
+		x.release()
+		assert x.fd == -1 // closed at release, after the run
+		C.close(int(fds[1]))
+	}
+	assert p.stats.timeouts == 1
+}

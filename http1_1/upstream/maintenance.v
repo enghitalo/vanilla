@@ -23,8 +23,12 @@ import time
 // socket, the response), not the whole exchange. When it passes first, the
 // continuation runs with event_loop.timed_out(), and advance() ends the
 // exchange the same way: expire(), then it watches the socket again, for the
-// hangup. Either way the app sees .failed with .timeout once, from the
-// hangup's run, and the fd is closed once no watch is left on it.
+// hangup. When both pass together, this timer's event comes first in the
+// loop iteration and the timed-out run finds the exchange expired: it only
+// watches the socket again. That run never answers itself: a watch it left
+// would turn into a tombstone on the fd release() closes (#342). Either way
+// the app sees .failed with .timeout once, from the hangup's run, and the fd
+// is closed once no watch is left on it.
 
 // maintenance_idle_ms is the tick when nothing is due sooner: how long a kept
 // connection the upstream closed can sit unnoticed by the pool (acquire()

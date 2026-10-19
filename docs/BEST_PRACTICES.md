@@ -372,11 +372,12 @@ budget with `event_loop.watch_fd_deadline(...)` /
 `watch_fd_persistent_deadline(...)` (`timeout_ms` < 0 exempts a long poll;
 each watch arms a fresh deadline, so pass the time left to bound a multi-step
 request). When the deadline passes first, the continuation runs once with
-`event_loop.timed_out()` true: answer 504 and return `.done`. On a pooled fd
-the reply is still due, and the park's tombstone consumes it in order (the
-continuation runs again, against a discarded buffer, when it arrives, with
-`event_loop.orphaned()` true), so in the timeout branch don't read the fd and
-don't release the connection:
+`event_loop.timed_out()` true: answer 504 and return `.done` (an
+`http1_1.upstream` exchange is the exception: call `advance()`, below). On a
+pooled fd the reply is still due, and the park's tombstone consumes it in
+order (the continuation runs again, against a discarded buffer, when it
+arrives, with `event_loop.orphaned()` true), so in the timeout branch don't
+read the fd and don't release the connection:
 
 ```v
 if event_loop.timed_out() {

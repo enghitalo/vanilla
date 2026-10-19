@@ -62,11 +62,13 @@ module upstream
 // with .timeout, once (maintenance.v says how). Call advance() in every run of
 // the continuation: in one with event_loop.timed_out() it ends the exchange
 // and answers .pending (return .suspend), and the hangup that follows at once
-// brings the .timeout. A continuation that answers timed_out() itself must not
-// release() the exchange there: the runtime goes on watching its socket, as a
-// tombstone that drains the reply, and release() would close the fd under
-// that watch (#342). The tombstone's run calls advance() and release() as
-// usual.
+// brings the .timeout (or .ready, for an answer complete already). A
+// continuation that answers timed_out() itself must not release() the
+// exchange there: the runtime goes on watching its socket, as a tombstone that
+// drains the reply, and release() would close the fd under that watch (#342).
+// The slot then stays busy until the reply comes or the exchange's own
+// deadline passes (maintain()), and the tombstone's run calls advance() and
+// release() as usual.
 //
 // One exchange per parked request: do not start a second exchange from a
 // continuation (on a client that disconnected meanwhile, the runtime only

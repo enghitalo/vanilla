@@ -292,8 +292,8 @@ concatenates, interpolates or allocates per request. The
   Parked requests are bounded by `Limits.park_timeout_ms` /
   `watch_fd_deadline` (PR #249, #200; epoll worker only). An
   `http1_1.upstream` exchange ends at whichever passes first, its own deadline
-  (the pool's maintenance timer) or `park_timeout_ms`, with `.timeout` either
-  way (#322).
+  (the pool's maintenance timer) or `park_timeout_ms`, which bounds each wait,
+  with `.timeout` either way (#322).
 - **Still open:** the kqueue (darwin) backend enforces none of these timeouts
   (nor `max_connections`): `wait_kqueue(..., -1)` never wakes for a sweep, and
   `accept` busy-spins on `EMFILE`.

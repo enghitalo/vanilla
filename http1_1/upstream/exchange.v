@@ -49,8 +49,12 @@ pub fn (mut x Exchange) send(mut el core.EventLoop, cont core.WakeFn, payload vo
 		x.deadline = now + ms_ns(x.pool.origin.response_timeout_ms)
 		r := x.drive(false, mut el, cont, payload)
 		if r == .ready {
-			// Wake the continuation at once (the socket is writable, or hung
-			// up): it finds the exchange .ready, as on every other path.
+			// An early answer, complete before the request was all written:
+			// the connection is done (no_reuse), and its socket may be full,
+			// so it may never turn writable. Shut it down: the hangup wakes
+			// the continuation at once, and it finds the exchange .ready, as
+			// on every other path.
+			C.shutdown(x.fd, C.SHUT_RDWR)
 			return x.park(true, mut el, cont, payload)
 		}
 		return r
@@ -66,6 +70,22 @@ pub fn (mut x Exchange) send(mut el core.EventLoop, cont core.WakeFn, payload vo
 // (event_loop.timed_out()) or run by a tombstone (event_loop.orphaned())
 // included: it handles both.
 pub fn (mut x Exchange) advance(ready_fd_error bool, mut el core.EventLoop, cont core.WakeFn, payload voidptr) Poll {
+	if el.timed_out() && x.phase != .idle && x.fd >= 0 {
+		// The park's own deadline (Limits.park_timeout_ms) passed. The fd is
+		// not ready: no read, write or connect check on it (SO_ERROR reads 0
+		// while a connect is in flight). This run never ends the exchange,
+		// even one maintain() expired in this same loop iteration (the two
+		// deadlines passed together) or one .ready already (an early answer
+		// waiting on a full socket): ended here, the watch would turn into a
+		// tombstone, and release() would close the fd under it (#342). It
+		// shuts the socket down as maintain() does and keeps watching it: the
+		// hangup wakes this continuation again at once, and that run answers
+		// (.timeout below, or .ready).
+		if !x.timed_out {
+			x.expire()
+		}
+		return x.park(false, mut el, cont, payload)
+	}
 	match x.phase {
 		.ready {
 			return .ready
@@ -81,18 +101,6 @@ pub fn (mut x Exchange) advance(ready_fd_error bool, mut el core.EventLoop, cont
 	if x.timed_out {
 		x.pool.stats.timeouts++
 		return x.fail(.timeout)
-	}
-	if el.timed_out() {
-		// The park's own deadline (Limits.park_timeout_ms) passed before the
-		// exchange's. The fd is not ready: no read, write or connect check
-		// on it (SO_ERROR reads 0 while a connect is in flight). End the
-		// exchange as maintain() does, and keep watching the socket: its
-		// hangup wakes this continuation again at once, and that run reports
-		// .timeout above. Left unwatched, the watch would turn into a
-		// tombstone instead, and release() would close the fd under it
-		// (#342).
-		x.expire()
-		return x.park(false, mut el, cont, payload)
 	}
 	if x.phase == .connecting {
 		// Writable (or an error / hangup): the connect finished one way or
