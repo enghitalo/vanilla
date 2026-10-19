@@ -394,6 +394,42 @@ fn test_maintain_enforces_deadlines() {
 	C.close(int(fds[1]))
 }
 
+// An early answer complete when send() returns (a 413 read at EAGAIN, before
+// the upload is all written: no_reuse) may sit behind a full socket that never
+// turns writable. send() shuts the socket down before it parks, so the hangup
+// is pending at once and the continuation gets the .ready answer, instead of
+// waiting for the upstream to close or for a deadline.
+fn test_early_answer_at_send_wakes_at_once() {
+	mut p := plain_pool(Origin{
+		host:              '127.0.0.1'
+		max_request_bytes: 8 << 20
+	})
+	mut x := p.acquire() or { panic('slot') }
+	assert x.request('POST', '/v1/upload')
+	mut b := x.body()
+	unsafe {
+		b.grow_len(4 << 20) // far more than the socket pair holds
+		vmemset(b.data, `a`, 4 << 20)
+	}
+	mut fds := [2]i32{}
+	assert C.socketpair(C.AF_UNIX, C.SOCK_STREAM | C.SOCK_NONBLOCK, 0, &fds[0]) == 0
+	x.fd = int(fds[0]) // a kept connection: send() writes at once
+	early := 'HTTP/1.1 413 Content Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
+	C.write(int(fds[1]), early.str, usize(early.len)) // waiting already
+	mut el := core.EventLoop{
+		register: record_watch
+	}
+	assert x.send(mut el, never_woken, unsafe { nil }) == .pending
+	assert el.last_watched == x.fd
+	assert C.transport_wait(x.fd, 0) > 0 // shut down: the hangup is pending now
+	el.last_watched = -1
+	assert x.advance(true, mut el, never_woken, unsafe { nil }) == .ready
+	assert x.status() == 413
+	x.release()
+	assert x.fd == -1 // not reused (no_reuse): closed
+	C.close(int(fds[1]))
+}
+
 fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
 fn C.socket(domain int, typ int, protocol int) int
 fn C.bind(fd int, addr voidptr, len u32) int
@@ -520,10 +556,12 @@ fn test_advance_after_the_park_deadline() {
 // finds the exchange done already. maintain() (a timerfd event, handled
 // before the loop's timers) expired it in the same iteration: the park's
 // deadline and the exchange's passed together, as when park_timeout_ms equals
-// an origin timeout. Or an early answer was complete at send(), and the
-// exchange waits on a full socket, .ready. Ended in that run, the watch would
-// turn into a tombstone and release() would close the fd under it (#342): the
-// run watches the socket again (.pending), and the next one answers.
+// an origin timeout. Or the exchange is .ready already, an early answer
+// complete at send() (defensive: send() shuts such a socket down, so its
+// hangup normally wakes the continuation before any deadline). Ended in that
+// run, the watch would turn into a tombstone and release() would close the fd
+// under it (#342): the run watches the socket again (.pending), and the next
+// one answers.
 fn test_timed_out_run_never_ends_the_exchange() {
 	mut p := plain_pool(Origin{
 		host: '127.0.0.1'

@@ -75,12 +75,13 @@ pub fn (mut x Exchange) advance(ready_fd_error bool, mut el core.EventLoop, cont
 		// not ready: no read, write or connect check on it (SO_ERROR reads 0
 		// while a connect is in flight). This run never ends the exchange,
 		// even one maintain() expired in this same loop iteration (the two
-		// deadlines passed together) or one .ready already (an early answer
-		// waiting on a full socket): ended here, the watch would turn into a
-		// tombstone, and release() would close the fd under it (#342). It
-		// shuts the socket down as maintain() does and keeps watching it: the
-		// hangup wakes this continuation again at once, and that run answers
-		// (.timeout below, or .ready).
+		// deadlines passed together), or one .ready already (an early answer:
+		// send() shut its socket down, so the hangup normally wakes it first):
+		// ended here, the watch would turn into a tombstone, and release()
+		// would close the fd under it (#342). It shuts the socket down as
+		// maintain() does and keeps watching it: the hangup wakes this
+		// continuation again at once, and that run answers (.timeout below,
+		// or .ready).
 		if !x.timed_out {
 			x.expire()
 		}

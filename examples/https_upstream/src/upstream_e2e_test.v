@@ -564,7 +564,11 @@ fn test_early_response() {
 		assert status_of(get(p, '/ok')) == 200
 		assert e.fake.stat('accepted') == 2
 		// The same on a kept connection, where the handler itself writes the
-		// request and may meet the whole answer before it returns.
+		// request and may meet the whole answer before it returns (send() then
+		// shuts the socket down: upstream_test.v's
+		// test_early_answer_at_send_wakes_at_once). If the answer comes after
+		// the request parked on the full socket, it is read when the upstream
+		// closes, after 1 s here (on CI's runners, that is the usual order).
 		r2, _ := call(p, 'POST /fill/${4 << 20}/e413 HTTP/1.1\r\nHost: edge\r\n\r\n', 10_000)
 		assert status_of(r2) == 413, r2
 	}
@@ -1559,12 +1563,12 @@ fn test_exchange_deadline_before_the_park_deadline() {
 }
 
 // Both deadlines equal, as with park_timeout_ms set to an origin's timeout:
-// they pass in the same loop iteration, maintain() (a timerfd event) first,
-// then the timed-out run, which finds the exchange expired already. That run
-// must not end it either: it keeps watching the socket, and the hangup's run
-// gets .timeout. Ended there, the watch became a tombstone on the fd that
-// release() closed (#342): the next exchange, given that number, lost its
-// answer to the tombstone.
+// they can pass in the same loop iteration (the connect and handshake stages
+// do), maintain() (a timerfd event) first, then the timed-out run, which finds
+// the exchange expired already. That run must not end it either: it keeps
+// watching the socket, and the hangup's run gets .timeout. Ended there, the
+// watch became a tombstone on the fd that release() closed (#342): the next
+// exchange, given that number, lost its answer to the tombstone.
 fn test_equal_park_and_exchange_deadlines() {
 	run_timeout_cases(deadline_short_ms, deadline_short_ms)
 }
