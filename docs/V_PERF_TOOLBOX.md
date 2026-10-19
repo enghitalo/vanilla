@@ -278,6 +278,16 @@ goes through a `calloc`'d copy, an allocation on every call. `&a[0]` of a
 returned `&int` gets nothing: `*p = e` stores 8 bytes, over the `int` after
 it (errno through `__errno_location()`).
 
+**One declaration types every call.** V registers `fn C.` declarations
+program-wide: when several modules declare one C function, every call to it,
+in every module, is typed by one of them, picked by parse order
+(vlang/v#30915). Give a C function the return type vlib's builtin gives it, or
+use builtin's declaration (`memchr` and `memmem` return `voidptr`), and cast
+before pointer arithmetic: `&u8(p) - base`. With an `&u8` memchr of its own,
+http1_1/client built or not depending on what else a program imported (#383).
+[`scripts/check_c_fn_decls.sh`](../scripts/check_c_fn_decls.sh) (CI) fails
+when two declarations of one function return different types.
+
 ## Beyond `[]u8`
 
 Arrays aren't the only structure. Consider: `map`, fixed `[N]T` (stack), channels,
