@@ -113,7 +113,9 @@ pub:
 	tcp transport.TcpOpts
 	// resolve maps host:port to addresses, at Pool.new and on a Resolver's
 	// lookup threads (never on a worker); nil: the system resolver
-	// (getaddrinfo).
+	// (getaddrinfo). The pools that follow one host:port (one per worker, and
+	// any other follower of the Resolver) share each lookup of it, made with
+	// the first one's resolve: give them all the same.
 	resolve ResolveFn = unsafe { nil }
 	// allow_unresolved lets Pool.new start the pool with no address when the
 	// host does not resolve (its DNS is down at boot), instead of failing: one
@@ -133,8 +135,8 @@ pub:
 // it cannot. It runs at startup (Pool.new, in each worker's make_state) and on
 // a Resolver's lookup threads, so it may block and allocate, and it may run on
 // several threads at once: the Resolver looks different origins up in
-// parallel (one origin once at a time). A ResolveFn several origins share must
-// be thread-safe; one that never returns keeps its lookup thread for good.
+// parallel (one origin once at a time), next to the workers' Pool.new. Make it
+// thread-safe; one that never returns keeps its lookup thread for good.
 pub type ResolveFn = fn (host string, port int) []transport.Addr
 
 // Poll is where an exchange stands after send() / advance().

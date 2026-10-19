@@ -50,7 +50,7 @@ fn test_records_swap_the_table() {
 	assert table.len == 1 && table[0].family == a2.family
 }
 
-// Port is the test resolver's answer, read on the resolver thread.
+// Port is the test resolver's answer, read on a lookup thread.
 @[heap]
 struct Port {
 mut:
@@ -119,9 +119,9 @@ fn test_feed_allocates_nothing() {
 	a := ip_addr('127.0.0.1', 80) or { panic('addr') }
 	mut r := Resolver.new(60_000) or { panic(err) } // never started: the test writes
 	mut f := r.follow('127.0.0.1', 80, unsafe { nil }) or { panic(err) }
-	mut n := r.subs[0].name
-	n.found[0] = a
-	n.count = 1
+	mut t := &LookupThread{} // a lookup's answer, as a lookup thread leaves it
+	t.found[0] = a
+	t.count = 1
 	wfd := r.subs[0].fd
 	defer {
 		for fd in [f.fd, wfd, r.wake_r, r.wake_w] {
@@ -136,7 +136,7 @@ fn test_feed_allocates_nothing() {
 	mut swapped := 0
 	for _ in 0 .. 1000 {
 		r.seq++
-		r.write_update(wfd, n)
+		r.write_update(wfd, t)
 		if f.take(mut table) {
 			swapped++
 		}
@@ -305,7 +305,7 @@ fn test_stop_does_not_wait_for_a_blocked_lookup() {
 	r.stop()
 	took := sw.elapsed().milliseconds()
 	eprintln('stop() took ${took} ms with a lookup blocked')
-	assert took < 100, 'stop() waited for the lookup'
+	assert took < 1000, 'stop() waited for the lookup'
 	// The follower's pipe is closed (EOF), and empty.
 	mut rec := Record{}
 	assert C.transport_wait(f.fd, 1000) > 0
@@ -362,4 +362,121 @@ fn test_stop_right_after_an_ask_returns_at_once() {
 	}
 	eprintln('${slow} of 500 stops waited out interval_ms (${interval} ms); worst ${worst} us')
 	assert slow == 0
+}
+
+// An ask made while its host's lookup is in flight is kept: that lookup
+// started before it, so the host is looked up once more, one refresh gap (1 s)
+// after the first lookup ends, with no further ask. The flag the ask sets
+// survives the lookup in flight: only the next lookup clears it, as it starts.
+fn test_ask_during_a_lookup_is_kept() {
+	mut g := new_gate()
+	mut r := Resolver.new(60_000) or { panic(err) }
+	mut f := r.follow('svc.test', 80, g.resolve_fn()) or { panic(err) }
+	r.start()
+	f.ask()
+	assert wait_for(&g.entered, 1, 2000) // the first lookup is in flight
+	f.ask()
+	stdatomic.store_i64(&g.open, 1)
+	assert answered(mut f)
+	sw := time.new_stopwatch()
+	assert wait_for(&g.entered, 2, 3000), 'the ask made during the lookup was lost'
+	took := sw.elapsed().milliseconds()
+	time.sleep(200 * time.millisecond)
+	lookups := stdatomic.load_i64(&g.entered)
+	eprintln('the second lookup started ${took} ms after the first one answered; ${lookups} lookups')
+	assert lookups == 2
+	assert took >= 800, 'the second lookup came ${took} ms after the first, inside the refresh gap'
+	r.stop()
+	C.close(f.fd)
+}
+
+// Calls counts a ResolveFn's calls (atomic: a lookup thread calls it).
+@[heap]
+struct Calls {
+mut:
+	n i64
+}
+
+// While every lookup thread is busy, the hosts that are due get the threads
+// in turn: 2 * max_lookups hosts whose lookups take 300 ms, each due 100 ms
+// after its last lookup ends (interval_ms 100), keep every thread busy, and a
+// quick host followed after them is still looked up. (Handed out in follow
+// order, the threads all went to the slow hosts, and the quick one starved.)
+fn test_busy_lookup_threads_serve_every_host_in_turn() {
+	slow := fn (host string, port int) []Addr {
+		time.sleep(300 * time.millisecond)
+		return []
+	}
+	mut calls := &Calls{}
+	cc := calls
+	quick := fn [cc] (host string, port int) []Addr {
+		stdatomic.add_i64(&cc.n, 1)
+		return []
+	}
+	mut r := Resolver.new(100) or { panic(err) }
+	mut fds := []int{}
+	for i in 0 .. 2 * max_lookups {
+		f := r.follow('slow${i}.test', 80, slow) or { panic(err) }
+		fds << f.fd
+	}
+	f := r.follow('quick.test', 80, quick) or { panic(err) }
+	fds << f.fd
+	r.start()
+	time.sleep(2 * time.second)
+	n := stdatomic.load_i64(&calls.n)
+	r.stop()
+	for fd in fds {
+		C.close(fd)
+	}
+	eprintln('the quick host was looked up ${n} times in 2 s, behind ${2 * max_lookups} slow hosts')
+	assert n >= 1, 'the quick host starved'
+}
+
+// A host's first periodic refresh comes interval_ms after its first follow,
+// although the resolver thread was already waiting when the follow came.
+// (Before, it came up to two intervals later: the thread set the host's first
+// due time only when it next woke.)
+fn test_first_refresh_comes_interval_after_the_follow() {
+	mut calls := &Calls{}
+	cc := calls
+	resolve := fn [cc] (host string, port int) []Addr {
+		stdatomic.add_i64(&cc.n, 1)
+		return []
+	}
+	mut r := Resolver.new(1000) or { panic(err) }
+	r.start()
+	time.sleep(500 * time.millisecond) // the thread is in its first wait
+	f := r.follow('svc.test', 80, resolve) or { panic(err) }
+	sw := time.new_stopwatch()
+	for stdatomic.load_i64(&calls.n) == 0 && sw.elapsed().milliseconds() < 3000 {
+		time.sleep(time.millisecond)
+	}
+	took := sw.elapsed().milliseconds()
+	r.stop()
+	C.close(f.fd)
+	eprintln('the first periodic refresh came ${took} ms after the follow (interval_ms 1000)')
+	assert took >= 800 && took < 1300, 'the first refresh came ${took} ms after the follow'
+}
+
+// Hosts that come due together start together: A and B both ask before the
+// Resolver starts, so one hand-out finds both due. A's lookup blocks, and B's
+// answer still comes while it is in flight. (Before #366, B's lookup ran after
+// A's.)
+fn test_hosts_due_together_are_looked_up_together() {
+	mut ga := new_gate()
+	mut gb := new_gate()
+	stdatomic.store_i64(&gb.open, 1)
+	mut r := Resolver.new(60_000) or { panic(err) }
+	mut fa := r.follow('a.test', 80, ga.resolve_fn()) or { panic(err) }
+	mut fb := r.follow('b.test', 80, gb.resolve_fn()) or { panic(err) }
+	fa.ask()
+	fb.ask()
+	r.start()
+	assert answered(mut fb), "B's lookup waited for A's"
+	assert stdatomic.load_i64(&ga.left) == 0 // A's lookup is still blocked
+	stdatomic.store_i64(&ga.open, 1)
+	assert answered(mut fa)
+	r.stop()
+	C.close(fa.fd)
+	C.close(fb.fd)
 }

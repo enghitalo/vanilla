@@ -17,10 +17,10 @@ import transport
 // worker over that pool's own pipe. Each origin is looked up on its own, on a
 // few lookup threads, so one provider's slow DNS delays only that provider's
 // refreshes; the pools of one origin (one per worker) share each lookup of it.
-// A worker never resolves, never waits, and shares no mutable state with the
-// resolver: the pipe carries fixed-size address records, and the worker copies
-// them into its pool's table on its own thread (a clientless watch,
-// start_maintenance). The Resolver itself is transport.Resolver
+// A worker never resolves, never waits and takes no lock: the pipe carries
+// fixed-size address records, the worker copies them into its pool's table on
+// its own thread (a clientless watch, start_maintenance), and an ask only sets
+// an atomic flag. The Resolver itself is transport.Resolver
 // (transport/resolver_nix.c.v); pg_async's pools can follow the same one.
 //
 //   resolver := upstream.Resolver.new(30_000)!   // before new_server

@@ -277,7 +277,7 @@ fn test_acquire_sheds_past_max_conns() {
 	b.release()
 }
 
-// Port is the test resolver's answer, read on the resolver thread.
+// Port is the test resolver's answer, read on a lookup thread.
 @[heap]
 struct Port {
 mut:
