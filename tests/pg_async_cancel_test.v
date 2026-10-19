@@ -4,12 +4,13 @@
 // (watch_fd_persistent_deadline); when the deadline passes, the continuation
 // cancels the query (PgConn.cancel, a CancelRequest driven as a background
 // watch on the same worker) and answers 504. The cancelled query's reply
-// (57014, then ReadyForQuery) is drained by the park's tombstone, so the next
-// request on that same connection gets its own result. Against
-// pg_async/testdata/fake_pg.py, whose `select pg_sleep(S)` a CancelRequest
-// interrupts; one worker with a one-connection pool, so every request shares
-// the connection. Both pool shapes: pipelined (acquire_pipelined) and
-// exclusive (acquire/release: the tombstone run releases the connection).
+// (57014, then ReadyForQuery) is drained by the park's tombstone, whose run
+// sees event_loop.orphaned() (#349), so the next request on that same
+// connection gets its own result. Against pg_async/testdata/fake_pg.py, whose
+// `select pg_sleep(S)` a CancelRequest interrupts; one worker with a
+// one-connection pool, so every request shares the connection. Both pool
+// shapes: pipelined (acquire_pipelined) and exclusive (acquire/release: the
+// tombstone run releases the connection).
 // Skipped without python3 (unless VANILLA_REQUIRE_FAKE_PG is set). With
 // PGHOST set it runs against that server too (its real pg_sleep).
 import os
@@ -40,6 +41,7 @@ mut:
 	timeouts  i64 // continuation runs with timed_out()
 	cancels   i64 // cancel() calls that started a request
 	cancelled i64 // runs that consumed a 57014 (the tombstone's)
+	orphaned  i64 // ... and knew it: event_loop.orphaned() (#349)
 }
 
 const pc = &PcCounts{}
@@ -131,6 +133,9 @@ fn pc_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidp
 	}
 	poll := conn.async_on_readable() or {
 		if err is pg_async.PgError && err.sqlstate == '57014' {
+			if event_loop.orphaned() {
+				stdatomic.add_i64(&c.orphaned, 1)
+			}
 			stdatomic.add_i64(&c.cancelled, 1)
 		}
 		if exclusive {
@@ -188,7 +193,7 @@ fn pc_until(p &i64, want i64) i64 {
 // server (live true).
 fn pc_check(slow_path string, live bool) ! {
 	mut c := unsafe { pc }
-	for f in [&c.timeouts, &c.cancels, &c.cancelled] {
+	for f in [&c.timeouts, &c.cancels, &c.cancelled, &c.orphaned] {
 		stdatomic.store_i64(f, 0)
 	}
 	mut fake := if live { testkit.FakePg{} } else { testkit.start_fake_pg([])! }
@@ -216,6 +221,7 @@ fn pc_check(slow_path string, live bool) ! {
 	assert got_a.starts_with('HTTP/1.1 504 '), '${slow_path}: no 504 after ${took} ms: ${got_a}'
 	assert took >= pc_deadline_ms - 20 && took < 2000, '${slow_path}: a ${pc_deadline_ms} ms deadline answered after ${took} ms'
 	assert pc_until(&c.cancelled, 1) == 1, '${slow_path}: the cancelled reply was not drained'
+	assert stdatomic.load_i64(&c.orphaned) == 1, "${slow_path}: the tombstone's run did not see event_loop.orphaned()"
 	assert stdatomic.load_i64(&c.timeouts) == 1
 	assert stdatomic.load_i64(&c.cancels) == 1
 	if !live {

@@ -201,8 +201,9 @@ fn test_cycle_answers_and_closes_every_fd() {
 // The budget runs out first (the epoll worker's park deadline): the
 // continuation answers 504 with what arrived and cancels the rest. The
 // runtime then keeps the watch as a tombstone and runs the continuation again,
-// against a discarded buffer, while the aggregator is readable: here, at once
-// (the cancelled timers fire now, not in 10 s). That run closes everything.
+// orphaned (against a discarded buffer), while the aggregator is readable:
+// here, at once (the cancelled timers fire now, not in 10 s). That run closes
+// everything.
 fn test_budget_answers_504_and_the_tombstone_run_closes_everything() {
 	base_t, base_p := open_fds()
 	state := new_state()
@@ -224,7 +225,7 @@ fn test_budget_answers_504_and_the_tombstone_run_closes_everything() {
 	assert resp.starts_with('HTTP/1.1 504 Gateway Timeout\r\n')
 	assert resp.all_after('Content-Length: ').int() == resp.all_after('\r\n\r\n').len
 	assert resp.contains('{"n":4,"done":0,')
-	event_loop.reason = .ready
+	event_loop.reason = .orphaned // as the runtime runs a tombstone
 	mut scratch := []u8{}
 	mut runs := 0
 	for {
