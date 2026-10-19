@@ -113,8 +113,8 @@ not `watch_fd` (request-owned). Here is what happens on each path:
 | path | epoll worker | io_uring worker |
 |---|---|---|
 | members finish | `on_ready` closes them as they finish, then the aggregator | same |
-| budget runs out | `on_ready` answers 504 and cancels the members. The runtime keeps the watch as a **tombstone**: once the cancelled members fire, `on_ready` runs again (its output discarded) and closes them and the aggregator | no deadline: as "members finish" |
-| client hangs up while parked | the watch becomes a tombstone: `on_ready` runs as members finish, its answer discarded, and closes everything | the hangup is noticed only on resume: `on_ready` runs as usual and the send fails |
+| budget runs out | `on_ready` answers 504 and cancels the members. The runtime keeps the watch as a **tombstone**: once the cancelled members fire, `on_ready` runs again, orphaned, and closes them and the aggregator | no deadline: as "members finish" |
+| client hangs up while parked | the watch becomes a tombstone: `on_ready` runs, orphaned, as members finish, and closes everything | the hangup is noticed only on resume: `on_ready` runs as usual and the send fails |
 
 A `watch_fd` aggregator would be wrong on epoll. On a hangup the runtime
 closes a request-owned fd itself and does not run the continuation, so the
@@ -137,9 +137,9 @@ Two rules follow, and `on_ready` keeps both:
   upstream that may never answer needs a deadline of its own, or its
   socket shut down on the budget, as the cancel step does.
 
-`on_ready` cannot tell whether it runs for a live request or a tombstone,
-and does not need to: it writes the answer either way (a tombstone's output
-is discarded), and `answered` keeps a run after the 504 from writing again.
+A tombstone's run is **orphaned**: `event_loop.orphaned()` is true, its
+request is over (answered 504, or its client gone) and its output is
+discarded. There `on_ready` only drains and closes, and writes no answer.
 
 ## Engine-level multi-watch
 
