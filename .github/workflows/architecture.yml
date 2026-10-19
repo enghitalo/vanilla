@@ -5,7 +5,9 @@ name: Architecture
 #   2. the external-consumer import convention (`import vanilla.server`)
 #      that `v install` users rely on.
 # And one from CHECKLIST #42: a module whose public API is fully documented
-# stays so (pull requests only: it compares with the base).
+# stays so (pull requests only: it compares with the base). And one from #383:
+# every `fn C.` declaration of a C function returns the same type, since V
+# types all of a program's calls to it by one of them.
 
 on:
   push:
@@ -28,6 +30,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Enforce one-direction dependency rule
         run: sh scripts/check_dependency_direction.sh
+
+  c-fn-decls:
+    runs-on: ubuntu-latest
+    name: C declarations agree (grep)
+    steps:
+      - uses: actions/checkout@v4
+      - name: One return type per C function (#383)
+        run: sh scripts/check_c_fn_decls.sh
 
   doc-coverage:
     if: github.event_name == 'pull_request'
