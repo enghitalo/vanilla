@@ -480,3 +480,31 @@ fn test_hosts_due_together_are_looked_up_together() {
 	C.close(fa.fd)
 	C.close(fb.fd)
 }
+
+// A ResolveFn runs with SIGPIPE blocked, as it did on the resolver thread
+// before #366: one that writes to a pipe without a reader gets EPIPE, and the
+// process lives on. (Spawned by start()'s caller, the lookup threads took its
+// signal mask, and such a write killed the process.)
+fn test_a_resolvefn_never_dies_of_sigpipe() {
+	mut fds := [2]i32{}
+	assert C.transport_pipe(&fds[0]) == 0
+	C.close(int(fds[0])) // no reader
+	mut calls := &Calls{}
+	cc := calls
+	wfd := int(fds[1])
+	resolve := fn [cc, wfd] (host string, port int) []Addr {
+		b := u8(1)
+		C.write(wfd, &b, 1) // EPIPE, not SIGPIPE
+		stdatomic.add_i64(&cc.n, 1)
+		return []
+	}
+	mut r := Resolver.new(60_000) or { panic(err) }
+	f := r.follow('svc.test', 80, resolve) or { panic(err) }
+	r.start()
+	f.ask()
+	assert wait_for(&calls.n, 1, 2000), 'the lookup did not run'
+	time.sleep(20 * time.millisecond)
+	r.stop()
+	C.close(wfd)
+	C.close(f.fd)
+}

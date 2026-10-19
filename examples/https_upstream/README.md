@@ -88,8 +88,9 @@ return .done
   re-resolves each origin every interval (and sooner when every address of
   that origin fails: that origin alone, at most once a second, or once per
   interval if that is shorter, however many calls fail) and hands the answer
-  to each worker over a pipe — no `getaddrinfo` and no lock on a worker (an
-  ask only sets an atomic flag). Each origin is looked up on its own, on a
+  to each worker over a pipe — no `getaddrinfo` and no lock on a worker's
+  request path (an ask sets an atomic flag, and writes one wake byte when it
+  sets it). Each origin is looked up on its own, on a
   few lookup threads, so one provider's slow DNS delays no other provider's
   refreshes. (`upstream.Resolver` is `transport.Resolver`: `pg_async` pools
   can follow the same one.) `allow_unresolved: true`

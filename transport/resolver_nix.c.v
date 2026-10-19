@@ -15,11 +15,11 @@ import time
 // re-dial's address, or it has none), at once or refresh_gap_ms after the
 // host's last lookup, then hands the answer to each follower of the host over
 // that follower's own pipe. A worker never resolves, never waits and takes no
-// lock: the pipe carries fixed-size address records (one write each, under
-// PIPE_BUF, so atomic), the worker copies them into its own table on its own
-// thread (Feed.take), and an ask only sets an atomic flag. One Resolver can
-// serve every follower in the process: http1_1.upstream's pools and
-// pg_async's.
+// lock on the request path: the pipe carries fixed-size address records (one
+// write each, under PIPE_BUF, so atomic), the worker copies them into its own
+// table on its own thread (Feed.take), and an ask sets an atomic flag (and
+// writes one wake byte when it sets it). One Resolver can serve every
+// follower in the process: http1_1.upstream's pools and pg_async's.
 //
 // Each host is looked up on its own, on one of max_lookups lookup threads
 // (spawned by start()), so a slow lookup (a host whose DNS drops queries holds
@@ -296,12 +296,12 @@ pub fn (f &Feed) followed() bool {
 
 // ask asks the resolver to refresh the feed's host (a dial failed: every
 // address an exchange tried, or a re-dial's address; or the follower has no
-// address): at once, or one gap (refresh_gap_ms) after the host's last lookup. It sets a flag on the follower's own Sub,
-// which the host's next lookup clears as it starts, and only the ask that sets
-// it writes a byte to wake the resolver thread: a burst of asks costs one
-// write per lookup, and a full pipe loses nothing (the thread is awake
-// already, and the flag holds the ask). Nothing for a feed that follows no
-// resolver.
+// address): at once, or one gap (refresh_gap_ms) after the host's last
+// lookup. It sets a flag on the follower's own Sub, which the host's next
+// lookup clears as it starts, and only the ask that sets it writes a byte to
+// wake the resolver thread: a burst of asks costs one write per lookup, and a
+// full pipe loses nothing (the thread is awake already, and the flag holds
+// the ask). Nothing for a feed that follows no resolver.
 pub fn (f &Feed) ask() {
 	if f.sub == unsafe { nil } {
 		return
@@ -512,6 +512,10 @@ fn (mut r Resolver) start_lookup(mut n Name) bool {
 // look is a lookup thread: it runs each lookup the resolver thread hands it,
 // then wakes that thread for the answer. It writes to no follower's pipe.
 fn (mut r Resolver) look(mut t LookupThread) {
+	// A ResolveFn that writes to a peer gone away gets EPIPE, not a SIGPIPE
+	// that kills the process: this thread took start()'s caller's signal mask,
+	// which need not block it.
+	C.transport_block_sigpipe()
 	for {
 		t.sem.wait()
 		if stdatomic.load_i64(&r.stop_flag) != 0 {
