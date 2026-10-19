@@ -3,7 +3,8 @@ module upstream
 
 // Unit tests without a server: request building and validation, the Host
 // header, origin validation, the resolver hand-off, and deadline expiry. The
-// exchange over real sockets is examples/https_upstream's e2e suite.
+// exchange over real sockets is examples/https_upstream's e2e suite; the
+// resolver's records themselves, transport/resolver_test.v.
 import core
 import time
 import sync.stdatomic
@@ -214,6 +215,10 @@ fn test_unresolved_origin_needs_a_resolver() {
 	one_address := fn [a] (host string, port int) []transport.Addr {
 		return [a]
 	}
+	// One Resolver for every pool here; start() then stop() closes the write
+	// ends of their pipes. (Its own wake pipe stays open: a Resolver lives as
+	// long as the process.)
+	mut r := Resolver.new(60_000) or { panic(err) }
 	for host in ['provider.test', 'fe80::1%no-such-interface'] {
 		for resolve in [no_address, one_address] {
 			mut p := plain_pool(Origin{
@@ -230,15 +235,16 @@ fn test_unresolved_origin_needs_a_resolver() {
 				assert err.msg().contains('Resolver'), err.msg()
 			}
 			assert p.timer_fd == -1 && el.last_watched == -1, host // nothing armed
-			mut r := Resolver.new(60_000) or { panic(err) } // never started
 			p.follow(mut r) or { panic(err) }
 			p.start_maintenance(mut el) or { panic(err) }
-			assert p.timer_fd >= 0 && el.last_watched == p.feed_fd, host
-			for fd in [p.timer_fd, p.feed_fd, r.subs[0].fd, r.wake_r, r.wake_w] {
+			assert p.timer_fd >= 0 && el.last_watched == p.feed.fd, host
+			for fd in [p.timer_fd, p.feed.fd] {
 				C.close(fd)
 			}
 		}
 	}
+	r.start()
+	r.stop()
 	for o in [Origin{
 		host:             '127.0.0.1'
 		allow_unresolved: true
@@ -271,45 +277,6 @@ fn test_acquire_sheds_past_max_conns() {
 	b.release()
 }
 
-fn (mut p Pool) take(r Record) {
-	p.take_record(&r)
-}
-
-// The resolver's records swap the pool's address table only once a whole
-// update has arrived in order; a broken update is dropped.
-fn test_resolver_records_swap_the_table() {
-	mut p := plain_pool(Origin{
-		host: '127.0.0.1'
-		port: 80
-	})
-	assert p.addrs.len == 1
-	a1 := transport.ip_addr('10.0.0.1', 80) or { panic('a1') }
-	a2 := transport.ip_addr('::1', 80) or { panic('a2') }
-	rec := fn (seq u32, idx int, count int, a transport.Addr) Record {
-		return Record{
-			seq:    seq
-			idx:    u16(idx)
-			count:  u16(count)
-			family: i32(a.family)
-			len:    a.len
-			data:   a.data
-		}
-	}
-	p.take(rec(1, 0, 2, a1))
-	assert p.addrs.len == 1 // not yet
-	p.take(rec(1, 1, 2, a2))
-	assert p.addrs.len == 2
-	assert p.addrs[0].data == a1.data && p.addrs[1].family == a2.family
-	// Out of order (a record lost on a full pipe): the update is dropped.
-	p.take(rec(2, 0, 3, a2))
-	p.take(rec(2, 2, 3, a2))
-	p.take(rec(3, 1, 1, a1))
-	assert p.addrs.len == 2 && p.addrs[0].data == a1.data
-	// A whole update replaces it.
-	p.take(rec(4, 0, 1, a2))
-	assert p.addrs.len == 1 && p.addrs[0].family == a2.family
-}
-
 // Port is the test resolver's answer, read on the resolver thread.
 @[heap]
 struct Port {
@@ -338,14 +305,11 @@ fn test_resolver_thread_hands_off() {
 		r.stop()
 	}
 	stdatomic.store_i64(&port.n, 2222)
-	mut rec := Record{}
 	sw := time.new_stopwatch()
 	for sw.elapsed().milliseconds() < 2000 {
-		if C.read(p.feed_fd, &rec, sizeof(Record)) == int(sizeof(Record)) {
-			p.take_record(&rec)
-			if p.addrs.len == 1 && (int(p.addrs[0].data[2]) << 8 | int(p.addrs[0].data[3])) == 2222 {
-				break
-			}
+		if p.feed.take(mut p.addrs) && p.addrs.len == 1
+			&& (int(p.addrs[0].data[2]) << 8 | int(p.addrs[0].data[3])) == 2222 {
+			break
 		}
 		time.sleep(5 * time.millisecond)
 	}
@@ -378,9 +342,9 @@ fn test_feed_stops_when_the_resolver_stops() {
 	stdatomic.store_i64(&port.n, 2222)
 	r.start()
 	p.request_resolve()
-	assert C.upstream_wait(p.feed_fd, 2000) > 0 // the update is in the pipe
+	assert C.transport_wait(p.feed.fd, 2000) > 0 // the update is in the pipe
 	r.stop()
-	fd := p.feed_fd
+	fd := p.feed.fd
 	mut el := core.EventLoop{
 		register: record_watch
 	}
@@ -389,61 +353,8 @@ fn test_feed_stops_when_the_resolver_stops() {
 	assert on_feed(mut out, fd, true, voidptr(p), unsafe { nil }, mut el) == .done
 	C.close(fd) // the runtime's part of .done
 	assert el.last_watched == -1
-	assert p.feed_fd == -1
+	assert p.feed.fd == -1
 	assert (int(p.addrs[0].data[2]) << 8 | int(p.addrs[0].data[3])) == 2222
-}
-
-#include <malloc.h>
-
-struct C.mallinfo2 {
-	uordblks usize
-	hblkhd   usize
-}
-
-fn C.mallinfo2() C.mallinfo2
-
-fn heap_bytes() i64 {
-	mi := C.mallinfo2()
-	return i64(mi.uordblks) + i64(mi.hblkhd)
-}
-
-// A resolver update allocates nothing on either side: under -gc none (nothing
-// is ever freed) 1000 updates written by write_update and taken by on_feed
-// leave the heap as it was.
-fn test_feed_allocates_nothing() {
-	$if gcboehm ? {
-		return
-	}
-	$if race ? {
-		return
-	}
-	mut p := plain_pool(Origin{
-		host: '127.0.0.1'
-		port: 80
-	})
-	mut r := Resolver.new(60_000) or { panic(err) } // never started: the test writes
-	p.follow(mut r) or { panic(err) }
-	r.found << p.addrs[0]
-	wfd := r.subs[0].fd
-	mut el := core.EventLoop{
-		register: record_watch
-	}
-	mut out := []u8{}
-	heap0 := heap_bytes()
-	if heap0 == 0 {
-		return
-	}
-	mut parked := 0
-	for _ in 0 .. 1000 {
-		r.seq++
-		r.write_update(wfd)
-		if on_feed(mut out, p.feed_fd, false, voidptr(p), unsafe { nil }, mut el) == .suspend {
-			parked++
-		}
-	}
-	growth := heap_bytes() - heap0
-	assert parked == 1000
-	assert growth < 1024, 'the heap grew ${growth} bytes over 1000 resolver updates'
 }
 
 // maintain() shuts down the socket of an exchange past its deadline (its

@@ -127,6 +127,89 @@ static inline int transport_socket_error(int fd) {
 	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &v, &len) != 0) return errno;
 	return v;
 }
+
+// The Resolver's calls (resolver_nix.c.v): getaddrinfo, the pipes, the wait.
+#include <netdb.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+
+#if defined(__linux__)
+// A GNU extension (glibc and musl have it): declared here, as <unistd.h> may
+// already be in without _GNU_SOURCE.
+extern int pipe2(int pipefd[2], int flags);
+#endif
+
+// transport_resolved is one resolved address, as transport_resolve copies it out.
+typedef struct {
+	int family;
+	unsigned int len;
+	unsigned char data[128];
+} transport_resolved;
+
+// transport_resolve resolves host:port (getaddrinfo, TCP) into out[0..max):
+// the count of IPv4 / IPv6 addresses, in getaddrinfo's order, or -1 with the
+// getaddrinfo error in *gai_err. Blocking: call it at startup or on the
+// resolver thread, never on a worker.
+static inline int transport_resolve(const char *host, const char *port, transport_resolved *out, int max, int *gai_err) {
+	struct addrinfo hints, *res = NULL, *ai;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	int rc = getaddrinfo(host, port, &hints, &res);
+	if (rc != 0) {
+		*gai_err = rc;
+		return -1;
+	}
+	int n = 0;
+	for (ai = res; ai != NULL && n < max; ai = ai->ai_next) {
+		if (ai->ai_family != AF_INET && ai->ai_family != AF_INET6) continue;
+		if (ai->ai_addrlen == 0 || ai->ai_addrlen > sizeof(out[n].data)) continue;
+		out[n].family = ai->ai_family;
+		out[n].len = (unsigned int)ai->ai_addrlen;
+		memcpy(out[n].data, ai->ai_addr, ai->ai_addrlen);
+		n++;
+	}
+	freeaddrinfo(res);
+	return n;
+}
+
+// transport_pipe opens a non-blocking, close-on-exec pipe: 0, or -errno.
+static inline int transport_pipe(int *fds) {
+#if defined(__linux__)
+	return pipe2(fds, O_NONBLOCK | O_CLOEXEC) == 0 ? 0 : -errno;
+#else
+	if (pipe(fds) != 0) return -errno;
+	for (int i = 0; i < 2; i++) {
+		fcntl(fds[i], F_SETFL, fcntl(fds[i], F_GETFL, 0) | O_NONBLOCK);
+		fcntl(fds[i], F_SETFD, FD_CLOEXEC);
+	}
+	return 0;
+#endif
+}
+
+// transport_block_sigpipe blocks SIGPIPE on the calling thread: a write to a
+// pipe without a reader then fails with EPIPE instead of killing the process.
+static inline void transport_block_sigpipe(void) {
+	sigset_t set;
+	sigemptyset(&set);
+	sigaddset(&set, SIGPIPE);
+	pthread_sigmask(SIG_BLOCK, &set, NULL);
+}
+
+// transport_wait polls one fd for readability up to timeout_ms: > 0 when
+// readable, 0 on timeout, -1 on error.
+static inline int transport_wait(int fd, int timeout_ms) {
+	struct pollfd p;
+	p.fd = fd;
+	p.events = POLLIN;
+	p.revents = 0;
+	int r;
+	do {
+		r = poll(&p, 1, timeout_ms);
+	} while (r < 0 && errno == EINTR);
+	return r;
+}
 #endif
 
 #endif

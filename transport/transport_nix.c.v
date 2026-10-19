@@ -12,7 +12,9 @@ module transport
 // SCOPE GUARD: bytes + non-blocking fds ONLY. The day this module grows its
 // own event loop or an HTTP client, it has become a second framework.
 // Protocol clients (request serializers / response parsers) live inside
-// their protocol module (http1_1/client later), not here.
+// their protocol module (http1_1/client later), not here. Name resolution is
+// never a worker's: the Resolver (resolver_nix.c.v) runs it on its own
+// thread and hands the addresses over a pipe, for the clients to dial.
 //
 // `_nix` suffix: every Unix. The Windows side lives in
 // transport_windows.c.v (landed with its consumer, vtest — per
