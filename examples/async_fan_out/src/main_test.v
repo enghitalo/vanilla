@@ -163,6 +163,28 @@ fn test_member_delays_spread_up_to_ms() {
 	assert member_delay(5, 32, 31) == 5
 }
 
+// A park armed with time_left() never ends before the budget does, even when
+// a millisecond boundary passes between launch and park (vanilla#373: a start
+// truncated to the ms made that park 1 ms short, and the 504 came at 1499 ms
+// of a 1500 ms budget). Each try starts up to 1 ms in the past, so a boundary
+// falls between start and park in about half of them.
+fn test_time_left_never_ends_before_the_budget() {
+	mut g := Group{
+		budget: 1500
+	}
+	for i in 0 .. 2000 {
+		g.start = now_ns() - i64(i % 1000) * 1000
+		tl := g.time_left()
+		read := now_ns() // no earlier than the clock read inside time_left
+		assert tl <= g.budget
+		assert read + i64(tl) * 1_000_000 >= g.start + i64(g.budget) * 1_000_000, 'a ${tl} ms park ends before the ${g.budget} ms budget'
+	}
+	g.start = now_ns() - 3 * i64(g.budget) * 1_000_000
+	assert g.time_left() == 1, 'spent: the shortest deadline'
+	g.budget = 0
+	assert g.time_left() == 0, 'no budget: Limits.park_timeout_ms'
+}
+
 fn test_other_paths_404_and_bad_requests_close() {
 	state := new_state()
 	mut event_loop := core.EventLoop{

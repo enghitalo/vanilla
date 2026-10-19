@@ -106,7 +106,7 @@ mut:
 	done   int              // members that finished (the answer reports how many)
 	ms     int              // the slowest member's delay
 	budget int              // ms for the whole fan-out; 0 = Limits.park_timeout_ms
-	start  i64              // now_ms() when the handler ran
+	start  i64              // now_ns() when the handler ran
 	fds    [max_members]i32 // member fds; -1 once closed
 }
 
@@ -150,11 +150,13 @@ fn (mut st FanState) release(mut g Group) {
 	st.free = g.idx
 }
 
-// now_ms is the monotonic clock in milliseconds (see examples/async_time_limit
-// for why not time.ticks()).
+// now_ns is the monotonic clock in nanoseconds (see examples/async_time_limit
+// for why not time.ticks()). Not whole ms: a start truncated to the ms would
+// make the first park's deadline 1 ms short whenever a millisecond boundary
+// passes between launch and park (vanilla#373).
 @[inline]
-fn now_ms() i64 {
-	return i64(time.sys_mono_now() / 1_000_000)
+fn now_ns() i64 {
+	return i64(time.sys_mono_now())
 }
 
 // member_delay is member i's delay: ms*(i+1)/n, at least 1 ms (a timerfd armed
@@ -208,7 +210,7 @@ fn (mut g Group) launch(n int, ms int, budget int) bool {
 	g.done = 0
 	g.ms = ms
 	g.budget = budget
-	g.start = now_ms()
+	g.start = now_ns()
 	g.agg = C.fan_open()
 	if g.agg < 0 {
 		return false
@@ -261,12 +263,13 @@ fn (mut g Group) close_members() {
 // time_left is the deadline for g's next park: what is left of its budget
 // (at least 1 ms), or 0 (Limits.park_timeout_ms) without one. Each watch arms
 // a fresh deadline, so the budget bounds the whole fan-out, not one wake.
+// Rounded up to the ms: the park then never ends before the budget does.
 fn (g &Group) time_left() int {
 	if g.budget <= 0 {
 		return 0
 	}
-	left := g.budget - int(now_ms() - g.start)
-	return if left > 0 { left } else { 1 }
+	left := i64(g.budget) * 1_000_000 - (now_ns() - g.start)
+	return if left > 0 { int((left + 999_999) / 1_000_000) } else { 1 }
 }
 
 // park watches g's aggregator. Caller-owned (persistent): see the module
@@ -334,7 +337,7 @@ fn digits(n i64) int {
 
 // answer appends g's response under `head` (the 200 or the 504 status line).
 fn answer(mut out []u8, head string, g &Group) {
-	elapsed := now_ms() - g.start
+	elapsed := (now_ns() - g.start) / 1_000_000
 	sum := sum_ms(g.ms, g.n)
 	core.append_str(mut out, head)
 	wi(mut out, body_n.len + digits(g.n) + body_done.len + digits(g.done) + body_elapsed.len +
