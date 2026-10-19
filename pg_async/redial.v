@@ -40,9 +40,9 @@ import transport
 // starting at the next address (addr_cursor), so a dead one is not retried
 // first forever; when its address failed (no connection), a pool that follows
 // a Resolver also asks it for a refresh (redial_failed), and every attempt
-// takes the Resolver's latest addresses first. The first attempt starts on the first acquire after the
-// loss, so with steady traffic a slot is back within a few requests while its
-// siblings keep serving.
+// takes the Resolver's latest addresses first. The first attempt starts on
+// the first acquire after the loss, so with steady traffic a slot is back
+// within a few requests while its siblings keep serving.
 
 // redial_backoff is the pause after a failed attempt (server down or
 // restarting) before the next one, so a dead server costs one connect per

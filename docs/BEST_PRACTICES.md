@@ -467,7 +467,8 @@ kqueue a deadline watch is a plain watch, and `cancel` fails.
   `maintain()` from your own timer), whose ticks take its updates. Re-dials
   and `max_lifetime_ms` recycles then dial the addresses its thread keeps
   fresh (each attempt takes the latest first), and an attempt whose address
-  failed, refused or unreachable, asks it for a refresh. One Resolver serves
+  failed (refused, unreachable, or timed out while connecting) asks it for a
+  refresh. One Resolver serves
   every worker's pools, `http1_1.upstream`'s too
   ([vanilla#351](https://github.com/enghitalo/vanilla/issues/351)). An IP
   address needs none.

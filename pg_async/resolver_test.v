@@ -410,14 +410,17 @@ fn C.getsockname(fd int, addr voidptr, len &u32) int
 
 // silent_listener listens on 127.0.0.1 and never accepts: the kernel
 // completes every connect, and nothing ever answers. Its fd and address.
+// (Each call is made outside its check: -prod strips asserts.)
 fn silent_listener() (int, transport.Addr) {
 	mut a := transport.ip_addr('127.0.0.1', 0) or { panic('addr') }
 	fd := C.socket(a.family, C.SOCK_STREAM, 0)
-	assert fd >= 0
-	assert C.bind(fd, voidptr(&a.data[0]), a.len) == 0
-	assert C.listen(fd, 16) == 0
+	bound := C.bind(fd, voidptr(&a.data[0]), a.len)
+	listening := C.listen(fd, 16)
 	mut sl := u32(128)
-	assert C.getsockname(fd, voidptr(&a.data[0]), &sl) == 0
+	named := C.getsockname(fd, voidptr(&a.data[0]), &sl)
+	if fd < 0 || bound != 0 || listening != 0 || named != 0 {
+		panic('cannot open a listener on 127.0.0.1')
+	}
 	return fd, a
 }
 
@@ -469,6 +472,12 @@ fn test_only_an_address_failure_asks_for_a_refresh() {
 	// times out in the startup.
 	stdatomic.store_i64(&fail.n, 0)
 	lfd, silent := silent_listener()
+	mut lfd_open := true
+	defer {
+		if lfd_open {
+			C.close(lfd)
+		}
+	}
 	pool.addrs[0] = silent // as if the Resolver had answered it
 	drive(mut pools, 1500, fn () bool {
 		return false
@@ -477,6 +486,7 @@ fn test_only_an_address_failure_asks_for_a_refresh() {
 	asked := l.elsewhere()
 	// The attempt at 3.3 s is refused: it asks.
 	C.close(lfd)
+	lfd_open = false
 	drive(mut pools, 1200, fn () bool {
 		return false
 	})
