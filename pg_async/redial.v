@@ -38,8 +38,9 @@ import transport
 // the table too. A failed attempt (refused, closed, authentication error, or
 // redial_timeout) closes its socket and is retried after redial_backoff,
 // starting at the next address (addr_cursor), so a dead one is not retried
-// first forever; a pool that follows a Resolver also asks it for a refresh
-// (PgPool.redial). The first attempt starts on the first acquire after the
+// first forever; when its address failed (no connection), a pool that follows
+// a Resolver also asks it for a refresh (redial_failed), and every attempt
+// takes the Resolver's latest addresses first. The first attempt starts on the first acquire after the
 // loss, so with steady traffic a slot is back within a few requests while its
 // siblings keep serving.
 
@@ -54,11 +55,14 @@ const redial_timeout = u64(10 * time.second)
 
 // redial advances a non-ready connection's re-dial by one non-blocking step and
 // reports whether it is ready to serve. An attempt dials from `table` (the
-// pool's addresses, kept fresh by a Resolver), or resolves cfg.host itself
-// when `table` is empty. Never inlined: it is the cold path of acquire*(),
-// and inlined into a request handler it would crowd the hot code around it.
+// pool's addresses, kept fresh by the Resolver behind `feed`), or resolves
+// cfg.host itself when `table` is empty (the pool follows no Resolver). An
+// attempt first takes the updates waiting in `feed`, so it dials the
+// Resolver's latest addresses even when maintain() has not taken them yet.
+// Never inlined: it is the cold path of acquire*(), and inlined into a
+// request handler it would crowd the hot code around it.
 @[noinline]
-fn (mut c PgConn) redial(cfg ConnConfig, table []transport.Addr) bool {
+fn (mut c PgConn) redial(cfg ConnConfig, mut table []transport.Addr, mut feed transport.Feed) bool {
 	if c.state == .ready {
 		return true
 	}
@@ -67,16 +71,17 @@ fn (mut c PgConn) redial(cfg ConnConfig, table []transport.Addr) bool {
 		if c.inflight.len > 0 || now < c.retry_at {
 			return false // requests still parked on the old socket, or backing off
 		}
+		feed.take(mut table) // one read(2); nothing without a Resolver
 		c.redial_start(cfg, table) or {
-			c.redial_failed(now)
+			c.redial_failed(now, feed)
 			return false
 		}
 	} else if now >= c.dial_deadline {
-		c.redial_failed(now)
+		c.redial_failed(now, feed)
 		return false
 	}
 	ready := c.redial_step(cfg) or {
-		c.redial_failed(now)
+		c.redial_failed(now, feed)
 		return false
 	}
 	return ready
@@ -110,12 +115,14 @@ fn (mut c PgConn) redial_start(cfg ConnConfig, table []transport.Addr) ! {
 	c.ready_status = tx_idle // a new session is in no transaction
 	c.rollback_deadline = 0
 	c.start_auth(cfg)!
+	// From here a failure is the address's (redial_failed): the dial, then
+	// the connect it starts.
+	c.state = .connecting
 	c.fd = if table.len > 0 {
 		dial_addrs(table, &cfg, true, c.addr_cursor)!
 	} else {
 		dial(&cfg, true, c.addr_cursor)!
 	}
-	c.state = .connecting
 	c.dial_deadline = time.sys_mono_now() + if cfg.connect_timeout_ms > 0 {
 		u64(cfg.connect_timeout_ms) * u64(time.millisecond)
 	} else {
@@ -229,8 +236,17 @@ fn (mut c PgConn) send_startup(cfg ConnConfig) !bool {
 	return error('pg: re-dial: ${c.io_error('connect')}')
 }
 
-// redial_failed abandons the attempt in flight (if any) and schedules the next.
-fn (mut c PgConn) redial_failed(now u64) {
+// redial_failed abandons the attempt in flight (if any) and schedules the
+// next, at the next address. An attempt that failed while still connecting
+// (refused, unreachable, timed out, or no address taking the dial) also asks
+// the Resolver behind `feed` for a refresh, in case the server moved. One
+// that failed before dialing (password_fn) or after connecting (TLS,
+// authentication, a close during startup) asks nothing: its address
+// answered, or was never tried.
+fn (mut c PgConn) redial_failed(now u64, feed &transport.Feed) {
+	if c.state == .connecting {
+		feed.ask() // nothing without a Resolver
+	}
 	c.close_socket()
 	c.state = .broken
 	c.retry_at = now + redial_backoff

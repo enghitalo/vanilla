@@ -463,9 +463,11 @@ kqueue a deadline watch is a plain watch, and `cancel` fails.
   does, exactly when the database is in trouble (a failover, a DNS change).
   Build the Resolver before `new_server` (`transport.Resolver.new(30_000)`,
   `start()`), call `pool.follow(mut resolver)` in `make_state` after
-  `new_pool`, and run `start_maintenance`, whose ticks take its updates.
-  Re-dials and `max_lifetime_ms` recycles then dial the addresses its thread
-  keeps fresh, and a failed attempt asks it for a refresh. One Resolver serves
+  `new_pool`, and run `start_maintenance` (elsewhere than the epoll worker,
+  `maintain()` from your own timer), whose ticks take its updates. Re-dials
+  and `max_lifetime_ms` recycles then dial the addresses its thread keeps
+  fresh (each attempt takes the latest first), and an attempt whose address
+  failed, refused or unreachable, asks it for a refresh. One Resolver serves
   every worker's pools, `http1_1.upstream`'s too
   ([vanilla#351](https://github.com/enghitalo/vanilla/issues/351)). An IP
   address needs none.

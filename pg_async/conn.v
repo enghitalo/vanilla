@@ -212,7 +212,10 @@ pub:
 	// resolves host, so on a Resolver's thread when the pool follows one, and
 	// on the worker at each re-dial attempt when it does not. Every worker's
 	// pool and the Resolver can call it at the same time: state it shares
-	// needs atomics or a lock. nil: getaddrinfo.
+	// needs atomics or a lock. A Resolver makes one lookup per host:port per
+	// refresh, for every pool that follows that host:port, with the resolve of
+	// the first one that followed it: give them all the same resolve (the
+	// pools new_pool builds from one ConnConfig do). nil: getaddrinfo.
 	resolve transport.ResolveFn = unsafe { nil }
 	// user is the role to log in as. Required: PostgreSQL refuses a startup
 	// without one.

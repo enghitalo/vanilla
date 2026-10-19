@@ -97,7 +97,8 @@ fn (mut c PgConn) probe_idle() {
 // loses it. A connection due for recycling while its ROLLBACK is in flight is
 // recycled at a later tick, once the ROLLBACK is answered. A pool that
 // follows a Resolver (follow) first takes its updates into the address table
-// the re-dials dial from. Never waits on the server (a re-dial's name
+// the re-dials dial from, which also keeps its pipe from filling while no
+// re-dial runs. Never waits on the server (a re-dial's name
 // resolution aside, unless the pool follows a Resolver: ConnConfig.host).
 pub fn (mut p PgPool) maintain() int {
 	mut next := maintenance_idle_ms

@@ -150,14 +150,16 @@ pub fn new_pool(cfg ConnConfig, size int) !&PgPool {
 // follow has the pool's re-dials dial from an address table that the
 // Resolver `r` keeps fresh on its own thread, so the worker never resolves
 // ConnConfig.host after startup (vanilla#351): a lost connection's re-dial
-// and a max_lifetime_ms recycle both dial the addresses r found last, and a
-// failed attempt asks r for a refresh (PgPool.redial). Call it in make_state,
-// after new_pool: it resolves the host once more to fill the table
-// (blocking, with ConnConfig.resolve when set), then follows r, whose thread
-// re-resolves it with the same resolve. maintain() takes r's updates into the
-// table: run start_maintenance (or maintain() from your own timer). One
-// Resolver can serve every pool of every worker, and http1_1.upstream's pools
-// too. Without follow, each re-dial attempt resolves the host on the worker.
+// and a max_lifetime_ms recycle both dial the addresses r found last, and an
+// attempt whose address failed asks r for a refresh (PgPool.redial). Call it
+// in make_state, after new_pool: it resolves the host once more to fill the
+// table (blocking, with ConnConfig.resolve when set), then follows r, whose
+// thread re-resolves it with the same resolve. Each re-dial attempt takes
+// r's updates first, and maintain() takes them at every tick, which keeps the
+// pipe from filling: run start_maintenance (or maintain() from your own
+// timer). One Resolver can serve every pool of every worker, and
+// http1_1.upstream's pools too. Without follow, each re-dial attempt resolves
+// the host on the worker.
 pub fn (mut p PgPool) follow(mut r transport.Resolver) ! {
 	if p.feed.followed() {
 		return error('pg pool: the pool already follows a resolver')
@@ -175,22 +177,16 @@ pub fn (mut p PgPool) follow(mut r transport.Resolver) ! {
 
 // redial advances connection i's re-dial by one non-blocking step
 // (PgConn.redial): from the address table when the pool follows a Resolver,
-// else resolving ConnConfig.host on the worker. An attempt that failed (its
-// address refused, timed out or failed the handshake) asks the Resolver for
-// a refresh, in case the server moved: at most one ask per connection per
+// taking its latest updates first, else resolving ConnConfig.host on the
+// worker. An attempt whose address failed (no connection) asks the Resolver
+// for a refresh, in case the server moved: at most one ask per connection per
 // redial_backoff, and the Resolver answers the asks of every pool within its
 // refresh gap with one lookup (transport.Feed.ask). Never inlined: the cold
-// path of acquire*() and maintain().
+// path of acquire*() and maintain(), whose call sites pass only the pool and
+// the index.
 @[noinline]
 fn (mut p PgPool) redial(i int) bool {
-	cursor := p.conns[i].addr_cursor
-	if p.conns[i].redial(p.cfg, p.addrs) {
-		return true
-	}
-	if p.conns[i].addr_cursor != cursor {
-		p.feed.ask() // redial_failed moved the cursor: the attempt failed
-	}
-	return false
+	return p.conns[i].redial(p.cfg, mut p.addrs, mut p.feed)
 }
 
 // size is the number of connections in the pool.

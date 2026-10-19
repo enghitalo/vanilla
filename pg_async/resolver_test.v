@@ -1,4 +1,4 @@
-// vtest build: !windows
+// vtest build: linux
 module pg_async
 
 import sync.stdatomic
@@ -12,8 +12,9 @@ import transport
 // never waits on a slow lookup; a lost connection and a max_lifetime_ms
 // recycle both follow the table; a pool that follows none resolves at every
 // attempt, as before; and failed attempts ask for refreshes without a lookup
-// per attempt. The test thread plays the worker. Skipped without python3
-// unless VANILLA_REQUIRE_FAKE_PG is set (CI).
+// per attempt. The test thread plays the worker. Linux only: the lookups are
+// told apart by thread id (gettid). Skipped without python3 unless
+// VANILLA_REQUIRE_FAKE_PG is set (CI).
 
 // Lookup is a scripted ConnConfig.resolve: it answers 127.0.0.1 at `port`,
 // after waiting slow_ms, and counts its calls by thread: the worker's (the
@@ -28,14 +29,9 @@ mut:
 	other_calls  i64 // atomic
 }
 
-// tid is the calling thread's id (Linux). Elsewhere 0, and the tests do not
-// tell the threads apart.
+// tid is the calling thread's id.
 fn tid() u32 {
-	$if linux {
-		return C.gettid()
-	} $else {
-		return 0
-	}
+	return C.gettid()
 }
 
 fn (l &Lookup) resolve_fn() transport.ResolveFn {
@@ -210,9 +206,7 @@ fn test_redial_never_waits_for_a_slow_resolver() {
 	assert redial_ms < 1500, 'the re-dial waited for the lookup'
 	assert rt_query(mut pool, 0, 'select 8')! == 8
 	assert rt_stat(fake, 'authenticated', 3) == 3
-	$if linux {
-		assert l.on_worker() == boot_calls, 'the worker looked the host up after follow'
-	}
+	assert l.on_worker() == boot_calls, 'the worker looked the host up after follow'
 }
 
 // The issue's second test: the host moves (the lookup answers server B). The
@@ -268,9 +262,7 @@ fn test_redial_and_recycle_follow_the_table() {
 	assert a.stat('authenticated') == 2 // the two bring-ups only
 	assert rt_query(mut lost, 0, 'select 1')! == 1
 	assert rt_query(mut aged, 0, 'select 2')! == 2
-	$if linux {
-		assert l.on_worker() == before, 'the worker looked the host up'
-	}
+	assert l.on_worker() == before, 'the worker looked the host up'
 }
 
 // The issue's third test: without a Resolver nothing changes. Each re-dial
@@ -304,9 +296,7 @@ fn test_redial_without_a_resolver_resolves_on_the_worker() {
 	assert pool.conns[0].state == .ready
 	assert rt_stat(b, 'authenticated', 1) == 1
 	assert rt_query(mut pool, 0, 'select 3')! == 3
-	$if linux {
-		assert l.on_worker() == before + 1, 'one attempt, one lookup on the worker'
-	}
+	assert l.on_worker() == before + 1, 'one attempt, one lookup on the worker'
 	assert l.elsewhere() == 0
 }
 
@@ -320,6 +310,9 @@ fn test_failed_redials_ask_without_a_lookup_storm() {
 		return
 	}
 	mut fake := testkit.start_fake_pg([])!
+	defer {
+		fake.stop() // stopped below already: a no-op then
+	}
 	mut l := new_lookup(fake.port)
 	mut r := transport.Resolver.new(60_000)! // only asks refresh within the test
 	mut pools := []&PgPool{}
@@ -358,4 +351,137 @@ fn test_failed_redials_ask_without_a_lookup_storm() {
 	assert attempts >= 32, 'the re-dials did not keep trying'
 	assert lookups >= 1, 'no failed attempt asked for a refresh'
 	assert lookups <= window_ms / 1000 + 2, 'a lookup storm: ${lookups} lookups for ${attempts} failed attempts'
+}
+
+// Re-dials that only requests drive (acquire*() and no maintain(): a backend
+// without start_maintenance, or a request that reaches the slot before the
+// timer's tick) still dial the Resolver's latest addresses, because each
+// attempt takes them first. The server moved from A to B while the
+// connection was down: the first attempt, to A, is refused and asks; the
+// next one, a backoff later, goes to B.
+fn test_an_attempt_takes_the_latest_addresses_first() {
+	if !testkit.fake_pg_available() {
+		return
+	}
+	mut a := testkit.start_fake_pg([])!
+	defer {
+		a.stop()
+	}
+	mut b := testkit.start_fake_pg([])!
+	defer {
+		b.stop()
+	}
+	mut l := new_lookup(a.port)
+	mut pool := new_pool(lookup_cfg(l), 1)!
+	defer {
+		pool.close()
+	}
+	mut r := transport.Resolver.new(60_000)! // only asks refresh within the test
+	pool.follow(mut r)!
+	r.start()
+	defer {
+		r.stop()
+	}
+	a.stop() // A is gone: its address refuses
+	stdatomic.store_i64(&l.port, b.port) // the name now points at B
+	pool.conn(0).lose('test: the server went away')
+	sw := time.new_stopwatch()
+	for sw.elapsed().milliseconds() < 4000 && pool.conns[0].state != .ready {
+		pool.acquire_pipelined() or {}
+		time.sleep(2 * time.millisecond)
+	}
+	assert pool.conns[0].state == .ready, 'the re-dials never reached B'
+	assert pool.conns[0].addr_cursor >= 1, 'no attempt failed first'
+	assert l.elsewhere() >= 1, 'the failed attempt did not ask'
+	assert rt_stat(b, 'authenticated', 1) == 1
+	assert rt_query(mut pool, 0, 'select 4')! == 4
+}
+
+// Fail is whether the scripted password_fn below fails.
+@[heap]
+struct Fail {
+mut:
+	n i64 // atomic
+}
+
+fn C.bind(fd int, addr voidptr, len u32) int
+fn C.listen(fd int, backlog int) int
+fn C.getsockname(fd int, addr voidptr, len &u32) int
+
+// silent_listener listens on 127.0.0.1 and never accepts: the kernel
+// completes every connect, and nothing ever answers. Its fd and address.
+fn silent_listener() (int, transport.Addr) {
+	mut a := transport.ip_addr('127.0.0.1', 0) or { panic('addr') }
+	fd := C.socket(a.family, C.SOCK_STREAM, 0)
+	assert fd >= 0
+	assert C.bind(fd, voidptr(&a.data[0]), a.len) == 0
+	assert C.listen(fd, 16) == 0
+	mut sl := u32(128)
+	assert C.getsockname(fd, voidptr(&a.data[0]), &sl) == 0
+	return fd, a
+}
+
+// Only an attempt whose address failed asks for a refresh. One that never
+// dialed (password_fn failed: a token service down) or that connected and
+// then failed (a server that accepts and never answers the startup) asks
+// nothing: the address answered, or was never tried, and an ask would
+// re-resolve every host the Resolver follows (#366). A refused connect then
+// asks.
+fn test_only_an_address_failure_asks_for_a_refresh() {
+	if !testkit.fake_pg_available() {
+		return
+	}
+	mut fake := testkit.start_fake_pg([])!
+	defer {
+		fake.stop()
+	}
+	mut l := new_lookup(fake.port)
+	fail := &Fail{}
+	mut pool := new_pool(ConnConfig{
+		...lookup_cfg(l)
+		password:           ''
+		password_fn:        fn [fail] () !string {
+			if stdatomic.load_i64(&fail.n) != 0 {
+				return error('the token service is down')
+			}
+			return 'secret'
+		}
+		connect_timeout_ms: 300 // bounds a re-dial attempt
+	}, 1)!
+	defer {
+		pool.close()
+	}
+	mut r := transport.Resolver.new(60_000)! // only asks refresh within the test
+	pool.follow(mut r)!
+	r.start()
+	defer {
+		r.stop()
+	}
+	mut pools := [pool]
+	// Attempts at 0 and 1 s fail before dialing.
+	stdatomic.store_i64(&fail.n, 1)
+	pool.conn(0).lose('test: the server went away')
+	drive(mut pools, 1200, fn () bool {
+		return false
+	})
+	no_dial := pool.conns[0].addr_cursor
+	// The attempt at 2 s connects to a listener that never answers, and
+	// times out in the startup.
+	stdatomic.store_i64(&fail.n, 0)
+	lfd, silent := silent_listener()
+	pool.addrs[0] = silent // as if the Resolver had answered it
+	drive(mut pools, 1500, fn () bool {
+		return false
+	})
+	connected := pool.conns[0].addr_cursor - no_dial
+	asked := l.elsewhere()
+	// The attempt at 3.3 s is refused: it asks.
+	C.close(lfd)
+	drive(mut pools, 1200, fn () bool {
+		return false
+	})
+	eprintln('${no_dial} attempts without a password and ${connected} that connected and timed out asked for ${asked} lookups; a refused connect then asked for ${l.elsewhere()}')
+	assert asked == 0, 'an attempt that reached no address, or that connected, asked'
+	assert no_dial >= 1 && connected >= 1, 'the attempts did not fail as scripted'
+	assert l.elsewhere() >= 1, 'a refused connect did not ask'
 }
