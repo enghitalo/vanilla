@@ -5,13 +5,26 @@ import time
 // Pool maintenance, off the request path: deadlines, idle and lifetime
 // expiry, and the liveness probe of kept connections.
 //
-// Deadlines: a parked exchange has no deadline of its own in the runtime yet
-// (#200). Until it does, maintain() shuts down the socket of an exchange past
-// its deadline (shutdown(2), SHUT_RDWR): the watch parked on it fires as a
-// hangup, and advance() answers .failed with .timeout. The connection is
-// closed at release, so a late reply can never reach another exchange. The
-// timer is re-armed for the next thing due, so a deadline is kept to within
-// a millisecond or so, not to a tick.
+// Deadlines: maintain() enforces each exchange's own, connect_timeout_ms for
+// the connect and the TLS handshake, then response_timeout_ms. It shuts the
+// socket of an exchange past its deadline down (expire(): shutdown(2),
+// SHUT_RDWR), the watch parked on it fires as a hangup, and advance() answers
+// .failed with .timeout. The connection is closed at release, after that
+// run, so a late reply can never reach another exchange. The timer is
+// re-armed for the next thing due, so a deadline is kept to within a
+// millisecond or so, not to a tick.
+//
+// The runtime's deadlines (#200) cannot take this over: the epoll worker
+// gives a tombstone (an exchange whose client left) and a clientless watch
+// (examples/logging's shipper) none, and those exchanges must end on time
+// too, or a silent upstream holds their slot for good. A parked request's
+// watch has one more deadline, the runtime's Limits.park_timeout_ms, armed
+// afresh at each park: it bounds each wait (the connect, a TLS flight, a full
+// socket, the response), not the whole exchange. When it passes first, the
+// continuation runs with event_loop.timed_out(), and advance() ends the
+// exchange the same way: expire(), then it watches the socket again, for the
+// hangup. Either way the app sees .failed with .timeout once, from the
+// hangup's run, and the fd is closed once no watch is left on it.
 
 // maintenance_idle_ms is the tick when nothing is due sooner: how long a kept
 // connection the upstream closed can sit unnoticed by the pool (acquire()
@@ -32,9 +45,7 @@ pub fn (mut p Pool) maintain() int {
 				continue // not in flight
 			}
 			if now >= x.deadline {
-				// Wake the parked watch with a hangup; advance() reports .timeout.
-				x.timed_out = true
-				C.shutdown(x.fd, C.SHUT_RDWR)
+				x.expire() // the parked watch wakes; advance() reports .timeout
 			} else if x.deadline - now < next {
 				next = x.deadline - now
 			}

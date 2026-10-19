@@ -395,3 +395,123 @@ fn test_maintain_enforces_deadlines() {
 }
 
 fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
+fn C.socket(domain int, typ int, protocol int) int
+fn C.bind(fd int, addr voidptr, len u32) int
+fn C.listen(fd int, backlog int) int
+fn C.getsockname(fd int, addr voidptr, len &u32) int
+
+// full_listener listens on 127.0.0.1 with its accept queue full: one
+// connection waits in it, never accepted, so the kernel drops the SYN of every
+// later connect, which stays in SYN_SENT. Returns the listener, that
+// connection and the port.
+fn full_listener() (int, int, int) {
+	lfd := C.socket(C.AF_INET, C.SOCK_STREAM, 0)
+	mut a := transport.ip_addr('127.0.0.1', 0) or { panic('addr') }
+	assert C.bind(lfd, voidptr(&a.data[0]), a.len) == 0
+	assert C.listen(lfd, 0) == 0
+	mut l := u32(a.data.len)
+	C.getsockname(lfd, voidptr(&a.data[0]), &l)
+	port := (int(a.data[2]) << 8) | int(a.data[3])
+	queued := transport.dial_tcp('127.0.0.1', port) or { panic(err) }
+	time.sleep(20 * time.millisecond) // its handshake completes: the queue is full
+	return lfd, queued, port
+}
+
+// TimedOutRun is what advance() did in a continuation run with
+// event_loop.timed_out(), then in the run after it (ready_fd_error: the
+// hangup).
+struct TimedOutRun {
+	phase Phase
+	head  int // the request's length
+mut:
+	first       Poll
+	phase_after Phase
+	off         int  // request bytes written by then
+	read        int  // response bytes read by then
+	timed_out   bool // the exchange is marked timed out
+	rearmed     bool // the fd is watched again
+	hung_up     bool // the socket is shut down: its watch wakes at once
+	second      Poll
+	failure     Failure
+}
+
+// The park's own deadline (Limits.park_timeout_ms) passes before the
+// exchange's (#322): its continuation runs with event_loop.timed_out(), the
+// fd not ready. advance() then neither reads nor writes the socket, nor
+// takes a connect in flight for done: it shuts the socket down and watches it
+// again (.pending), so the hangup wakes the continuation at once, and that
+// run gets .failed with .timeout, once. In each phase; the reading socket
+// already holds a reply that came too late, the sending one has room.
+fn test_advance_after_the_park_deadline() {
+	mut p := plain_pool(Origin{
+		host:                '127.0.0.1'
+		connect_timeout_ms:  10_000
+		response_timeout_ms: 10_000
+	})
+	lfd, queued, port := full_listener()
+	defer {
+		C.close(lfd)
+		C.close(queued)
+	}
+	mut runs := []TimedOutRun{}
+	for phase in [Phase.connecting, .sending, .reading] {
+		mut x := p.acquire() or { panic('slot') }
+		assert x.request('GET', '/v1/slow')
+		x.head << '\r\n'.bytes() // what send() ends the head with
+		x.framer.reset(false)
+		mut peer := -1
+		if phase == .connecting {
+			x.fd = transport.dial_tcp('127.0.0.1', port) or { panic(err) } // stays in SYN_SENT
+		} else {
+			mut fds := [2]i32{}
+			assert C.socketpair(C.AF_UNIX, C.SOCK_STREAM | C.SOCK_NONBLOCK, 0, &fds[0]) == 0
+			x.fd = int(fds[0])
+			peer = int(fds[1])
+		}
+		if phase == .reading {
+			x.off = x.head.len
+			late := 'HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nlate'
+			C.write(peer, late.str, usize(late.len))
+		}
+		x.phase = phase
+		x.deadline = time.sys_mono_now() + u64(10 * time.second)
+		mut el := core.EventLoop{
+			register: record_watch
+			reason:   .timeout
+		}
+		mut r := TimedOutRun{
+			phase: phase
+			head:  x.head.len
+		}
+		r.first = x.advance(false, mut el, never_woken, unsafe { nil })
+		r.phase_after = x.phase
+		r.off = x.off
+		r.read = x.resp.len
+		r.timed_out = x.timed_out
+		r.rearmed = el.last_watched == x.fd
+		r.hung_up = if peer >= 0 {
+			C.upstream_peek(peer) == 0 // the peer reads our FIN
+		} else {
+			C.transport_wait(x.fd, 0) > 0 // SYN_SENT reports nothing until it ends
+		}
+		el.reason = .ready
+		el.last_watched = -1
+		r.second = x.advance(true, mut el, never_woken, unsafe { nil })
+		r.failure = x.failure()
+		x.release()
+		assert x.fd == -1 // closed at release
+		if peer >= 0 {
+			C.close(peer)
+		}
+		eprintln('${phase}: the timed-out run got ${r.first} (now ${r.phase_after}, ${r.off} B written, ${r.read} B read, timed_out ${r.timed_out}, watched again ${r.rearmed}, shut down ${r.hung_up}); the next run got ${r.second} (${r.failure})')
+		runs << r
+	}
+	for r in runs {
+		assert r.first == .pending && r.rearmed, r.str()
+		assert r.phase_after == r.phase && r.read == 0, r.str()
+		assert r.off == if r.phase == .reading { r.head } else { 0 }, r.str()
+		assert r.timed_out && r.hung_up, r.str()
+		assert r.second == .failed && r.failure == .timeout, r.str()
+	}
+	assert p.stats.timeouts == 3
+}
