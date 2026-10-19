@@ -123,11 +123,12 @@ fn status_at(buf []u8, p int) int {
 	return int(d0 - `0`) * 100 + int(d1 - `0`) * 10 + int(d2 - `0`)
 }
 
-fn C.memchr(buf &u8, char int, len usize) &u8
-
 // lf_idx returns the index of the first LF at/after `from`, or -1. memchr
 // (vectorized in glibc), so the head walk hops line to line instead of
-// testing every byte.
+// testing every byte. C.memchr is vlib's builtin declaration, which returns
+// voidptr, so the result is cast before the arithmetic. Don't redeclare it
+// with another return type: V types every call in the program by one of the
+// declarations, picked by parse order (#383, vlang/v#30915).
 @[inline]
 fn lf_idx(buf []u8, from int) int {
 	if from >= buf.len {
@@ -138,7 +139,7 @@ fn lf_idx(buf []u8, from int) int {
 	if p == unsafe { nil } {
 		return -1
 	}
-	return from + int(unsafe { p - base })
+	return from + int(unsafe { &u8(p) - base })
 }
 
 // field_value returns (start, len) of the value of the field line

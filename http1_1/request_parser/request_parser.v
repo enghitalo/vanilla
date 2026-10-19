@@ -33,8 +33,10 @@ pub mut:
 	body          Slice
 }
 
-fn C.memchr(buf &u8, char int, len usize) &u8
-fn C.memmem(haystack &u8, h_len usize, needle &u8, n_len usize) &u8
+// C.memchr and C.memmem are vlib's builtin declarations, which return
+// voidptr; every call below casts the result. Don't redeclare them with
+// another return type: V types every call in the program by one of the
+// declarations, picked by parse order (#383, vlang/v#30915).
 
 // find_byte_idx returns the index of `c`, or -1 when absent (libc memchr,
 // AVX2-accelerated via glibc IFUNC). A plain int, not `!int`: a Result wrapper
