@@ -351,7 +351,7 @@ fn win_compact_read_buf(mut cs WinConn, pos int) {
 	}
 	leftover := cs.read_buf.len - pos
 	if leftover > 0 {
-		unsafe { C.memmove(cs.read_buf.data, &u8(cs.read_buf.data) + pos, usize(leftover)) }
+		unsafe { C.memmove(cs.read_buf.data, &u8(cs.read_buf.data) + pos, u64(leftover)) }
 	}
 	unsafe {
 		cs.read_buf.len = leftover
@@ -619,7 +619,7 @@ fn win_worker(port voidptr, h core.Handler, make_state fn () voidptr, limits cor
 	mut now := u64(0) // monotonic ns, read once per completion by the sweep gate
 	for {
 		mut bytes := u32(0)
-		mut key := usize(0)
+		mut key := u64(0)
 		mut ovp := &C.OVERLAPPED(unsafe { nil })
 		// Block until a completion arrives. While a deadline is armed, wake no
 		// later than the next due sweep (at most one interval away, so a
@@ -718,14 +718,14 @@ fn win_accept_loop(socket_fd int, ports []voidptr, limits core.Limits, active_co
 		socket.set_tcp_nodelay(client_fd)
 		port := ports[next]
 		next = (next + 1) % ports.len
-		if !iocp.associate(port, client_fd, usize(client_fd)) {
+		if !iocp.associate(port, client_fd, u64(client_fd)) {
 			eprintln('[iocp] failed to associate accepted socket: WSA ${C.WSAGetLastError()}')
 			socket.close_socket(client_fd)
 			continue
 		}
 		// Registered successfully — count it (released at close).
 		stdatomic.add_i64(&active_conns.n, 1)
-		if !iocp.post(port, 0, usize(client_fd), unsafe { nil }) {
+		if !iocp.post(port, 0, u64(client_fd), unsafe { nil }) {
 			stdatomic.add_i64(&active_conns.n, -1)
 			socket.close_socket(client_fd)
 		}

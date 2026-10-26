@@ -29,16 +29,17 @@ import vtest
 
 #include <sys/socket.h>
 #include <malloc.h>
+#include "@VMODROOT/socket/sock_shim.h"
 
-fn C.recv(fd int, buf voidptr, len usize, flags int) int
+fn C.vanilla_recv(fd int, buf voidptr, len u64, flags int) int
 fn C.setsockopt(fd int, level int, optname int, optval voidptr, optlen u32) int
 fn C.pipe(fds &i32) int
 fn C.close(fd int) int
 fn C.shutdown(fd int, how int) int
 
 struct C.mallinfo2 {
-	uordblks usize
-	hblkhd   usize
+	uordblks u64
+	hblkhd   u64
 }
 
 fn C.mallinfo2() C.mallinfo2
@@ -355,7 +356,7 @@ fn cp_dial(port int, req string) !CpClient {
 
 fn (mut c CpClient) send(s string) ! {
 	for _ in 0 .. 2000 {
-		n := C.send(c.fd, s.str, usize(s.len), C.MSG_NOSIGNAL)
+		n := C.vanilla_send(c.fd, s.str, u64(s.len), C.MSG_NOSIGNAL)
 		if n == s.len {
 			return
 		}
@@ -375,7 +376,7 @@ fn (mut c CpClient) until(needle string, ms int) bool {
 		if c.acc.bytestr().contains(needle) {
 			return true
 		}
-		n := C.recv(c.fd, &buf[0], 4096, C.MSG_DONTWAIT)
+		n := C.vanilla_recv(c.fd, &buf[0], 4096, C.MSG_DONTWAIT)
 		if n > 0 {
 			unsafe { c.acc.push_many(&buf[0], n) }
 			continue
@@ -398,7 +399,7 @@ fn (mut c CpClient) line_after(marker string, ms int) ?string {
 		if s.contains(marker) && s.all_after(marker).contains('\n') {
 			return s.all_after(marker).all_before('\n')
 		}
-		n := C.recv(c.fd, &buf[0], 4096, C.MSG_DONTWAIT)
+		n := C.vanilla_recv(c.fd, &buf[0], 4096, C.MSG_DONTWAIT)
 		if n > 0 {
 			unsafe { c.acc.push_many(&buf[0], n) }
 			continue
@@ -416,7 +417,7 @@ fn (mut c CpClient) eof(ms int) bool {
 	deadline := time.sys_mono_now() + u64(ms) * 1_000_000
 	mut buf := [4096]u8{}
 	for time.sys_mono_now() < deadline {
-		n := C.recv(c.fd, &buf[0], 4096, C.MSG_DONTWAIT)
+		n := C.vanilla_recv(c.fd, &buf[0], 4096, C.MSG_DONTWAIT)
 		if n > 0 {
 			unsafe { c.acc.push_many(&buf[0], n) }
 			continue
@@ -695,7 +696,7 @@ fn test_epoll_push_two_producers_keep_order() ! {
 	mut pending := []u8{cap: 64}
 	deadline := time.sys_mono_now() + 20 * u64(time.second)
 	for lines < 2 * per && time.sys_mono_now() < deadline {
-		n := C.recv(a.fd, &buf[0], 65536, 0)
+		n := C.vanilla_recv(a.fd, &buf[0], 65536, 0)
 		if n < 0 && C.errno == C.EAGAIN {
 			time.sleep(50 * time.microsecond) // the client fd is non-blocking
 			continue
@@ -1167,7 +1168,7 @@ fn cp_read_lines(fd int, want int) int {
 	mut buf := [16384]u8{}
 	mut got := 0
 	for got < want {
-		n := C.recv(fd, &buf[0], 16384, 0)
+		n := C.vanilla_recv(fd, &buf[0], 16384, 0)
 		if n < 0 && C.errno == C.EAGAIN {
 			time.sleep(20 * time.microsecond) // the client fd is non-blocking
 			continue

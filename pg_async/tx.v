@@ -102,7 +102,7 @@ pub fn is_serialization_failure(err IError) bool {
 //   poll := conn.async_on_readable() or {
 //       pool.release(idx) // from acquire(): on every path, and before the step below
 //       if policy.retry(attempt, err) {
-//           if policy.park_backoff(attempt, mut event_loop, on_backoff, voidptr(usize(attempt + 1))) {
+//           if policy.park_backoff(attempt, mut event_loop, on_backoff, voidptr(u64(attempt + 1))) {
 //               return .suspend // on_backoff: acquire, submit it all again
 //           }
 //       }

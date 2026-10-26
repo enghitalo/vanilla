@@ -35,11 +35,12 @@ import vtest
 
 #include <sys/socket.h>
 #include <sys/timerfd.h>
+#include "@VMODROOT/socket/sock_shim.h"
 
-fn C.read(fd int, buf voidptr, count usize) int
-fn C.write(fd int, buf voidptr, count usize) int
-fn C.send(fd int, buf voidptr, len usize, flags int) int
-fn C.recv(fd int, buf voidptr, len usize, flags int) int
+fn C.read(fd int, buf voidptr, count u64) int
+fn C.write(fd int, buf voidptr, count u64) int
+fn C.vanilla_send(fd int, buf voidptr, len u64, flags int) int
+fn C.vanilla_recv(fd int, buf voidptr, len u64, flags int) int
 fn C.clock_gettime(clk int, ts &C.timespec) int
 fn C.close(fd int) int
 fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
@@ -113,21 +114,21 @@ fn cf_park(cont core.WakeFn) core.Handler {
 		}
 		b := [u8(`x`)]!
 		C.write(int(sv[1]), &b[0], 1)
-		event_loop.watch_fd(int(sv[0]), .readable, cont, voidptr(usize(u32(sv[1]))))
+		event_loop.watch_fd(int(sv[0]), .readable, cont, voidptr(u64(u32(sv[1]))))
 		return .suspend
 	}
 }
 
 fn cf_answer_close(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	C.close(ready_fd)
-	C.close(int(u32(usize(watch_payload))))
+	C.close(int(u32(u64(watch_payload))))
 	out << cf_ok_close
 	return .close
 }
 
 fn cf_answer_big_close(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	C.close(ready_fd)
-	C.close(int(u32(usize(watch_payload))))
+	C.close(int(u32(u64(watch_payload))))
 	cf_small_sndbuf(event_loop.client_fd)
 	cf_append_big(mut out, cf_big_close_head)
 	return .close
@@ -613,7 +614,7 @@ fn check_half_closed_peer_sleeps_while_parked(backend server.IOBackend) ! {
 	rcvbuf := i32(64 * 1024)
 	C.setsockopt(fd, C.SOL_SOCKET, C.SO_RCVBUF, &rcvbuf, u32(sizeof(i32)))
 	socket.set_blocking(fd, true)
-	if C.send(fd, cf_req.data, usize(cf_req.len), C.MSG_NOSIGNAL) != cf_req.len {
+	if C.vanilla_send(fd, cf_req.data, u64(cf_req.len), C.MSG_NOSIGNAL) != cf_req.len {
 		return error('${backend}: the request did not go out')
 	}
 	socket.shutdown_write(fd)
@@ -625,7 +626,7 @@ fn check_half_closed_peer_sleeps_while_parked(backend server.IOBackend) ! {
 	mut last := 0
 	mut buf := []u8{len: 64 * 1024}
 	for {
-		last = C.recv(fd, buf.data, usize(buf.len), 0)
+		last = C.vanilla_recv(fd, buf.data, u64(buf.len), 0)
 		if last <= 0 {
 			break
 		}

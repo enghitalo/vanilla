@@ -135,7 +135,7 @@ fn lf_idx(buf []u8, from int) int {
 		return -1
 	}
 	base := unsafe { &u8(buf.data) + from }
-	p := unsafe { C.memchr(base, int(`\n`), usize(buf.len - from)) }
+	p := unsafe { C.memchr(base, int(`\n`), u64(buf.len - from)) }
 	if p == unsafe { nil } {
 		return -1
 	}

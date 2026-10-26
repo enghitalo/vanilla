@@ -17,8 +17,9 @@ import time
 import core
 
 #include <errno.h>
+#include "@VMODROOT/socket/sock_shim.h"
 
-fn C.send(fd int, buf voidptr, n usize, flags int) int
+fn C.vanilla_send(fd int, buf voidptr, n u64, flags int) int
 
 // msg_nosignal returns MSG_NOSIGNAL on Linux: a dead viewer must not raise
 // SIGPIPE — we detect it from send(). macOS has no such flag; SIGPIPE is
@@ -126,7 +127,7 @@ fn send_all(fd int, data []u8) bool {
 	mut off := 0
 	mut stalls := 0
 	for off < data.len {
-		n := C.send(fd, unsafe { &u8(data.data) + off }, usize(data.len - off), msg_nosignal())
+		n := C.vanilla_send(fd, unsafe { &u8(data.data) + off }, u64(data.len - off), msg_nosignal())
 		if n > 0 {
 			off += n
 			stalls = 0

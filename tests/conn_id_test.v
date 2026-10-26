@@ -25,12 +25,13 @@ import vtest
 
 #include <sys/socket.h>
 #include <fcntl.h>
+#include "@VMODROOT/socket/sock_shim.h"
 
-fn C.send(__fd int, __buf voidptr, __n usize, __flags int) int
-fn C.recv(__fd int, __buf voidptr, __n usize, __flags int) int
+fn C.vanilla_send(__fd int, __buf voidptr, __n u64, __flags int) int
+fn C.vanilla_recv(__fd int, __buf voidptr, __n u64, __flags int) int
 fn C.pipe(fds &i32) int
-fn C.write(fd int, buf voidptr, count usize) int
-fn C.read(fd int, buf voidptr, count usize) int
+fn C.write(fd int, buf voidptr, count u64) int
+fn C.read(fd int, buf voidptr, count u64) int
 fn C.close(fd int) int
 fn C.fcntl(fd int, cmd int, arg int) int
 
@@ -156,7 +157,7 @@ fn ci_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 		// closes both ends (the write end comes as its payload).
 		mut fds := [2]i32{}
 		C.pipe(&fds[0])
-		event_loop.watch_fd_deadline(int(fds[0]), .readable, ci_timed_out, voidptr(isize(fds[1])),
+		event_loop.watch_fd_deadline(int(fds[0]), .readable, ci_timed_out, voidptr(i64(fds[1])),
 			20)
 		return .suspend
 	}
@@ -206,7 +207,7 @@ fn ci_resumed(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voi
 // ci_timed_out is GET /slow's continuation, run by its park's deadline.
 fn ci_timed_out(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	C.close(ready_fd)
-	C.close(int(isize(watch_payload)))
+	C.close(int(i64(watch_payload)))
 	return ci_report(mut out, if event_loop.timed_out() { 'timeout' } else { 'ready' },
 		event_loop.conn_id(), -1, 0, false)
 }
@@ -322,7 +323,7 @@ fn (mut c CiClient) send(s string) ! {
 	deadline := time.sys_mono_now() + 10 * u64(time.second)
 	mut off := 0
 	for off < s.len {
-		n := C.send(c.fd, unsafe { s.str + off }, usize(s.len - off), C.MSG_NOSIGNAL)
+		n := C.vanilla_send(c.fd, unsafe { s.str + off }, u64(s.len - off), C.MSG_NOSIGNAL)
 		if n > 0 {
 			off += n
 			continue
@@ -340,7 +341,7 @@ fn (mut c CiClient) reports(n int, ms int) []u64 {
 	deadline := time.sys_mono_now() + u64(ms) * 1_000_000
 	mut buf := [4096]u8{}
 	for c.acc.bytestr().count('#') < n {
-		k := C.recv(c.fd, &buf[0], 4096, C.MSG_DONTWAIT)
+		k := C.vanilla_recv(c.fd, &buf[0], 4096, C.MSG_DONTWAIT)
 		if k > 0 {
 			unsafe { c.acc.push_many(&buf[0], k) }
 			continue
@@ -358,7 +359,7 @@ fn (mut c CiClient) eof(ms int) bool {
 	deadline := time.sys_mono_now() + u64(ms) * 1_000_000
 	mut buf := [4096]u8{}
 	for time.sys_mono_now() < deadline {
-		k := C.recv(c.fd, &buf[0], 4096, C.MSG_DONTWAIT)
+		k := C.vanilla_recv(c.fd, &buf[0], 4096, C.MSG_DONTWAIT)
 		if k > 0 {
 			unsafe { c.acc.push_many(&buf[0], k) }
 			continue

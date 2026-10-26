@@ -25,7 +25,7 @@ import os
 import core
 import http1_1.request_parser
 
-fn C.memchr(buf voidptr, c int, n usize) voidptr
+fn C.memchr(buf voidptr, c int, n u64) voidptr
 
 const raw_request = 'GET /users/42/posts?id=123&format=json HTTP/1.1\r\nHost: example.com\r\nUser-Agent: wrk/4.1\r\nAccept: application/json\r\nConnection: keep-alive\r\n\r\n'.bytes()
 
@@ -126,7 +126,7 @@ fn build_log_line(req_buffer []u8, out []u8, start int) int {
 		return 0
 	}
 	unsafe {
-		sp1 := C.memchr(&req_buffer[0], ` `, usize(req_buffer.len))
+		sp1 := C.memchr(&req_buffer[0], ` `, u64(req_buffer.len))
 		if sp1 == nil {
 			return 0
 		}
@@ -134,7 +134,7 @@ fn build_log_line(req_buffer []u8, out []u8, start int) int {
 		if after_method >= req_buffer.len {
 			return 0
 		}
-		sp2 := C.memchr(&req_buffer[after_method], ` `, usize(req_buffer.len - after_method))
+		sp2 := C.memchr(&req_buffer[after_method], ` `, u64(req_buffer.len - after_method))
 		if sp2 == nil {
 			return 0
 		}

@@ -27,7 +27,7 @@ pub const ev_error = u16(0x4000) // EV_ERROR
 // V struct for kevent (mirrors C struct)
 pub struct C.kevent {
 pub mut:
-	ident  usize
+	ident  u64
 	filter i16
 	flags  u16
 	fflags u32
@@ -47,7 +47,7 @@ pub fn create_kqueue_fd() int {
 // Add a file descriptor to a kqueue instance with given filter (EVFILT_READ/EVFILT_WRITE).
 pub fn add_fd_to_kqueue(kq int, fd int, filter i16) int {
 	mut kev := C.kevent{
-		ident:  usize(fd)
+		ident:  u64(fd)
 		filter: filter
 		flags:  ev_add
 		fflags: 0
@@ -64,7 +64,7 @@ pub fn add_fd_to_kqueue(kq int, fd int, filter i16) int {
 // Remove a file descriptor from a kqueue instance.
 pub fn remove_fd_from_kqueue(kq int, fd int) {
 	mut kev := C.kevent{
-		ident: usize(fd)
+		ident: u64(fd)
 		flags: ev_delete
 	}
 	// Remove both read and write filters

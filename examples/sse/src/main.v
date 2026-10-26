@@ -189,7 +189,7 @@ fn subscribe(mut hub Hub, mut out []u8, mut event_loop core.EventLoop) core.Step
 		return .close
 	}
 	id := hub.new_id()
-	handle := event_loop.subscribe(sse_wake, voidptr(usize(id)))
+	handle := event_loop.subscribe(sse_wake, voidptr(u64(id)))
 	if handle.is_nil() {
 		// Taken over but not subscribed: nothing could ever reach it. The
 		// takeover queued above is dropped with this .close.
@@ -226,7 +226,7 @@ fn sse_wake(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidp
 			return .close // the stream ends here; an EventSource reconnects later
 		}
 		.closed {
-			hub.leave(u64(usize(watch_payload)))
+			hub.leave(u64(u64(watch_payload)))
 		}
 		else {}
 	}

@@ -25,7 +25,7 @@ import http1_1.response
 #include "@VMODROOT/examples/async_incremental_read/producer.h"
 
 fn C.spawn_producer(sh_path &char, script &char) int
-fn C.read(fd int, buf voidptr, count usize) int
+fn C.read(fd int, buf voidptr, count u64) int
 
 // producer is the child's shell loop: five lines, 200 ms apart.
 const producer = c'for i in 1 2 3 4 5; do echo "line $i"; sleep 0.2; done'

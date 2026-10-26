@@ -7,7 +7,7 @@ import core
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
-fn C.read(fd int, buf voidptr, count usize) int
+fn C.read(fd int, buf voidptr, count u64) int
 
 // start_maintenance drives maintain() from a timerfd on this worker's event
 // loop. Call it from the server's on_worker_start, with the pool the worker's

@@ -9,7 +9,7 @@ import transport
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
-fn C.read(fd int, buf voidptr, count usize) int
+fn C.read(fd int, buf voidptr, count u64) int
 
 // start_maintenance drives maintain() from a one-shot timerfd on this worker's
 // event loop, and, for a pool following a Resolver, watches the resolver's

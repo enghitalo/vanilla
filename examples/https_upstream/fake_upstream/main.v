@@ -55,6 +55,7 @@ import transport
 #include <netinet/in.h>
 #include <poll.h>
 #include <fcntl.h>
+#include "@VMODROOT/socket/sock_shim.h"
 
 fn C.socket(domain int, typ int, protocol int) int
 fn C.bind(fd int, addr voidptr, len u32) int
@@ -62,8 +63,8 @@ fn C.listen(fd int, backlog int) int
 fn C.accept(fd int, addr voidptr, len voidptr) int
 fn C.getsockname(fd int, addr voidptr, len &u32) int
 fn C.setsockopt(fd int, level int, name int, val voidptr, len u32) int
-fn C.recv(fd int, buf voidptr, n usize, flags int) int
-fn C.send(fd int, buf voidptr, n usize, flags int) int
+fn C.vanilla_recv(fd int, buf voidptr, n u64, flags int) int
+fn C.vanilla_send(fd int, buf voidptr, n u64, flags int) int
 fn C.shutdown(fd int, how int) int
 fn C.close(fd int) int
 fn C.fcntl(fd int, cmd int, arg int) int
@@ -134,7 +135,7 @@ fn (c &Conn) wait(events int, ms int) bool {
 // the handshake exactly, so what it has not processed is still there.
 fn (c &Conn) client_flight_waiting() bool {
 	mut b := u8(0)
-	return C.recv(c.fd, &b, 1, C.MSG_PEEK | C.MSG_DONTWAIT) == 1 && (b == 20 || b == 23)
+	return C.vanilla_recv(c.fd, &b, 1, C.MSG_PEEK | C.MSG_DONTWAIT) == 1 && (b == 20 || b == 23)
 }
 
 // handshake drives the server side to the end: false if it failed. With
@@ -194,7 +195,7 @@ fn (mut c Conn) read(mut buf []u8) int {
 				return if c.sess.peer_closed() { 0 } else { -1 }
 			}
 		} else {
-			n = C.recv(c.fd, p, usize(room), 0)
+			n = C.vanilla_recv(c.fd, p, u64(room), 0)
 			if n < 0 {
 				if C.errno == C.EINTR {
 					continue
@@ -247,7 +248,7 @@ fn (mut c Conn) write(b []u8) bool {
 			}
 			return false
 		}
-		n := C.send(c.fd, unsafe { &u8(b.data) + off }, usize(b.len - off), C.MSG_NOSIGNAL)
+		n := C.vanilla_send(c.fd, unsafe { &u8(b.data) + off }, u64(b.len - off), C.MSG_NOSIGNAL)
 		if n > 0 {
 			off += n
 			continue

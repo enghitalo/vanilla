@@ -41,8 +41,8 @@ import vtest
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
-fn C.read(fd int, buf voidptr, count usize) int
-fn C.write(fd int, buf voidptr, count usize) int
+fn C.read(fd int, buf voidptr, count u64) int
+fn C.write(fd int, buf voidptr, count u64) int
 fn C.close(fd int) int
 fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
 
@@ -145,7 +145,7 @@ fn sd_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 		return sd_parked()
 	}
 	if sd_has_prefix(req, sd_chain_prefix) {
-		event_loop.watch_fd(sd_timer(sd_chain_ms), .readable, sd_chain_step, voidptr(usize(sd_chain_steps - 1)))
+		event_loop.watch_fd(sd_timer(sd_chain_ms), .readable, sd_chain_step, voidptr(u64(sd_chain_steps - 1)))
 		return sd_parked()
 	}
 	if sd_has_prefix(req, sd_pq_prefix) {
@@ -190,9 +190,9 @@ fn sd_chain_step(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload 
 	mut tmp := [8]u8{}
 	C.read(ready_fd, &tmp[0], 8)
 	C.close(ready_fd)
-	left := int(usize(watch_payload))
+	left := int(u64(watch_payload))
 	if left > 0 {
-		event_loop.watch_fd(sd_timer(sd_chain_ms), .readable, sd_chain_step, voidptr(usize(left - 1)))
+		event_loop.watch_fd(sd_timer(sd_chain_ms), .readable, sd_chain_step, voidptr(u64(left - 1)))
 		return .suspend
 	}
 	out << sd_chained
@@ -475,7 +475,7 @@ fn check_shutdown_waits_for_pipelined_parks(backend server.IOBackend, hangup_see
 	spawn fn [up1] () {
 		time.sleep(300 * time.millisecond) // the query latency
 		results := '123'.bytes()
-		C.write(up1, &results[0], usize(results.len))
+		C.write(up1, &results[0], u64(results.len))
 	}()
 	waited := sd_shutdown(mut h, 5000)
 	got_b := testkit.fd_read_until(b, '\r\n\r\n2', 2000)

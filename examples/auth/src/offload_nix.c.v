@@ -31,8 +31,8 @@ import core
 #include <unistd.h>
 
 fn C.pipe(fds &i32) int
-fn C.write(fd int, buf voidptr, n usize) int
-fn C.read(fd int, buf voidptr, n usize) int
+fn C.write(fd int, buf voidptr, n u64) int
+fn C.read(fd int, buf voidptr, n u64) int
 fn C.close(fd int) int
 
 // Bounds. hash_pool_size caps concurrent argon2 computations PER WORKER, so peak

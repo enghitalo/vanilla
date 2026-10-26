@@ -111,7 +111,7 @@ fn write_proc(path &char, s string) bool {
 	if fd < 0 {
 		return false
 	}
-	n := C.write(fd, s.str, usize(s.len))
+	n := C.write(fd, s.str, u64(s.len))
 	C.close(fd)
 	return n == s.len
 }

@@ -14,9 +14,10 @@ module pg_async
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include "@VMODROOT/socket/sock_shim.h"
 
-fn C.recv(fd int, buf voidptr, len usize, flags int) int
-fn C.send(fd int, buf voidptr, len usize, flags int) int
+fn C.vanilla_recv(fd int, buf voidptr, len u64, flags int) int
+fn C.vanilla_send(fd int, buf voidptr, len u64, flags int) int
 fn C.fcntl(fd int, cmd int, arg int) int
 
 // max_inflight is the default per-connection pipeline depth cap
@@ -461,7 +462,7 @@ fn (mut c PgConn) fill_recv_buf() {
 				rem := c.recv_buf.len - c.recv_pos
 				if rem > 0 {
 					unsafe {
-						C.memmove(c.recv_buf.data, &u8(c.recv_buf.data) + c.recv_pos, usize(rem))
+						C.memmove(c.recv_buf.data, &u8(c.recv_buf.data) + c.recv_pos, u64(rem))
 					}
 				}
 				unsafe {

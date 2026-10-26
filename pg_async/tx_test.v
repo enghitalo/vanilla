@@ -100,7 +100,7 @@ fn ready_msg(status u8) []u8 {
 fn send_all(fd int, b []u8) {
 	mut off := 0
 	for off < b.len {
-		n := C.send(fd, unsafe { &u8(b.data) + off }, usize(b.len - off), 0)
+		n := C.vanilla_send(fd, unsafe { &u8(b.data) + off }, u64(b.len - off), 0)
 		assert n > 0
 		off += n
 	}
@@ -115,7 +115,7 @@ fn drain(fd int, mut into []u8) {
 		if into.len == into.cap {
 			unsafe { into.grow_cap(into.cap) }
 		}
-		n := C.recv(fd, unsafe { &u8(into.data) + into.len }, usize(into.cap - into.len),
+		n := C.vanilla_recv(fd, unsafe { &u8(into.data) + into.len }, u64(into.cap - into.len),
 			C.MSG_DONTWAIT)
 		if n <= 0 {
 			return

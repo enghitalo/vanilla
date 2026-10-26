@@ -415,7 +415,7 @@ fn test_early_answer_at_send_wakes_at_once() {
 	assert C.socketpair(C.AF_UNIX, C.SOCK_STREAM | C.SOCK_NONBLOCK, 0, &fds[0]) == 0
 	x.fd = int(fds[0]) // a kept connection: send() writes at once
 	early := 'HTTP/1.1 413 Content Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'
-	C.write(int(fds[1]), early.str, usize(early.len)) // waiting already
+	C.write(int(fds[1]), early.str, u64(early.len)) // waiting already
 	mut el := core.EventLoop{
 		register: record_watch
 	}
@@ -507,7 +507,7 @@ fn test_advance_after_the_park_deadline() {
 		if phase == .reading {
 			x.off = x.head.len
 			late := 'HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nlate'
-			C.write(peer, late.str, usize(late.len))
+			C.write(peer, late.str, u64(late.len))
 		}
 		x.phase = phase
 		x.deadline = time.sys_mono_now() + u64(10 * time.second)

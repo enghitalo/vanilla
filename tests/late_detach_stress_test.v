@@ -29,16 +29,17 @@ import vtest
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
+#include "@VMODROOT/socket/sock_shim.h"
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
 fn C.eventfd(initval u32, flags int) int
-fn C.read(fd int, buf voidptr, count usize) int
+fn C.read(fd int, buf voidptr, count u64) int
 fn C.close(fd int) int
 fn C.socket(domain int, typ int, protocol int) int
 fn C.connect(fd int, addr voidptr, len u32) int
-fn C.send(fd int, buf voidptr, n usize, flags int) int
-fn C.recv(fd int, buf voidptr, n usize, flags int) int
+fn C.vanilla_send(fd int, buf voidptr, n u64, flags int) int
+fn C.vanilla_recv(fd int, buf voidptr, n u64, flags int) int
 fn C.setsockopt(fd int, level int, opt int, val voidptr, len u32) int
 fn C.getsockname(fd int, addr voidptr, len &u32) int
 fn C.getpeername(fd int, addr voidptr, len &u32) int
@@ -131,7 +132,7 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
 	if req.len > 9 && req[5] == `s` { // GET /step
 		b := C.eventfd(1, C.EFD_NONBLOCK | C.EFD_CLOEXEC)
 		a := one_shot_timer(1)
-		event_loop.watch_fd(a, .readable, after_a, unsafe { voidptr(isize(b)) })
+		event_loop.watch_fd(a, .readable, after_a, unsafe { voidptr(i64(b)) })
 		return .suspend
 	}
 	core.append_str(mut out, ok_resp)
@@ -142,20 +143,20 @@ fn after_a(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidpt
 	drain(ready_fd)
 	mut pc := unsafe { cnt }
 	stdatomic.store_i64(&pc.loop_fd, event_loop.loop_fd)
-	mut keep := isize(-1)
+	mut keep := i64(-1)
 	if keep_open {
-		keep = isize(ready_fd)
+		keep = i64(ready_fd)
 	} else {
 		C.close(ready_fd) // freed here, before the runtime detaches the number
 	}
-	event_loop.watch_fd(int(isize(watch_payload)), .readable, after_b, unsafe { voidptr(keep) })
+	event_loop.watch_fd(int(i64(watch_payload)), .readable, after_b, unsafe { voidptr(keep) })
 	return .suspend
 }
 
 fn after_b(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	drain(ready_fd)
 	C.close(ready_fd)
-	keep := int(isize(watch_payload))
+	keep := int(i64(watch_payload))
 	if keep >= 0 {
 		C.close(keep)
 	}
@@ -188,7 +189,7 @@ fn one_request(port int, step bool, timeout_s i64) {
 		'GET / HTTP/1.1\r\nHost: x\r\n\r\n'
 	}
 	for {
-		if C.send(fd, req.str, usize(req.len), C.MSG_NOSIGNAL) >= 0 || C.errno != C.EINTR {
+		if C.vanilla_send(fd, req.str, u64(req.len), C.MSG_NOSIGNAL) >= 0 || C.errno != C.EINTR {
 			break
 		}
 	}
@@ -199,7 +200,7 @@ fn one_request(port int, step bool, timeout_s i64) {
 	// stop-the-world ones): retry on EINTR, up to the overall deadline.
 	deadline := time.sys_mono_now() + u64(timeout_s) * 1_000_000_000
 	for got < want && time.sys_mono_now() < deadline {
-		n := C.recv(fd, unsafe { &buf[got] }, usize(128 - got), 0)
+		n := C.vanilla_recv(fd, unsafe { &buf[got] }, u64(128 - got), 0)
 		if n < 0 && C.errno == C.EINTR {
 			continue
 		}

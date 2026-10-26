@@ -245,7 +245,7 @@ fn C.bind(fd int, addr voidptr, len u32) int
 fn C.listen(fd int, backlog int) int
 fn C.getsockname(fd int, addr voidptr, len &u32) int
 fn C.accept(fd int, addr voidptr, len voidptr) int
-fn C.read(fd int, buf voidptr, count usize) int
+fn C.read(fd int, buf voidptr, count u64) int
 
 // CtListener is a loopback listener with an accept queue of one, plus a
 // connection to it that stands in for a session with the server. While that

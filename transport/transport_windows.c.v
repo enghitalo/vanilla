@@ -56,7 +56,7 @@ fn C.htons(u16) u16
 
 fn C.inet_pton(int, &char, voidptr) int
 
-fn C.memset(voidptr, int, usize) voidptr
+fn C.memset(voidptr, int, u64) voidptr
 
 // max_unix_path mirrors the unix side so cross-platform config validation
 // stays uniform even where dial_unix itself is unsupported.

@@ -59,7 +59,7 @@ fn recording_loop(r &Recorded) core.EventLoop {
 // tick runs sse_tick for `reason` with the count `sent` and returns its step.
 fn tick(mut out []u8, reason core.WakeReason, sent int, mut el core.EventLoop) core.Step {
 	el.reason = reason
-	return sse_tick(mut out, 7, false, voidptr(usize(sent)), unsafe { nil }, mut el)
+	return sse_tick(mut out, 7, false, voidptr(u64(sent)), unsafe { nil }, mut el)
 }
 
 // dechunk decodes a chunked body that starts at `start` (RFC 9112 §7.1),
@@ -146,8 +146,8 @@ fn test_sse_tick_frames_each_event_as_a_chunk_and_ends_the_body() {
 		if n < 5 {
 			assert step == .done, 'tick ${n}'
 			assert r.wake_ms == tick_ms, 'tick ${n} must re-arm its timer'
-			assert r.subscribed && usize(r.sub_state) == usize(n), 'tick ${n} must store its count'
-			sent = int(usize(r.sub_state))
+			assert r.subscribed && u64(r.sub_state) == u64(n), 'tick ${n} must store its count'
+			sent = int(u64(r.sub_state))
 		} else {
 			assert step == .close, 'the last tick ends the stream'
 			assert r.wake_ms == 0, 'the last tick must not re-arm'

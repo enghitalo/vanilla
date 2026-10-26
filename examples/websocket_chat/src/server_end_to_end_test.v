@@ -11,8 +11,9 @@ import transport
 import vtest
 
 #include <sys/socket.h>
+#include "@VMODROOT/socket/sock_shim.h"
 
-fn C.recv(fd int, buf voidptr, len usize, flags int) int
+fn C.vanilla_recv(fd int, buf voidptr, len u64, flags int) int
 
 // WsClient is a raw WebSocket client: it masks what it sends and parses the
 // server's (unmasked) frames out of what it reads.
@@ -51,7 +52,7 @@ fn ws_connect(port int, name string) !WsClient {
 fn (mut c WsClient) send_raw(b []u8) ! {
 	mut off := 0
 	for _ in 0 .. 3000 {
-		n := C.send(c.fd, &b[off], usize(b.len - off), C.MSG_NOSIGNAL)
+		n := C.vanilla_send(c.fd, &b[off], u64(b.len - off), C.MSG_NOSIGNAL)
 		if n > 0 {
 			off += n
 			if off == b.len {
@@ -83,7 +84,7 @@ fn (mut c WsClient) fill(ms int) bool {
 	deadline := time.sys_mono_now() + u64(ms) * 1_000_000
 	mut buf := [4096]u8{}
 	for time.sys_mono_now() < deadline {
-		n := C.recv(c.fd, &buf[0], 4096, C.MSG_DONTWAIT)
+		n := C.vanilla_recv(c.fd, &buf[0], 4096, C.MSG_DONTWAIT)
 		if n > 0 {
 			unsafe { c.acc.push_many(&buf[0], n) }
 			return true

@@ -117,7 +117,7 @@ fn reuse_backend_conn(fd int) {
 	mut acc := []u8{}
 	mut buf := [4096]u8{}
 	for {
-		n := C.recv(fd, &buf[0], usize(buf.len), 0)
+		n := C.vanilla_recv(fd, &buf[0], u64(buf.len), 0)
 		if n <= 0 {
 			return
 		}
@@ -133,7 +133,7 @@ fn reuse_backend_conn(fd int) {
 			}
 			mut off := 0
 			for off < reply.len {
-				w := C.send(fd, unsafe { &reply[off] }, usize(reply.len - off), C.MSG_NOSIGNAL)
+				w := C.vanilla_send(fd, unsafe { &reply[off] }, u64(reply.len - off), C.MSG_NOSIGNAL)
 				if w <= 0 {
 					return
 				}

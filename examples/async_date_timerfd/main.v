@@ -27,7 +27,7 @@ import time
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
-fn C.read(fd int, buf voidptr, count usize) int
+fn C.read(fd int, buf voidptr, count u64) int
 
 // 'Date: ' (6) + IMF-fixdate (29, RFC 9110 §5.6.7) + CRLF (2) = 37 bytes.
 const date_line_len = 37

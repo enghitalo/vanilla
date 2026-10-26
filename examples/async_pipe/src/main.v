@@ -17,8 +17,8 @@ import http1_1.response
 #include <unistd.h>
 
 fn C.pipe(fds &i32) int
-fn C.write(fd int, buf voidptr, n usize) int
-fn C.read(fd int, buf voidptr, n usize) int
+fn C.write(fd int, buf voidptr, n u64) int
+fn C.read(fd int, buf voidptr, n u64) int
 fn C.close(fd int) int
 
 const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'

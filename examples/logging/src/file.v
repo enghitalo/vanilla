@@ -43,7 +43,7 @@ fn (mut w Worker) reopen(gen i64) {
 fn write_all(fd int, b []u8) bool {
 	mut off := 0
 	for off < b.len {
-		n := C.write(fd, unsafe { &u8(b.data) + off }, usize(b.len - off))
+		n := C.write(fd, unsafe { &u8(b.data) + off }, u64(b.len - off))
 		if n < 0 {
 			if C.errno == C.EINTR {
 				continue

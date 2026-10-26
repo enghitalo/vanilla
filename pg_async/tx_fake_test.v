@@ -532,7 +532,7 @@ fn test_fake_conflict_waits_on_a_timerfd_between_attempts() {
 				pool.release(i)
 				assert policy.retry(attempt, err)
 				mut el := bo_loop(&l)
-				parked := policy.park_backoff(attempt, mut el, bo_fired, voidptr(usize(attempt + 1)))
+				parked := policy.park_backoff(attempt, mut el, bo_fired, voidptr(u64(attempt + 1)))
 				assert parked
 				assert el.last_watched == l.fd
 				assert el.timeout_ms == -1, 'the timer is its own deadline'
@@ -553,7 +553,7 @@ fn test_fake_conflict_waits_on_a_timerfd_between_attempts() {
 				mut fired := bo_loop(&l)
 				step := l.cont(mut scratch, l.fd, false, l.payload, unsafe { nil }, mut fired)
 				assert step == .done
-				attempt = int(usize(l.payload))
+				attempt = int(u64(l.payload))
 				continue
 			}
 			pool.release(i)
@@ -593,14 +593,14 @@ fn test_fake_conflict_waits_on_a_timerfd_between_attempts() {
 					break
 				}
 				mut el := bo_loop(&l)
-				parked := quick.park_backoff(attempt, mut el, bo_fired, voidptr(usize(attempt + 1)))
+				parked := quick.park_backoff(attempt, mut el, bo_fired, voidptr(u64(attempt + 1)))
 				assert parked
 				ready := C.pg_async_wait(l.fd, C.POLLIN, 2000)
 				assert ready > 0
 				waits++
 				mut fired := bo_loop(&l)
 				l.cont(mut scratch, l.fd, false, l.payload, unsafe { nil }, mut fired)
-				attempt = int(usize(l.payload))
+				attempt = int(u64(l.payload))
 				continue
 			}
 			assert false, 'every attempt conflicts'

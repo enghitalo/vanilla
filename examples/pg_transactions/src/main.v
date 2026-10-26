@@ -163,13 +163,13 @@ fn run_attempt(mut st TxState, attempt int, timer int, mut out []u8, mut event_l
 // allocation).
 @[inline]
 fn parked(idx int, attempt int) voidptr {
-	return voidptr((usize(attempt) << 16) | usize(idx))
+	return voidptr((u64(attempt) << 16) | u64(idx))
 }
 
 fn on_reply(mut out []u8, ready_fd int, _ bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut st := unsafe { &TxState(worker_state) }
-	idx := int(usize(watch_payload) & 0xffff)
-	attempt := int(usize(watch_payload) >> 16)
+	idx := int(u64(watch_payload) & 0xffff)
+	attempt := int(u64(watch_payload) >> 16)
 	if st.timers[idx] >= 0 {
 		// The timer this attempt waited on: on_backoff stepped away from it,
 		// and the runtime has taken it out of the event loop since.
@@ -187,7 +187,7 @@ fn on_reply(mut out []u8, ready_fd int, _ bool, watch_payload voidptr, worker_st
 		if st.policy.retry(attempt, err) {
 			// A conflict: the batch did nothing. Wait, then run it again, whole
 			// (on_backoff: the next attempt's number is its payload).
-			next := voidptr(usize(attempt + 1))
+			next := voidptr(u64(attempt + 1))
 			if st.policy.park_backoff(attempt, mut event_loop, on_backoff, next) {
 				return .suspend
 			}
@@ -221,7 +221,7 @@ fn on_reply(mut out []u8, ready_fd int, _ bool, watch_payload voidptr, worker_st
 // nothing to tell apart.
 fn on_backoff(mut out []u8, ready_fd int, _ bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut st := unsafe { &TxState(worker_state) }
-	step := run_attempt(mut st, int(usize(watch_payload)), ready_fd, mut out, mut event_loop)
+	step := run_attempt(mut st, int(u64(watch_payload)), ready_fd, mut out, mut event_loop)
 	if step != .suspend {
 		os.fd_close(ready_fd) // answered without a watch: nothing steps away from it
 	}

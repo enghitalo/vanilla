@@ -1314,14 +1314,14 @@ fn bb_huge_handler(file_fd int, length i64, accepted &core.Counter) core.Handler
 fn bb_reset_mid_body(port int) ! {
 	fd := transport.dial_tcp('127.0.0.1', port)!
 	socket.set_blocking(fd, true)
-	if C.send(fd, bb_huge_req.data, usize(bb_huge_req.len), 0) != bb_huge_req.len {
+	if C.vanilla_send(fd, bb_huge_req.data, u64(bb_huge_req.len), 0) != bb_huge_req.len {
 		transport.close_fd(fd)
 		return error('could not send GET /huge')
 	}
 	mut buf := []u8{len: 64 * 1024}
 	mut got := 0
 	for got < bb_reset_after {
-		n := C.recv(fd, buf.data, usize(buf.len), 0)
+		n := C.vanilla_recv(fd, buf.data, u64(buf.len), 0)
 		if n <= 0 {
 			transport.close_fd(fd)
 			return error('the server ended GET /huge after ${got} bytes')

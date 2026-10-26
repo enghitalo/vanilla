@@ -28,7 +28,7 @@ import http1_1.request_parser { HttpRequest }
 import http1_1.router { Method, Path }
 import http1_1.veb_like { Params }
 
-fn C.memchr(s voidptr, c int, n usize) voidptr
+fn C.memchr(s voidptr, c int, n u64) voidptr
 
 // ── shared reply framing ─────────────────────────────────────────────────────
 
@@ -165,7 +165,7 @@ fn drop_body(mut out []u8, start int) {
 	unsafe {
 		mut i := start
 		for i + 3 < out.len {
-			q := C.memchr(&u8(out.data) + i, `\r`, usize(out.len - 3 - i))
+			q := C.memchr(&u8(out.data) + i, `\r`, u64(out.len - 3 - i))
 			if q == nil {
 				return
 			}

@@ -27,9 +27,9 @@ mut:
 
 fn C.poll(fds voidptr, nfds u64, timeout int) int
 
-fn C.read(fd int, buf voidptr, count usize) int
+fn C.read(fd int, buf voidptr, count u64) int
 
-fn C.write(fd int, buf voidptr, count usize) int
+fn C.write(fd int, buf voidptr, count u64) int
 
 // poll bit values from <poll.h> (linux/darwin agree on these).
 const fd_pollin = i16(0x001)
@@ -56,7 +56,7 @@ pub fn fd_write_all(fd int, data []u8, deadline_ms int) bool {
 		if sw.elapsed().milliseconds() >= deadline_ms {
 			return false
 		}
-		n := C.write(fd, unsafe { &data[off] }, usize(data.len - off))
+		n := C.write(fd, unsafe { &data[off] }, u64(data.len - off))
 		if n > 0 {
 			off += n
 			continue
@@ -89,7 +89,7 @@ pub fn fd_read_until(fd int, needle string, deadline_ms int) string {
 		if C.poll(voidptr(&pfd), 1, 50) <= 0 {
 			continue
 		}
-		n := C.read(fd, voidptr(&buf[0]), usize(buf.len))
+		n := C.read(fd, voidptr(&buf[0]), u64(buf.len))
 		if n == 0 {
 			break // EOF
 		}

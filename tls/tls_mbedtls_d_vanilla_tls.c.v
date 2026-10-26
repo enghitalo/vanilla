@@ -21,8 +21,8 @@ fn C.vtls_global_init() int
 fn C.vtls_parallel_crypto() int
 fn C.vtls_ctx_new() voidptr
 fn C.vtls_ctx_free(ctx voidptr)
-fn C.vtls_use_self_signed(ctx voidptr, sans &&char, nsans usize) int
-fn C.vtls_use_pem(ctx voidptr, cert &u8, clen usize, key &u8, klen usize) int
+fn C.vtls_use_self_signed(ctx voidptr, sans &&char, nsans u64) int
+fn C.vtls_use_pem(ctx voidptr, cert &u8, clen u64, key &u8, klen u64) int
 fn C.vtls_setup(ctx voidptr) int
 fn C.vtls_set_alpn(ctx voidptr, list &char) int
 fn C.vtls_cert_pem(ctx voidptr) &char
@@ -31,9 +31,9 @@ fn C.vtls_get_alpn(sess voidptr) &char
 fn C.vtls_session_new(ctx voidptr, fd int) voidptr
 fn C.vtls_session_free(sess voidptr)
 fn C.vtls_handshake(sess voidptr) int
-fn C.vtls_read(sess voidptr, buf &u8, len usize) int
+fn C.vtls_read(sess voidptr, buf &u8, len u64) int
 fn C.vtls_mark_readable(sess voidptr)
-fn C.vtls_write(sess voidptr, buf &u8, len usize) int
+fn C.vtls_write(sess voidptr, buf &u8, len u64) int
 fn C.vtls_enable_ktls(sess voidptr, fd int) int
 fn C.vtls_ktls_active(sess voidptr) int
 fn C.vtls_ktls_failed(sess voidptr) int
@@ -47,8 +47,8 @@ fn C.vtls_verify_failed(sess voidptr) int
 fn C.vtls_client_setup(ctx voidptr, ca_file &char, verify int) int
 fn C.vtls_client_session_new(ctx voidptr, fd int, host &char) voidptr
 fn C.vtls_session_reset(sess voidptr, fd int) int
-fn C.vtls_handshake_error(sess voidptr, buf &char, len usize)
-fn C.vtls_error_string(err int, buf &char, len usize)
+fn C.vtls_handshake_error(sess voidptr, buf &char, len u64)
+fn C.vtls_error_string(err int, buf &char, len u64)
 
 // parallel_crypto reports whether TLS workers can run their crypto in
 // parallel: true when the linked Mbed TLS was built with MBEDTLS_THREADING_C
@@ -102,7 +102,7 @@ pub fn new_self_signed(opts SelfSignedOpts) !&Config {
 	for s in opts.sans {
 		csans << &char(s.str)
 	}
-	if C.vtls_use_self_signed(ctx, unsafe { &&char(csans.data) }, usize(csans.len)) != 0 {
+	if C.vtls_use_self_signed(ctx, unsafe { &&char(csans.data) }, u64(csans.len)) != 0 {
 		C.vtls_ctx_free(ctx)
 		return error('vtls: self-signed certificate generation failed - each SAN must be "DNS:<host>" or "IP:<v4|v6>" (got ${opts.sans})')
 	}
@@ -167,7 +167,7 @@ pub fn new_from_pem(cert []u8, key []u8) !&Config {
 	if k.len == 0 || k[k.len - 1] != 0 {
 		k << 0
 	}
-	if C.vtls_use_pem(ctx, c.data, usize(c.len), k.data, usize(k.len)) != 0 {
+	if C.vtls_use_pem(ctx, c.data, u64(c.len), k.data, u64(k.len)) != 0 {
 		C.vtls_ctx_free(ctx)
 		return error('vtls: failed to parse PEM cert/key')
 	}
@@ -302,7 +302,7 @@ pub fn (s &Session) handshake() int {
 // precedes a fatal error). Raw pointer so the read loop can fill a buffer's
 // spare capacity.
 pub fn (s &Session) read_into(ptr &u8, len int) int {
-	return C.vtls_read(s.sess, ptr, usize(len))
+	return C.vtls_read(s.sess, ptr, u64(len))
 }
 
 // mark_readable tells the session its socket may hold new bytes (a readable
@@ -320,7 +320,7 @@ pub fn (s &Session) mark_readable() {
 // before it processes a TLS 1.3 session ticket); the call then reports it
 // sent and sends nothing. `closed` on a fatal error.
 pub fn (s &Session) write_from(ptr &u8, len int) int {
-	return C.vtls_write(s.sess, ptr, usize(len))
+	return C.vtls_write(s.sess, ptr, u64(len))
 }
 
 // enable_ktls hands record crypto to the kernel after the handshake. true => reads
@@ -475,12 +475,12 @@ pub fn (s &Session) verify_failed() bool {
 // allocates a V string.
 pub fn (s &Session) handshake_error() string {
 	mut buf := [512]u8{}
-	C.vtls_handshake_error(s.sess, &char(&buf[0]), usize(buf.len))
+	C.vtls_handshake_error(s.sess, &char(&buf[0]), u64(buf.len))
 	return unsafe { cstring_to_vstring(&char(&buf[0])) }
 }
 
 fn error_text(rc int) string {
 	mut buf := [256]u8{}
-	C.vtls_error_string(rc, &char(&buf[0]), usize(buf.len))
+	C.vtls_error_string(rc, &char(&buf[0]), u64(buf.len))
 	return unsafe { cstring_to_vstring(&char(&buf[0])) }
 }

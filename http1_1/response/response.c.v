@@ -1,8 +1,9 @@
 module response
 
 #include <errno.h>
+#include "@VMODROOT/socket/sock_shim.h"
 
-fn C.send(__fd int, __buf voidptr, __n usize, __flags int) int
+fn C.vanilla_send(__fd int, __buf voidptr, __n u64, __flags int) int
 fn C.perror(s &char)
 
 // send_flags keeps every send here from raising SIGPIPE on a peer that is
@@ -47,7 +48,7 @@ pub const status_100_continue_response = 'HTTP/1.1 100 Continue\r\n\r\n'.bytes()
 pub fn send_response(fd int, buffer_ptr &u8, buffer_len int) ! {
 	mut total_sent := 0
 	for total_sent < buffer_len {
-		sent := C.send(fd, unsafe { buffer_ptr + total_sent }, usize(buffer_len - total_sent),
+		sent := C.vanilla_send(fd, unsafe { buffer_ptr + total_sent }, u64(buffer_len - total_sent),
 			send_flags)
 		if sent > 0 {
 			total_sent += sent
@@ -62,21 +63,21 @@ pub fn send_response(fd int, buffer_ptr &u8, buffer_len int) ! {
 }
 
 pub fn send_bad_request_response(fd int) {
-	C.send(fd, tiny_bad_request_response.data, tiny_bad_request_response.len, send_flags)
+	C.vanilla_send(fd, tiny_bad_request_response.data, tiny_bad_request_response.len, send_flags)
 }
 
 pub fn send_status_444_response(fd int) {
-	C.send(fd, status_444_response.data, status_444_response.len, send_flags)
+	C.vanilla_send(fd, status_444_response.data, status_444_response.len, send_flags)
 }
 
 pub fn send_status_413_response(fd int) {
-	C.send(fd, status_413_response.data, status_413_response.len, send_flags)
+	C.vanilla_send(fd, status_413_response.data, status_413_response.len, send_flags)
 }
 
 pub fn send_status_431_response(fd int) {
-	C.send(fd, status_431_response.data, status_431_response.len, send_flags)
+	C.vanilla_send(fd, status_431_response.data, status_431_response.len, send_flags)
 }
 
 pub fn send_status_408_response(fd int) {
-	C.send(fd, status_408_response.data, status_408_response.len, send_flags)
+	C.vanilla_send(fd, status_408_response.data, status_408_response.len, send_flags)
 }

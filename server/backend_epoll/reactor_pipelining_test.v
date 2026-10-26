@@ -33,7 +33,7 @@ fn other_cont(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voi
 // no queue is allocated.
 fn test_single_watch_no_queue() {
 	mut r := Reactor{}
-	r.reactor_watch(10, 100, noop_cont, voidptr(usize(1)))
+	r.reactor_watch(10, 100, noop_cont, voidptr(u64(1)))
 	assert r.watches[10].active
 	assert r.watches[10].client_fd == 100
 	assert r.watches[10].queue.len == 0
@@ -43,22 +43,22 @@ fn test_single_watch_no_queue() {
 // existing head into queue[0] and appending the newcomer in submission order.
 fn test_second_client_promotes_to_queue() {
 	mut r := Reactor{}
-	r.reactor_watch(10, 100, noop_cont, voidptr(usize(1)))
-	r.reactor_watch(10, 200, noop_cont, voidptr(usize(2)))
+	r.reactor_watch(10, 100, noop_cont, voidptr(u64(1)))
+	r.reactor_watch(10, 200, noop_cont, voidptr(u64(2)))
 	assert r.watches[10].active
 	assert r.watches[10].queue.len == 2
 	assert r.watches[10].queue[0].client_fd == 100 // original head first (FIFO)
 	assert r.watches[10].queue[1].client_fd == 200
-	assert r.watches[10].queue[0].udata == voidptr(usize(1))
-	assert r.watches[10].queue[1].udata == voidptr(usize(2))
+	assert r.watches[10].queue[0].udata == voidptr(u64(1))
+	assert r.watches[10].queue[1].udata == voidptr(u64(2))
 }
 
 // Further parks append at the tail, preserving submission order.
 fn test_third_client_appends_fifo() {
 	mut r := Reactor{}
-	r.reactor_watch(10, 100, noop_cont, voidptr(usize(1)))
-	r.reactor_watch(10, 200, noop_cont, voidptr(usize(2)))
-	r.reactor_watch(10, 300, noop_cont, voidptr(usize(3)))
+	r.reactor_watch(10, 100, noop_cont, voidptr(u64(1)))
+	r.reactor_watch(10, 200, noop_cont, voidptr(u64(2)))
+	r.reactor_watch(10, 300, noop_cont, voidptr(u64(3)))
 	assert r.watches[10].queue.len == 3
 	assert r.watches[10].queue[0].client_fd == 100
 	assert r.watches[10].queue[1].client_fd == 200
@@ -69,13 +69,13 @@ fn test_third_client_appends_fifo() {
 // bytes) updates its slot in place — never a duplicate append.
 fn test_rearm_is_idempotent() {
 	mut r := Reactor{}
-	r.reactor_watch(10, 100, noop_cont, voidptr(usize(1)))
-	r.reactor_watch(10, 200, noop_cont, voidptr(usize(2)))
+	r.reactor_watch(10, 100, noop_cont, voidptr(u64(1)))
+	r.reactor_watch(10, 200, noop_cont, voidptr(u64(2)))
 	// Front (100) re-arms with fresh udata.
-	r.reactor_watch(10, 100, other_cont, voidptr(usize(9)))
+	r.reactor_watch(10, 100, other_cont, voidptr(u64(9)))
 	assert r.watches[10].queue.len == 2 // no duplicate
 	assert r.watches[10].queue[0].client_fd == 100
-	assert r.watches[10].queue[0].udata == voidptr(usize(9)) // updated in place
+	assert r.watches[10].queue[0].udata == voidptr(u64(9)) // updated in place
 	assert r.watches[10].queue[1].client_fd == 200
 }
 
@@ -83,20 +83,20 @@ fn test_rearm_is_idempotent() {
 // does NOT promote to a queue.
 fn test_single_rearm_stays_single() {
 	mut r := Reactor{}
-	r.reactor_watch(10, 100, noop_cont, voidptr(usize(1)))
-	r.reactor_watch(10, 100, other_cont, voidptr(usize(7)))
+	r.reactor_watch(10, 100, noop_cont, voidptr(u64(1)))
+	r.reactor_watch(10, 100, other_cont, voidptr(u64(7)))
 	assert r.watches[10].queue.len == 0
 	assert r.watches[10].client_fd == 100
-	assert r.watches[10].udata == voidptr(usize(7))
+	assert r.watches[10].udata == voidptr(u64(7))
 }
 
 // A disconnected client is tombstoned in place: its slot survives (alignment with
 // the connection's in-flight FIFO) but is marked dead; siblings are untouched.
 fn test_mark_dead_tombstones_slot() {
 	mut r := Reactor{}
-	r.reactor_watch(10, 100, noop_cont, voidptr(usize(1)))
-	r.reactor_watch(10, 200, noop_cont, voidptr(usize(2)))
-	r.reactor_watch(10, 300, noop_cont, voidptr(usize(3)))
+	r.reactor_watch(10, 100, noop_cont, voidptr(u64(1)))
+	r.reactor_watch(10, 200, noop_cont, voidptr(u64(2)))
+	r.reactor_watch(10, 300, noop_cont, voidptr(u64(3)))
 	r.reactor_mark_dead(10, 200)
 	assert r.watches[10].queue.len == 3 // slot kept, not removed
 	assert !r.watches[10].queue[0].dead
@@ -116,7 +116,7 @@ fn test_mark_dead_tombstones_slot() {
 // a reconnect + a fresh auth handshake on the next borrow.)
 fn test_orphan_single_persistent_tombstones_not_closes() {
 	mut r := Reactor{}
-	r.reactor_watch(10, 100, noop_cont, voidptr(usize(1)))
+	r.reactor_watch(10, 100, noop_cont, voidptr(u64(1)))
 	r.watches[10].persistent = true // armed via watch_persistent (a pool fd)
 	tombstoned := r.reactor_orphan_single(10, 100)
 	assert tombstoned // caller must leave the fd open
@@ -124,7 +124,7 @@ fn test_orphan_single_persistent_tombstones_not_closes() {
 	assert r.watches[10].queue.len == 1
 	assert r.watches[10].queue[0].dead
 	assert r.watches[10].queue[0].client_fd == 100
-	assert r.watches[10].queue[0].udata == voidptr(usize(1)) // carried from the single watch
+	assert r.watches[10].queue[0].udata == voidptr(u64(1)) // carried from the single watch
 }
 
 // A request-owned (non-persistent) fd is NOT tombstoned: reactor_orphan_single
@@ -132,7 +132,7 @@ fn test_orphan_single_persistent_tombstones_not_closes() {
 // timerfd / pipe).
 fn test_orphan_single_nonpersistent_closes() {
 	mut r := Reactor{}
-	r.reactor_watch(10, 100, noop_cont, voidptr(usize(1)))
+	r.reactor_watch(10, 100, noop_cont, voidptr(u64(1)))
 	// persistent defaults to false (a plain watch()).
 	assert !r.reactor_orphan_single(10, 100)
 	assert r.watches[10].queue.len == 0 // untouched; caller will clear + close
@@ -144,13 +144,13 @@ fn test_orphan_single_nonpersistent_closes() {
 fn test_orphan_single_declines_queue_inactive_and_oob() {
 	mut r := Reactor{}
 	// Already a queue (pipelined) — decline even if persistent.
-	r.reactor_watch(10, 100, noop_cont, voidptr(usize(1)))
-	r.reactor_watch(10, 200, noop_cont, voidptr(usize(2)))
+	r.reactor_watch(10, 100, noop_cont, voidptr(u64(1)))
+	r.reactor_watch(10, 200, noop_cont, voidptr(u64(2)))
 	r.watches[10].persistent = true
 	assert !r.reactor_orphan_single(10, 100)
 	// Inactive persistent slot — decline.
 	mut r2 := Reactor{}
-	r2.reactor_watch(11, 100, noop_cont, voidptr(usize(1)))
+	r2.reactor_watch(11, 100, noop_cont, voidptr(u64(1)))
 	r2.watches[11].persistent = true
 	r2.reactor_clear(11) // active = false
 	assert !r2.reactor_orphan_single(11, 100)
@@ -162,7 +162,7 @@ fn test_orphan_single_declines_queue_inactive_and_oob() {
 // The flat table grows by doubling for a high fd, like the connection table.
 fn test_table_grows_for_high_fd() {
 	mut r := Reactor{}
-	r.reactor_watch(5000, 100, noop_cont, voidptr(usize(1)))
+	r.reactor_watch(5000, 100, noop_cont, voidptr(u64(1)))
 	assert r.watches.len > 5000
 	assert r.watches[5000].active
 	assert r.watches[5000].client_fd == 100
@@ -259,9 +259,9 @@ fn test_dead_run_steps_to_a_pooled_fd_on_its_client_number() {
 		reactor:   unsafe { voidptr(&r) }
 		register:  register_watch
 	}
-	w.watch_fd_persistent(m, .readable, noop_cont, voidptr(usize(5)))
+	w.watch_fd_persistent(m, .readable, noop_cont, voidptr(u64(5)))
 	assert w.last_watched == m && !r.dead_refused
 	assert r.watches[m].active && r.watches[m].queue.len == 1
-	assert r.watches[m].queue[0].dead && r.watches[m].queue[0].udata == voidptr(usize(5))
+	assert r.watches[m].queue[0].dead && r.watches[m].queue[0].udata == voidptr(u64(5))
 	assert epoll_events_of(ep, m) != 0
 }

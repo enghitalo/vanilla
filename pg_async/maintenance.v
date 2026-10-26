@@ -46,7 +46,7 @@ fn (mut c PgConn) probe_idle() {
 	}
 	// The common case, nothing arrived: one peek, no copy.
 	mut b := u8(0)
-	n := C.recv(c.fd, &b, 1, C.MSG_PEEK | C.MSG_DONTWAIT)
+	n := C.vanilla_recv(c.fd, &b, 1, C.MSG_PEEK | C.MSG_DONTWAIT)
 	if n < 0 {
 		e := C.errno
 		if e != C.EAGAIN && e != C.EWOULDBLOCK && e != C.EINTR {

@@ -108,7 +108,7 @@ fn pc_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 	}
 	conn.async_flush() or {}
 	// The payload: the slot, and whether it is held exclusively (bit 16).
-	payload := voidptr(usize(idx) | if exclusive { usize(1) << 16 } else { usize(0) })
+	payload := voidptr(u64(idx) | if exclusive { u64(1) << 16 } else { u64(0) })
 	ms := if slow { pc_deadline_ms } else { 0 }
 	event_loop.watch_fd_persistent_deadline(st.pool.fd(idx), .readable, pc_ready, payload,
 		ms)
@@ -118,8 +118,8 @@ fn pc_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 fn pc_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut st := unsafe { &PcState(worker_state) }
 	mut c := unsafe { pc }
-	idx := int(usize(watch_payload) & 0xffff)
-	exclusive := usize(watch_payload) >> 16 != 0
+	idx := int(u64(watch_payload) & 0xffff)
+	exclusive := u64(watch_payload) >> 16 != 0
 	mut conn := st.pool.conn(idx)
 	if event_loop.timed_out() {
 		// The reply is still due: leave it (and the slot) to the tombstone run.

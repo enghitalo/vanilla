@@ -30,9 +30,10 @@ import os
 import pg_async
 
 #include <sys/socket.h>
+#include "@VMODROOT/socket/sock_shim.h"
 
 fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
-fn C.send(fd int, buf voidptr, len usize, flags int) int
+fn C.vanilla_send(fd int, buf voidptr, len u64, flags int) int
 
 const depth = 8 // queries per round: pg_async's max_inflight
 
@@ -328,7 +329,7 @@ fn pair() [2]int {
 fn send_all(fd int, b []u8) {
 	mut off := 0
 	for off < b.len {
-		n := C.send(fd, unsafe { &u8(b.data) + off }, usize(b.len - off), 0)
+		n := C.vanilla_send(fd, unsafe { &u8(b.data) + off }, u64(b.len - off), 0)
 		if n <= 0 {
 			panic('send failed (errno ${C.errno})')
 		}

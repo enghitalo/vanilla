@@ -672,8 +672,8 @@ fn test_tls_partial_record_writes_resume_with_the_same_length() {
 
 // glibc's malloc statistics: only the fields heap_bytes reads.
 struct C.mallinfo2 {
-	uordblks usize // bytes in chunks in use, over every arena
-	hblkhd   usize // bytes in chunks mmapped on their own
+	uordblks u64 // bytes in chunks in use, over every arena
+	hblkhd   u64 // bytes in chunks mmapped on their own
 }
 
 fn C.mallinfo2() C.mallinfo2

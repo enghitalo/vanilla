@@ -46,11 +46,11 @@ import vtest
 fn C.eventfd(initval u32, flags int) int
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
-fn C.read(fd int, buf voidptr, count usize) int
+fn C.read(fd int, buf voidptr, count u64) int
 fn C.close(fd int) int
 fn C.pipe(fds &i32) int
 fn C.setsockopt(fd int, level int, optname int, optval voidptr, optlen u32) int
-fn C.write(fd int, buf voidptr, count usize) int
+fn C.write(fd int, buf voidptr, count u64) int
 fn C.shutdown(fd int, how int) int
 
 const ta_backstop = time.Duration(5 * time.second)

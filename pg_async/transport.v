@@ -35,7 +35,7 @@ fn C.pg_async_pending_bytes(fd int) int
 @[inline]
 fn (mut c PgConn) recv_some(p &u8, max int) int {
 	if !c.tls.active() {
-		n := C.recv(c.fd, p, usize(max), 0)
+		n := C.vanilla_recv(c.fd, p, u64(max), 0)
 		if n >= 0 {
 			return n
 		}
@@ -69,7 +69,7 @@ fn (mut c PgConn) tls_recv(p &u8, max int) int {
 @[inline]
 fn (mut c PgConn) send_some(p &u8, len int) int {
 	if !c.tls.active() {
-		n := C.send(c.fd, p, usize(len), C.MSG_NOSIGNAL)
+		n := C.vanilla_send(c.fd, p, u64(len), C.MSG_NOSIGNAL)
 		if n >= 0 {
 			return n
 		}
@@ -161,7 +161,7 @@ fn new_tls_config(cfg &ConnConfig) !&tls.Config {
 // write on a fresh connection: false while a non-blocking connect is still in
 // flight (EAGAIN, or ENOTCONN on BSD), true once sent.
 fn (mut c PgConn) send_ssl_request() !bool {
-	n := C.send(c.fd, &ssl_request[0], usize(ssl_request.len), C.MSG_NOSIGNAL)
+	n := C.vanilla_send(c.fd, &ssl_request[0], u64(ssl_request.len), C.MSG_NOSIGNAL)
 	if n == ssl_request.len {
 		return true
 	}
@@ -181,7 +181,7 @@ fn (mut c PgConn) send_ssl_request() !bool {
 // .disable refuses.
 fn (mut c PgConn) ssl_answer() !bool {
 	mut b := u8(0)
-	n := C.recv(c.fd, &b, 1, 0)
+	n := C.vanilla_recv(c.fd, &b, 1, 0)
 	if n == 0 {
 		return error('pg: the server closed the connection after SSLRequest')
 	}

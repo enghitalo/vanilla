@@ -630,7 +630,7 @@ fn iou_drain_requests(mut env IouEnv, mut conn io_uring.Connection, limits Limit
 		leftover := conn.read_buf.len - pos
 		if leftover > 0 {
 			unsafe {
-				C.memmove(conn.read_buf.data, &u8(conn.read_buf.data) + pos, usize(leftover))
+				C.memmove(conn.read_buf.data, &u8(conn.read_buf.data) + pos, u64(leftover))
 			}
 		}
 		unsafe {

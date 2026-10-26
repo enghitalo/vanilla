@@ -23,8 +23,8 @@ mut:
 	sun_path   [104]char
 }
 
-fn C.memset(voidptr, int, usize) voidptr
-fn C.memcpy(voidptr, voidptr, usize) voidptr
+fn C.memset(voidptr, int, u64) voidptr
+fn C.memcpy(voidptr, voidptr, u64) voidptr
 fn C.unlink(&char) int
 
 // fill_sockaddr_un zeroes and fills an AF_UNIX address, or errors when the
@@ -38,7 +38,7 @@ fn fill_sockaddr_un(path string, mut a C.sockaddr_un) ! {
 	}
 	C.memset(voidptr(&a), 0, sizeof(C.sockaddr_un))
 	a.sun_family = u16(C.AF_UNIX)
-	C.memcpy(voidptr(&a.sun_path[0]), path.str, usize(path.len))
+	C.memcpy(voidptr(&a.sun_path[0]), path.str, u64(path.len))
 }
 
 // unlink_socket_path removes a socket file, ignoring errors (the path may

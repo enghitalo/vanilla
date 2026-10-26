@@ -26,7 +26,7 @@ module router
 // takes the cursor and keeps popping. The path is walked once; each segment
 // costs one memchr and is compared by the `match` (length first, then bytes).
 
-fn C.memchr(s voidptr, c int, n usize) voidptr
+fn C.memchr(s voidptr, c int, n u64) voidptr
 
 // Method is the request method: RFC 9110's nine, or .unknown for any other
 // token, including a request line without one.
@@ -158,7 +158,7 @@ pub fn (mut p Path) next() string {
 		return ''
 	}
 	start := p.pos
-	q := C.memchr(unsafe { p.base + start }, `/`, usize(p.len - start))
+	q := C.memchr(unsafe { p.base + start }, `/`, u64(p.len - start))
 	end := if q == unsafe { nil } { p.len } else { int(unsafe { &u8(q) - p.base }) }
 	p.pos = end + 1
 	return unsafe { tos(p.base + start, end - start) }

@@ -218,7 +218,7 @@ fn safe_path(mut st State, url_path []u8) ?int {
 	}
 	// A NUL would end the C string early, so realpath would resolve a shorter
 	// path than the one requested: refuse it.
-	if url_path.len > 0 && unsafe { C.memchr(url_path.data, 0, usize(url_path.len)) } != nil {
+	if url_path.len > 0 && unsafe { C.memchr(url_path.data, 0, u64(url_path.len)) } != nil {
 		return none
 	}
 	unsafe {
@@ -543,7 +543,7 @@ fn handle(req_buffer []u8, mut out []u8, _client_fd int, worker_state voidptr, m
 		// parse_range guarantees 0 <= start <= end < size.
 		length := int(end + 1 - start)
 		unsafe {
-			vmemmove(&u8(out.data) + body_at, &u8(out.data) + body_at + int(start), isize(length))
+			vmemmove(&u8(out.data) + body_at, &u8(out.data) + body_at + int(start), int(length))
 			out.len = body_at + length
 		}
 	}

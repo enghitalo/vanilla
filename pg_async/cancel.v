@@ -176,7 +176,7 @@ fn (mut c PgConn) cancel_step() !bool {
 		if c.tls_cfg == unsafe { nil } {
 			c.cancel.phase = .sending // the request is the first write
 		} else {
-			n := C.send(c.cancel.fd, &ssl_request[0], usize(ssl_request.len), C.MSG_NOSIGNAL)
+			n := C.vanilla_send(c.cancel.fd, &ssl_request[0], u64(ssl_request.len), C.MSG_NOSIGNAL)
 			if n < 0 {
 				e := C.errno
 				if e == C.EAGAIN || e == C.EWOULDBLOCK || e == C.ENOTCONN {
@@ -193,7 +193,7 @@ fn (mut c PgConn) cancel_step() !bool {
 	}
 	if c.cancel.phase == .ssl_request {
 		mut b := u8(0)
-		n := C.recv(c.cancel.fd, &b, 1, 0)
+		n := C.vanilla_recv(c.cancel.fd, &b, 1, 0)
 		if n < 0 {
 			e := C.errno
 			if e == C.EAGAIN || e == C.EWOULDBLOCK {
@@ -250,7 +250,7 @@ fn (mut c PgConn) cancel_step() !bool {
 			}
 			return error('pg: cancel: TLS write failed')
 		}
-		n := C.send(c.cancel.fd, p, usize(l), C.MSG_NOSIGNAL)
+		n := C.vanilla_send(c.cancel.fd, p, u64(l), C.MSG_NOSIGNAL)
 		if n > 0 {
 			c.cancel.off += n
 			continue

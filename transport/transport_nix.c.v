@@ -58,8 +58,8 @@ fn C.close(int) int
 fn C.fcntl(int, int, int) int
 fn C.htons(u16) u16
 fn C.inet_pton(int, &char, voidptr) int
-fn C.memset(voidptr, int, usize) voidptr
-fn C.memcpy(voidptr, voidptr, usize) voidptr
+fn C.memset(voidptr, int, u64) voidptr
+fn C.memcpy(voidptr, voidptr, u64) voidptr
 
 // max_unix_path mirrors socket.max_unix_path (104-byte sun_path minus the
 // NUL — the smaller BSD size, so Linux configs stay portable).
@@ -112,7 +112,7 @@ pub fn dial_unix(path string) !int {
 	mut addr := C.transport_sockaddr_un{}
 	C.memset(voidptr(&addr), 0, sizeof(C.transport_sockaddr_un))
 	addr.sun_family = u16(C.AF_UNIX)
-	C.memcpy(voidptr(&addr.sun_path[0]), path.str, usize(path.len))
+	C.memcpy(voidptr(&addr.sun_path[0]), path.str, u64(path.len))
 	fd := C.socket(C.AF_UNIX, C.SOCK_STREAM, 0)
 	if fd < 0 {
 		return error('dial_unix: socket creation failed')

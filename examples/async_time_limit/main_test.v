@@ -12,7 +12,7 @@ import http1_1.response
 #include <unistd.h>
 
 fn C.pipe(fds &i32) int
-fn C.write(fd int, buf voidptr, n usize) int
+fn C.write(fd int, buf voidptr, n u64) int
 
 fn get(target string) []u8 {
 	return 'GET ${target} HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()

@@ -144,7 +144,7 @@ fn test_events_subscribes() {
 	assert voidptr(qt.cont) == voidptr(drain_conn), 'the connection was not handed to drain_conn'
 	assert hub.size() == 1
 	assert hub.subs[0].handle.fd == 7
-	assert u64(usize(r.sub_state)) == hub.subs[0].id
+	assert u64(u64(r.sub_state)) == hub.subs[0].id
 	assert r.wake_ms == 15_000, 'the heartbeat was not armed'
 }
 
@@ -166,7 +166,7 @@ fn wake(reason core.WakeReason, data string, id u64, mut hub Hub, mut r Recorded
 	el.post_ptr = voidptr(data.str)
 	el.post_len = data.len
 	mut out := []u8{}
-	step := sse_wake(mut out, 9, false, voidptr(usize(id)), voidptr(hub), mut el)
+	step := sse_wake(mut out, 9, false, voidptr(u64(id)), voidptr(hub), mut el)
 	return out.bytestr(), step
 }
 
@@ -243,12 +243,12 @@ fn test_serving_allocates_nothing() {
 			el.reason = .posted
 			el.post_ptr = voidptr(event.str)
 			el.post_len = event.len
-			sse_wake(mut out, 9, false, voidptr(usize(1)), voidptr(hub), mut el)
+			sse_wake(mut out, 9, false, voidptr(u64(1)), voidptr(hub), mut el)
 			unsafe {
 				out.len = 0
 			}
 			el.reason = .timeout
-			sse_wake(mut out, 9, false, voidptr(usize(1)), voidptr(hub), mut el)
+			sse_wake(mut out, 9, false, voidptr(u64(1)), voidptr(hub), mut el)
 		}
 		grown := gc_heap_usage().total_bytes - before
 		assert r.posts == 2 * (rounds + 1) // both broadcasts reached the subscriber

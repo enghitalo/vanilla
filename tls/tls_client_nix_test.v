@@ -9,6 +9,7 @@ import os
 
 #include <sys/socket.h>
 #include <fcntl.h>
+#include "@VMODROOT/socket/sock_shim.h"
 
 fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
 fn C.close(fd int) int
@@ -234,7 +235,7 @@ fn test_server_session_tickets() {
 			cr, sr := handshake_both(cli, srv)
 			assert cr == 0 && sr == 0, cli.handshake_error()
 			mut peek := [4096]u8{}
-			waiting := C.recv(fds[1], &peek[0], usize(peek.len), C.MSG_PEEK | C.MSG_DONTWAIT)
+			waiting := C.vanilla_recv(fds[1], &peek[0], u64(peek.len), C.MSG_PEEK | C.MSG_DONTWAIT)
 			if n == 0 {
 				assert waiting < 0, 'nothing should follow the handshake, got ${waiting} bytes'
 			} else {
@@ -266,4 +267,4 @@ fn test_server_session_tickets() {
 	}
 }
 
-fn C.recv(fd int, buf voidptr, n usize, flags int) int
+fn C.vanilla_recv(fd int, buf voidptr, n u64, flags int) int

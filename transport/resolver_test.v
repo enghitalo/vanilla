@@ -95,8 +95,8 @@ fn test_thread_hands_off() {
 #include <malloc.h>
 
 struct C.mallinfo2 {
-	uordblks usize
-	hblkhd   usize
+	uordblks u64
+	hblkhd   u64
 }
 
 fn C.mallinfo2() C.mallinfo2
@@ -313,12 +313,12 @@ fn test_stop_does_not_wait_for_a_blocked_lookup() {
 	// The lookup returns: its thread drops the answer and writes nothing, not
 	// even to the wake pipe.
 	mut b := [64]u8{}
-	for C.read(r.wake_r, &b[0], usize(b.len)) > 0 {
+	for C.read(r.wake_r, &b[0], u64(b.len)) > 0 {
 	}
 	stdatomic.store_i64(&g.open, 1)
 	assert wait_for(&g.left, 1, 2000)
 	time.sleep(20 * time.millisecond)
-	assert C.read(r.wake_r, &b[0], usize(b.len)) < 0
+	assert C.read(r.wake_r, &b[0], u64(b.len)) < 0
 	C.close(f.fd)
 	C.close(r.wake_r)
 	C.close(r.wake_w)

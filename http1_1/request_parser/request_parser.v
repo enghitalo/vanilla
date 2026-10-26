@@ -64,7 +64,7 @@ fn memmem_idx_portable(buf &u8, len int, bytes_ptr &u8, bytes_len int) int {
 	first := unsafe { *bytes_ptr }
 	mut pos := 0
 	for pos <= len - bytes_len {
-		p := unsafe { C.memchr(buf + pos, first, usize(len - bytes_len - pos + 1)) }
+		p := unsafe { C.memchr(buf + pos, first, u64(len - bytes_len - pos + 1)) }
 		if p == unsafe { nil } {
 			return -1
 		}

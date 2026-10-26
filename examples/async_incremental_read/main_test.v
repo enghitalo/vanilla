@@ -14,7 +14,7 @@ import http1_1.response
 #include <sys/resource.h>
 
 fn C.pipe(fds &i32) int
-fn C.write(fd int, buf voidptr, n usize) int
+fn C.write(fd int, buf voidptr, n u64) int
 fn C.fcntl(fd int, cmd int, arg int) int
 
 struct C.rlimit {
@@ -238,7 +238,7 @@ fn test_on_chunk_frames_what_the_pipe_holds() {
 	mut out := []u8{}
 	out << `>`
 	line := 'line 1\n'
-	assert C.write(wfd, line.str, usize(line.len)) == line.len
+	assert C.write(wfd, line.str, u64(line.len)) == line.len
 	step := on_chunk(mut out, rfd, false, unsafe { nil }, unsafe { nil }, mut event_loop)
 	assert step == .suspend
 	assert event_loop.last_watched == rfd
@@ -247,7 +247,7 @@ fn test_on_chunk_frames_what_the_pipe_holds() {
 	for i in 0 .. big.len {
 		big[i] = u8(`a` + i % 26)
 	}
-	assert C.write(wfd, big.data, usize(big.len)) == big.len
+	assert C.write(wfd, big.data, u64(big.len)) == big.len
 	on_chunk(mut out, rfd, false, unsafe { nil }, unsafe { nil }, mut event_loop)
 	on_chunk(mut out, rfd, false, unsafe { nil }, unsafe { nil }, mut event_loop)
 	want := '>7\r\nline 1\n\r\n' + '1000\r\n' + big[..4096].bytestr() + '\r\n' + '388\r\n' +

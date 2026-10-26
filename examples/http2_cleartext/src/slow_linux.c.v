@@ -12,7 +12,7 @@ import core
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
-fn C.read(fd int, buf voidptr, count usize) int
+fn C.read(fd int, buf voidptr, count u64) int
 
 fn slow_route_linux(mut res []u8, mut event_loop core.EventLoop) core.Step {
 	tfd := C.timerfd_create(C.CLOCK_MONOTONIC, 0)

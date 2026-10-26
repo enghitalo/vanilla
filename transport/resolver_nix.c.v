@@ -171,8 +171,8 @@ fn C.transport_resolve(host &char, port &char, out &C.transport_resolved, max in
 fn C.transport_pipe(fds &i32) int
 fn C.transport_wait(fd int, timeout_ms int) int
 fn C.transport_block_sigpipe()
-fn C.read(fd int, buf voidptr, count usize) int
-fn C.write(fd int, buf voidptr, n usize) int
+fn C.read(fd int, buf voidptr, count u64) int
+fn C.write(fd int, buf voidptr, n u64) int
 
 // Resolver.new makes a resolver that refreshes each followed host every
 // `interval_ms` (e.g. 30_000). start() it once the followers follow it, or
@@ -394,7 +394,7 @@ fn (mut r Resolver) run() {
 	gap := u64(if r.interval_ms < refresh_gap_ms { r.interval_ms } else { refresh_gap_ms }) * u64(time.millisecond)
 	mut drain := [64]u8{}
 	for {
-		for C.read(r.wake_r, &drain[0], usize(drain.len)) > 0 {
+		for C.read(r.wake_r, &drain[0], u64(drain.len)) > 0 {
 		}
 		// After every drain and before the next wait: the drain may have taken
 		// stop()'s byte, which comes after the flag (#368).

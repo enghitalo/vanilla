@@ -3,8 +3,9 @@ module request
 import http1_1.request_parser
 
 #include <errno.h>
+#include "@VMODROOT/socket/sock_shim.h"
 
-fn C.recv(__fd int, __buf voidptr, __n usize, __flags int) int
+fn C.vanilla_recv(__fd int, __buf voidptr, __n u64, __flags int) int
 
 // read_request reads one complete HTTP/1.1 message from the socket.
 //
@@ -49,7 +50,7 @@ pub fn read_request(client_fd int, max_header_bytes int, max_body_bytes int, max
 			unsafe { buf.grow_cap(buf.cap) } // double capacity on demand
 		}
 		spare := buf.cap - buf.len
-		bytes_read := C.recv(client_fd, unsafe { &u8(buf.data) + buf.len }, usize(spare), 0)
+		bytes_read := C.vanilla_recv(client_fd, unsafe { &u8(buf.data) + buf.len }, u64(spare), 0)
 		if bytes_read < 0 {
 			if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
 				if buf.len == 0 {

@@ -211,7 +211,7 @@ fn fake_backend_conn(fd int) {
 	mut acc := []u8{}
 	mut buf := [4096]u8{}
 	for {
-		n := C.recv(fd, &buf[0], usize(buf.len), 0)
+		n := C.vanilla_recv(fd, &buf[0], u64(buf.len), 0)
 		if n <= 0 {
 			stdatomic.add_i64(&f.eofs, 1)
 			return
@@ -224,7 +224,7 @@ fn fake_backend_conn(fd int) {
 				stdatomic.add_i64(&f.held, 1)
 				for stdatomic.load_i64(&f.hold) == 1 {
 					mut b := u8(0)
-					if C.recv(fd, &b, 1, C.MSG_PEEK | C.MSG_DONTWAIT) == 0 {
+					if C.vanilla_recv(fd, &b, 1, C.MSG_PEEK | C.MSG_DONTWAIT) == 0 {
 						stdatomic.add_i64(&f.eofs, 1)
 						return
 					}
@@ -233,7 +233,7 @@ fn fake_backend_conn(fd int) {
 			}
 			mut off := 0
 			for off < backend_response.len {
-				w := C.send(fd, unsafe { backend_response.str + off }, usize(backend_response.len - off),
+				w := C.vanilla_send(fd, unsafe { backend_response.str + off }, u64(backend_response.len - off),
 					C.MSG_NOSIGNAL)
 				if w <= 0 {
 					return

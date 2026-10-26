@@ -32,12 +32,13 @@ import vtest
 
 #include <unistd.h>
 #include <sys/socket.h>
+#include "@VMODROOT/socket/sock_shim.h"
 
 fn C.pipe(fds &i32) int
-fn C.read(fd int, buf voidptr, count usize) int
-fn C.write(fd int, buf voidptr, count usize) int
+fn C.read(fd int, buf voidptr, count u64) int
+fn C.write(fd int, buf voidptr, count u64) int
 fn C.close(fd int) int
-fn C.recv(fd int, buf voidptr, len usize, flags int) int
+fn C.vanilla_recv(fd int, buf voidptr, len u64, flags int) int
 fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
 fn C.clock() i64
 
@@ -139,24 +140,24 @@ fn pd_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 	}
 	if pd_has_prefix(req, 'GET /keep ') {
 		// Times out twice: the first timeout re-arms (keep waiting) once.
-		event_loop.watch_fd_deadline(never, .readable, pd_never_cont, voidptr(usize(1)),
+		event_loop.watch_fd_deadline(never, .readable, pd_never_cont, voidptr(u64(1)),
 			150)
 		return .suspend
 	}
 	if pd_has_prefix(req, 'GET /pq200 ') {
-		event_loop.watch_fd_persistent_deadline(db, .readable, pd_pq_cont, voidptr(usize(200)),
+		event_loop.watch_fd_persistent_deadline(db, .readable, pd_pq_cont, voidptr(u64(200)),
 			200)
 		return .suspend
 	}
 	if pd_has_prefix(req, 'GET /pqbg200 ') {
 		// /pq200 whose readiness run (here: the tombstone's) also arms a
 		// background watch (pd_bg_flag).
-		event_loop.watch_fd_persistent_deadline(db, .readable, pd_pq_cont, voidptr(usize(200) | pd_bg_flag),
+		event_loop.watch_fd_persistent_deadline(db, .readable, pd_pq_cont, voidptr(u64(200) | pd_bg_flag),
 			200)
 		return .suspend
 	}
 	if pd_has_prefix(req, 'GET /pq5000 ') {
-		event_loop.watch_fd_persistent_deadline(db, .readable, pd_pq_cont, voidptr(usize(5000)),
+		event_loop.watch_fd_persistent_deadline(db, .readable, pd_pq_cont, voidptr(u64(5000)),
 			5000)
 		return .suspend
 	}
@@ -192,9 +193,9 @@ fn pd_never_cont(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload 
 	mut p := unsafe { pd }
 	if event_loop.timed_out() {
 		stdatomic.add_i64(&p.timeouts, 1)
-		left := int(usize(watch_payload))
+		left := int(u64(watch_payload))
 		if left > 0 {
-			event_loop.watch_fd_deadline(ready_fd, .readable, pd_never_cont, voidptr(usize(left - 1)),
+			event_loop.watch_fd_deadline(ready_fd, .readable, pd_never_cont, voidptr(u64(left - 1)),
 				150)
 			return .suspend
 		}
@@ -211,7 +212,7 @@ fn pd_never_cont(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload 
 
 // pd_bg_flag in a /pq watch_payload: its readiness run arms a background
 // watch on a fresh pipe, as pg_async's cancel() does from a continuation.
-const pd_bg_flag = usize(1) << 20
+const pd_bg_flag = u64(1) << 20
 
 // pd_pq_cont is a pooled-DB continuation (pg_async's shape): one byte is one
 // result. watch_payload is the deadline to re-arm with (and pd_bg_flag). On
@@ -225,7 +226,7 @@ fn pd_pq_cont(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voi
 		return .done
 	}
 	stdatomic.add_i64(&p.runs, 1)
-	if usize(watch_payload) & pd_bg_flag != 0 {
+	if u64(watch_payload) & pd_bg_flag != 0 {
 		mut fds := [2]i32{}
 		C.pipe(&fds[0])
 		stdatomic.store_i64(&p.bg_w, i64(fds[1]))
@@ -236,7 +237,7 @@ fn pd_pq_cont(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voi
 	mut b := [1]u8{}
 	if C.read(ready_fd, &b[0], 1) != 1 {
 		event_loop.watch_fd_persistent_deadline(ready_fd, .readable, pd_pq_cont, watch_payload,
-			int(usize(watch_payload) & (pd_bg_flag - 1)))
+			int(u64(watch_payload) & (pd_bg_flag - 1)))
 		return .suspend
 	}
 	stdatomic.add_i64(&p.drained, 1)
@@ -319,13 +320,13 @@ fn pd_until(counter &i64, want int) int {
 // read, no EOF.
 fn pd_open_conn(fd int) bool {
 	mut b := [1]u8{}
-	n := C.recv(fd, &b[0], 1, C.MSG_DONTWAIT | C.MSG_PEEK)
+	n := C.vanilla_recv(fd, &b[0], 1, C.MSG_DONTWAIT | C.MSG_PEEK)
 	return n < 0 && (C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK)
 }
 
 fn pd_write(p &i64, s string) {
 	fd := pd_load(p)
-	C.write(fd, s.str, usize(s.len))
+	C.write(fd, s.str, u64(s.len))
 }
 
 // --- the issue's repro ----------------------------------------------------------

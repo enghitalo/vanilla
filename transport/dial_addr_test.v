@@ -126,8 +126,8 @@ fn test_ip_addr() {
 #include <malloc.h>
 
 struct C.mallinfo2 {
-	uordblks usize
-	hblkhd   usize
+	uordblks u64
+	hblkhd   u64
 }
 
 fn C.mallinfo2() C.mallinfo2
