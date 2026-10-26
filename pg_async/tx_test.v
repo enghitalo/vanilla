@@ -2,6 +2,10 @@
 module pg_async
 
 #include <sys/socket.h>
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_recv(fd int, buf voidptr, n u64, flags int) int
+fn C.vanilla_send(fd int, buf voidptr, n u64, flags int) int
 
 fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
 

@@ -3,6 +3,11 @@ module pg_async
 import tls
 import time
 
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_recv(fd int, buf voidptr, n u64, flags int) int
+fn C.vanilla_send(fd int, buf voidptr, n u64, flags int) int
+
 // The connection's byte transport: the socket itself, or a TLS session over it
 // (ssl_mode != .disable, vanilla#196). Every send and recv of the query path,
 // the re-dial and the blocking bring-up goes through send_some / recv_some,

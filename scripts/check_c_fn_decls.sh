@@ -12,10 +12,30 @@
 #   - A C function declared in several files returns the same type in all.
 #   - memchr and memmem, when declared, return voidptr, as vlib's builtin
 #     declares them for every module.
+#   - No `usize`, `isize` or `uint` in any .v file (#385): V master deprecates the
+#     first two (vlang/v#31113) and -prod makes that an error, while the V before
+#     it has no `uint` at all; u64 and i64 hold on both.
+#   - No declaration of the libc functions vlib or a consumer also declares with a
+#     size type (send, recv, sendto, read, write, pread, sendfile, memset, memcpy,
+#     memmove, memchr): vanilla calls them as vanilla_* (core/libc_shim.h), so its
+#     declarations never meet theirs, whichever V (#385).
 #
 # Run from the repo root. Exits non-zero on any violation.
 
 set -u
+
+status=0
+sizes=$(grep -rnwE --include='*.v' --exclude-dir=.git --exclude-dir=.claude 'usize|isize|uint' . || true)
+if [ -n "$sizes" ]; then
+    printf 'usize, isize or uint (use u64 and i64, #385):\n%s\n\n' "$sizes"
+    status=1
+fi
+libc=$(grep -rnE --include='*.v' --exclude-dir=.git --exclude-dir=.claude \
+    '^[[:space:]]*(pub[[:space:]]+)?fn[[:space:]]+C\.(send|recv|sendto|read|write|pread|sendfile|memset|memcpy|memmove|memchr)[[:space:]]*\(' . || true)
+if [ -n "$libc" ]; then
+    printf 'a libc function declared under its own name (use C.vanilla_*, core/libc_shim.h, #385):\n%s\n\n' "$libc"
+    status=1
+fi
 
 grep -rnE --include='*.v' --exclude-dir=.git --exclude-dir=.claude \
     '^[[:space:]]*(pub[[:space:]]+)?fn[[:space:]]+C\.[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(' . |
@@ -73,4 +93,5 @@ END {
     }
     print "C declarations check OK."
 }
-'
+' || status=1
+exit "$status"

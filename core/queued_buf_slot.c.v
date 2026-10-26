@@ -14,6 +14,7 @@ module core
 // macOS/Windows these are pure V stubs that compile to nothing platform-specific.
 
 #include "@VMODROOT/core/queued_buf_slot.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.vanilla_qb_enable()
 fn C.vanilla_qb_set_allowed(allowed bool)

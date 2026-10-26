@@ -29,7 +29,10 @@ import vtest
 
 #include <sys/socket.h>
 #include <malloc.h>
-#include "@VMODROOT/socket/sock_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_send(fd int, buf voidptr, n u64, flags int) int
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
 
 fn C.vanilla_recv(fd int, buf voidptr, len u64, flags int) int
 fn C.setsockopt(fd int, level int, optname int, optval voidptr, optlen u32) int
@@ -1038,7 +1041,7 @@ fn test_epoll_parked_takeover_sees_fin_behind_a_frame() ! {
 	// The watch was torn down with the connection: the runtime closed the
 	// pipe's read end (a request-owned watch_fd), so a write finds no reader.
 	one := u8(1)
-	wrote := C.write(int(stdatomic.load_i64(&c.park_w)), &one, 1)
+	wrote := C.vanilla_write(int(stdatomic.load_i64(&c.park_w)), &one, 1)
 	assert wrote < 0 && C.errno == C.EPIPE, 'the parked watch fd is still open'
 }
 
@@ -1067,7 +1070,7 @@ fn test_epoll_parked_takeover_buffers_frames_for_the_resume() ! {
 	// End the park: its fd becomes readable.
 	c := unsafe { cp }
 	one := u8(1)
-	C.write(int(stdatomic.load_i64(&c.park_w)), &one, 1)
+	C.vanilla_write(int(stdatomic.load_i64(&c.park_w)), &one, 1)
 	assert a.until('resumed\necho:one\necho:two\n', 2000), a.acc.bytestr()
 }
 

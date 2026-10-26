@@ -14,7 +14,9 @@ module pg_async
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/socket.h>
-#include "@VMODROOT/socket/sock_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_memmove(dest voidptr, src voidptr, n u64) voidptr
 
 fn C.vanilla_recv(fd int, buf voidptr, len u64, flags int) int
 fn C.vanilla_send(fd int, buf voidptr, len u64, flags int) int
@@ -462,7 +464,7 @@ fn (mut c PgConn) fill_recv_buf() {
 				rem := c.recv_buf.len - c.recv_pos
 				if rem > 0 {
 					unsafe {
-						C.memmove(c.recv_buf.data, &u8(c.recv_buf.data) + c.recv_pos, u64(rem))
+						C.vanilla_memmove(c.recv_buf.data, &u8(c.recv_buf.data) + c.recv_pos, u64(rem))
 					}
 				}
 				unsafe {

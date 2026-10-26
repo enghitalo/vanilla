@@ -32,11 +32,11 @@ import vtest
 
 #include <unistd.h>
 #include <sys/socket.h>
-#include "@VMODROOT/socket/sock_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.pipe(fds &i32) int
-fn C.read(fd int, buf voidptr, count u64) int
-fn C.write(fd int, buf voidptr, count u64) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
 fn C.close(fd int) int
 fn C.vanilla_recv(fd int, buf voidptr, len u64, flags int) int
 fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
@@ -204,7 +204,7 @@ fn pd_never_cont(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload 
 	}
 	stdatomic.add_i64(&p.runs, 1)
 	mut b := [1]u8{}
-	C.read(ready_fd, &b[0], 1)
+	C.vanilla_read(ready_fd, &b[0], 1)
 	core.append_str(mut out, pd_ok_head)
 	out << b[0]
 	return .done
@@ -235,7 +235,7 @@ fn pd_pq_cont(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voi
 		}
 	}
 	mut b := [1]u8{}
-	if C.read(ready_fd, &b[0], 1) != 1 {
+	if C.vanilla_read(ready_fd, &b[0], 1) != 1 {
 		event_loop.watch_fd_persistent_deadline(ready_fd, .readable, pd_pq_cont, watch_payload,
 			int(u64(watch_payload) & (pd_bg_flag - 1)))
 		return .suspend
@@ -326,7 +326,7 @@ fn pd_open_conn(fd int) bool {
 
 fn pd_write(p &i64, s string) {
 	fd := pd_load(p)
-	C.write(fd, s.str, u64(s.len))
+	C.vanilla_write(fd, s.str, u64(s.len))
 }
 
 // --- the issue's repro ----------------------------------------------------------
@@ -467,7 +467,7 @@ fn test_epoll_late_readiness_wakes_nothing() ! {
 	assert testkit.fd_read_until(fd, '\r\n\r\nok', 1000).ends_with('ok')
 	// Nobody consumed the late byte.
 	mut b := [1]u8{}
-	assert C.read(pd_load(&p.never_r), &b[0], 1) == 1 && b[0] == `L`
+	assert C.vanilla_read(pd_load(&p.never_r), &b[0], 1) == 1 && b[0] == `L`
 }
 
 // A persistent (pooled) fd: the request times out with the reply still due.

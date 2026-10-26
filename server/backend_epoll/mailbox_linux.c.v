@@ -49,6 +49,10 @@ import core
 import epoll
 import sync.stdatomic
 
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
+
 // mailbox_inline is the payload a mailbox slot carries inline: post_bytes with
 // more reports .too_big.
 pub const mailbox_inline = 240
@@ -142,7 +146,7 @@ fn (mut m Mailbox) arm(epoll_fd int) bool {
 	mut was := sig_idle
 	if !C.atomic_compare_exchange_strong_u64(voidptr(&m.state), &was, sig_armed) {
 		one := u64(1)
-		C.write(m.wake_fd, &one, 8)
+		C.vanilla_write(m.wake_fd, &one, 8)
 	}
 	return true
 }
@@ -174,7 +178,7 @@ fn mailbox_post(mbox voidptr, fd int, epoch u64, tag u64, data []u8) core.PostRe
 					mut was := u64(1)
 					if C.atomic_compare_exchange_strong_u64(voidptr(&m.sleeping), &was, 0) {
 						one := u64(1)
-						C.write(m.wake_fd, &one, 8)
+						C.vanilla_write(m.wake_fd, &one, 8)
 					}
 				}
 				return .ok
@@ -224,7 +228,7 @@ pub fn mailbox_signal_shutdown(mbox voidptr, inflight &core.Counter) {
 		if was == sig_armed {
 			if C.atomic_compare_exchange_strong_u64(voidptr(&m.state), &was, sig_signalled) {
 				one := u64(1)
-				C.write(m.wake_fd, &one, 8)
+				C.vanilla_write(m.wake_fd, &one, 8)
 				return
 			}
 			continue

@@ -25,13 +25,13 @@ import vtest
 
 #include <sys/socket.h>
 #include <fcntl.h>
-#include "@VMODROOT/socket/sock_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.vanilla_send(__fd int, __buf voidptr, __n u64, __flags int) int
 fn C.vanilla_recv(__fd int, __buf voidptr, __n u64, __flags int) int
 fn C.pipe(fds &i32) int
-fn C.write(fd int, buf voidptr, count u64) int
-fn C.read(fd int, buf voidptr, count u64) int
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
 fn C.close(fd int) int
 fn C.fcntl(fd int, cmd int, arg int) int
 
@@ -147,7 +147,7 @@ fn ci_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 		mut fds := [2]i32{}
 		C.pipe(&fds[0])
 		one := u8(1)
-		C.write(int(fds[1]), &one, 1)
+		C.vanilla_write(int(fds[1]), &one, 1)
 		C.close(int(fds[1]))
 		event_loop.watch_fd(int(fds[0]), .readable, ci_resumed, unsafe { nil })
 		return .suspend
@@ -199,7 +199,7 @@ fn ci_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 // ci_resumed is GET /park's continuation.
 fn ci_resumed(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut b := u8(0)
-	C.read(ready_fd, &b, 1)
+	C.vanilla_read(ready_fd, &b, 1)
 	C.close(ready_fd) // the request owns it
 	return ci_report(mut out, 'resumed', event_loop.conn_id(), -1, 0, false)
 }
@@ -215,7 +215,7 @@ fn ci_timed_out(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload v
 // ci_take reads one byte of the shared pipe: a parked request's reply.
 fn ci_take(fd int) bool {
 	mut b := u8(0)
-	return C.read(fd, &b, 1) == 1
+	return C.vanilla_read(fd, &b, 1) == 1
 }
 
 // ci_queued is GET /queue's continuation: it takes its byte and reports.
@@ -568,7 +568,7 @@ fn test_epoll_conn_id_in_queued_and_tombstone_runs() ! {
 	b.send(ci_get('/queue'))!
 	assert ci_until(&s.parked, 2, 3000) == 2
 	two := [u8(`a`), `b`]!
-	assert C.write(int(fds[1]), &two[0], 2) == 2
+	assert C.vanilla_write(int(fds[1]), &two[0], 2) == 2
 	qa := a.reports(2, 3000)
 	qb := b.reports(2, 3000)
 	got := a.acc.bytestr() + ' / ' + b.acc.bytestr()
@@ -606,7 +606,7 @@ fn test_epoll_conn_id_in_queued_and_tombstone_runs() ! {
 	assert d_fd[0] == c_fd[0], 'd did not get the number c freed: nothing was checked'
 	assert dr[0] != cr[0]
 	one := u8(`c`)
-	assert C.write(int(fds[1]), &one, 1) == 1
+	assert C.vanilla_write(int(fds[1]), &one, 1) == 1
 	assert ci_until(&s.dead_runs, 1, 3000) == 1, 'the tombstone did not run'
 	assert stdatomic.load_i64(&s.dead_id) == 0, 'a tombstone run has no connection, even on a live number'
 	// d is untouched: same id, and its answer is its own.

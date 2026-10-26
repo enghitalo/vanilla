@@ -12,6 +12,9 @@ import http1_1.request_parser
 import http1_1.upstream
 
 #include <sys/timerfd.h>
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
@@ -377,7 +380,7 @@ fn arm_timer(fd int, first_ms int, period_ms int) {
 // own loop and never waits on another worker.
 fn tick(mut _ []u8, ready_fd int, _ bool, _ voidptr, worker_state voidptr, mut el core.EventLoop) core.Step {
 	mut expirations := u64(0)
-	C.read(ready_fd, &expirations, 8)
+	C.vanilla_read(ready_fd, &expirations, 8)
 	mut w := unsafe { &Worker(worker_state) }
 	w.kicked = false
 	w.flush()

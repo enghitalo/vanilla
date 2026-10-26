@@ -1,5 +1,9 @@
 module request_parser
 
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_memchr(s voidptr, c int, n u64) voidptr
+
 const empty_space = u8(` `)
 // NOTE: escaped rune literals like `\r` evaluate to the backslash byte (92) in
 // this V toolchain, not 13/10 — which silently breaks all request parsing. Use
@@ -45,7 +49,7 @@ pub mut:
 // parsers that run on every request.
 @[inline]
 fn find_byte_idx(buf &u8, len int, c u8) int {
-	p := unsafe { C.memchr(buf, c, len) }
+	p := unsafe { C.vanilla_memchr(buf, c, len) }
 	if p == unsafe { nil } {
 		return -1
 	}
@@ -64,7 +68,7 @@ fn memmem_idx_portable(buf &u8, len int, bytes_ptr &u8, bytes_len int) int {
 	first := unsafe { *bytes_ptr }
 	mut pos := 0
 	for pos <= len - bytes_len {
-		p := unsafe { C.memchr(buf + pos, first, u64(len - bytes_len - pos + 1)) }
+		p := unsafe { C.vanilla_memchr(buf + pos, first, u64(len - bytes_len - pos + 1)) }
 		if p == unsafe { nil } {
 			return -1
 		}

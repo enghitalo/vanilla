@@ -1,7 +1,7 @@
 module response
 
 #include <errno.h>
-#include "@VMODROOT/socket/sock_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.vanilla_send(__fd int, __buf voidptr, __n u64, __flags int) int
 fn C.perror(s &char)

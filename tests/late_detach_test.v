@@ -49,13 +49,13 @@ import vtest
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
-#include "@VMODROOT/socket/sock_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
 fn C.eventfd(initval u32, flags int) int
-fn C.read(fd int, buf voidptr, count u64) int
-fn C.write(fd int, buf voidptr, count u64) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
 fn C.close(fd int) int
 fn C.fcntl(fd int, cmd int, arg int) int
 fn C.socket(domain int, typ int, protocol int) int
@@ -185,7 +185,7 @@ fn one_shot_timer(ms int) int {
 
 fn drain(fd int) {
 	mut tmp := [8]u8{}
-	C.read(fd, &tmp[0], 8)
+	C.vanilla_read(fd, &tmp[0], 8)
 }
 
 fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
@@ -548,7 +548,7 @@ fn test_epoll_background_continuation_closing_its_fd() {
 		close_all(socks)
 	}
 	one := u64(1)
-	C.write(int(stdatomic.load_i64(&rp.shared_fd)), &one, 8) // the background watch fires
+	C.vanilla_write(int(stdatomic.load_i64(&rp.shared_fd)), &one, 8) // the background watch fires
 	assert wait_go(), 'the background continuation never ran'
 	clients := connect_until_reused(h.port(), socks)
 	time.sleep(100 * time.millisecond) // the continuation returns at once; let the worker loop go round
@@ -586,7 +586,7 @@ fn test_epoll_last_queued_continuation_closing_its_fd() {
 	send_str(cb, 'GET /pipe HTTP/1.1\r\nHost: x\r\n\r\n')
 	assert wait_for(&rp.parks, 2), 'the second request did not park'
 	one := u64(1)
-	C.write(int(stdatomic.load_i64(&rp.shared_fd)), &one, 8) // the shared fd is ready
+	C.vanilla_write(int(stdatomic.load_i64(&rp.shared_fd)), &one, 8) // the shared fd is ready
 	assert wait_go(), 'the second continuation never ran'
 	clients := connect_until_reused(h.port(), socks)
 	ra := read_until(ca, stepped_resp.len)
@@ -626,7 +626,7 @@ fn test_epoll_tombstone_continuation_closing_its_fd() {
 	C.shutdown(ca, C.SHUT_WR)
 	assert wait_eof(ca), 'the server did not close the connection of a client that left'
 	one := u64(1)
-	C.write(int(stdatomic.load_i64(&rp.shared_fd)), &one, 8) // the tombstone's reply is due
+	C.vanilla_write(int(stdatomic.load_i64(&rp.shared_fd)), &one, 8) // the tombstone's reply is due
 	assert wait_go(), 'the tombstone continuation never ran'
 	clients := connect_until_reused(h.port(), socks)
 	time.sleep(100 * time.millisecond) // no client answers this run; let the worker loop go round

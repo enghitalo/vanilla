@@ -9,7 +9,7 @@ import os
 
 #include <sys/socket.h>
 #include <fcntl.h>
-#include "@VMODROOT/socket/sock_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
 fn C.close(fd int) int

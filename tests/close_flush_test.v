@@ -35,10 +35,10 @@ import vtest
 
 #include <sys/socket.h>
 #include <sys/timerfd.h>
-#include "@VMODROOT/socket/sock_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
 
-fn C.read(fd int, buf voidptr, count u64) int
-fn C.write(fd int, buf voidptr, count u64) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
 fn C.vanilla_send(fd int, buf voidptr, len u64, flags int) int
 fn C.vanilla_recv(fd int, buf voidptr, len u64, flags int) int
 fn C.clock_gettime(clk int, ts &C.timespec) int
@@ -113,7 +113,7 @@ fn cf_park(cont core.WakeFn) core.Handler {
 			return .close
 		}
 		b := [u8(`x`)]!
-		C.write(int(sv[1]), &b[0], 1)
+		C.vanilla_write(int(sv[1]), &b[0], 1)
 		event_loop.watch_fd(int(sv[0]), .readable, cont, voidptr(u64(u32(sv[1]))))
 		return .suspend
 	}
@@ -186,7 +186,7 @@ fn cf_shared(cont core.WakeFn) core.Handler {
 		sh.parked++
 		if sh.parked == 2 {
 			b := [u8(`x`)]!
-			C.write(sh.wfd, &b[0], 1)
+			C.vanilla_write(sh.wfd, &b[0], 1)
 		}
 		return .suspend
 	}
@@ -194,7 +194,7 @@ fn cf_shared(cont core.WakeFn) core.Handler {
 
 fn cf_shared_close(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8) // the first head consumes the byte; later heads get EAGAIN
+	C.vanilla_read(ready_fd, &tmp[0], 8) // the first head consumes the byte; later heads get EAGAIN
 	out << cf_ok_close
 	return .close
 }
@@ -204,7 +204,7 @@ fn cf_shared_close(mut out []u8, ready_fd int, ready_fd_error bool, watch_payloa
 // to the second.
 fn cf_shared_big_close(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8)
+	C.vanilla_read(ready_fd, &tmp[0], 8)
 	cf_small_sndbuf(event_loop.client_fd)
 	cf_append_big(mut out, cf_big_close_head)
 	return .close

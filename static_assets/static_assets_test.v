@@ -10,6 +10,8 @@ import sync.stdatomic
 import core
 import http1_1.request_parser
 
+#include "@VMODROOT/core/libc_shim.h"
+
 // A small built bundle written to a temp dir for the suite to serve.
 const fixture_root = os.join_path(os.temp_dir(), 'vanilla_static_assets_fixture')
 

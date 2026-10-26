@@ -34,13 +34,15 @@ import tls
 #include <sys/epoll.h>
 #include <sys/sendfile.h>
 #include <unistd.h>
-#include "@VMODROOT/socket/sock_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
 
 // recv/send were inherited from server.c.v while this lived in that module;
 // now in backend_epoll they must be declared here.
 fn C.vanilla_recv(__fd int, __buf voidptr, __n u64, __flags int) int
 fn C.vanilla_send(__fd int, __buf voidptr, __n u64, __flags int) int
-fn C.memmove(__dest voidptr, __src voidptr, __n u64) voidptr
+fn C.vanilla_memmove(__dest voidptr, __src voidptr, __n u64) voidptr
 
 // sendfile(2): copy bytes from a file fd straight to the socket inside the
 // kernel (no userspace bounce). With a non-NULL offset the kernel advances it
@@ -48,7 +50,7 @@ fn C.memmove(__dest voidptr, __src voidptr, __n u64) voidptr
 // send from many connections/threads at once. core.append_file_region (pread)
 // is the userspace fallback, used when the file body must go out as bytes
 // because a pipelined response must follow it in order.
-fn C.sendfile(out_fd int, in_fd int, offset &i64, count u64) i64
+fn C.vanilla_sendfile(out_fd int, in_fd int, offset &i64, count u64) i64
 
 // Bound a single sendfile(2) call so one connection can't monopolize the worker;
 // the remainder streams on the next writable edge.
@@ -378,7 +380,7 @@ fn (mut q BirthQueue) push(fd int, seq u64, accepted_ns u64) {
 	stdatomic.store_u64(&q.tail, t + 1) // publishes the entry
 	if stdatomic.load_u64(&q.sleeping) != 0 {
 		one := u64(1)
-		C.write(q.wake_fd, &one, 8)
+		C.vanilla_write(q.wake_fd, &one, 8)
 	}
 }
 
@@ -623,7 +625,7 @@ fn drain_file(fd int, mut cs ConnState) int {
 		} else {
 			u64(cs.file_remaining)
 		}
-		sent := C.sendfile(fd, cs.file_fd, &cs.file_off, want)
+		sent := C.vanilla_sendfile(fd, cs.file_fd, &cs.file_off, want)
 		if sent > 0 {
 			cs.file_remaining -= i64(sent)
 			continue

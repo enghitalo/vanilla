@@ -27,6 +27,7 @@ module transport
 #include <fcntl.h>
 #include <errno.h>
 #include "@VMODROOT/transport/transport_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 // Deliberately no vanilla imports: transport sits in the same band as
 // socket/ (dependency rule, docs/ARCHITECTURE.md). The shim header typedefs
@@ -58,8 +59,8 @@ fn C.close(int) int
 fn C.fcntl(int, int, int) int
 fn C.htons(u16) u16
 fn C.inet_pton(int, &char, voidptr) int
-fn C.memset(voidptr, int, u64) voidptr
-fn C.memcpy(voidptr, voidptr, u64) voidptr
+fn C.vanilla_memset(voidptr, int, u64) voidptr
+fn C.vanilla_memcpy(voidptr, voidptr, u64) voidptr
 
 // max_unix_path mirrors socket.max_unix_path (104-byte sun_path minus the
 // NUL — the smaller BSD size, so Linux configs stay portable).
@@ -79,7 +80,7 @@ fn set_nonblocking(fd int) {
 // fd with C.close when done.
 pub fn dial_tcp(ipv4 string, port int) !int {
 	mut addr := C.transport_sockaddr_in{}
-	C.memset(voidptr(&addr), 0, sizeof(C.transport_sockaddr_in))
+	C.vanilla_memset(voidptr(&addr), 0, sizeof(C.transport_sockaddr_in))
 	addr.sin_family = u16(C.AF_INET)
 	addr.sin_port = C.htons(u16(port))
 	if C.inet_pton(C.AF_INET, &char(ipv4.str), voidptr(&addr.sin_addr)) != 1 {
@@ -110,9 +111,9 @@ pub fn dial_unix(path string) !int {
 		return error('dial_unix: invalid socket path (1..${max_unix_path} bytes): ${path}')
 	}
 	mut addr := C.transport_sockaddr_un{}
-	C.memset(voidptr(&addr), 0, sizeof(C.transport_sockaddr_un))
+	C.vanilla_memset(voidptr(&addr), 0, sizeof(C.transport_sockaddr_un))
 	addr.sun_family = u16(C.AF_UNIX)
-	C.memcpy(voidptr(&addr.sun_path[0]), path.str, u64(path.len))
+	C.vanilla_memcpy(voidptr(&addr.sun_path[0]), path.str, u64(path.len))
 	fd := C.socket(C.AF_UNIX, C.SOCK_STREAM, 0)
 	if fd < 0 {
 		return error('dial_unix: socket creation failed')

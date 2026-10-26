@@ -12,6 +12,9 @@ import time
 #include <sys/epoll.h>
 #include <sched.h>
 #include <sys/eventfd.h>
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
 
 fn C.perror(s &char)
 fn C.eventfd(initval u32, flags int) int
@@ -442,7 +445,7 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 					// The accept thread queued a connection while this worker
 					// slept: reset the eventfd (drain_births above took the entry).
 					mut n := u64(0)
-					C.read(fd, &n, 8)
+					C.vanilla_read(fd, &n, 8)
 					continue
 				}
 				if st.mbox_armed && fd == st.mbox.wake_fd {

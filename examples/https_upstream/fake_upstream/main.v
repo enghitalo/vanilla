@@ -55,7 +55,7 @@ import transport
 #include <netinet/in.h>
 #include <poll.h>
 #include <fcntl.h>
-#include "@VMODROOT/socket/sock_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.socket(domain int, typ int, protocol int) int
 fn C.bind(fd int, addr voidptr, len u32) int

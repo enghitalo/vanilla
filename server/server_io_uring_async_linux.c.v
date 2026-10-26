@@ -59,6 +59,9 @@ import sync.stdatomic
 
 #include <fcntl.h>
 #include <sys/syscall.h>
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_memmove(dest voidptr, src voidptr, n u64) voidptr
 
 fn C.fcntl(fd int, cmd int, arg int) int
 fn C.getpid() int
@@ -630,7 +633,7 @@ fn iou_drain_requests(mut env IouEnv, mut conn io_uring.Connection, limits Limit
 		leftover := conn.read_buf.len - pos
 		if leftover > 0 {
 			unsafe {
-				C.memmove(conn.read_buf.data, &u8(conn.read_buf.data) + pos, u64(leftover))
+				C.vanilla_memmove(conn.read_buf.data, &u8(conn.read_buf.data) + pos, u64(leftover))
 			}
 		}
 		unsafe {

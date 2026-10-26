@@ -11,6 +11,9 @@ import core
 import sync.stdatomic
 
 #include <signal.h>
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
 
 fn C.raise(sig int) int
 
@@ -341,7 +344,7 @@ fn test_kick_fires_the_timer_once() {
 	assert w.kicked // passing flush_at asked for an early tick ...
 	time.sleep(5 * time.millisecond)
 	mut n := u64(0)
-	assert C.read(tfd, &n, 8) == 8 // ... and the timer fired, long before its period
+	assert C.vanilla_read(tfd, &n, 8) == 8 // ... and the timer fired, long before its period
 	assert n == 1
 }
 

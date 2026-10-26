@@ -23,11 +23,13 @@ module main
 // this server doesn't expose to the handler.
 import core
 
+#include "@VMODROOT/core/libc_shim.h"
+
 // Buffered, thread-safe (glibc locks the stream), append-mode C stdio.
 fn C.fopen(path &char, mode &char) voidptr
 fn C.fwrite(ptr voidptr, size u64, nmemb u64, stream voidptr) u64
 fn C.fflush(stream voidptr) int
-fn C.memchr(buf voidptr, c int, n u64) voidptr
+fn C.vanilla_memchr(buf voidptr, c int, n u64) voidptr
 
 struct AccessLog {
 	cfile voidptr // C FILE*, opened "ab" (append + fully buffered)
@@ -76,7 +78,7 @@ fn (l &AccessLog) record(req_buffer []u8, out []u8, start int) {
 	unsafe {
 		// First space ends the method; the prefix up to the SECOND space is the
 		// contiguous "METHOD SP PATH" we want to log.
-		sp1 := C.memchr(&req_buffer[0], ` `, u64(req_buffer.len))
+		sp1 := C.vanilla_memchr(&req_buffer[0], ` `, u64(req_buffer.len))
 		if sp1 == nil {
 			return
 		}
@@ -84,7 +86,7 @@ fn (l &AccessLog) record(req_buffer []u8, out []u8, start int) {
 		if after_method >= req_buffer.len {
 			return
 		}
-		sp2 := C.memchr(&req_buffer[after_method], ` `, u64(req_buffer.len - after_method))
+		sp2 := C.vanilla_memchr(&req_buffer[after_method], ` `, u64(req_buffer.len - after_method))
 		if sp2 == nil {
 			return
 		}

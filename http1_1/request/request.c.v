@@ -3,7 +3,7 @@ module request
 import http1_1.request_parser
 
 #include <errno.h>
-#include "@VMODROOT/socket/sock_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.vanilla_recv(__fd int, __buf voidptr, __n u64, __flags int) int
 

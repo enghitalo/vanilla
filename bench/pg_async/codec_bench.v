@@ -30,7 +30,7 @@ import os
 import pg_async
 
 #include <sys/socket.h>
-#include "@VMODROOT/socket/sock_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
 fn C.vanilla_send(fd int, buf voidptr, len u64, flags int) int

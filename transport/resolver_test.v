@@ -93,6 +93,10 @@ fn test_thread_hands_off() {
 }
 
 #include <malloc.h>
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
 
 struct C.mallinfo2 {
 	uordblks u64
@@ -283,7 +287,7 @@ fn test_unfollowed_during_its_lookup_gets_nothing() {
 	// fa's pipe: closed by its writer (the read end sees EOF), and empty.
 	mut rec := Record{}
 	assert C.transport_wait(fa.fd, 2000) > 0
-	n := C.read(fa.fd, &rec, sizeof(Record))
+	n := C.vanilla_read(fa.fd, &rec, sizeof(Record))
 	assert n == 0, 'the follower that left got ${n} bytes'
 	r.stop()
 	C.close(fa.fd)
@@ -309,16 +313,16 @@ fn test_stop_does_not_wait_for_a_blocked_lookup() {
 	// The follower's pipe is closed (EOF), and empty.
 	mut rec := Record{}
 	assert C.transport_wait(f.fd, 1000) > 0
-	assert C.read(f.fd, &rec, sizeof(Record)) == 0
+	assert C.vanilla_read(f.fd, &rec, sizeof(Record)) == 0
 	// The lookup returns: its thread drops the answer and writes nothing, not
 	// even to the wake pipe.
 	mut b := [64]u8{}
-	for C.read(r.wake_r, &b[0], u64(b.len)) > 0 {
+	for C.vanilla_read(r.wake_r, &b[0], u64(b.len)) > 0 {
 	}
 	stdatomic.store_i64(&g.open, 1)
 	assert wait_for(&g.left, 1, 2000)
 	time.sleep(20 * time.millisecond)
-	assert C.read(r.wake_r, &b[0], u64(b.len)) < 0
+	assert C.vanilla_read(r.wake_r, &b[0], u64(b.len)) < 0
 	C.close(f.fd)
 	C.close(r.wake_r)
 	C.close(r.wake_w)
@@ -494,7 +498,7 @@ fn test_a_resolvefn_never_dies_of_sigpipe() {
 	wfd := int(fds[1])
 	resolve := fn [cc, wfd] (host string, port int) []Addr {
 		b := u8(1)
-		C.write(wfd, &b, 1) // EPIPE, not SIGPIPE
+		C.vanilla_write(wfd, &b, 1) // EPIPE, not SIGPIPE
 		stdatomic.add_i64(&cc.n, 1)
 		return []
 	}

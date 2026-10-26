@@ -8,10 +8,11 @@ import core
 #include <sys/timerfd.h>
 #include <time.h>
 #include <unistd.h>
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
-fn C.read(fd int, buf voidptr, count u64) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
 
 const delayed_response = fixed_json(json_200_head, '{"delayed":true}')
 const delay_unavailable_response = 'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
@@ -38,7 +39,7 @@ fn start_delay(ms int, mut out []u8, mut event_loop core.EventLoop) core.Step {
 // it), answer.
 fn delay_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8)
+	C.vanilla_read(ready_fd, &tmp[0], 8)
 	C.close(ready_fd)
 	core.append_str(mut out, delayed_response)
 	return .done

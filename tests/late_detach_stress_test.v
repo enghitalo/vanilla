@@ -29,12 +29,12 @@ import vtest
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
-#include "@VMODROOT/socket/sock_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
 fn C.eventfd(initval u32, flags int) int
-fn C.read(fd int, buf voidptr, count u64) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
 fn C.close(fd int) int
 fn C.socket(domain int, typ int, protocol int) int
 fn C.connect(fd int, addr voidptr, len u32) int
@@ -125,7 +125,7 @@ fn one_shot_timer(ms int) int {
 
 fn drain(fd int) {
 	mut tmp := [8]u8{}
-	C.read(fd, &tmp[0], 8)
+	C.vanilla_read(fd, &tmp[0], 8)
 }
 
 fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {

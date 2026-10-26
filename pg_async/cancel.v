@@ -4,6 +4,11 @@ import core
 import tls
 import transport
 
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_recv(fd int, buf voidptr, n u64, flags int) int
+fn C.vanilla_send(fd int, buf voidptr, n u64, flags int) int
+
 // Cancelling the query a connection is running (vanilla#200), with
 // PostgreSQL's CancelRequest: a second connection to the same server carries
 // Int32(length) Int32(80877102) Int32(process id) and the secret key of the

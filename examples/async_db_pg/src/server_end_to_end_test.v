@@ -15,7 +15,7 @@ import vtest
 import sync.stdatomic
 
 #include <sys/socket.h>
-#include "@VMODROOT/socket/sock_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.vanilla_recv(fd int, buf voidptr, n u64, flags int) int
 fn C.vanilla_send(fd int, buf voidptr, n u64, flags int) int

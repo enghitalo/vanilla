@@ -46,6 +46,10 @@ import epoll
 import tls
 
 #include <sys/epoll.h>
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_recv(fd int, buf voidptr, n u64, flags int) int
+fn C.vanilla_send(fd int, buf voidptr, n u64, flags int) int
 
 // ConnState.tls: how the connection's bytes move. Ordered so that each hot
 // check is one compare: the readable edge and recv/send look for

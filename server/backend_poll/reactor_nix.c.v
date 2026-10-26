@@ -28,11 +28,11 @@ import http1_1.response
 #include <errno.h>
 #include <string.h>
 #include <sys/socket.h>
-#include "@VMODROOT/socket/sock_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.vanilla_recv(__fd int, __buf voidptr, __n u64, __flags int) int
 fn C.vanilla_send(__fd int, __buf voidptr, __n u64, __flags int) int
-fn C.memmove(__dest voidptr, __src voidptr, __n u64) voidptr
+fn C.vanilla_memmove(__dest voidptr, __src voidptr, __n u64) voidptr
 
 const pl_stream_body_above = 1024 * 1024
 const pl_read_buf_cap = 8 * 1024
@@ -175,7 +175,7 @@ fn compact_read_buf(mut cs PollConn, pos int) {
 	}
 	leftover := cs.read_buf.len - pos
 	if leftover > 0 {
-		unsafe { C.memmove(cs.read_buf.data, &u8(cs.read_buf.data) + pos, u64(leftover)) }
+		unsafe { C.vanilla_memmove(cs.read_buf.data, &u8(cs.read_buf.data) + pos, u64(leftover)) }
 	}
 	unsafe {
 		cs.read_buf.len = leftover

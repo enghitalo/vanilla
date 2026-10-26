@@ -8,6 +8,9 @@ import os
 import time
 
 #include <linux/io_uring.h>
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
 
 struct C.io_uring_sqe {
 	opcode        u8
@@ -239,7 +242,7 @@ fn test_poll_completes_only_once_the_fd_is_ready() {
 		assert submit(&r) == 1
 		mut cqes := unsafe { [2]&Cqe{} }
 		assert peek_batch_cqe(&r, &cqes[0], 2) == 0
-		assert C.write(p.write_fd, c'x', 1) == 1
+		assert C.vanilla_write(p.write_fd, c'x', 1) == 1
 		assert submit_and_wait(&r, 1) >= 0
 		n := peek_batch_cqe(&r, &cqes[0], 2)
 		assert n == 1

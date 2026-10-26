@@ -19,6 +19,7 @@ module transport
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include "@VMODROOT/transport/transport_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 @[typedef]
 struct C.transport_in_addr {
@@ -56,7 +57,7 @@ fn C.htons(u16) u16
 
 fn C.inet_pton(int, &char, voidptr) int
 
-fn C.memset(voidptr, int, u64) voidptr
+fn C.vanilla_memset(voidptr, int, u64) voidptr
 
 // max_unix_path mirrors the unix side so cross-platform config validation
 // stays uniform even where dial_unix itself is unsupported.
@@ -70,7 +71,7 @@ pub fn dial_tcp(ipv4 string, port int) !int {
 		return error('dial_tcp: WSAStartup failed')
 	}
 	mut addr := C.transport_sockaddr_in{}
-	C.memset(voidptr(&addr), 0, sizeof(C.transport_sockaddr_in))
+	C.vanilla_memset(voidptr(&addr), 0, sizeof(C.transport_sockaddr_in))
 	addr.sin_family = u16(C.AF_INET)
 	addr.sin_port = C.htons(u16(port))
 	if C.inet_pton(C.AF_INET, &char(ipv4.str), voidptr(&addr.sin_addr)) != 1 {

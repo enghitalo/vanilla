@@ -38,11 +38,12 @@ import vtest
 
 #include <sys/timerfd.h>
 #include <sys/socket.h>
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
-fn C.read(fd int, buf voidptr, count u64) int
-fn C.write(fd int, buf voidptr, count u64) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
 fn C.close(fd int) int
 fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
 
@@ -179,7 +180,7 @@ fn sd_timer_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload 
 		return .done
 	}
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8)
+	C.vanilla_read(ready_fd, &tmp[0], 8)
 	C.close(ready_fd)
 	out << sd_delayed
 	return .done
@@ -188,7 +189,7 @@ fn sd_timer_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload 
 // sd_chain_step: watch_payload is the number of parks still to go.
 fn sd_chain_step(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8)
+	C.vanilla_read(ready_fd, &tmp[0], 8)
 	C.close(ready_fd)
 	left := int(u64(watch_payload))
 	if left > 0 {
@@ -202,7 +203,7 @@ fn sd_chain_step(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload 
 // sd_pq_done takes the next result off the mock upstream, in order.
 fn sd_pq_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut b := [1]u8{}
-	if C.read(ready_fd, &b[0], 1) != 1 {
+	if C.vanilla_read(ready_fd, &b[0], 1) != 1 {
 		event_loop.watch_fd_persistent(ready_fd, .readable, sd_pq_done, watch_payload)
 		return .suspend
 	}
@@ -475,7 +476,7 @@ fn check_shutdown_waits_for_pipelined_parks(backend server.IOBackend, hangup_see
 	spawn fn [up1] () {
 		time.sleep(300 * time.millisecond) // the query latency
 		results := '123'.bytes()
-		C.write(up1, &results[0], u64(results.len))
+		C.vanilla_write(up1, &results[0], u64(results.len))
 	}()
 	waited := sd_shutdown(mut h, 5000)
 	got_b := testkit.fd_read_until(b, '\r\n\r\n2', 2000)

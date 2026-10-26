@@ -24,10 +24,11 @@ import time
 
 #include <sys/timerfd.h>
 #include <unistd.h>
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
-fn C.read(fd int, buf voidptr, count u64) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
 
 // 'Date: ' (6) + IMF-fixdate (29, RFC 9110 §5.6.7) + CRLF (2) = 37 bytes.
 const date_line_len = 37
@@ -103,7 +104,7 @@ fn on_start(worker_state voidptr, mut event_loop core.EventLoop) {
 // to `out` (there is no client) and lives for the worker's whole lifetime.
 fn date_tick(mut _out []u8, ready_fd int, _ready_fd_error bool, _watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8) // drain the expiration count to re-level the fd
+	C.vanilla_read(ready_fd, &tmp[0], 8) // drain the expiration count to re-level the fd
 	mut dc := unsafe { &DateCache(worker_state) }
 	rebuild(mut dc)
 	event_loop.watch_fd(ready_fd, .readable, date_tick, unsafe { nil })

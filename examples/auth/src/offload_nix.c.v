@@ -29,10 +29,11 @@ module main
 import core
 
 #include <unistd.h>
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.pipe(fds &i32) int
-fn C.write(fd int, buf voidptr, n u64) int
-fn C.read(fd int, buf voidptr, n u64) int
+fn C.vanilla_write(fd int, buf voidptr, n u64) int
+fn C.vanilla_read(fd int, buf voidptr, n u64) int
 fn C.close(fd int) int
 
 // Bounds. hash_pool_size caps concurrent argon2 computations PER WORKER, so peak
@@ -83,7 +84,7 @@ fn hash_worker(jobs chan HashJob) {
 		// The client may have disconnected mid-hash; the runtime then closed the
 		// read-end, so this write can fail with EPIPE — ignore it, just release
 		// the write-end. The pool thread owns pipe_w; the request owns pipe_r.
-		C.write(job.pipe_w, &verdict, 1)
+		C.vanilla_write(job.pipe_w, &verdict, 1)
 		C.close(job.pipe_w)
 	}
 }
@@ -130,7 +131,7 @@ fn token_done(mut out []u8, ready_fd int, _ready_fd_error bool, _watch_payload v
 	mut verdict := u8(0)
 	// Read the data byte even on HUP: the pool writes the verdict and THEN closes
 	// pipe_w, so a readable+hung-up read-end still carries the verdict first.
-	nread := C.read(ready_fd, &verdict, 1)
+	nread := C.vanilla_read(ready_fd, &verdict, 1)
 	C.close(ready_fd) // the request owns the read-end
 	if nread != 1 || verdict != 1 {
 		core.append_str(mut out, resp_401)

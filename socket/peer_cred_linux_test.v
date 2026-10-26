@@ -8,6 +8,10 @@ import os
 // (`${}` here is test scaffolding.)
 
 #include <sched.h>
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
 
 fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
 fn C.unshare(flags int) int
@@ -79,19 +83,19 @@ fn test_peer_cred_keeps_uid_and_gid_across_a_pid_namespace() {
 				if cred := peer_cred(sv[1]) {
 					rec = [i32(1), i32(cred.pid), i32(cred.uid), i32(cred.gid)]!
 				}
-				C.write(sv[1], &rec[0], sizeof(rec))
+				C.vanilla_write(sv[1], &rec[0], sizeof(rec))
 				C._exit(0)
 			}
 			C.waitpid(-1, unsafe { nil }, 0)
 			C._exit(0)
 		}
-		C.write(sv[1], &rec[0], sizeof(rec)) // no namespace: skip
+		C.vanilla_write(sv[1], &rec[0], sizeof(rec)) // no namespace: skip
 		C._exit(0)
 	}
 	close_socket(sv[1])
 	C.waitpid(child, unsafe { nil }, 0)
 	mut rec := [4]i32{}
-	n := C.read(sv[0], &rec[0], sizeof(rec))
+	n := C.vanilla_read(sv[0], &rec[0], sizeof(rec))
 	close_socket(sv[0])
 	assert n == sizeof(rec), 'no report from the namespaced reader'
 	if rec[0] == -1 {
@@ -111,7 +115,7 @@ fn write_proc(path &char, s string) bool {
 	if fd < 0 {
 		return false
 	}
-	n := C.write(fd, s.str, u64(s.len))
+	n := C.vanilla_write(fd, s.str, u64(s.len))
 	C.close(fd)
 	return n == s.len
 }

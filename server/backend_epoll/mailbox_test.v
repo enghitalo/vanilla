@@ -4,6 +4,10 @@ module backend_epoll
 import core
 import epoll
 
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
+
 // Unit tests for the push mailbox ring (mailbox_linux.c.v): the size rounding,
 // .full without blocking, .too_big, FIFO order across many laps, the sleep
 // announcement's re-check, and the shutdown handshake. Delivery to
@@ -88,7 +92,7 @@ fn test_mailbox_announce_sees_a_ready_post() {
 // mb_eventfd_count reads (and resets) an eventfd: 0 when nothing was written.
 fn mb_eventfd_count(fd int) u64 {
 	mut n := u64(0)
-	if C.read(fd, &n, 8) != 8 {
+	if C.vanilla_read(fd, &n, 8) != 8 {
 		return 0
 	}
 	return n

@@ -10,6 +10,9 @@ import sync.stdatomic
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
 
 // write_file appends the buffer to the log file, reopening it first when
 // SIGHUP or a rotation asked for it. A failed open or write drops the
@@ -43,7 +46,7 @@ fn (mut w Worker) reopen(gen i64) {
 fn write_all(fd int, b []u8) bool {
 	mut off := 0
 	for off < b.len {
-		n := C.write(fd, unsafe { &u8(b.data) + off }, u64(b.len - off))
+		n := C.vanilla_write(fd, unsafe { &u8(b.data) + off }, u64(b.len - off))
 		if n < 0 {
 			if C.errno == C.EINTR {
 				continue

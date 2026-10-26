@@ -17,7 +17,7 @@ import time
 import core
 
 #include <errno.h>
-#include "@VMODROOT/socket/sock_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.vanilla_send(fd int, buf voidptr, n u64, flags int) int
 

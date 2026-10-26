@@ -8,6 +8,7 @@ import tls
 
 #include <signal.h>
 #include "@VMODROOT/server/sigpipe_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.signal(sig int, handler voidptr) voidptr
 fn C.vanilla_ignore_default_sigpipe() int

@@ -50,7 +50,9 @@ import core
 import http1_1.request_parser { HttpRequest, Slice }
 import http1_1.response
 
-fn C.memchr(s voidptr, c int, n u64) voidptr
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_memchr(s voidptr, c int, n u64) voidptr
 
 // max_params caps the :name and *name segments of one route.
 pub const max_params = 8
@@ -178,7 +180,7 @@ fn drop_body(mut out []u8, start int) {
 	unsafe {
 		mut i := start
 		for i + 3 < out.len {
-			q := C.memchr(&u8(out.data) + i, 13, u64(out.len - 3 - i))
+			q := C.vanilla_memchr(&u8(out.data) + i, 13, u64(out.len - 3 - i))
 			if q == nil {
 				return
 			}
@@ -372,7 +374,7 @@ fn (mut t Table) finish() {
 fn (t &Table) lookup(req HttpRequest, mut p Params) int {
 	start := req.path.start
 	base := unsafe { &u8(req.buffer.data) + start }
-	q := C.memchr(base, `?`, u64(req.path.len))
+	q := C.vanilla_memchr(base, `?`, u64(req.path.len))
 	len := if q == unsafe { nil } { req.path.len } else { int(unsafe { &u8(q) - base }) }
 	if len == 0 || unsafe { base[0] } != `/` {
 		return -1
@@ -390,7 +392,7 @@ fn (t &Table) find(ni int, base &u8, start int, len int, pos int, mut p Params) 
 	if pos > len {
 		return if node.allow.len > 0 { ni } else { -1 }
 	}
-	q := C.memchr(unsafe { base + pos }, `/`, u64(len - pos))
+	q := C.vanilla_memchr(unsafe { base + pos }, `/`, u64(len - pos))
 	end := if q == unsafe { nil } { len } else { int(unsafe { &u8(q) - base }) }
 	seg_len := end - pos
 	for c in node.statics {

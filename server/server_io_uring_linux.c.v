@@ -15,7 +15,7 @@ import time
 #include <sched.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
-#include "@VMODROOT/socket/sock_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 struct C.rlimit {
 mut:
@@ -29,7 +29,7 @@ fn C.sleep(seconds u32) u32
 fn C.close(fd int) int
 fn C.shutdown(sockfd int, how int) int
 fn C.vanilla_recv(__fd int, __buf voidptr, __n u64, __flags int) int
-fn C.memmove(dest voidptr, src voidptr, n u64) voidptr
+fn C.vanilla_memmove(dest voidptr, src voidptr, n u64) voidptr
 // mask is a cpu_set_t* in <sched.h>; we hand it a raw u64 word array, so keep
 // the binding untyped rather than model cpu_set_t (whose header typedef would
 // clash with any V-side struct declaration).

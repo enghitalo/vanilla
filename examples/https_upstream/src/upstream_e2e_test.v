@@ -1722,7 +1722,7 @@ fn test_late_reply_after_a_park_deadline_reaches_nobody() {
 }
 
 #include <malloc.h>
-#include "@VMODROOT/socket/sock_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 struct C.mallinfo2 {
 	uordblks u64

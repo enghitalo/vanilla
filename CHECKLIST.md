@@ -90,7 +90,7 @@ concatenates, interpolates or allocates per request. The
   // Send what fits; park the rest on EVFILT_WRITE. false = close the connection.
   fn kq_flush(kq int, fd int, mut c KqConn) bool {
   	for c.write_off < c.out.len {
-  		n := C.send(fd, unsafe { &c.out[c.write_off] }, c.out.len - c.write_off, 0)
+  		n := C.vanilla_send(fd, unsafe { &c.out[c.write_off] }, c.out.len - c.write_off, 0)
   		if n > 0 {
   			c.write_off += int(n)
   			continue

@@ -15,10 +15,11 @@ import http1_1.request_parser
 import http1_1.response
 
 #include <unistd.h>
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.pipe(fds &i32) int
-fn C.write(fd int, buf voidptr, n u64) int
-fn C.read(fd int, buf voidptr, n u64) int
+fn C.vanilla_write(fd int, buf voidptr, n u64) int
+fn C.vanilla_read(fd int, buf voidptr, n u64) int
 fn C.close(fd int) int
 
 const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'
@@ -61,7 +62,7 @@ fn handle(req []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut eve
 		// consumer would instead watch a DB socket / upstream / timer that becomes
 		// ready later — the worker keeps serving others until then.
 		b := u8(1)
-		C.write(int(fds[1]), &b, 1)
+		C.vanilla_write(int(fds[1]), &b, 1)
 		C.close(int(fds[1]))
 		event_loop.watch_fd(int(fds[0]), .readable, pipe_done, unsafe { nil })
 		return .suspend
@@ -74,7 +75,7 @@ fn handle(req []u8, mut out []u8, _client_fd int, _worker_state voidptr, mut eve
 // request owns the watched fd), and answer.
 fn pipe_done(mut out []u8, ready_fd int, _ready_fd_error bool, _watch_payload voidptr, _worker_state voidptr, mut _event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8)
+	C.vanilla_read(ready_fd, &tmp[0], 8)
 	C.close(ready_fd)
 	core.append_str(mut out, resp_async)
 	return .done

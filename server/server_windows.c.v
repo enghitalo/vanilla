@@ -54,6 +54,9 @@ pub enum IOBackend {
 
 #include <winsock2.h>
 #include <windows.h>
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_memmove(dest voidptr, src voidptr, n u64) voidptr
 
 // C.WSAGetLastError / C.memmove come from builtin's program-wide decls.
 
@@ -351,7 +354,7 @@ fn win_compact_read_buf(mut cs WinConn, pos int) {
 	}
 	leftover := cs.read_buf.len - pos
 	if leftover > 0 {
-		unsafe { C.memmove(cs.read_buf.data, &u8(cs.read_buf.data) + pos, u64(leftover)) }
+		unsafe { C.vanilla_memmove(cs.read_buf.data, &u8(cs.read_buf.data) + pos, u64(leftover)) }
 	}
 	unsafe {
 		cs.read_buf.len = leftover

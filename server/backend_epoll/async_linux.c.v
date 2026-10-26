@@ -35,6 +35,10 @@ import sync.stdatomic
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_memmove(dest voidptr, src voidptr, n u64) voidptr
+fn C.vanilla_recv(fd int, buf voidptr, n u64, flags int) int
 
 fn C.fcntl(fd int, cmd int, arg int) int
 fn C.getpid() int
@@ -1384,7 +1388,7 @@ fn compact_read_buf(mut cs ConnState, pos int) {
 	}
 	leftover := cs.read_buf.len - pos
 	if leftover > 0 {
-		unsafe { C.memmove(cs.read_buf.data, &u8(cs.read_buf.data) + pos, u64(leftover)) }
+		unsafe { C.vanilla_memmove(cs.read_buf.data, &u8(cs.read_buf.data) + pos, u64(leftover)) }
 	}
 	unsafe {
 		cs.read_buf.len = leftover
