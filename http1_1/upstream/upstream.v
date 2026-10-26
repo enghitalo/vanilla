@@ -87,8 +87,8 @@ import core
 #include "@VMODROOT/http1_1/upstream/upstream_shim.h"
 
 fn C.upstream_dup_onto(fd int, onto int) int
-fn C.upstream_send(fd int, p1 voidptr, n1 usize, p2 voidptr, n2 usize) i64
-fn C.upstream_recv(fd int, p voidptr, n usize) i64
+fn C.upstream_send(fd int, p1 voidptr, n1 u64, p2 voidptr, n2 u64) i64
+fn C.upstream_recv(fd int, p voidptr, n u64) i64
 fn C.upstream_peek(fd int) int
 fn C.close(fd int) int
 fn C.shutdown(fd int, how int) int

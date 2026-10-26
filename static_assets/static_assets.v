@@ -66,6 +66,7 @@ import core
 import http1_1.request_parser
 
 #include "@VMODROOT/static_assets/file_sig.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 @[typedef]
 struct C.vanilla_sa_sig {

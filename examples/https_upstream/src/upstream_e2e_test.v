@@ -23,8 +23,8 @@ import http1_1.upstream
 #include <poll.h>
 
 fn C.poll(fds voidptr, n u64, timeout int) int
-fn C.recv(fd int, buf voidptr, n usize, flags int) int
-fn C.send(fd int, buf voidptr, n usize, flags int) int
+fn C.vanilla_recv(fd int, buf voidptr, n u64, flags int) int
+fn C.vanilla_send(fd int, buf voidptr, n u64, flags int) int
 fn C.listen(fd int, backlog int) int
 
 const fake_src = os.join_path(@DIR, '..', 'fake_upstream', 'main.v')
@@ -255,7 +255,7 @@ fn read_response(fd int, mut acc []u8, mut buf []u8, wait_ms int) {
 		if C.poll(voidptr(&p[0]), 1, 20) <= 0 {
 			continue
 		}
-		n := C.recv(fd, buf.data, usize(buf.len), 0)
+		n := C.vanilla_recv(fd, buf.data, u64(buf.len), 0)
 		if n <= 0 {
 			if n < 0 && C.errno == C.EAGAIN {
 				continue
@@ -1722,10 +1722,11 @@ fn test_late_reply_after_a_park_deadline_reaches_nobody() {
 }
 
 #include <malloc.h>
+#include "@VMODROOT/core/libc_shim.h"
 
 struct C.mallinfo2 {
-	uordblks usize
-	hblkhd   usize
+	uordblks u64
+	hblkhd   u64
 }
 
 fn C.mallinfo2() C.mallinfo2
@@ -1768,7 +1769,7 @@ fn test_no_allocation_per_exchange() {
 	run := fn [fd, reqs] (n int, mut acc []u8, mut buf []u8) {
 		for i in 0 .. n {
 			req := reqs[i % reqs.len]
-			C.send(fd, req.data, usize(req.len), 0)
+			C.vanilla_send(fd, req.data, u64(req.len), 0)
 			read_response(fd, mut acc, mut buf, 5000)
 			if client.status_code(acc) != 200 {
 				panic('call ${i} failed: ${acc.bytestr()}')

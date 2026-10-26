@@ -13,9 +13,10 @@ import transport
 import vtest
 
 #include <sys/socket.h>
+#include "@VMODROOT/core/libc_shim.h"
 
-fn C.recv(fd int, buf voidptr, n usize, flags int) int
-fn C.send(fd int, buf voidptr, n usize, flags int) int
+fn C.vanilla_recv(fd int, buf voidptr, n u64, flags int) int
+fn C.vanilla_send(fd int, buf voidptr, n u64, flags int) int
 fn C.getsockname(fd int, addr voidptr, addrlen &u32) int
 fn C.getpeername(fd int, addr voidptr, addrlen &u32) int
 
@@ -47,7 +48,7 @@ fn (c Client) send(s string) ! {
 		return
 	}
 	for _ in 0 .. 2000 {
-		n := C.send(c.fd, s.str, usize(s.len), C.MSG_NOSIGNAL)
+		n := C.vanilla_send(c.fd, s.str, u64(s.len), C.MSG_NOSIGNAL)
 		if n == s.len {
 			return
 		}
@@ -67,7 +68,7 @@ fn (mut c Client) until(needle string, ms int) bool {
 		if c.acc.bytestr().contains(needle) {
 			return true
 		}
-		n := C.recv(c.fd, &buf[0], 4096, C.MSG_DONTWAIT)
+		n := C.vanilla_recv(c.fd, &buf[0], 4096, C.MSG_DONTWAIT)
 		if n > 0 {
 			unsafe { c.acc.push_many(&buf[0], n) }
 			continue
@@ -85,7 +86,7 @@ fn (mut c Client) eof(ms int) bool {
 	deadline := time.sys_mono_now() + u64(ms) * 1_000_000
 	mut buf := [4096]u8{}
 	for time.sys_mono_now() < deadline {
-		n := C.recv(c.fd, &buf[0], 4096, C.MSG_DONTWAIT)
+		n := C.vanilla_recv(c.fd, &buf[0], 4096, C.MSG_DONTWAIT)
 		if n > 0 {
 			unsafe { c.acc.push_many(&buf[0], n) }
 			continue

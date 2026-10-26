@@ -40,6 +40,9 @@ import vtest
 #include <netinet/tcp.h>
 #include <signal.h>
 #include <malloc.h>
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_recv(fd int, buf voidptr, n u64, flags int) int
 
 struct C.linger {
 	l_onoff  int
@@ -48,8 +51,8 @@ struct C.linger {
 
 // glibc's malloc statistics: only the fields ts_heap_bytes reads.
 struct C.mallinfo2 {
-	uordblks usize // bytes in chunks in use, over every arena
-	hblkhd   usize // bytes in chunks mmapped on their own
+	uordblks u64 // bytes in chunks in use, over every arena
+	hblkhd   u64 // bytes in chunks mmapped on their own
 }
 
 fn C.signal(sig int, handler voidptr) voidptr
@@ -544,7 +547,7 @@ fn ts_reset_mid_body(port int, n int, mut buf []u8) !int {
 	mut got := 0
 	for got < n {
 		a.wait_for_read(ts_backstop) or { break }
-		k := C.recv(a.handle, buf.data, usize(buf.len), 0) // the socket is non-blocking
+		k := C.vanilla_recv(a.handle, buf.data, u64(buf.len), 0) // the socket is non-blocking
 		if k > 0 {
 			got += int(k)
 		} else if k == 0 || C.errno != C.EAGAIN {

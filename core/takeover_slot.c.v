@@ -14,6 +14,7 @@ module core
 // returns false and the handler must answer an error instead of upgrading.
 
 #include "@VMODROOT/core/takeover_slot.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.vanilla_to_enable()
 fn C.vanilla_to_queue(cont voidptr, state voidptr) bool

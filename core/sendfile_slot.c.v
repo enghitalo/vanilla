@@ -17,6 +17,7 @@ module core
 // ConnHandler.
 
 #include "@VMODROOT/core/sendfile_slot.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.vanilla_sf_enable()
 fn C.vanilla_sf_set_allowed(allowed bool)

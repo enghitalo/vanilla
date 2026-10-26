@@ -28,10 +28,11 @@ import http1_1.response
 #include <errno.h>
 #include <string.h>
 #include <sys/socket.h>
+#include "@VMODROOT/core/libc_shim.h"
 
-fn C.recv(__fd int, __buf voidptr, __n usize, __flags int) int
-fn C.send(__fd int, __buf voidptr, __n usize, __flags int) int
-fn C.memmove(__dest voidptr, __src voidptr, __n usize) voidptr
+fn C.vanilla_recv(__fd int, __buf voidptr, __n u64, __flags int) int
+fn C.vanilla_send(__fd int, __buf voidptr, __n u64, __flags int) int
+fn C.vanilla_memmove(__dest voidptr, __src voidptr, __n u64) voidptr
 
 const pl_stream_body_above = 1024 * 1024
 const pl_read_buf_cap = 8 * 1024
@@ -148,7 +149,7 @@ fn (mut w WorkerState) close_conn_at(i int, active_conns &core.Counter) {
 // reset, which can discard the response's untransmitted tail (RFC 9112 §9.6).
 fn (mut w WorkerState) close_drained(i int, active_conns &core.Counter) {
 	cs := w.conns[i]
-	for C.recv(cs.fd, cs.read_buf.data, usize(cs.read_buf.cap), 0) > 0 {
+	for C.vanilla_recv(cs.fd, cs.read_buf.data, u64(cs.read_buf.cap), 0) > 0 {
 	}
 	w.close_conn_at(i, active_conns)
 }
@@ -174,7 +175,7 @@ fn compact_read_buf(mut cs PollConn, pos int) {
 	}
 	leftover := cs.read_buf.len - pos
 	if leftover > 0 {
-		unsafe { C.memmove(cs.read_buf.data, &u8(cs.read_buf.data) + pos, usize(leftover)) }
+		unsafe { C.vanilla_memmove(cs.read_buf.data, &u8(cs.read_buf.data) + pos, u64(leftover)) }
 	}
 	unsafe {
 		cs.read_buf.len = leftover
@@ -187,8 +188,8 @@ fn compact_read_buf(mut cs PollConn, pos int) {
 //  -1  hard error — caller must close
 fn flush_pending(mut w WorkerState, mut cs PollConn, limits core.Limits) int {
 	for cs.write_off < cs.write_buf.len {
-		n := C.send(cs.fd, unsafe { &u8(cs.write_buf.data) + cs.write_off },
-			usize(cs.write_buf.len - cs.write_off), msg_nosignal)
+		n := C.vanilla_send(cs.fd, unsafe { &u8(cs.write_buf.data) + cs.write_off },
+			u64(cs.write_buf.len - cs.write_off), msg_nosignal)
 		if n > 0 {
 			cs.write_off += n
 			continue
@@ -260,7 +261,7 @@ fn begin_close(mut w WorkerState, mut cs PollConn) {
 fn discard_while_closing(mut w WorkerState, i int, active_conns &core.Counter) bool {
 	mut cs := w.conns[i]
 	for {
-		n := C.recv(cs.fd, cs.read_buf.data, usize(cs.read_buf.cap), 0)
+		n := C.vanilla_recv(cs.fd, cs.read_buf.data, u64(cs.read_buf.cap), 0)
 		if n > 0 {
 			continue
 		}
@@ -420,7 +421,7 @@ fn serve_readable(h core.Handler, mut w WorkerState, i int, limits core.Limits, 
 			} else {
 				cs.read_buf.cap
 			}
-			dn := C.recv(cs.fd, cs.read_buf.data, usize(want), 0)
+			dn := C.vanilla_recv(cs.fd, cs.read_buf.data, u64(want), 0)
 			if dn < 0 {
 				if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
 					break
@@ -466,7 +467,7 @@ fn serve_readable(h core.Handler, mut w WorkerState, i int, limits core.Limits, 
 			}
 		}
 		spare := cs.read_buf.cap - cs.read_buf.len
-		n := C.recv(cs.fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, usize(spare), 0)
+		n := C.vanilla_recv(cs.fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, u64(spare), 0)
 		if n < 0 {
 			if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
 				break

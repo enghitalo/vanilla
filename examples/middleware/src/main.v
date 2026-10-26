@@ -22,6 +22,10 @@ module main
 import server
 import os
 
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
+
 fn main() {
 	// Open the access log once; the pointer is shared across all workers.
 	log := new_access_log('access.log') or {
@@ -57,7 +61,7 @@ fn main() {
 	wake := os.pipe()!
 	on_signal := fn [wake] (_ os.Signal) {
 		saved := C.errno
-		C.write(wake.write_fd, c'x', 1)
+		C.vanilla_write(wake.write_fd, c'x', 1)
 		C.errno = saved
 	}
 	os.signal_opt(.int, on_signal)!

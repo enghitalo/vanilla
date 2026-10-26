@@ -24,8 +24,10 @@ import core
 import transport
 import http1_1.client
 
-fn C.send(fd int, buf voidptr, n usize, flags int) int
-fn C.recv(fd int, buf voidptr, n usize, flags int) int
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_send(fd int, buf voidptr, n u64, flags int) int
+fn C.vanilla_recv(fd int, buf voidptr, n u64, flags int) int
 
 const edge_port = 8095
 
@@ -162,7 +164,7 @@ fn edge_handler(req []u8, mut res []u8, client_fd int, worker_state voidptr, mut
 	mut off := 0
 	for off < st.req_scratch.len {
 		n :=
-			C.send(fd, unsafe { &u8(st.req_scratch.data) + off }, usize(st.req_scratch.len - off), 0)
+			C.vanilla_send(fd, unsafe { &u8(st.req_scratch.data) + off }, u64(st.req_scratch.len - off), 0)
 		if n <= 0 {
 			st.drop_conn(ci) // stale pooled conn (backend restarted) — fail this one
 			core.append_str(mut res, edge_bad_gateway)
@@ -203,8 +205,8 @@ fn on_backend_reply(mut out []u8, ready_fd int, ready_fd_error bool, watch_paylo
 			}
 			unsafe { c.resp_buf.grow_cap(c.resp_buf.cap) }
 		}
-		n := C.recv(ready_fd, unsafe { &u8(c.resp_buf.data) + c.resp_buf.len },
-			usize(c.resp_buf.cap - c.resp_buf.len), 0)
+		n := C.vanilla_recv(ready_fd, unsafe { &u8(c.resp_buf.data) + c.resp_buf.len },
+			u64(c.resp_buf.cap - c.resp_buf.len), 0)
 		if n > 0 {
 			unsafe {
 				c.resp_buf.len += n

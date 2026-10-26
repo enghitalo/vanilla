@@ -42,15 +42,16 @@ import vtest
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
 #include <sys/socket.h>
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.eventfd(initval u32, flags int) int
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
-fn C.read(fd int, buf voidptr, count usize) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
 fn C.close(fd int) int
 fn C.pipe(fds &i32) int
 fn C.setsockopt(fd int, level int, optname int, optval voidptr, optlen u32) int
-fn C.write(fd int, buf voidptr, count usize) int
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
 fn C.shutdown(fd int, how int) int
 
 const ta_backstop = time.Duration(5 * time.second)
@@ -215,7 +216,7 @@ fn ta_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 
 fn ta_park_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8)
+	C.vanilla_read(ready_fd, &tmp[0], 8)
 	C.close(ready_fd) // the request owns it
 	mut s := unsafe { ta }
 	stdatomic.add_i64(&s.resumes, 1)
@@ -225,7 +226,7 @@ fn ta_park_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload v
 
 fn ta_parked_id(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8)
+	C.vanilla_read(ready_fd, &tmp[0], 8)
 	C.close(ready_fd) // the request owns it
 	ta_id_report(mut out, event_loop.conn_id(), -1)
 	return .done
@@ -250,7 +251,7 @@ fn ta_id_report(mut out []u8, id u64, fd int) {
 
 fn ta_wait_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [1]u8{}
-	C.read(ready_fd, &tmp[0], 1)
+	C.vanilla_read(ready_fd, &tmp[0], 1)
 	C.close(ready_fd) // the request owns the read end
 	core.append_str(mut out, ta_waited)
 	return .done
@@ -357,7 +358,7 @@ fn ta_wake(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidpt
 // reads several at once), re-arm (it is periodic).
 fn ta_tick(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut expirations := u64(0)
-	C.read(ready_fd, &expirations, 8)
+	C.vanilla_read(ready_fd, &expirations, 8)
 	mut w := unsafe { &TaWorker(worker_state) }
 	w.ticks += i64(expirations)
 	event_loop.watch_fd(ready_fd, .readable, ta_tick, unsafe { nil })
@@ -543,7 +544,7 @@ fn test_tls_parked_then_pipelined_then_fin() ! {
 		open := ta_active(mut h)
 		mut s := unsafe { ta }
 		one := u8(1)
-		C.write(int(stdatomic.load_i64(&s.wait_w)), &one, 1) // the park ends
+		C.vanilla_write(int(stdatomic.load_i64(&s.wait_w)), &one, 1) // the park ends
 		got := ta_read_until_close(mut c)
 		h.stop()
 		ta_close_wait()
@@ -627,7 +628,7 @@ fn test_tls_expect_100_after_park() ! {
 		time.sleep(50 * time.millisecond) // read while parked
 		mut s := unsafe { ta }
 		one := u8(1)
-		C.write(int(stdatomic.load_i64(&s.wait_w)), &one, 1) // the park ends
+		C.vanilla_write(int(stdatomic.load_i64(&s.wait_w)), &one, 1) // the park ends
 		got := ta_read_n(mut c, ta_waited.len + ta_100.len)
 		c.write_string('hello')!
 		answer := ta_read_n(mut c, ta_up.len)

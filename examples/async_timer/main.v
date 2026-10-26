@@ -23,10 +23,11 @@ import http1_1.response
 #include <sys/timerfd.h>
 #include <time.h>
 #include <unistd.h>
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
-fn C.read(fd int, buf voidptr, count usize) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
 
 const resp_ok = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'
 
@@ -105,7 +106,7 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
 // owns it), append the response, and finish.
 fn timer_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8)
+	C.vanilla_read(ready_fd, &tmp[0], 8)
 	C.close(ready_fd)
 	core.append_str(mut out, resp_delayed)
 	return .done

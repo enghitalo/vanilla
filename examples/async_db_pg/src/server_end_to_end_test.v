@@ -15,9 +15,10 @@ import vtest
 import sync.stdatomic
 
 #include <sys/socket.h>
+#include "@VMODROOT/core/libc_shim.h"
 
-fn C.recv(fd int, buf voidptr, n usize, flags int) int
-fn C.send(fd int, buf voidptr, n usize, flags int) int
+fn C.vanilla_recv(fd int, buf voidptr, n u64, flags int) int
+fn C.vanilla_send(fd int, buf voidptr, n u64, flags int) int
 fn C.close(fd int) int
 
 const db_req = 'GET /db HTTP/1.1\r\nHost: x\r\n\r\n'.bytes()
@@ -242,7 +243,7 @@ fn read_exact(fd int, n int) ?[]u8 {
 	mut buf := []u8{len: n}
 	mut got := 0
 	for got < n {
-		r := C.recv(fd, unsafe { &buf[got] }, usize(n - got), 0)
+		r := C.vanilla_recv(fd, unsafe { &buf[got] }, u64(n - got), 0)
 		if r <= 0 {
 			return none
 		}
@@ -254,7 +255,7 @@ fn read_exact(fd int, n int) ?[]u8 {
 fn send_all(fd int, b []u8) {
 	mut off := 0
 	for off < b.len {
-		n := C.send(fd, unsafe { &b[off] }, usize(b.len - off), C.MSG_NOSIGNAL)
+		n := C.vanilla_send(fd, unsafe { &b[off] }, u64(b.len - off), C.MSG_NOSIGNAL)
 		if n <= 0 {
 			return
 		}
@@ -265,5 +266,5 @@ fn send_all(fd int, b []u8) {
 // peer_closed reports whether the server side closed the connection (EOF).
 fn peer_closed(fd int) bool {
 	mut b := u8(0)
-	return C.recv(fd, &b, 1, C.MSG_PEEK | C.MSG_DONTWAIT) == 0
+	return C.vanilla_recv(fd, &b, 1, C.MSG_PEEK | C.MSG_DONTWAIT) == 0
 }

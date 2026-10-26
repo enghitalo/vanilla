@@ -46,6 +46,10 @@ import epoll
 import tls
 
 #include <sys/epoll.h>
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_recv(fd int, buf voidptr, n u64, flags int) int
+fn C.vanilla_send(fd int, buf voidptr, n u64, flags int) int
 
 // ConnState.tls: how the connection's bytes move. Ordered so that each hot
 // check is one compare: the readable edge and recv/send look for
@@ -85,7 +89,7 @@ fn set_errno(e i32) {
 @[noinline]
 fn tls_recv(mut cs ConnState, fd int, ptr &u8, len int) int {
 	if cs.tls == tls_kernel {
-		n := C.recv(fd, ptr, usize(len), 0)
+		n := C.vanilla_recv(fd, ptr, u64(len), 0)
 		if n < 0 && C.errno == C.EIO {
 			return 0
 		}
@@ -122,7 +126,7 @@ fn tls_recv(mut cs ConnState, fd int, ptr &u8, len int) int {
 fn tls_send(mut cs ConnState, fd int, ptr &u8, len int) int {
 	if cs.tls == tls_kernel {
 		flags := if cs.file_remaining > 0 { C.MSG_NOSIGNAL | C.MSG_MORE } else { C.MSG_NOSIGNAL }
-		return C.send(fd, ptr, usize(len), flags)
+		return C.vanilla_send(fd, ptr, u64(len), flags)
 	}
 	n := if cs.tls_pend > 0 { cs.tls_pend } else { len }
 	r := cs.sess.write_from(ptr, n)
@@ -349,7 +353,7 @@ fn tls_file_chunk(mut cs ConnState) int {
 // kernel, waiting for more, and the close would discard it with the bytes
 // already in it.
 @[noinline]
-fn tls_file_failed(mut cs ConnState, sent isize) int {
+fn tls_file_failed(mut cs ConnState, sent i64) int {
 	if sent < 0 && (C.errno == C.EINVAL || C.errno == C.EOPNOTSUPP || C.errno == C.ENOSYS) {
 		cs.no_sendfile = true
 		return tls_file_chunk(mut cs)

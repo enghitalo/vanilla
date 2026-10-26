@@ -20,10 +20,11 @@ import http1_1.response
 
 #include <sys/timerfd.h>
 #include <unistd.h>
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
-fn C.read(fd int, buf voidptr, count usize) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
 
 const not_found = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
@@ -43,7 +44,7 @@ fn one_shot_timer(ms int) int {
 // stage owns its own timerfd).
 fn drain_close(fd int) {
 	mut tmp := [8]u8{}
-	C.read(fd, &tmp[0], 8)
+	C.vanilla_read(fd, &tmp[0], 8)
 	C.close(fd)
 }
 

@@ -10,9 +10,10 @@ import http1_1.request_parser
 import http1_1.response
 
 #include <unistd.h>
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.pipe(fds &i32) int
-fn C.write(fd int, buf voidptr, n usize) int
+fn C.vanilla_write(fd int, buf voidptr, n u64) int
 
 fn get(target string) []u8 {
 	return 'GET ${target} HTTP/1.1\r\nHost: localhost\r\n\r\n'.bytes()
@@ -117,7 +118,7 @@ fn test_tick_rearms_with_one_step_less() {
 		C.close(int(fds[1]))
 	}
 	expiry := u64(1)
-	written := C.write(int(fds[1]), &expiry, 8)
+	written := C.vanilla_write(int(fds[1]), &expiry, 8)
 	assert written == 8
 	start := now_ms()
 	mut armed := Armed{}
@@ -143,7 +144,7 @@ fn test_tick_frames_the_504_for_any_elapsed_width() {
 		rc := C.pipe(unsafe { &fds[0] })
 		assert rc == 0
 		expiry := u64(1)
-		written := C.write(int(fds[1]), &expiry, 8)
+		written := C.vanilla_write(int(fds[1]), &expiry, 8)
 		assert written == 8
 		mut event_loop := core.EventLoop{
 			register: record_register
@@ -165,7 +166,7 @@ fn test_tick_frames_the_200_when_the_work_is_done() {
 	rc := C.pipe(unsafe { &fds[0] })
 	assert rc == 0
 	expiry := u64(1)
-	written := C.write(int(fds[1]), &expiry, 8)
+	written := C.vanilla_write(int(fds[1]), &expiry, 8)
 	assert written == 8
 	mut event_loop := core.EventLoop{
 		register: record_register
@@ -241,7 +242,7 @@ fn job(req []u8, mut out []u8, mut event_loop core.EventLoop, mut armed Armed) c
 	expiry := u64(1)
 	mut step := core.Step.suspend
 	for step == .suspend {
-		C.write(int(fds[1]), &expiry, 8)
+		C.vanilla_write(int(fds[1]), &expiry, 8)
 		step = tick(mut out, int(fds[0]), false, armed.payload, unsafe { nil }, mut event_loop)
 	}
 	C.close(int(fds[1])) // the last tick closed fds[0]

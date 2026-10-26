@@ -37,8 +37,10 @@ import server
 import socket
 import transport
 
-fn C.send(__fd int, __buf voidptr, __n usize, __flags int) int
-fn C.recv(__fd int, __buf voidptr, __n usize, __flags int) int
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_send(__fd int, __buf voidptr, __n u64, __flags int) int
+fn C.vanilla_recv(__fd int, __buf voidptr, __n u64, __flags int) int
 
 // A send to a peer the server already closed (refused-connect probes, races
 // around shutdown) must report an error, not kill the test binary: Linux
@@ -345,7 +347,7 @@ fn (mut c HConn) write_some() {
 	if c.sent >= r.send.len {
 		return
 	}
-	n := C.send(c.fd, unsafe { &r.send[c.sent] }, usize(r.send.len - c.sent), msg_nosignal)
+	n := C.vanilla_send(c.fd, unsafe { &r.send[c.sent] }, u64(r.send.len - c.sent), msg_nosignal)
 	if n > 0 {
 		c.sent += n
 	}
@@ -357,7 +359,7 @@ fn (mut c HConn) read_burst(mut buf []u8, rev int) {
 		return
 	}
 	for {
-		n := C.recv(c.fd, unsafe { &buf[0] }, usize(buf.len), 0)
+		n := C.vanilla_recv(c.fd, unsafe { &buf[0] }, u64(buf.len), 0)
 		if n > 0 {
 			c.acc << buf[..n]
 			continue

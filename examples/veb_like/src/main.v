@@ -24,6 +24,10 @@ import http1_1.request_parser { HttpRequest }
 import os
 import http1_1.veb_like { Params }
 
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
+
 struct App {}
 
 // ── static routes ──────────────────────────────────────────────────────────
@@ -232,7 +236,7 @@ fn main() {
 	wake := os.pipe()!
 	on_signal := fn [wake] (_ os.Signal) {
 		saved := C.errno
-		C.write(wake.write_fd, c'x', 1)
+		C.vanilla_write(wake.write_fd, c'x', 1)
 		C.errno = saved
 	}
 	os.signal_opt(.term, on_signal)!

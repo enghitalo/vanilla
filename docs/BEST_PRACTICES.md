@@ -150,7 +150,7 @@ response against 4.7 ns for `out << resp` with a `const ... .bytes()`, whose
 bytes are also copied to the heap at startup
 ([V_PERF_TOOLBOX.md](V_PERF_TOOLBOX.md#appending-a-static-response)). Keep
 `.bytes()` for a const used as a `[]u8` value — returned, compared, compressed,
-or passed to `C.send` — and for the library's public `[]u8` consts
+or passed to `C.vanilla_send` — and for the library's public `[]u8` consts
 (`out << response.status_413_response`).
 
 ### 3b. Dynamic responses → append parts straight into `out`

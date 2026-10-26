@@ -8,6 +8,9 @@ import os
 import time
 
 #include <linux/io_uring.h>
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
 
 struct C.io_uring_sqe {
 	opcode        u8
@@ -146,9 +149,9 @@ fn test_abi_constants_match_the_kernel_header() {
 	assert ioring_op_send == u8(C.IORING_OP_SEND)
 	assert ioring_op_recv == u8(C.IORING_OP_RECV)
 	assert ioring_accept_multishot == u16(C.IORING_ACCEPT_MULTISHOT)
-	assert ioring_off_sq_ring == isize(C.IORING_OFF_SQ_RING)
-	assert ioring_off_cq_ring == isize(C.IORING_OFF_CQ_RING)
-	assert ioring_off_sqes == isize(C.IORING_OFF_SQES)
+	assert ioring_off_sq_ring == i64(C.IORING_OFF_SQ_RING)
+	assert ioring_off_cq_ring == i64(C.IORING_OFF_CQ_RING)
+	assert ioring_off_sqes == i64(C.IORING_OFF_SQES)
 	assert ioring_feat_single_mmap == u32(C.IORING_FEAT_SINGLE_MMAP)
 	assert ioring_feat_ext_arg == u32(C.IORING_FEAT_EXT_ARG)
 	assert ioring_enter_getevents == u32(C.IORING_ENTER_GETEVENTS)
@@ -239,11 +242,11 @@ fn test_poll_completes_only_once_the_fd_is_ready() {
 		assert submit(&r) == 1
 		mut cqes := unsafe { [2]&Cqe{} }
 		assert peek_batch_cqe(&r, &cqes[0], 2) == 0
-		assert C.write(p.write_fd, c'x', 1) == 1
+		assert C.vanilla_write(p.write_fd, c'x', 1) == 1
 		assert submit_and_wait(&r, 1) >= 0
 		n := peek_batch_cqe(&r, &cqes[0], 2)
 		assert n == 1
-		assert cqes[0].user_data == encode_user_data(op_poll, voidptr(usize(p.read_fd)))
+		assert cqes[0].user_data == encode_user_data(op_poll, voidptr(u64(p.read_fd)))
 		assert decode_ext_fd(cqes[0].user_data) == p.read_fd
 		assert u32(cqes[0].res) & pollin != 0
 		cq_advance(&r, n)

@@ -49,22 +49,23 @@ import vtest
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
 fn C.eventfd(initval u32, flags int) int
-fn C.read(fd int, buf voidptr, count usize) int
-fn C.write(fd int, buf voidptr, count usize) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
 fn C.close(fd int) int
 fn C.fcntl(fd int, cmd int, arg int) int
 fn C.socket(domain int, typ int, protocol int) int
 fn C.connect(fd int, addr voidptr, len u32) int
-fn C.send(fd int, buf voidptr, n usize, flags int) int
-fn C.recv(fd int, buf voidptr, n usize, flags int) int
+fn C.vanilla_send(fd int, buf voidptr, n u64, flags int) int
+fn C.vanilla_recv(fd int, buf voidptr, n u64, flags int) int
 fn C.setsockopt(fd int, level int, opt int, val voidptr, len u32) int
 fn C.shutdown(fd int, how int) int
 fn C.bind(fd int, addr voidptr, len u32) int
-fn C.sendto(fd int, buf voidptr, n usize, flags int, addr voidptr, len u32) int
+fn C.vanilla_sendto(fd int, buf voidptr, n u64, flags int, addr voidptr, len u32) int
 fn C.clock() i64 // this process's CPU time, in CLOCKS_PER_SEC (1e6 on POSIX) units
 
 const ok_resp = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'
@@ -184,14 +185,14 @@ fn one_shot_timer(ms int) int {
 
 fn drain(fd int) {
 	mut tmp := [8]u8{}
-	C.read(fd, &tmp[0], 8)
+	C.vanilla_read(fd, &tmp[0], 8)
 }
 
 fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	if req.len > 9 && req[5] == `s` { // GET /step
 		b := C.eventfd(1, C.EFD_NONBLOCK | C.EFD_CLOEXEC) // readable at once: the next step
 		a := one_shot_timer(1) // this step
-		event_loop.watch_fd(a, .readable, after_a, unsafe { voidptr(isize(b)) })
+		event_loop.watch_fd(a, .readable, after_a, unsafe { voidptr(i64(b)) })
 		return .suspend
 	}
 	if req.len > 9 && req[5] == `d` { // GET /deadline
@@ -216,14 +217,14 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
 		} else {
 			core.WakeFn(close_and_step)
 		}
-		event_loop.watch_fd_persistent(shared, .readable, cont, unsafe { voidptr(isize(next)) })
+		event_loop.watch_fd_persistent(shared, .readable, cont, unsafe { voidptr(i64(next)) })
 		stdatomic.store_i64(&p.parks, parks + 1)
 		return .suspend
 	}
 	if req.len > 9 && req[5] == `u` { // GET /udp: watch the test's UDP socket, keep it, step away
 		next := C.eventfd(1, C.EFD_NONBLOCK | C.EFD_CLOEXEC)
 		event_loop.watch_fd(int(stdatomic.load_i64(&rp.shared_fd)), .readable, keep_and_step,
-			unsafe { voidptr(isize(next)) })
+			unsafe { voidptr(i64(next)) })
 		return .suspend
 	}
 	core.append_str(mut out, ok_resp)
@@ -242,7 +243,7 @@ fn after_a(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidpt
 		stdatomic.store_i64(&p.keep, ready_fd)
 	}
 	choreograph(ready_fd, event_loop.loop_fd)
-	event_loop.watch_fd(int(isize(watch_payload)), .readable, after_b, unsafe { nil })
+	event_loop.watch_fd(int(i64(watch_payload)), .readable, after_b, unsafe { nil })
 	return .suspend
 }
 
@@ -275,7 +276,7 @@ fn on_deadline(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload vo
 // second request, whose continuation then runs off the same edge
 // (drain_pipelined).
 fn pipe_head(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
-	event_loop.watch_fd(int(isize(watch_payload)), .readable, after_b, unsafe { nil })
+	event_loop.watch_fd(int(i64(watch_payload)), .readable, after_b, unsafe { nil })
 	return .suspend
 }
 
@@ -286,7 +287,7 @@ fn pipe_head(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload void
 fn close_and_step(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	C.close(ready_fd)
 	choreograph(ready_fd, event_loop.loop_fd)
-	event_loop.watch_fd(int(isize(watch_payload)), .readable, after_b, unsafe { nil })
+	event_loop.watch_fd(int(i64(watch_payload)), .readable, after_b, unsafe { nil })
 	return .suspend
 }
 
@@ -295,7 +296,7 @@ fn close_and_step(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload
 fn keep_and_step(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut p := unsafe { rp }
 	stdatomic.store_i64(&p.loop_fd, event_loop.loop_fd)
-	event_loop.watch_fd(int(isize(watch_payload)), .readable, after_b, unsafe { nil })
+	event_loop.watch_fd(int(i64(watch_payload)), .readable, after_b, unsafe { nil })
 	return .suspend
 }
 
@@ -308,14 +309,14 @@ fn bg_start(worker_state voidptr, mut event_loop core.EventLoop) {
 	a := C.eventfd(0, C.EFD_NONBLOCK | C.EFD_CLOEXEC)
 	mut p := unsafe { rp }
 	stdatomic.store_i64(&p.shared_fd, a)
-	event_loop.watch_fd(a, .readable, bg_after_a, unsafe { voidptr(isize(b)) })
+	event_loop.watch_fd(a, .readable, bg_after_a, unsafe { voidptr(i64(b)) })
 }
 
 fn bg_after_a(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	drain(ready_fd)
 	C.close(ready_fd)
 	choreograph(ready_fd, event_loop.loop_fd)
-	event_loop.watch_fd(int(isize(watch_payload)), .readable, bg_after_b, unsafe { nil })
+	event_loop.watch_fd(int(i64(watch_payload)), .readable, bg_after_b, unsafe { nil })
 	return .suspend
 }
 
@@ -361,7 +362,7 @@ fn tcp_connect(fd int, port int) {
 }
 
 fn send_str(fd int, s string) {
-	C.send(fd, s.str, usize(s.len), 0)
+	C.vanilla_send(fd, s.str, u64(s.len), 0)
 }
 
 // read_until reads until `want` bytes arrived, the peer closes, or 3 s pass.
@@ -372,7 +373,7 @@ fn read_until(fd int, want int) string {
 	// stop-the-world ones): retry on EINTR, up to the overall 3 s.
 	deadline := time.sys_mono_now() + 3_000_000_000
 	for got < want && time.sys_mono_now() < deadline {
-		n := C.recv(fd, unsafe { &buf[got] }, usize(buf.len - got), 0)
+		n := C.vanilla_recv(fd, unsafe { &buf[got] }, u64(buf.len - got), 0)
 		if n < 0 && C.errno == C.EINTR {
 			continue
 		}
@@ -389,7 +390,7 @@ fn wait_eof(fd int) bool {
 	mut b := [1]u8{}
 	deadline := time.sys_mono_now() + 3_000_000_000
 	for time.sys_mono_now() < deadline {
-		n := C.recv(fd, &b[0], 1, 0)
+		n := C.vanilla_recv(fd, &b[0], 1, 0)
 		if n == 0 {
 			return true
 		}
@@ -547,7 +548,7 @@ fn test_epoll_background_continuation_closing_its_fd() {
 		close_all(socks)
 	}
 	one := u64(1)
-	C.write(int(stdatomic.load_i64(&rp.shared_fd)), &one, 8) // the background watch fires
+	C.vanilla_write(int(stdatomic.load_i64(&rp.shared_fd)), &one, 8) // the background watch fires
 	assert wait_go(), 'the background continuation never ran'
 	clients := connect_until_reused(h.port(), socks)
 	time.sleep(100 * time.millisecond) // the continuation returns at once; let the worker loop go round
@@ -585,7 +586,7 @@ fn test_epoll_last_queued_continuation_closing_its_fd() {
 	send_str(cb, 'GET /pipe HTTP/1.1\r\nHost: x\r\n\r\n')
 	assert wait_for(&rp.parks, 2), 'the second request did not park'
 	one := u64(1)
-	C.write(int(stdatomic.load_i64(&rp.shared_fd)), &one, 8) // the shared fd is ready
+	C.vanilla_write(int(stdatomic.load_i64(&rp.shared_fd)), &one, 8) // the shared fd is ready
 	assert wait_go(), 'the second continuation never ran'
 	clients := connect_until_reused(h.port(), socks)
 	ra := read_until(ca, stepped_resp.len)
@@ -625,7 +626,7 @@ fn test_epoll_tombstone_continuation_closing_its_fd() {
 	C.shutdown(ca, C.SHUT_WR)
 	assert wait_eof(ca), 'the server did not close the connection of a client that left'
 	one := u64(1)
-	C.write(int(stdatomic.load_i64(&rp.shared_fd)), &one, 8) // the tombstone's reply is due
+	C.vanilla_write(int(stdatomic.load_i64(&rp.shared_fd)), &one, 8) // the tombstone's reply is due
 	assert wait_go(), 'the tombstone continuation never ran'
 	clients := connect_until_reused(h.port(), socks)
 	time.sleep(100 * time.millisecond) // no client answers this run; let the worker loop go round
@@ -656,7 +657,7 @@ fn udp_on_loopback(port int) (int, int) {
 		return -1, -1
 	}
 	peer := C.socket(C.AF_INET, C.SOCK_DGRAM | C.SOCK_CLOEXEC, 0)
-	C.sendto(peer, c'x', 1, 0, voidptr(&a[0]), 16)
+	C.vanilla_sendto(peer, c'x', 1, 0, voidptr(&a[0]), 16)
 	return fd, peer
 }
 

@@ -23,9 +23,10 @@ import http1_1.response
 #include <unistd.h>
 #flag @VMODROOT/examples/async_incremental_read/producer.c
 #include "@VMODROOT/examples/async_incremental_read/producer.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.spawn_producer(sh_path &char, script &char) int
-fn C.read(fd int, buf voidptr, count usize) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
 
 // producer is the child's shell loop: five lines, 200 ms apart.
 const producer = c'for i in 1 2 3 4 5; do echo "line $i"; sleep 0.2; done'
@@ -118,7 +119,7 @@ fn on_chunk(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidp
 		out.grow_cap(size_line_max + read_max + 2)
 	}
 	data := unsafe { &u8(out.data) + out.len + size_line_max }
-	n := C.read(ready_fd, data, read_max)
+	n := C.vanilla_read(ready_fd, data, read_max)
 	if n > 0 {
 		// HTTP chunk = <hex length>\r\n<bytes>\r\n. The capacity is reserved:
 		// the appends below never move out.data.

@@ -37,10 +37,11 @@ import vtest
 
 #include <sys/socket.h>
 #include <unistd.h>
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
-fn C.read(fd int, buf voidptr, count usize) int
-fn C.write(fd int, buf voidptr, count usize) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
 fn C.close(fd int) int
 
 const or_ok = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok'
@@ -53,11 +54,11 @@ const or_get = 'GET / HTTP/1.1\r\nHost: x\r\n\r\n'
 
 // or_step in a watch_payload: once its reply is read, the run steps to the
 // second pooled connection (up0) instead of answering.
-const or_step = usize(1)
+const or_step = u64(1)
 
 // or_move in a watch_payload: on timeout, the run moves the request to the
 // second pooled connection (it waits there) instead of answering 504.
-const or_move = usize(2)
+const or_move = u64(2)
 
 // OrState holds the pooled fds the requests park on and what each
 // continuation run saw. The handlers run on the worker thread, the checks on
@@ -199,21 +200,21 @@ fn or_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 fn or_reply(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	or_record(event_loop.reason(), event_loop.timed_out())
 	if event_loop.timed_out() {
-		if usize(watch_payload) == or_move {
+		if u64(watch_payload) == or_move {
 			s := unsafe { ors }
 			event_loop.watch_fd_persistent(int(or_load(&s.up0)), .readable, or_second,
-				voidptr(usize(1)))
+				voidptr(u64(1)))
 			return .suspend
 		}
 		core.append_str(mut out, or_504)
 		return .done
 	}
 	mut b := [1]u8{}
-	if C.read(ready_fd, &b[0], 1) != 1 {
+	if C.vanilla_read(ready_fd, &b[0], 1) != 1 {
 		core.append_str(mut out, 'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n')
 		return .done
 	}
-	if usize(watch_payload) == or_step {
+	if u64(watch_payload) == or_step {
 		s := unsafe { ors }
 		event_loop.watch_fd_persistent(int(or_load(&s.up0)), .readable, or_second, unsafe { nil })
 		return .suspend
@@ -230,9 +231,9 @@ fn or_reply(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidp
 fn or_second(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	or_record(event_loop.reason(), event_loop.timed_out())
 	mut b := [1]u8{}
-	C.read(ready_fd, &b[0], 1)
+	C.vanilla_read(ready_fd, &b[0], 1)
 	if watch_payload == unsafe { nil } {
-		event_loop.watch_fd_persistent(ready_fd, .readable, or_second, voidptr(usize(1)))
+		event_loop.watch_fd_persistent(ready_fd, .readable, or_second, voidptr(u64(1)))
 		return .suspend
 	}
 	core.append_str(mut out, or_ok_head)
@@ -284,7 +285,7 @@ fn or_until(counter &i64, want i64) i64 {
 }
 
 fn or_write(p &i64, s string) {
-	C.write(int(or_load(p)), s.str, usize(s.len))
+	C.vanilla_write(int(or_load(p)), s.str, u64(s.len))
 }
 
 // --- the issue's repro ----------------------------------------------------------
@@ -330,7 +331,7 @@ fn test_epoll_run_of_a_client_that_left_is_orphaned() ! {
 	// and it consumed the reply rather than leave it for the next request.
 	assert or_round_trip(barrier), 'the barrier was not served after the orphaned run'
 	mut b := [1]u8{}
-	assert C.read(int(or_load(&s.db0)), &b[0], 1) < 0, 'the reply was left on the pooled fd'
+	assert C.vanilla_read(int(or_load(&s.db0)), &b[0], 1) < 0, 'the reply was left on the pooled fd'
 	assert or_load(&s.runs) == 2
 }
 
@@ -365,7 +366,7 @@ fn test_epoll_drain_after_a_timed_out_park_is_orphaned() ! {
 	assert testkit.fd_read_until(fd, '\r\n\r\n', 200) == '', 'the drain answered the client a second time'
 	assert or_round_trip(fd), 'the client was not served after the drain'
 	mut b := [1]u8{}
-	assert C.read(int(or_load(&s.db0)), &b[0], 1) < 0, 'the late reply was left on the pooled fd'
+	assert C.vanilla_read(int(or_load(&s.db0)), &b[0], 1) < 0, 'the late reply was left on the pooled fd'
 }
 
 // A timeout run that moves the request to another fd (it waits on the second

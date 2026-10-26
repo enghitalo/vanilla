@@ -17,6 +17,11 @@ module backend_epoll
 import core
 import sync.stdatomic
 
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
+
 // push_default_watermark bounds what a pushed connection may have pending
 // (ServerConfig.push_watermark_bytes, 0 = this): a wake fn that leaves more
 // unsent closes it. A subscriber that stops reading would otherwise grow its
@@ -95,7 +100,7 @@ fn subscribe_conn(mut el core.EventLoop, wake_fn core.WakeFn, sub_state voidptr)
 			epoch: st.stamp_of(fd)
 		}
 		one := u64(1)
-		C.write(st.mbox.wake_fd, &one, 8)
+		C.vanilla_write(st.mbox.wake_fd, &one, 8)
 	}
 	cs.wake_fn = wake_fn
 	cs.sub_state = sub_state
@@ -208,7 +213,7 @@ fn drain_mailbox(mut reactor Reactor, epoll_fd int, limits core.Limits, counter 
 // the connections that subscribed since (subscribe_conn wrote it).
 fn on_mailbox_wake(mut reactor Reactor, epoll_fd int, limits core.Limits, counter &core.Counter, active_conns &core.Counter, mut st PlainState, state voidptr) {
 	mut n := u64(0)
-	C.read(st.mbox.wake_fd, &n, 8)
+	C.vanilla_read(st.mbox.wake_fd, &n, 8)
 	if st.shutdown_seen {
 		if st.late_shutdown.len > 0 {
 			deliver_late_shutdown(mut reactor, epoll_fd, limits, counter, active_conns, mut

@@ -140,7 +140,7 @@ fn handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut even
 	// The persistent watch keeps the socket open and still runs on_db_ready when
 	// the reply arrives (its response is discarded), which drains the reply and
 	// releases the slot. The slot index rides in watch_payload.
-	event_loop.watch_fd_persistent(st.pool.fd(idx), .readable, on_db_ready, voidptr(usize(idx)))
+	event_loop.watch_fd_persistent(st.pool.fd(idx), .readable, on_db_ready, voidptr(u64(idx)))
 	return .suspend
 }
 
@@ -149,7 +149,7 @@ fn handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut even
 // Every path that does not re-arm releases the slot.
 fn on_db_ready(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut st := unsafe { &DbState(worker_state) }
-	idx := int(usize(watch_payload))
+	idx := int(u64(watch_payload))
 	mut conn := st.pool.conn(idx)
 	poll := conn.async_on_readable() or {
 		st.pool.release(idx)

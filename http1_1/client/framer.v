@@ -347,7 +347,7 @@ pub fn (mut f Framer) body_in_place(mut buf []u8) []u8 {
 				break // framed already: the last chunk
 			}
 			if w != data {
-				unsafe { vmemmove(&u8(buf.data) + w, &u8(buf.data) + data, isize(size)) }
+				unsafe { vmemmove(&u8(buf.data) + w, &u8(buf.data) + data, int(size)) }
 			}
 			w += int(size)
 			pos = data + int(size) + 2 // past the data and its CRLF

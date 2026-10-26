@@ -35,6 +35,10 @@ import sync.stdatomic
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_memmove(dest voidptr, src voidptr, n u64) voidptr
+fn C.vanilla_recv(fd int, buf voidptr, n u64, flags int) int
 
 fn C.fcntl(fd int, cmd int, arg int) int
 fn C.getpid() int
@@ -632,7 +636,7 @@ fn handle_readable(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, kn
 			return
 		}
 		mut probe := [1]u8{}
-		if C.recv(fd, &probe[0], 1, C.MSG_PEEK) == 0 {
+		if C.vanilla_recv(fd, &probe[0], 1, C.MSG_PEEK) == 0 {
 			close_client(mut reactor, epoll_fd, fd, active_conns, mut st)
 		}
 		return
@@ -805,7 +809,7 @@ fn serve_conn(h core.Handler, mut reactor Reactor, epoll_fd int, fd int, limits 
 		}
 		spare := cs.read_buf.cap - cs.read_buf.len
 		n := if plain {
-			C.recv(fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, usize(spare), 0)
+			C.vanilla_recv(fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, u64(spare), 0)
 		} else {
 			tls_recv(mut cs, fd, unsafe { &u8(cs.read_buf.data) + cs.read_buf.len }, spare)
 		}
@@ -1384,7 +1388,7 @@ fn compact_read_buf(mut cs ConnState, pos int) {
 	}
 	leftover := cs.read_buf.len - pos
 	if leftover > 0 {
-		unsafe { C.memmove(cs.read_buf.data, &u8(cs.read_buf.data) + pos, usize(leftover)) }
+		unsafe { C.vanilla_memmove(cs.read_buf.data, &u8(cs.read_buf.data) + pos, u64(leftover)) }
 	}
 	unsafe {
 		cs.read_buf.len = leftover

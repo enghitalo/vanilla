@@ -7,11 +7,12 @@ module core
 
 #include <unistd.h>
 #include "@VMODROOT/core/regular_file_nix.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 // pread(2) reads at an explicit offset and leaves the fd's own position alone,
 // so one shared fd is safe to read from many threads at once (the property
 // sendfile(2) with an explicit offset has too).
-fn C.pread(fd int, buf voidptr, count usize, offset i64) isize
+fn C.vanilla_pread(fd int, buf voidptr, count u64, offset i64) i64
 
 fn C.vanilla_regular_file_size(fd int) i64
 
@@ -38,7 +39,7 @@ pub fn append_file_region(mut buf []u8, file_fd int, off i64, length i64) i64 {
 	unsafe { buf.grow_len(int(length)) }
 	mut got := i64(0)
 	for got < length {
-		n := C.pread(file_fd, unsafe { &u8(buf.data) + start + int(got) }, usize(length - got),
+		n := C.vanilla_pread(file_fd, unsafe { &u8(buf.data) + start + int(got) }, u64(length - got),
 			off + got)
 		if n <= 0 {
 			break // EOF (the file shrank) or a read error: keep what was read

@@ -15,6 +15,7 @@ import time
 #include <sched.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
+#include "@VMODROOT/core/libc_shim.h"
 
 struct C.rlimit {
 mut:
@@ -27,12 +28,12 @@ fn C.perror(s &char)
 fn C.sleep(seconds u32) u32
 fn C.close(fd int) int
 fn C.shutdown(sockfd int, how int) int
-fn C.recv(__fd int, __buf voidptr, __n usize, __flags int) int
-fn C.memmove(dest voidptr, src voidptr, n usize) voidptr
+fn C.vanilla_recv(__fd int, __buf voidptr, __n u64, __flags int) int
+fn C.vanilla_memmove(dest voidptr, src voidptr, n u64) voidptr
 // mask is a cpu_set_t* in <sched.h>; we hand it a raw u64 word array, so keep
 // the binding untyped rather than model cpu_set_t (whose header typedef would
 // clash with any V-side struct declaration).
-fn C.sched_setaffinity(pid int, cpusetsize usize, mask voidptr) int
+fn C.sched_setaffinity(pid int, cpusetsize u64, mask voidptr) int
 
 // iou_backend_available reports whether the io_uring backend can actually run in
 // THIS process (kernel supports io_uring_setup AND it is not blocked by a
@@ -91,7 +92,7 @@ fn iou_release(worker &io_uring.Worker, mut conn io_uring.Connection, active_con
 @[noinline]
 fn iou_release_closing(worker &io_uring.Worker, mut conn io_uring.Connection, active_conns &core.Counter, track bool) {
 	if conn.read_buf.cap > 0 {
-		for C.recv(conn.fd, conn.read_buf.data, usize(conn.read_buf.cap), C.MSG_DONTWAIT) > 0 {
+		for C.vanilla_recv(conn.fd, conn.read_buf.data, u64(conn.read_buf.cap), C.MSG_DONTWAIT) > 0 {
 		}
 	}
 	iou_release(worker, mut conn, active_conns, track)
@@ -134,7 +135,7 @@ fn iou_arm_recv(worker &io_uring.Worker, mut conn io_uring.Connection, limits Li
 // write_timeout_ms > 0, so the default path pays nothing. Returns false if the SQ
 // is full.
 @[inline]
-fn iou_arm_send(worker &io_uring.Worker, mut conn io_uring.Connection, data &u8, data_len usize, limits Limits) bool {
+fn iou_arm_send(worker &io_uring.Worker, mut conn io_uring.Connection, data &u8, data_len u64, limits Limits) bool {
 	if limits.write_timeout_ms > 0 && conn.write_deadline == 0 {
 		conn.write_deadline = time.sys_mono_now() + u64(limits.write_timeout_ms) * 1_000_000
 	}
@@ -151,7 +152,7 @@ fn iou_arm_drain_recv(worker &io_uring.Worker, mut conn io_uring.Connection, lim
 	if limits.read_timeout_ms > 0 && conn.read_deadline == 0 {
 		conn.read_deadline = time.sys_mono_now() + u64(limits.read_timeout_ms) * 1_000_000
 	}
-	return io_uring.prepare_recv_n(&worker.ring, mut conn, usize(conn.body_drain))
+	return io_uring.prepare_recv_n(&worker.ring, mut conn, u64(conn.body_drain))
 }
 
 // iou_flush_response arms the batched send for everything still pending in
@@ -172,7 +173,7 @@ fn iou_flush_response(worker &io_uring.Worker, mut conn io_uring.Connection, lim
 	} else {
 		unsafe { &u8(conn.response_buffer.data) + conn.bytes_sent }
 	}
-	posted := iou_arm_send(worker, mut conn, ptr, usize(total - conn.bytes_sent), limits)
+	posted := iou_arm_send(worker, mut conn, ptr, u64(total - conn.bytes_sent), limits)
 	// Count the in-flight response ONLY once the send is actually queued. If the SQ
 	// is full (posted == false) no send CQE will ever arrive, so a pre-increment
 	// would leak into worker.inflight and make Server.shutdown() wait out its whole
@@ -197,7 +198,7 @@ fn maybe_pin_worker(cpu int) {
 	}
 	mut set := [16]u64{} // CPU_SETSIZE/64 words → up to 1024 CPUs
 	set[cpu / 64] |= u64(1) << u32(cpu % 64)
-	C.sched_setaffinity(0, usize(sizeof(set)), voidptr(&set[0]))
+	C.sched_setaffinity(0, u64(sizeof(set)), voidptr(&set[0]))
 }
 
 // --- io_uring CQE handlers -------------------------------------------------
@@ -484,7 +485,7 @@ fn handle_io_uring_write(worker &io_uring.Worker, cqe &io_uring.Cqe, mut env Iou
 		} else {
 			unsafe { &u8(conn.response_buffer.data) + conn.bytes_sent }
 		}
-		iou_arm_send(worker, mut *conn, ptr, usize(pending_total - conn.bytes_sent), limits)
+		iou_arm_send(worker, mut *conn, ptr, u64(pending_total - conn.bytes_sent), limits)
 		return
 	}
 	// Whole response sent — the write is no longer outstanding; release the drain

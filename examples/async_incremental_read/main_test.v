@@ -12,9 +12,12 @@ import http1_1.response
 
 #include <fcntl.h>
 #include <sys/resource.h>
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
 
 fn C.pipe(fds &i32) int
-fn C.write(fd int, buf voidptr, n usize) int
+fn C.vanilla_write(fd int, buf voidptr, n u64) int
 fn C.fcntl(fd int, cmd int, arg int) int
 
 struct C.rlimit {
@@ -204,7 +207,7 @@ fn test_producer_starts_with_default_sigpipe_and_sigchld() ! {
 	mut got := []u8{}
 	mut buf := [256]u8{}
 	for {
-		n := C.read(fd, &buf[0], buf.len)
+		n := C.vanilla_read(fd, &buf[0], buf.len)
 		if n <= 0 {
 			break
 		}
@@ -238,7 +241,7 @@ fn test_on_chunk_frames_what_the_pipe_holds() {
 	mut out := []u8{}
 	out << `>`
 	line := 'line 1\n'
-	assert C.write(wfd, line.str, usize(line.len)) == line.len
+	assert C.vanilla_write(wfd, line.str, u64(line.len)) == line.len
 	step := on_chunk(mut out, rfd, false, unsafe { nil }, unsafe { nil }, mut event_loop)
 	assert step == .suspend
 	assert event_loop.last_watched == rfd
@@ -247,7 +250,7 @@ fn test_on_chunk_frames_what_the_pipe_holds() {
 	for i in 0 .. big.len {
 		big[i] = u8(`a` + i % 26)
 	}
-	assert C.write(wfd, big.data, usize(big.len)) == big.len
+	assert C.vanilla_write(wfd, big.data, u64(big.len)) == big.len
 	on_chunk(mut out, rfd, false, unsafe { nil }, unsafe { nil }, mut event_loop)
 	on_chunk(mut out, rfd, false, unsafe { nil }, unsafe { nil }, mut event_loop)
 	want := '>7\r\nline 1\n\r\n' + '1000\r\n' + big[..4096].bytestr() + '\r\n' + '388\r\n' +

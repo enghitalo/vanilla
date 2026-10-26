@@ -6,10 +6,11 @@ import transport
 
 #include <sys/timerfd.h>
 #include <time.h>
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
-fn C.read(fd int, buf voidptr, count usize) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
 
 // start_maintenance drives maintain() from a one-shot timerfd on this worker's
 // event loop, and, for a pool following a Resolver, watches the resolver's
@@ -70,7 +71,7 @@ fn (mut p Pool) arm(ms int) {
 fn maintenance_tick(mut _ []u8, ready_fd int, _ bool, watch_payload voidptr, _ voidptr, mut el core.EventLoop) core.Step {
 	mut p := unsafe { &Pool(watch_payload) }
 	mut expirations := u64(0)
-	C.read(ready_fd, &expirations, 8)
+	C.vanilla_read(ready_fd, &expirations, 8)
 	if p.closed {
 		p.timer_fd = -1
 		return .done

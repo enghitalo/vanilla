@@ -44,6 +44,8 @@ import time
 import transport
 import vtest
 
+#include "@VMODROOT/core/libc_shim.h"
+
 $if linux {
 	#include <sys/timerfd.h>
 	#include <sys/socket.h>
@@ -63,15 +65,15 @@ fn C.setrlimit(resource int, rlim &C.rlimit) int
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
-fn C.read(fd int, buf voidptr, count usize) int
-fn C.write(fd int, buf voidptr, count usize) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
 fn C.close(fd int) int
 fn C.socketpair(domain int, typ int, protocol int, sv &i32) int
 fn C.fcntl(fd int, cmd int, arg int) int
 fn C.getpid() int
 fn C.clock() i64 // this process's CPU time, in CLOCKS_PER_SEC (1e6 on POSIX) units
-fn C.send(__fd int, __buf voidptr, __n usize, __flags int) int
-fn C.recv(__fd int, __buf voidptr, __n usize, __flags int) int
+fn C.vanilla_send(__fd int, __buf voidptr, __n u64, __flags int) int
+fn C.vanilla_recv(__fd int, __buf voidptr, __n u64, __flags int) int
 
 // et_fd_room makes fd number `n` usable: it raises the RLIMIT_NOFILE soft
 // limit past `n`, up to the hard limit. false when the hard limit is too low
@@ -245,7 +247,7 @@ fn et_dial(path string, req []u8) !int {
 fn et_write_all(fd int, b []u8) {
 	mut off := 0
 	for off < b.len {
-		n := C.send(fd, unsafe { &b[off] }, usize(b.len - off), C.MSG_NOSIGNAL)
+		n := C.vanilla_send(fd, unsafe { &b[off] }, u64(b.len - off), C.MSG_NOSIGNAL)
 		if n <= 0 {
 			return
 		}
@@ -268,7 +270,7 @@ fn et_read_response(fd int) []u8 {
 				return acc[..head + 4 + cl]
 			}
 		}
-		n := C.recv(fd, &buf[0], usize(buf.len), 0)
+		n := C.vanilla_recv(fd, &buf[0], u64(buf.len), 0)
 		if n <= 0 {
 			return acc
 		}
@@ -453,7 +455,7 @@ fn et_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 	if et_has_prefix(req, et_stream_prefix) {
 		out << et_stream_head
 		event_loop.watch_fd(et_timerfd(et_tick_ms, et_tick_ms), .readable, et_stream_tick,
-			voidptr(usize(0)))
+			voidptr(u64(0)))
 		return .suspend
 	}
 	if et_has_prefix(req, et_lines_prefix) {
@@ -507,8 +509,8 @@ fn et_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 			return .close // no response: the test fails on the missing frame
 		}
 		reply := [u8(`x`)]!
-		C.write(int(sv[1]), &reply[0], 1) // the upstream's reply, ready at once
-		pair := voidptr(usize(u32(sv[0])) | (usize(u32(sv[1])) << 32))
+		C.vanilla_write(int(sv[1]), &reply[0], 1) // the upstream's reply, ready at once
+		pair := voidptr(u64(u32(sv[0])) | (u64(u32(sv[1])) << 32))
 		event_loop.watch_fd(int(sv[0]), .readable, et_pool_done, pair)
 		return .suspend
 	}
@@ -518,7 +520,7 @@ fn et_handler(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut e
 			return .close // no response: the test fails on the missing frame
 		}
 		// Both ends ride in the payload: low 32 bits, high 32 bits.
-		pair := voidptr(usize(u32(sv[0])) | (usize(u32(sv[1])) << 32))
+		pair := voidptr(u64(u32(sv[0])) | (u64(u32(sv[1])) << 32))
 		event_loop.watch_fd(int(sv[0]), .writable, et_sock_step, pair)
 		return .suspend
 	}
@@ -532,15 +534,15 @@ fn et_choreo_handler(req []u8, mut out []u8, mut event_loop core.EventLoop) core
 		// A blocking read on a timerfd holds the worker (lower bound only).
 		tfd := et_timerfd(1000, 0)
 		mut tmp := [8]u8{}
-		C.read(tfd, &tmp[0], 8)
+		C.vanilla_read(tfd, &tmp[0], 8)
 		C.close(tfd)
 		mut sv := [2]i32{}
 		if C.socketpair(C.AF_UNIX, C.SOCK_STREAM, 0, &sv[0]) != 0 {
 			return .close
 		}
 		one := [u8(`x`)]!
-		C.write(int(sv[1]), &one[0], 1)
-		pair := voidptr(usize(u32(sv[0])) | (usize(u32(sv[1])) << 32))
+		C.vanilla_write(int(sv[1]), &one[0], 1)
+		pair := voidptr(u64(u32(sv[0])) | (u64(u32(sv[1])) << 32))
 		event_loop.watch_fd(int(sv[0]), .readable, et_block408_done, pair)
 		return .suspend
 	}
@@ -687,7 +689,7 @@ fn et_choreo_handler(req []u8, mut out []u8, mut event_loop core.EventLoop) core
 		if C.socketpair(C.AF_UNIX, C.SOCK_STREAM, 0, &sv[0]) != 0 {
 			return .close
 		}
-		pair := voidptr(usize(u32(sv[0])) | (usize(u32(sv[1])) << 32))
+		pair := voidptr(u64(u32(sv[0])) | (u64(u32(sv[1])) << 32))
 		event_loop.watch_fd(int(sv[0]), .writable, et_stepw_step, pair)
 		return .suspend
 	}
@@ -697,7 +699,7 @@ fn et_choreo_handler(req []u8, mut out []u8, mut event_loop core.EventLoop) core
 			return .close
 		}
 		et_write_all(int(sv[1]), et_req) // a whole request waits in sv[0]
-		pair := voidptr(usize(u32(sv[0])) | (usize(u32(sv[1])) << 32))
+		pair := voidptr(u64(u32(sv[0])) | (u64(u32(sv[1])) << 32))
 		event_loop.watch_fd(int(sv[0]), .readable, et_stepr_step, pair)
 		return .suspend
 	}
@@ -709,7 +711,7 @@ fn et_choreo_handler(req []u8, mut out []u8, mut event_loop core.EventLoop) core
 // is only reported by the next epoll_wait), then answers.
 fn et_block408_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	et_ch_close(unsafe { &et_ch.a })
-	pair := u64(usize(watch_payload))
+	pair := u64(u64(watch_payload))
 	C.close(int(u32(pair & 0xffff_ffff)))
 	C.close(int(u32(pair >> 32)))
 	out << et_ok
@@ -719,7 +721,7 @@ fn et_block408_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_paylo
 // et_park_done consumes x's byte, closes both ends and the connection.
 fn et_park_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8)
+	C.vanilla_read(ready_fd, &tmp[0], 8)
 	mut c := unsafe { et_ch }
 	stdatomic.store_i64(&c.x, -1)
 	C.close(ready_fd)
@@ -732,7 +734,7 @@ fn et_park_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload v
 fn et_h6_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut v := u64(0)
 	mut c := unsafe { et_ch }
-	if C.read(ready_fd, &v, 8) == 8 {
+	if C.vanilla_read(ready_fd, &v, 8) == 8 {
 		out << et_ok
 	} else {
 		stdatomic.add_i64(&c.spurious, 1)
@@ -760,13 +762,13 @@ fn et_timerfd_nonblock(ms int) int {
 // streams the response head (payload 1 = head sent), a digit completes it.
 fn et_pq_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut b := [1]u8{}
-	if C.read(ready_fd, &b[0], 1) != 1 {
+	if C.vanilla_read(ready_fd, &b[0], 1) != 1 {
 		event_loop.watch_fd_persistent(ready_fd, .readable, et_pq_done, watch_payload)
 		return .suspend
 	}
 	if b[0] == `.` {
 		out << et_pq_head
-		event_loop.watch_fd_persistent(ready_fd, .readable, et_pq_done, voidptr(usize(1)))
+		event_loop.watch_fd_persistent(ready_fd, .readable, et_pq_done, voidptr(u64(1)))
 		return .suspend
 	}
 	if watch_payload == unsafe { nil } {
@@ -782,7 +784,7 @@ fn et_pq_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voi
 fn et_tup_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut c := unsafe { et_ch }
 	mut b := [1]u8{}
-	if C.read(ready_fd, &b[0], 1) != 1 {
+	if C.vanilla_read(ready_fd, &b[0], 1) != 1 {
 		event_loop.watch_fd_persistent(ready_fd, .readable, et_tup_done, watch_payload)
 		return .suspend
 	}
@@ -917,8 +919,8 @@ fn et_step_twice(mut event_loop core.EventLoop) core.Step {
 	}
 	stdatomic.store_i64(&c.peer, i64(sv[1]))
 	stdatomic.store_i64(&c.x, i64(sv[0]))
-	event_loop.watch_fd_persistent(int(sv[0]), .writable, et_twice_done, voidptr(usize(1)))
-	event_loop.watch_fd_persistent(int(sv[0]), .readable, et_twice_done, voidptr(usize(2)))
+	event_loop.watch_fd_persistent(int(sv[0]), .writable, et_twice_done, voidptr(u64(1)))
+	event_loop.watch_fd_persistent(int(sv[0]), .readable, et_twice_done, voidptr(u64(2)))
 	return .suspend
 }
 
@@ -926,11 +928,11 @@ fn et_step_twice(mut event_loop core.EventLoop) core.Step {
 // watch's payload counts in `retried`, any other in `spurious`.
 fn et_twice_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut b := [1]u8{}
-	if C.read(ready_fd, &b[0], 1) != 1 {
+	if C.vanilla_read(ready_fd, &b[0], 1) != 1 {
 		event_loop.watch_fd_persistent(ready_fd, .readable, et_twice_done, watch_payload)
 		return .suspend
 	}
-	if usize(watch_payload) == 2 {
+	if u64(watch_payload) == 2 {
 		stdatomic.add_i64(unsafe { &et_ch.retried }, 1)
 	} else {
 		stdatomic.add_i64(unsafe { &et_ch.spurious }, 1)
@@ -942,7 +944,7 @@ fn et_twice_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload 
 // et_txpark_done answers /txpark once the fresh end x carries a byte.
 fn et_txpark_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut b := [1]u8{}
-	if C.read(ready_fd, &b[0], 1) != 1 {
+	if C.vanilla_read(ready_fd, &b[0], 1) != 1 {
 		event_loop.watch_fd_persistent(ready_fd, .readable, et_txpark_done, watch_payload)
 		return .suspend
 	}
@@ -954,18 +956,18 @@ fn et_txpark_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload
 // upstream to be writable, with the second step and a payload of its own.
 fn et_tstep_read(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut b := [1]u8{}
-	if C.read(ready_fd, &b[0], 1) != 1 {
+	if C.vanilla_read(ready_fd, &b[0], 1) != 1 {
 		event_loop.watch_fd_persistent(ready_fd, .readable, et_tstep_read, watch_payload)
 		return .suspend
 	}
-	event_loop.watch_fd_persistent(ready_fd, .writable, et_tstep_write, voidptr(usize(7)))
+	event_loop.watch_fd_persistent(ready_fd, .writable, et_tstep_write, voidptr(u64(7)))
 	return .suspend
 }
 
 // et_tstep_write is /tstep's second step: it counts a run that got its own
 // payload, and answers.
 fn et_tstep_write(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
-	if usize(watch_payload) == 7 {
+	if u64(watch_payload) == 7 {
 		stdatomic.add_i64(unsafe { &et_ch.step2 }, 1)
 	}
 	out << et_ok
@@ -975,7 +977,7 @@ fn et_tstep_write(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload
 // et_tretry_done takes the fresh connection's reply byte and answers.
 fn et_tretry_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut b := [1]u8{}
-	C.read(ready_fd, &b[0], 1)
+	C.vanilla_read(ready_fd, &b[0], 1)
 	stdatomic.add_i64(unsafe { &et_ch.retried }, 1)
 	out << et_ok
 	return .done
@@ -999,13 +1001,13 @@ fn et_stepr_step(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload 
 // worker served that end as if it were a client connection.
 fn et_stepr_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8)
+	C.vanilla_read(ready_fd, &tmp[0], 8)
 	C.close(ready_fd)
-	pair := u64(usize(watch_payload))
+	pair := u64(u64(watch_payload))
 	s := int(u32(pair & 0xffff_ffff))
 	peer := int(u32(pair >> 32))
-	unread := C.recv(s, &tmp[0], 1, C.MSG_PEEK | C.MSG_DONTWAIT) == 1
-	answered := C.recv(peer, &tmp[0], 1, C.MSG_DONTWAIT) > 0
+	unread := C.vanilla_recv(s, &tmp[0], 1, C.MSG_PEEK | C.MSG_DONTWAIT) == 1
+	answered := C.vanilla_recv(peer, &tmp[0], 1, C.MSG_DONTWAIT) > 0
 	C.close(s)
 	C.close(peer)
 	if unread && !answered {
@@ -1020,7 +1022,7 @@ fn et_stepr_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload 
 // is request-owned: the runtime closes it when the client goes away.
 fn et_forever_tick(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8)
+	C.vanilla_read(ready_fd, &tmp[0], 8)
 	out << u8(`x`)
 	event_loop.watch_fd(ready_fd, .readable, et_forever_tick, unsafe { nil })
 	return .suspend
@@ -1039,9 +1041,9 @@ fn et_sock_step(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload v
 // socketpair ends (the request owns them).
 fn et_sock_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8)
+	C.vanilla_read(ready_fd, &tmp[0], 8)
 	C.close(ready_fd)
-	pair := u64(usize(watch_payload))
+	pair := u64(u64(watch_payload))
 	C.close(int(u32(pair & 0xffff_ffff)))
 	C.close(int(u32(pair >> 32)))
 	out << et_ok
@@ -1054,8 +1056,8 @@ fn et_sock_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload v
 // now on the pooled end reads EOF, with no watch behind it.
 fn et_pool_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8)
-	pair := u64(usize(watch_payload))
+	C.vanilla_read(ready_fd, &tmp[0], 8)
+	pair := u64(u64(watch_payload))
 	C.close(int(u32(pair >> 32)))
 	mut pool := unsafe { et_pool }
 	stdatomic.store_i64(&pool.inode, i64(et_fd_inode(ready_fd)))
@@ -1078,7 +1080,7 @@ fn et_self_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload v
 
 fn et_delay_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8)
+	C.vanilla_read(ready_fd, &tmp[0], 8)
 	C.close(ready_fd)
 	out << et_delayed
 	return .done
@@ -1089,7 +1091,7 @@ fn et_delay_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload 
 // request, and it holds no deadline while suspended.
 fn et_lost_rearm(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8)
+	C.vanilla_read(ready_fd, &tmp[0], 8)
 	C.close(ready_fd)
 	event_loop.watch_fd(ready_fd, .readable, et_lost_rearm, unsafe { nil })
 	return .suspend
@@ -1100,14 +1102,14 @@ fn et_lost_rearm(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload 
 // The tick count rides in watch_payload, so the stream allocates nothing.
 fn et_stream_tick(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8) // level-triggered: consume the expiration
+	C.vanilla_read(ready_fd, &tmp[0], 8) // level-triggered: consume the expiration
 	out << et_tick
-	n := int(usize(watch_payload)) + 1
+	n := int(u64(watch_payload)) + 1
 	if n >= et_ticks {
 		C.close(ready_fd)
 		return .done
 	}
-	event_loop.watch_fd(ready_fd, .readable, et_stream_tick, voidptr(usize(n)))
+	event_loop.watch_fd(ready_fd, .readable, et_stream_tick, voidptr(u64(n)))
 	return .suspend
 }
 

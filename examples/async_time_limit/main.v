@@ -26,10 +26,11 @@ import http1_1.response
 
 #include <sys/timerfd.h>
 #include <unistd.h>
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
-fn C.read(fd int, buf voidptr, count usize) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
 
 const budget_ms = i64(300)
 
@@ -81,14 +82,14 @@ fn now_ms() i64 {
 // pack_job packs a job's start and steps left into a watch_payload.
 @[inline]
 fn pack_job(start i64, left int) voidptr {
-	return voidptr(usize((u64(start) << 16) | u64(left)))
+	return voidptr(u64((u64(start) << 16) | u64(left)))
 }
 
 // unpack_job is pack_job's inverse. The arithmetic right shift of the signed
 // value restores start's sign.
 @[inline]
 fn unpack_job(payload voidptr) (i64, int) {
-	p := u64(usize(payload))
+	p := u64(u64(payload))
 	return i64(p) >> 16, int(p & 0xffff)
 }
 
@@ -177,7 +178,7 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
 // otherwise consume one step and re-arm.
 fn tick(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8)
+	C.vanilla_read(ready_fd, &tmp[0], 8)
 	start, steps_left := unpack_job(watch_payload)
 	elapsed := now_ms() - start
 	if elapsed > budget_ms {

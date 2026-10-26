@@ -327,7 +327,7 @@ fn (mut x Exchange) write_some() int {
 			p2 = unsafe { &u8(x.body.data) + (x.off - hl) }
 			n2 = x.body.len - (x.off - hl)
 		}
-		r := C.upstream_send(x.fd, p1, usize(n1), p2, usize(n2))
+		r := C.upstream_send(x.fd, p1, u64(n1), p2, u64(n2))
 		if r >= 0 {
 			return int(r)
 		}
@@ -375,7 +375,7 @@ fn (mut x Exchange) write_some() int {
 // read_some reads into p[..max]: a byte count, io_again, io_eof or io_failed.
 fn (mut x Exchange) read_some(p &u8, max int) int {
 	if !x.sess.active() {
-		r := C.upstream_recv(x.fd, p, usize(max))
+		r := C.upstream_recv(x.fd, p, u64(max))
 		if r > 0 {
 			return int(r)
 		}
@@ -458,7 +458,7 @@ fn (mut x Exchange) recv_early() {
 			}
 			unsafe { x.resp.grow_cap(x.resp.cap) }
 		}
-		r := C.upstream_recv(x.fd, unsafe { &u8(x.resp.data) + x.resp.len }, usize(x.resp.cap - x.resp.len))
+		r := C.upstream_recv(x.fd, unsafe { &u8(x.resp.data) + x.resp.len }, u64(x.resp.cap - x.resp.len))
 		if r <= 0 {
 			return
 		}

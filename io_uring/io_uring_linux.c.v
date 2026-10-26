@@ -241,9 +241,9 @@ const ioring_op_accept = u8(13)
 const ioring_op_send = u8(26)
 const ioring_op_recv = u8(27)
 const ioring_accept_multishot = u16(1 << 0)
-const ioring_off_sq_ring = isize(0)
-const ioring_off_cq_ring = isize(0x8000000)
-const ioring_off_sqes = isize(0x10000000)
+const ioring_off_sq_ring = i64(0)
+const ioring_off_cq_ring = i64(0x8000000)
+const ioring_off_sqes = i64(0x10000000)
 const ioring_feat_single_mmap = u32(1 << 0)
 const ioring_feat_ext_arg = u32(1 << 8)
 const ioring_enter_getevents = u32(1 << 0)
@@ -279,9 +279,9 @@ mut:
 	cqes        &Cqe = unsafe { nil }
 	cq_mask     u32
 	sq_ring     voidptr
-	sq_ring_sz  usize
+	sq_ring_sz  u64
 	cq_ring     voidptr // == sq_ring when the kernel maps both rings at once
-	cq_ring_sz  usize
+	cq_ring_sz  u64
 	features    u32
 	ring_fd     int = -1
 	enter_fd    int = -1 // ring_fd, or its registered index after register_ring_fd
@@ -309,8 +309,8 @@ fn setup_ring(entries u32, ring &Ring, flags u32) int {
 	if fd < 0 {
 		return -C.errno
 	}
-	mut sq_ring_sz := usize(p.sq_off.array) + usize(p.sq_entries) * sizeof(u32)
-	mut cq_ring_sz := usize(p.cq_off.cqes) + usize(p.cq_entries) * sizeof(Cqe)
+	mut sq_ring_sz := u64(p.sq_off.array) + u64(p.sq_entries) * sizeof(u32)
+	mut cq_ring_sz := u64(p.cq_off.cqes) + u64(p.cq_entries) * sizeof(Cqe)
 	single_mmap := p.features & ioring_feat_single_mmap != 0
 	if single_mmap {
 		if cq_ring_sz > sq_ring_sz {
@@ -334,7 +334,7 @@ fn setup_ring(entries u32, ring &Ring, flags u32) int {
 			return err
 		}
 	}
-	sqes := map_ring(fd, usize(p.sq_entries) * sizeof(Sqe), ioring_off_sqes)
+	sqes := map_ring(fd, u64(p.sq_entries) * sizeof(Sqe), ioring_off_sqes)
 	if sqes == unsafe { nil } {
 		err := -C.errno
 		unsafe {
@@ -382,11 +382,11 @@ fn setup_ring(entries u32, ring &Ring, flags u32) int {
 }
 
 // map_ring maps one region of a new ring; nil on failure, with errno set.
-fn map_ring(fd int, size usize, offset isize) voidptr {
+fn map_ring(fd int, size u64, offset i64) voidptr {
 	ptr := unsafe {
 		C.mmap(nil, size, C.PROT_READ | C.PROT_WRITE, C.MAP_SHARED | C.MAP_POPULATE, fd, offset)
 	}
-	if isize(ptr) == -1 { // MAP_FAILED
+	if i64(ptr) == -1 { // MAP_FAILED
 		return unsafe { nil }
 	}
 	return ptr
@@ -405,7 +405,7 @@ pub fn queue_exit(ring &Ring) {
 		unsafe { C.syscall(C.SYS_io_uring_register, r.ring_fd, ioring_unregister_ring_fds, &up, 1) }
 	}
 	unsafe {
-		C.munmap(r.sqes, usize(r.sq_entries) * sizeof(Sqe))
+		C.munmap(r.sqes, u64(r.sq_entries) * sizeof(Sqe))
 		if r.cq_ring != r.sq_ring {
 			C.munmap(r.cq_ring, r.cq_ring_sz)
 		}
@@ -480,7 +480,7 @@ fn cq_needs_flush(r &Ring) bool {
 
 // enter calls io_uring_enter on the ring, through its registered index once
 // register_ring_fd succeeded. Returns the syscall result, or -errno.
-fn enter(r &Ring, to_submit u32, min_complete u32, flags u32, arg voidptr, argsz usize) int {
+fn enter(r &Ring, to_submit u32, min_complete u32, flags u32, arg voidptr, argsz u64) int {
 	ret := unsafe {
 		C.syscall(C.SYS_io_uring_enter, r.enter_fd, to_submit, min_complete, flags | r.enter_flags,
 			arg, argsz)
@@ -922,14 +922,14 @@ pub fn prepare_recv(ring &Ring, mut c Connection) bool {
 // recv never reads past the body into the next pipelined request. Returns false
 // if the SQ is full.
 @[direct_array_access]
-pub fn prepare_recv_n(ring &Ring, mut c Connection, n usize) bool {
+pub fn prepare_recv_n(ring &Ring, mut c Connection, n u64) bool {
 	sqe := get_sqe(ring)
 	if unsafe { sqe == nil } {
 		return false
 	}
 	mut want := n
-	if want > usize(c.read_buf.cap) {
-		want = usize(c.read_buf.cap)
+	if want > u64(c.read_buf.cap) {
+		want = u64(c.read_buf.cap)
 	}
 	unsafe {
 		*sqe = Sqe{
@@ -945,7 +945,7 @@ pub fn prepare_recv_n(ring &Ring, mut c Connection, n usize) bool {
 
 // prepare_send posts a send for [data, data+data_len). MSG_NOSIGNAL stops a
 // write to a dead peer from raising SIGPIPE (matches the epoll backend).
-pub fn prepare_send(ring &Ring, mut c Connection, data &u8, data_len usize) bool {
+pub fn prepare_send(ring &Ring, mut c Connection, data &u8, data_len u64) bool {
 	sqe := get_sqe(ring)
 	if unsafe { sqe == nil } {
 		return false
@@ -986,7 +986,7 @@ pub fn prepare_poll(ring &Ring, fd int, poll_mask u32) bool {
 			opcode:    ioring_op_poll_add
 			fd:        fd
 			op_flags:  mask
-			user_data: encode_user_data(op_poll, voidptr(usize(fd)))
+			user_data: encode_user_data(op_poll, voidptr(u64(fd)))
 		}
 	}
 	return true

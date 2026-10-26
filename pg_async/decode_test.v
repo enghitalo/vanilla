@@ -330,10 +330,10 @@ fn test_array_helpers_append_all_or_nothing_and_check_the_element_type() {
 	// text[] {a, b}: views into the row, not copies.
 	r.text_array_into(2, mut texts)!
 	assert texts.len == 2 && texts[0].bytestr() == 'a' && texts[1].bytestr() == 'b'
-	lo := usize(r.payload.data)
-	hi := lo + usize(r.payload.len)
+	lo := u64(r.payload.data)
+	hi := lo + u64(r.payload.len)
 	for t in texts {
-		assert usize(t.data) >= lo && usize(t.data) < hi, 'a view into the row'
+		assert u64(t.data) >= lo && u64(t.data) < hi, 'a view into the row'
 	}
 }
 
@@ -621,7 +621,7 @@ fn test_mutated_values_are_rejected_or_decoded_in_bounds() {
 		}
 		// A raw allocation of exactly b.len bytes: a V array keeps up to 15
 		// bytes of slack after its data, where an overread goes unnoticed.
-		raw := unsafe { &u8(C.malloc(usize(b.len))) }
+		raw := unsafe { &u8(C.malloc(u64(b.len))) }
 		if b.len > 0 {
 			unsafe { vmemcpy(raw, b.data, b.len) }
 		}

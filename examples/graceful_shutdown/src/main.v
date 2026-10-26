@@ -27,6 +27,10 @@ import server
 import core
 import os
 
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
+
 // A static response is a const string, appended with core.append_str: no
 // per-request copy (docs/BEST_PRACTICES.md §3a).
 const ok_response = 'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
@@ -56,7 +60,7 @@ fn main() {
 	wake := os.pipe()!
 	on_signal := fn [wake] (_ os.Signal) {
 		saved := C.errno
-		C.write(wake.write_fd, c'x', 1)
+		C.vanilla_write(wake.write_fd, c'x', 1)
 		C.errno = saved
 	}
 	os.signal_opt(.term, on_signal)!

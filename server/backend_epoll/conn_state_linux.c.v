@@ -34,12 +34,15 @@ import tls
 #include <sys/epoll.h>
 #include <sys/sendfile.h>
 #include <unistd.h>
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
 
 // recv/send were inherited from server.c.v while this lived in that module;
 // now in backend_epoll they must be declared here.
-fn C.recv(__fd int, __buf voidptr, __n usize, __flags int) int
-fn C.send(__fd int, __buf voidptr, __n usize, __flags int) int
-fn C.memmove(__dest voidptr, __src voidptr, __n usize) voidptr
+fn C.vanilla_recv(__fd int, __buf voidptr, __n u64, __flags int) int
+fn C.vanilla_send(__fd int, __buf voidptr, __n u64, __flags int) int
+fn C.vanilla_memmove(__dest voidptr, __src voidptr, __n u64) voidptr
 
 // sendfile(2): copy bytes from a file fd straight to the socket inside the
 // kernel (no userspace bounce). With a non-NULL offset the kernel advances it
@@ -47,7 +50,7 @@ fn C.memmove(__dest voidptr, __src voidptr, __n usize) voidptr
 // send from many connections/threads at once. core.append_file_region (pread)
 // is the userspace fallback, used when the file body must go out as bytes
 // because a pipelined response must follow it in order.
-fn C.sendfile(out_fd int, in_fd int, offset &i64, count usize) isize
+fn C.vanilla_sendfile(out_fd int, in_fd int, offset &i64, count u64) i64
 
 // Bound a single sendfile(2) call so one connection can't monopolize the worker;
 // the remainder streams on the next writable edge.
@@ -89,7 +92,7 @@ fn conn_recv(mut cs ConnState, fd int, ptr &u8, len int) int {
 	if cs.tls != tls_plain {
 		return tls_recv(mut cs, fd, ptr, len)
 	}
-	return C.recv(fd, ptr, usize(len), 0)
+	return C.vanilla_recv(fd, ptr, u64(len), 0)
 }
 
 // conn_send writes to a client connection with the contract of send(2) with
@@ -100,7 +103,7 @@ fn conn_send(mut cs ConnState, fd int, ptr &u8, len int) int {
 	if cs.tls != tls_plain {
 		return tls_send(mut cs, fd, ptr, len)
 	}
-	return C.send(fd, ptr, usize(len), C.MSG_NOSIGNAL)
+	return C.vanilla_send(fd, ptr, u64(len), C.MSG_NOSIGNAL)
 }
 
 // A request whose framed size exceeds this is STREAMED, not buffered: the head
@@ -377,7 +380,7 @@ fn (mut q BirthQueue) push(fd int, seq u64, accepted_ns u64) {
 	stdatomic.store_u64(&q.tail, t + 1) // publishes the entry
 	if stdatomic.load_u64(&q.sleeping) != 0 {
 		one := u64(1)
-		C.write(q.wake_fd, &one, 8)
+		C.vanilla_write(q.wake_fd, &one, 8)
 	}
 }
 
@@ -618,11 +621,11 @@ fn drain_file(fd int, mut cs ConnState) int {
 	}
 	for cs.file_remaining > 0 {
 		want := if cs.file_remaining > sm_sendfile_chunk {
-			usize(sm_sendfile_chunk)
+			u64(sm_sendfile_chunk)
 		} else {
-			usize(cs.file_remaining)
+			u64(cs.file_remaining)
 		}
-		sent := C.sendfile(fd, cs.file_fd, &cs.file_off, want)
+		sent := C.vanilla_sendfile(fd, cs.file_fd, &cs.file_off, want)
 		if sent > 0 {
 			cs.file_remaining -= i64(sent)
 			continue
@@ -773,7 +776,7 @@ fn flush_then_close(epoll_fd int, fd int, limits core.Limits, active_conns &core
 // reset, which can discard the response's untransmitted tail (RFC 9112 §9.6).
 @[noinline]
 fn close_drained(epoll_fd int, fd int, active_conns &core.Counter, mut st PlainState, mut cs ConnState) {
-	for C.recv(fd, cs.read_buf.data, usize(cs.read_buf.cap), C.MSG_DONTWAIT) > 0 {
+	for C.vanilla_recv(fd, cs.read_buf.data, u64(cs.read_buf.cap), C.MSG_DONTWAIT) > 0 {
 	}
 	close_conn(epoll_fd, fd, active_conns, mut st)
 }

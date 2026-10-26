@@ -7,6 +7,8 @@ import testkit
 import time
 import transport
 
+#include "@VMODROOT/core/libc_shim.h"
+
 // cancel() (vanilla#200): BackendKeyData kept at bring-up, then a
 // CancelRequest on its own connection, driven as a background watch. Against
 // pg_async/testdata/fake_pg.py, whose `select pg_sleep(S)` a matching
@@ -245,7 +247,7 @@ fn C.bind(fd int, addr voidptr, len u32) int
 fn C.listen(fd int, backlog int) int
 fn C.getsockname(fd int, addr voidptr, len &u32) int
 fn C.accept(fd int, addr voidptr, len voidptr) int
-fn C.read(fd int, buf voidptr, count usize) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
 
 // CtListener is a loopback listener with an accept queue of one, plus a
 // connection to it that stands in for a session with the server. While that
@@ -329,7 +331,7 @@ fn test_cancel_waits_for_its_connect_on_a_background_watch() ! {
 	}
 	mut got := [16]u8{}
 	assert C.pg_async_wait(cancel_side, C.POLLIN, 2000) > 0
-	assert C.read(cancel_side, &got[0], 16) == 16
+	assert C.vanilla_read(cancel_side, &got[0], 16) == 16
 	// Int32(16) Int32(80877102) Int32(42) and the key.
 	assert got == [u8(0), 0, 0, 16, 0x04, 0xd2, 0x16, 0x2e, 0, 0, 0, 42, 1, 2, 3, 4]!
 }

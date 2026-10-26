@@ -3,7 +3,9 @@ module main
 import core
 import strconv
 
-fn C.memchr(s voidptr, c int, n usize) voidptr
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_memchr(s voidptr, c int, n u64) voidptr
 
 // Response framing, appended straight into the connection's write buffer: a
 // const head (a string, appended with core.append_str), the body written in
@@ -114,7 +116,7 @@ fn drop_body(mut out []u8, start int) {
 	unsafe {
 		mut i := start
 		for i + 3 < out.len {
-			q := C.memchr(&u8(out.data) + i, `\r`, usize(out.len - 3 - i))
+			q := C.vanilla_memchr(&u8(out.data) + i, `\r`, u64(out.len - 3 - i))
 			if q == nil {
 				return
 			}

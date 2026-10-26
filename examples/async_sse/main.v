@@ -154,7 +154,7 @@ fn sse_tick(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidp
 			return .done // .closed: nothing to free
 		}
 	}
-	sent := int(usize(watch_payload)) + 1
+	sent := int(u64(watch_payload)) + 1
 	// One chunk: `<size in hex>\r\n<event>\r\n`. The size is the literal parts
 	// plus the digits of the two counters.
 	size := tick_head.len + strconv.dec_digits(u64(sent)) + tick_of.len +
@@ -171,7 +171,7 @@ fn sse_tick(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidp
 		core.append_str(mut out, bye_and_end)
 		return .close // the body is complete; it goes out, then the connection closes
 	}
-	event_loop.subscribe(sse_tick, voidptr(usize(sent)))
+	event_loop.subscribe(sse_tick, voidptr(u64(sent)))
 	event_loop.wake_after(tick_ms) // keep streaming
 	return .done
 }

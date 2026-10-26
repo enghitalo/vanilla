@@ -15,6 +15,10 @@ module main
 import server
 import os
 
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
+
 fn main() {
 	// Explicit per-OS backend selection (other OSes keep the default = 0).
 	mut backend := unsafe { server.IOBackend(0) }
@@ -46,7 +50,7 @@ fn main() {
 	wake := os.pipe()!
 	on_signal := fn [wake] (_ os.Signal) {
 		saved := C.errno
-		C.write(wake.write_fd, c'x', 1)
+		C.vanilla_write(wake.write_fd, c'x', 1)
 		C.errno = saved
 	}
 	os.signal_opt(.term, on_signal)!

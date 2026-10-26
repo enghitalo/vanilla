@@ -9,10 +9,11 @@ import core
 #include <sys/timerfd.h>
 #include <time.h>
 #include <unistd.h>
+#include "@VMODROOT/core/libc_shim.h"
 
 fn C.timerfd_create(clockid int, flags int) int
 fn C.timerfd_settime(fd int, flags int, new_value voidptr, old_value voidptr) int
-fn C.read(fd int, buf voidptr, count usize) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
 
 fn slow_route_linux(mut res []u8, mut event_loop core.EventLoop) core.Step {
 	tfd := C.timerfd_create(C.CLOCK_MONOTONIC, 0)
@@ -32,7 +33,7 @@ fn slow_route_linux(mut res []u8, mut event_loop core.EventLoop) core.Step {
 // it), append the response, and finish.
 fn slow_done(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
 	mut tmp := [8]u8{}
-	C.read(ready_fd, &tmp[0], 8)
+	C.vanilla_read(ready_fd, &tmp[0], 8)
 	C.close(ready_fd)
 	core.append_str(mut out, slow_response)
 	return .done

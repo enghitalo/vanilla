@@ -12,6 +12,9 @@ import time
 #include <sys/epoll.h>
 #include <sched.h>
 #include <sys/eventfd.h>
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
 
 fn C.perror(s &char)
 fn C.eventfd(initval u32, flags int) int
@@ -21,7 +24,7 @@ fn C.close(fd int) int
 // mask is a cpu_set_t* in <sched.h>; we hand it a raw u64 word array, so keep
 // the binding untyped rather than model cpu_set_t (whose header typedef would
 // clash with any V-side struct declaration).
-fn C.sched_setaffinity(pid int, cpusetsize usize, mask voidptr) int
+fn C.sched_setaffinity(pid int, cpusetsize u64, mask voidptr) int
 
 // maybe_pin_worker pins the calling worker thread to `cpu` when VANILLA_PIN_CPUS
 // is set. Opt-in: pinning warms caches and stops migration on dedicated
@@ -34,7 +37,7 @@ fn maybe_pin_worker(cpu int) {
 	}
 	mut set := [16]u64{} // CPU_SETSIZE/64 words → up to 1024 CPUs
 	set[cpu / 64] |= u64(1) << u32(cpu % 64)
-	C.sched_setaffinity(0, usize(sizeof(set)), voidptr(&set[0]))
+	C.sched_setaffinity(0, u64(sizeof(set)), voidptr(&set[0]))
 }
 
 // release_conn closes a connection: decrements the global active-connection
@@ -442,7 +445,7 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 					// The accept thread queued a connection while this worker
 					// slept: reset the eventfd (drain_births above took the entry).
 					mut n := u64(0)
-					C.read(fd, &n, 8)
+					C.vanilla_read(fd, &n, 8)
 					continue
 				}
 				if st.mbox_armed && fd == st.mbox.wake_fd {

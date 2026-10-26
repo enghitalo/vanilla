@@ -34,6 +34,10 @@ import http1_1.request_parser
 import http1_1.response
 import http1_1.upstream
 
+#include "@VMODROOT/core/libc_shim.h"
+
+fn C.vanilla_write(fd int, buf voidptr, count u64) int
+
 const port = 8098
 
 const resp_hello = 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\nHello, logs!\n'
@@ -196,7 +200,7 @@ fn main() {
 	wake := os.pipe()!
 	on_stop := fn [wake] (_ os.Signal) {
 		saved := C.errno
-		C.write(wake.write_fd, c'x', 1)
+		C.vanilla_write(wake.write_fd, c'x', 1)
 		C.errno = saved
 	}
 	os.signal_opt(.term, on_stop)!

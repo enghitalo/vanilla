@@ -4,6 +4,8 @@ import sync
 import sync.stdatomic
 import time
 
+#include "@VMODROOT/core/libc_shim.h"
+
 // Name resolution off the workers (#229; moved here from http1_1.upstream so
 // pg_async can follow it too, #351). getaddrinfo blocks for as long as the
 // DNS takes (seconds when it drops queries) and allocates, so a worker must
@@ -171,8 +173,8 @@ fn C.transport_resolve(host &char, port &char, out &C.transport_resolved, max in
 fn C.transport_pipe(fds &i32) int
 fn C.transport_wait(fd int, timeout_ms int) int
 fn C.transport_block_sigpipe()
-fn C.read(fd int, buf voidptr, count usize) int
-fn C.write(fd int, buf voidptr, n usize) int
+fn C.vanilla_read(fd int, buf voidptr, count u64) int
+fn C.vanilla_write(fd int, buf voidptr, n u64) int
 
 // Resolver.new makes a resolver that refreshes each followed host every
 // `interval_ms` (e.g. 30_000). start() it once the followers follow it, or
@@ -228,7 +230,7 @@ pub fn (mut r Resolver) stop() {
 	stdatomic.store_i64(&r.stop_flag, 1) // under mu: a lookup thread checks it there before it writes
 	r.mu.unlock()
 	b := u8(1)
-	C.write(r.wake_w, &b, 1)
+	C.vanilla_write(r.wake_w, &b, 1)
 	r.th.wait()
 	r.started = false
 	for mut t in r.threads {
@@ -311,7 +313,7 @@ pub fn (f &Feed) ask() {
 	if stdatomic.load_u64(&f.sub.asked) == 0
 		&& C.atomic_exchange_u64(voidptr(&f.sub.asked), 1) == 0 {
 		b := u8(1)
-		C.write(f.resolver.wake_w, &b, 1)
+		C.vanilla_write(f.resolver.wake_w, &b, 1)
 	}
 }
 
@@ -326,7 +328,7 @@ pub fn (mut f Feed) take(mut table []Addr) bool {
 	mut swapped := false
 	// Into the feed's record, not a local: V moves a local Record (its fixed
 	// array) to the heap, an allocation per call under -gc none.
-	for C.read(f.fd, &f.rec, sizeof(Record)) == int(sizeof(Record)) {
+	for C.vanilla_read(f.fd, &f.rec, sizeof(Record)) == int(sizeof(Record)) {
 		if f.take_record(mut table) {
 			swapped = true
 		}
@@ -379,7 +381,7 @@ pub fn (mut f Feed) unfollow() {
 	f.sub.gone = true
 	r.mu.unlock()
 	b := u8(1)
-	C.write(r.wake_w, &b, 1)
+	C.vanilla_write(r.wake_w, &b, 1)
 }
 
 // run is the resolver thread: it hands each host's lookups to the lookup
@@ -394,7 +396,7 @@ fn (mut r Resolver) run() {
 	gap := u64(if r.interval_ms < refresh_gap_ms { r.interval_ms } else { refresh_gap_ms }) * u64(time.millisecond)
 	mut drain := [64]u8{}
 	for {
-		for C.read(r.wake_r, &drain[0], usize(drain.len)) > 0 {
+		for C.vanilla_read(r.wake_r, &drain[0], u64(drain.len)) > 0 {
 		}
 		// After every drain and before the next wait: the drain may have taken
 		// stop()'s byte, which comes after the flag (#368).
@@ -528,7 +530,7 @@ fn (mut r Resolver) look(mut t LookupThread) {
 		if !stopped {
 			stdatomic.store_u64(&t.done, 1)
 			b := u8(1)
-			C.write(r.wake_w, &b, 1)
+			C.vanilla_write(r.wake_w, &b, 1)
 		}
 		r.mu.unlock()
 		if stopped {
@@ -563,7 +565,7 @@ fn (mut r Resolver) write_update(fd int, t &LookupThread) {
 			len:    t.found[k].len
 			data:   t.found[k].data
 		}
-		if C.write(fd, &r.rec, sizeof(Record)) != int(sizeof(Record)) {
+		if C.vanilla_write(fd, &r.rec, sizeof(Record)) != int(sizeof(Record)) {
 			return // the pipe is full (a stalled worker): it gets the next round
 		}
 	}
