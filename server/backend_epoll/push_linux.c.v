@@ -90,6 +90,13 @@ fn subscribe_conn(mut el core.EventLoop, wake_fn core.WakeFn, sub_state voidptr)
 		// Server.shutdown() can reach it (.shutdown). Retried by the next
 		// subscription if no eventfd could be made.
 		st.mbox_armed = st.mbox.arm(el.loop_fd)
+		wake := st.mbox.wake_fd
+		if st.mbox_armed && wake < r.watches.len && r.watches[wake].active
+			&& !r.waits_on(wake, fd) {
+			// The eventfd took the number of a watch fd the app closed under
+			// its slot (#342), which would get its wakes: see register_watch.
+			r.retire_stale(el.loop_fd, wake)
+		}
 	}
 	if st.shutdown_seen && cs.wake_fn == unsafe { nil } {
 		// This worker has delivered .shutdown already (a keep-alive connection

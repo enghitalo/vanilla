@@ -374,6 +374,79 @@ fn (mut r Reactor) reactor_clear(ext_fd int) {
 	}
 }
 
+// retire_stale frees the active slot of fd, whose file the app closed under
+// the watch (#342): a timed-out caller-owned watch's tombstone, the requests
+// queued behind a head that closed their pipelined fd. The kernel removed
+// the closed file from the epoll set, and fd now names another file, which
+// the caller has just met: a connection the accept thread registered, or an
+// fd a watch registers. The slot's entries wait on the closed file, which
+// reports nothing any more, so none of them runs: a tombstone goes without
+// its draining run (no reply can come), and a request parked there is
+// closed, as nothing can resume it (on_park_timeout closes a park that lost
+// its watch the same way). Out of line: only an app that closes a watched fd
+// gets here.
+@[direct_array_access; noinline]
+fn (mut r Reactor) retire_stale(epoll_fd int, fd int) {
+	if r.st != unsafe { nil } {
+		if r.watches[fd].queue.len == 0 {
+			r.close_stranded(epoll_fd, fd, r.watches[fd].client_fd)
+		}
+		for i in 0 .. r.watches[fd].queue.len {
+			if !r.watches[fd].queue[i].dead {
+				r.close_stranded(epoll_fd, fd, r.watches[fd].queue[i].client_fd)
+			}
+		}
+	}
+	r.watches[fd].active = false
+	r.watches[fd].persistent = false
+	unsafe {
+		r.watches[fd].queue.len = 0
+	}
+}
+
+// close_stranded closes connection c if it is parked on fd, a watch fd that
+// was closed under it (retire_stale). The unpark comes first, so the close
+// leaves fd, another file's number now, alone. Never c == fd: only the
+// runtime closes a connection's own socket, and that close ends its watch.
+@[direct_array_access]
+fn (mut r Reactor) close_stranded(epoll_fd int, fd int, c int) {
+	mut st := r.st
+	if c < 0 || c == fd || c >= st.conns.len {
+		return
+	}
+	mut cs := st.conns[c]
+	if unsafe { cs == nil } || cs.awaiting_fd != fd {
+		return
+	}
+	unpark_conn(mut st, mut cs)
+	close_conn(epoll_fd, c, st.active_conns, mut st)
+}
+
+// waits_on reports whether fd's active slot belongs to a continuation that
+// runs now, for client_fd (the caller): a pipelined head, a timed-out park,
+// a tombstone (on_park_timeout, drain_pipelined and run_tombstone keep the
+// slot in place while they run it). Its watch is the run's re-arm, which
+// updates the slot in place, and its caller reads the slot again once it
+// returns: never retired there (retire_stale).
+@[direct_array_access]
+fn (r &Reactor) waits_on(fd int, client_fd int) bool {
+	if r.rearming_dead && fd == r.dead_fd {
+		return true
+	}
+	if client_fd < 0 {
+		return false
+	}
+	if r.watches[fd].queue.len == 0 {
+		return r.watches[fd].client_fd == client_fd
+	}
+	for i in 0 .. r.watches[fd].queue.len {
+		if !r.watches[fd].queue[i].dead && r.watches[fd].queue[i].client_fd == client_fd {
+			return true
+		}
+	}
+	return false
+}
+
 // reactor_mark_dead tombstones the queued slot for client_fd on a pipelined ext_fd
 // (the client disconnected mid-pipeline). The slot is kept so the queue stays
 // aligned with the connection's in-flight FIFO; drain_pipelined consumes its
@@ -477,6 +550,19 @@ fn register_watch(mut w core.EventLoop, ext_fd int, interest core.WatchInterest,
 	}
 	r.armed = true // sticky: the event loop starts probing the watch table
 	events := if interest == .writable { u32(C.EPOLLOUT) } else { u32(C.EPOLLIN) }
+	// Re-arm if the fd is already in this worker's epoll (a pool-owned connection
+	// re-watched across queries), otherwise add it (a fresh request-owned fd).
+	// Trying MOD first avoids an EEXIST perror on every pool-fd reuse and needs no
+	// extra bookkeeping: a fresh fd's MOD fails with ENOENT and falls through to ADD.
+	fresh := epoll.mod_fd_in_epoll(w.loop_fd, ext_fd, events) != 0
+	if fresh && ext_fd < r.watches.len && r.watches[ext_fd].active
+		&& !r.waits_on(ext_fd, w.client_fd) {
+		// An active slot's fd is in this epoll until the app closes it under
+		// the watch: ext_fd is a new file under that number (#342). Recorded
+		// beside the old entries, it would wait behind them, and their
+		// continuations would run on its readiness first.
+		r.retire_stale(w.loop_fd, ext_fd)
+	}
 	r.reactor_watch(ext_fd, w.client_fd, cont, udata)
 	if w.persistent {
 		// Pool-owned fd (watch_persistent): mark the slot so a client disconnect won't
@@ -484,11 +570,7 @@ fn register_watch(mut w core.EventLoop, ext_fd int, interest core.WatchInterest,
 		// this re-stamps it every park; promotion to a queue preserves it.
 		r.watches[ext_fd].persistent = true
 	}
-	// Re-arm if the fd is already in this worker's epoll (a pool-owned connection
-	// re-watched across queries), otherwise add it (a fresh request-owned fd).
-	// Trying MOD first avoids an EEXIST perror on every pool-fd reuse and needs no
-	// extra bookkeeping: a fresh fd's MOD fails with ENOENT and falls through to ADD.
-	if epoll.mod_fd_in_epoll(w.loop_fd, ext_fd, events) != 0 {
+	if fresh {
 		if epoll.add_fd_to_epoll(w.loop_fd, ext_fd, events) < 0 {
 			// The fd could not be armed (bad fd, epoll limits): don't leave a slot
 			// marked active that the loop would never actually fire — clear it so the
@@ -565,6 +647,7 @@ fn register_dead_watch(mut w core.EventLoop, mut r Reactor, ext_fd int, interest
 	if !w.persistent {
 		return
 	}
+	fresh := epoll.mod_fd_in_epoll(w.loop_fd, ext_fd, events) != 0
 	if ext_fd == int(r.dead_step_fd) {
 		// A repeat on the fd this run already stepped to (#257): its dead slot
 		// is the tail of that queue. It takes the new continuation and
@@ -574,9 +657,13 @@ fn register_dead_watch(mut w core.EventLoop, mut r Reactor, ext_fd int, interest
 		r.watches[ext_fd].queue[last].cont = cont
 		r.watches[ext_fd].queue[last].udata = udata
 	} else {
+		if fresh && ext_fd < r.watches.len && r.watches[ext_fd].active
+			&& !r.waits_on(ext_fd, w.client_fd) {
+			r.retire_stale(w.loop_fd, ext_fd) // a closed fd's slot: see register_watch (#342)
+		}
 		r.reactor_tombstone(ext_fd, w.client_fd, cont, udata)
 	}
-	if epoll.mod_fd_in_epoll(w.loop_fd, ext_fd, events) != 0 {
+	if fresh {
 		if epoll.add_fd_to_epoll(w.loop_fd, ext_fd, events) < 0 {
 			// Not armable: drop the run's dead slot (the tail), and let
 			// run_tombstone know the step was refused (#257).
