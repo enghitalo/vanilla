@@ -32,7 +32,8 @@ import transport
 // (getaddrinfo: as long as the DNS takes). password_fn (a fresh credential
 // for every attempt) and the TLS handshake's crypto steps do run inline, once
 // per attempt. The SCRAM key derivation (PBKDF2) does not: the pool's
-// ScramCache already holds it, unless the server changed the salt. A
+// ScramCache already holds it, unless the password changed (password_fn
+// answered another one) or the server's salt did (vanilla#379). A
 // connection recycled for max_lifetime_ms takes the same path, driven by
 // maintain() alone (maintenance.v), so a recycle follows DNS changes through
 // the table too. A failed attempt (refused, closed, authentication error, or
@@ -204,8 +205,9 @@ fn (mut c PgConn) redial_step(cfg ConnConfig) !bool {
 // and the re-dial alike: its password, asked of password_fn when set (once
 // per attempt, before dialing: a failing provider costs no connect), in a
 // SCRAM client that has the pool's PBKDF2 result (ScramCache): no key
-// derivation per re-dial, plain or TLS. A cleartext request is answered with
-// the same password.
+// derivation per re-dial, plain or TLS, while the password and the server's
+// salt stay the same. A cleartext request is answered with the same
+// password.
 fn (mut c PgConn) start_auth(cfg ConnConfig) ! {
 	c.scram = ScramClient.new(cfg.user, attempt_password(&cfg)!)!
 	c.scram.cache = c.scram_cache

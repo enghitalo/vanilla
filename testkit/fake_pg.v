@@ -10,8 +10,8 @@ import time
 pub const fake_pg_script = os.join_path(@VMODROOT, 'pg_async', 'testdata', 'fake_pg.py')
 
 // FakePg is one running fake_pg.py process. Point a pg_async.ConnConfig at
-// 127.0.0.1:port (user anything, password 'secret' unless --password), and
-// stop() it when done.
+// 127.0.0.1:port (user anything, password 'secret' unless --password or
+// --password-file), and stop() it when done.
 pub struct FakePg {
 pub:
 	port       int

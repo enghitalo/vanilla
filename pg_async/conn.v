@@ -233,7 +233,9 @@ pub:
 	// fast and non-blocking (sign a token locally; fetch secrets elsewhere).
 	// Every worker's pool calls it from its own thread, so state it shares
 	// across workers needs a lock or atomics. An error fails the attempt, and
-	// a pool retries after its backoff.
+	// a pool retries after its backoff. Over SCRAM, an answer the pool has
+	// not just used costs its attempt one key derivation (PBKDF2, about 2 ms),
+	// which the pool reuses while the answers stay the same.
 	password_fn PasswordFn = unsafe { nil }
 	// database is the database to connect to; '' = the server's default, the
 	// database named like user.
@@ -440,8 +442,9 @@ mut:
 	// a failed-over primary) is not retried first forever.
 	addr_cursor int
 	// scram_cache is the pool's PBKDF2 cache (ScramCache), shared by its
-	// connections so a bring-up derives once and a re-dial not at all; nil
-	// for a standalone connection.
+	// connections so a bring-up derives once and a re-dial not at all while
+	// the password and the server's salt stay the same; nil for a standalone
+	// connection.
 	scram_cache &ScramCache = unsafe { nil }
 	// tls is the TLS session over fd (ssl_mode != .disable), else the zero
 	// Session: the one field every send and recv branches on (transport.v).

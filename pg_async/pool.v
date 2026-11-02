@@ -51,7 +51,7 @@ mut:
 	// (conns[i].rollback_deadline != 0).
 	idle  []bool
 	cfg   ConnConfig // to re-dial a lost connection
-	scram &ScramCache = unsafe { nil } // PBKDF2 result shared by every connection and re-dial
+	scram &ScramCache = unsafe { nil } // PBKDF2 result shared by every connection and re-dial (one password, salt and count)
 	// tls_cfg is the client TLS config every connection's session comes from
 	// (ssl_mode != .disable): the trusted CAs are parsed once per pool, not
 	// per connection or per re-dial.
