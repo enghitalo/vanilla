@@ -252,6 +252,10 @@ mut:
 	// a watch holds one count until it resumes or closes (park_conn), so
 	// Server.shutdown() waits for parked requests, not only running ones.
 	inflight &core.Counter = unsafe { nil }
+	// The server's count of open connections, set with inflight: a watch
+	// registration that finds a request parked on a closed fd's slot closes
+	// that connection (Reactor.retire_stale), with no other way to the count.
+	active_conns &core.Counter = unsafe { nil }
 	// close_seq counts this worker's closes (mark_stale: connections and the
 	// watch fds it tears down); closed_at[fd] is its value at fd's last close
 	// (grown on demand), and batch_seq its value when the current batch of

@@ -319,7 +319,10 @@ pub fn (mut event_loop EventLoop) watch_fd_persistent_deadline(fd int, interest 
 //     draining run does that. To get the reply sooner, ask the server to
 //     abandon the work (pg_async: PgConn.cancel); to give up on the
 //     connection, shutdown(2) its socket (the tombstone then drains on the
-//     hangup).
+//     hangup). A close(2) there leaves no draining run: a closed fd
+//     reports nothing, and the epoll worker drops the tombstone once the
+//     number names another file (vanilla#342). Hand the connection back
+//     in this run then.
 // Always false outside a continuation, and on backends that do not enforce
 // deadlines.
 @[inline]

@@ -395,6 +395,17 @@ runs as a background watch on the worker's loop. Park deadlines and
 background watches are enforced by the epoll worker; on io_uring and
 kqueue a deadline watch is a plain watch, and `cancel` fails.
 
+To give up on the connection instead, `shutdown(2)` its socket: the
+tombstone's run then sees the hangup, and releases the connection. A
+`close(2)` leaves no run to do that (a closed fd reports nothing), so release
+it in the timeout branch then. The epoll worker drops the tombstone once the
+number names another file, a client or an fd you watch, whose events it
+would otherwise take
+([vanilla#342](https://github.com/enghitalo/vanilla/issues/342)). Never close
+a connection that other requests still wait on, though: they wait for their
+deadlines, or are closed once the number names another file. Shut it down,
+and their runs see the hangup.
+
 **Do**
 
 - Use the **pool**, not a connection per request; build params/queries into

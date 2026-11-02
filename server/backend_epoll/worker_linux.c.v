@@ -233,6 +233,7 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 	mut events := [socket.max_connection_size]C.epoll_event{}
 	mut st := new_plain_state()
 	st.inflight = counter // parked requests count toward the shutdown drain (park_conn)
+	st.active_conns = active_conns
 	st.tls_cfg = tls_cfg // HTTPS: every connection starts with its handshake
 	st.reactor = unsafe { &reactor }
 	reactor.st = unsafe { &st }
@@ -431,9 +432,19 @@ fn process_events_plain(worker_id int, epoll_fd int, handler core.Handler, make_
 					// not ready.
 					continue
 				}
-				on_watch_ready(handler, mut reactor, epoll_fd, fd, ev, limits, counter,
-					active_conns, mut st, state)
-				continue
+				if !epoll.event_tagged(events[i]) {
+					on_watch_ready(handler, mut reactor, epoll_fd, fd, ev, limits, counter,
+						active_conns, mut st, state)
+					continue
+				}
+				// A registration of the accept thread's: a watch's never carries
+				// the tag (register_watch ADDs and MODs the plain fd). So the
+				// app closed the watched fd under its slot, and the number is a
+				// new connection's (#342). Handed to the watch, its first event
+				// ran the old continuation with the client's socket as ready_fd,
+				// and the request behind that spent edge was never read. Retire
+				// the slot and serve the event as the connection's, below.
+				reactor.retire_stale(epoll_fd, fd)
 			}
 			// fd's state, looked up ONCE per event and handed to the handlers.
 			mut cs := unsafe { &ConnState(nil) }
