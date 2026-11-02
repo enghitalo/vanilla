@@ -59,6 +59,11 @@ needs happen deterministically:
   --auth scram|cleartext|trust      (default scram; password --password).
       cleartext is AuthenticationCleartextPassword (code 3), over plaintext
       too: refusing that is the client's job; a wrong password is FATAL 28P01
+  --password-file PATH              the password is PATH's first line, read
+      at each authentication, instead of --password: a test changes the
+      role's password mid-run by rewriting it. The SCRAM salt changes with
+      the password, as ALTER ROLE ... PASSWORD makes PostgreSQL's (here it
+      is derived from the password, not random)
   --key-len N                       the BackendKeyData secret key's length
       (default 4, protocol 3.0's; up to 256, as protocol 3.2 allows)
 
@@ -82,8 +87,8 @@ of as a hang on a length read from the middle of a message.
 --stats-file PATH keeps `key=value` counters (accepted, authenticated, queries
 — one per Sync —, statements — one per Bind —, rollbacks, conflicts,
 server_closes, ssl_requests, tls_handshakes, sni, tickets, cancel_requests,
-cancels_honored, cancels_ignored, cancelled, password_messages, terminates,
-protocol_errors) up to date, so a test can assert on what the server saw.
+cancels_honored, cancels_ignored, cancelled, password_messages, auth_failures,
+terminates, protocol_errors) up to date, so a test can assert on what the server saw.
 Every connection is logged to stderr.
 
 It exits after --lifetime seconds, or within 0.2 s of its parent process
@@ -227,7 +232,25 @@ def data_row(values):
 # ── auth ────────────────────────────────────────────────────────────────────
 
 
+def role_password():
+    """The role's password now: --password, or --password-file's first line."""
+    if ARGS.password_file:
+        with open(ARGS.password_file) as f:
+            return f.readline().rstrip('\n')
+    return ARGS.password
+
+
+def salt_of(password):
+    """The SCRAM salt of the role's verifier: fixed, except with
+    --password-file, where each password has its own."""
+    if ARGS.password_file:
+        return SALT + hashlib.sha256(password.encode()).digest()[:8]
+    return SALT
+
+
 def scram_auth(conn):
+    password = role_password()
+    salt = salt_of(password)
     conn.sendall(msg(b'R', struct.pack('!I', 10) + b'SCRAM-SHA-256\x00\x00'))
     typ, body = read_typed(conn)  # SASLInitialResponse
     if typ != b'p':
@@ -242,7 +265,7 @@ def scram_auth(conn):
     client_first_bare = client_first[3:]
     cnonce = dict(kv.split('=', 1) for kv in client_first_bare.split(','))['r']
     nonce = cnonce + base64.b64encode(os.urandom(12)).decode()
-    server_first = f'r={nonce},s={base64.b64encode(SALT).decode()},i={ITERATIONS}'
+    server_first = f'r={nonce},s={base64.b64encode(salt).decode()},i={ITERATIONS}'
     conn.sendall(msg(b'R', struct.pack('!I', 11) + server_first.encode()))
     typ, body = read_typed(conn)  # SASLResponse
     if typ != b'p':
@@ -257,11 +280,12 @@ def scram_auth(conn):
         conn.sendall(error_response('FATAL', '08P01', 'invalid SCRAM response (nonce or channel binding mismatch)'))
         raise EOFError
     auth_message = f'{client_first_bare},{server_first},{without_proof}'.encode()
-    salted = hashlib.pbkdf2_hmac('sha256', ARGS.password.encode(), SALT, ITERATIONS)
+    salted = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, ITERATIONS)
     client_key = hmac.new(salted, b'Client Key', hashlib.sha256).digest()
     stored_key = hashlib.sha256(client_key).digest()
     client_sig = hmac.new(stored_key, auth_message, hashlib.sha256).digest()
     if bytes(a ^ b for a, b in zip(client_sig, proof)) != client_key:
+        bump('auth_failures')
         conn.sendall(error_response('FATAL', '28P01', 'password authentication failed for user'))
         raise EOFError
     server_key = hmac.new(salted, b'Server Key', hashlib.sha256).digest()
@@ -278,7 +302,8 @@ def cleartext_auth(conn):
         raise EOFError
     bump('password_messages')
     password, _ = cstr(body, 0)
-    if password != ARGS.password.encode():
+    if password != role_password().encode():
+        bump('auth_failures')
         conn.sendall(error_response('FATAL', '28P01', 'password authentication failed for user'))
         raise EOFError
 
@@ -609,6 +634,7 @@ def main():
     ap.add_argument('--stats-file', default='')
     ap.add_argument('--auth', choices=('scram', 'cleartext', 'trust'), default='scram')
     ap.add_argument('--password', default='secret')
+    ap.add_argument('--password-file', default='', help="the password, read at each authentication from this file's first line")
     ap.add_argument('--close', choices=('none', 'delayed', 'immediate', 'fatal'), default='none')
     ap.add_argument('--close-after', type=int, default=1)
     ap.add_argument('--hang-after', type=int, default=0)

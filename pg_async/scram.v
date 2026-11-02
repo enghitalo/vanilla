@@ -31,40 +31,56 @@ mut:
 	client_first_bare string
 	server_signature  []u8 // computed in handle_server_first, checked in handle_server_final
 	done              bool
-	// cache, when set, supplies the PBKDF2 result for a (salt, iterations) it
-	// already derived (ScramCache); nil derives every time.
+	// cache, when set, supplies the PBKDF2 result for a (password, salt,
+	// iterations) it already derived (ScramCache); nil derives every time.
 	cache &ScramCache = unsafe { nil }
 }
 
-// ScramCache keeps the PBKDF2 result for one (salt, iteration count). A role's
-// SCRAM verifier on the server does not change between connections, so a pool
-// derives Hi(password, salt, i) (4096 iterations of HMAC-SHA-256 by default:
-// ~2.3 ms of CPU and 20 allocations with V's crypto.pbkdf2 on V 0.5.2 5516000,
-// down from several MB before vlang/v#29324) once, and every other connection
-// and every re-dial reuses it: a reconnect then costs the worker no key
-// derivation and, under -gc none, leaks nothing for it. A new salt or count
-// (the role's password was changed) derives again.
+// ScramCache keeps the PBKDF2 result for one (password, salt, iteration
+// count). A pool derives Hi(password, salt, i) (4096 iterations of
+// HMAC-SHA-256 by default: ~2.3 ms of CPU and 20 allocations with V's
+// crypto.pbkdf2 on V 0.5.2 5516000, down from several MB before
+// vlang/v#29324) once, and every other connection and every re-dial reuses
+// it while all three stay the same: a reconnect then costs the worker no key
+// derivation and, under -gc none, leaks nothing for it. Any of the three that
+// changes derives again: password_fn may answer another password on any
+// attempt (a rotated secret, or a wrong one, which must fail to log in), and
+// the server's salt and count change with the role's password (vanilla#379).
 // It holds password-equivalent material, like the ConnConfig it comes from:
-// per pool (one worker thread, no lock), never logged.
+// per pool (one worker thread, no lock), never logged. The password itself
+// is kept only as its SHA-256.
 @[heap]
 pub struct ScramCache {
 mut:
 	salt       []u8
 	iterations int
+	password   [32]u8 // SHA-256 of the password the keys come from
 	client_key []u8
 	server_key []u8
 	derived    int // PBKDF2 runs so far (tests check the reuse)
+	hash       &sha256.Digest = unsafe { nil } // made at the first keys(); reset, write and checksum_into never allocate
 }
 
 // keys returns ClientKey and ServerKey for (password, salt, iterations),
-// deriving them only when the cache holds another salt or count.
+// deriving them only when the cache holds another password, salt or count.
 fn (mut cache ScramCache) keys(password string, salt []u8, iterations int) !([]u8, []u8) {
-	if cache.client_key.len == 0 || cache.iterations != iterations || cache.salt != salt {
+	if cache.hash == unsafe { nil } {
+		cache.hash = sha256.new()
+	}
+	cache.hash.reset()
+	if password.len > 0 {
+		cache.hash.write(unsafe { password.str.vbytes(password.len) })!
+	}
+	mut digest := [32]u8{}
+	cache.hash.checksum_into(mut unsafe { (&digest[0]).vbytes(digest.len) })
+	if cache.client_key.len == 0 || cache.iterations != iterations || cache.salt != salt
+		|| cache.password != digest {
 		client_key, server_key := derive_keys(password, salt, iterations)!
 		cache.client_key = client_key
 		cache.server_key = server_key
 		cache.salt = salt.clone()
 		cache.iterations = iterations
+		cache.password = digest
 		cache.derived++
 	}
 	return cache.client_key, cache.server_key
