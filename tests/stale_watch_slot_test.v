@@ -20,10 +20,16 @@
 //   * a pipelined queue: the head closes the shared fd, and the tombstone
 //     queued behind it waits on, until a client gets the number;
 //   * a request parked on an fd that another request's handler closes;
-//   * a later request watches a new fd that got the number.
+//   * a later request watches a new fd that got the number;
+//   * the guard (Reactor.waits_on): a queue's head closes the shared fd, opens
+//     a new one that gets the number (a re-dial) and watches it, all in its
+//     own run, then answers. That watch is the run's re-arm of the slot it
+//     runs from, which must stay in place: drain_pipelined pops it after the
+//     run. Retired there, the pop found an empty queue and the worker
+//     panicked, and the request queued behind was closed.
 // Every client must be served, the closed fd's continuations must never run
 // again, and a request still parked on the closed fd is closed: nothing can
-// resume it.
+// resume it (except in the guard's case, where its slot stays as it was).
 module main
 
 import os
@@ -54,6 +60,7 @@ const ok_resp = 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\
 const closed_resp = 'HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: keep-alive\r\n\r\nclosed'
 const again_resp = 'HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nagain'
 const late_resp = 'HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\nlate'
+const kept_resp = 'HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\nkept'
 const timeout_resp = 'HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n'
 
 // victims is how many clients a case can connect before one gets the freed
@@ -172,7 +179,7 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
 			20)
 		return .suspend
 	}
-	if req.len > 9 && req[5] == `p` { // GET /pipe, GET /park: park on the shared fd
+	if req.len > 9 && (req[5] == `p` || req[5] == `r`) { // GET /pipe, /park, /reopen: park on the shared fd
 		mut p := unsafe { ss }
 		mut shared := int(stdatomic.load_i64(&ss.shared_fd))
 		if shared < 0 {
@@ -180,7 +187,11 @@ fn handle(req []u8, mut out []u8, client_fd int, worker_state voidptr, mut event
 			stdatomic.store_i64(&p.shared_fd, shared)
 		}
 		parks := stdatomic.load_i64(&ss.parks)
-		cont := if req[6] == `i` && parks == 0 {
+		cont := if req[5] == `r` && parks == 0 {
+			core.WakeFn(head_reopen)
+		} else if req[5] == `r` {
+			core.WakeFn(kept)
+		} else if req[6] == `i` && parks == 0 {
 			core.WakeFn(head_close)
 		} else if req[6] == `i` {
 			core.WakeFn(behind)
@@ -280,6 +291,36 @@ fn behind(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr
 	stdatomic.store_i64(&p.behind, 1)
 	event_loop.watch_fd_persistent(ready_fd, .readable, behind, unsafe { nil })
 	return .suspend
+}
+
+// head_reopen is the head of the queue on the shared fd: it consumes its
+// reply, closes the connection and opens a new one, which gets the same
+// number (as a pool's re-dial would), and watches it. Then it answers after
+// all: a .done after its watch, which drain_pipelined takes as a rejected
+// park and pops (the watch's continuation, parked, must never run).
+fn head_reopen(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	drain(ready_fd)
+	C.close(ready_fd)
+	fd := fd_numbered(ready_fd)
+	if fd >= 0 {
+		mut p := unsafe { ss }
+		stdatomic.store_i64(&p.freed, fd)
+		stdatomic.store_i64(&p.reused, 1)
+		event_loop.watch_fd_persistent(fd, .readable, parked, unsafe { nil })
+	}
+	core.append_str(mut out, closed_resp)
+	return .done
+}
+
+// kept is queued behind head_reopen, on the same number: it waits until the
+// fd under that number is ready, then answers.
+fn kept(mut out []u8, ready_fd int, ready_fd_error bool, watch_payload voidptr, worker_state voidptr, mut event_loop core.EventLoop) core.Step {
+	if drain(ready_fd) != 8 {
+		event_loop.watch_fd_persistent(ready_fd, .readable, kept, unsafe { nil })
+		return .suspend
+	}
+	core.append_str(mut out, kept_resp)
+	return .done
 }
 
 // parked is a live request's continuation on the shared fd that /kill
@@ -588,4 +629,49 @@ fn test_epoll_new_watch_on_the_number_of_a_closed_fd() {
 	report('new watch on the number')
 	assert r2 == again_resp, 'the new watch was never woken: the tombstone consumed its readiness (${r2.len} bytes)'
 	assert old_runs() == 0, 'the tombstone of a closed fd ran on another file'
+}
+
+// The guard (Reactor.waits_on). A queue's head closes the shared fd, opens a
+// new one that gets the number and watches it, all in its own run (the MOD
+// fails, as for any new file under a closed fd's number), then answers. That
+// run keeps its slot in place and drain_pipelined pops the head after it, so
+// the watch must update the slot, not retire it. Retired, the pop found an
+// empty queue (array.delete panicked, which ends the process) and the request
+// queued behind was closed. Kept, that request waits on the new fd, answers
+// once it is ready, and the server stays up.
+fn test_epoll_head_reopening_its_fd_under_the_same_number() {
+	ss_reset(false)
+	mut h := start(server.ServerConfig{})
+	defer {
+		h.stop()
+	}
+	ca := tcp_socket()
+	cb := tcp_socket()
+	cc := tcp_socket()
+	defer {
+		C.close(ca)
+		C.close(cb)
+		C.close(cc)
+	}
+	tcp_connect(ca, h.port())
+	send_str(ca, 'GET /reopen HTTP/1.1\r\nHost: x\r\n\r\n')
+	assert wait_for(&ss.parks, 1), 'the first request did not park'
+	tcp_connect(cb, h.port())
+	send_str(cb, 'GET /reopen HTTP/1.1\r\nHost: x\r\n\r\n')
+	assert wait_for(&ss.parks, 2), 'the second request did not park'
+	one := u64(1)
+	C.vanilla_write(int(stdatomic.load_i64(&ss.shared_fd)), &one, 8) // the head's reply
+	ra := read_until(ca, closed_resp.len)
+	report('head reopens its fd')
+	assert reused(), 'interleaving not reached: the head did not get the number back'
+	assert ra == closed_resp
+	C.vanilla_write(freed(), &one, 8) // the new fd under that number is ready
+	rb := read_until(cb, kept_resp.len)
+	tcp_connect(cc, h.port())
+	send_str(cc, 'GET / HTTP/1.1\r\nHost: x\r\n\r\n')
+	rc := read_until(cc, ok_resp.len)
+	assert rb == kept_resp, 'the request queued behind the head was dropped (${rb.len} bytes)'
+	assert rc == ok_resp
+	assert old_runs() == 0, "the head's rejected watch ran"
+	C.close(freed())
 }
