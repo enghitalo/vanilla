@@ -22,7 +22,7 @@ import http1_1.upstream
 
 #include <poll.h>
 
-fn C.poll(fds voidptr, n u64, timeout int) int
+fn C.vanilla_poll(fds voidptr, nfds u64, timeout int) int
 fn C.vanilla_recv(fd int, buf voidptr, n u64, flags int) int
 fn C.vanilla_send(fd int, buf voidptr, n u64, flags int) int
 fn C.listen(fd int, backlog int) int
@@ -252,7 +252,7 @@ fn read_response(fd int, mut acc []u8, mut buf []u8, wait_ms int) {
 		mut p := [2]i32{} // struct pollfd: fd; events | revents << 16
 		p[0] = i32(fd)
 		p[1] = i32(C.POLLIN)
-		if C.poll(voidptr(&p[0]), 1, 20) <= 0 {
+		if C.vanilla_poll(voidptr(&p[0]), 1, 20) <= 0 {
 			continue
 		}
 		n := C.vanilla_recv(fd, buf.data, u64(buf.len), 0)

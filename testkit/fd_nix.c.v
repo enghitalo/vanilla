@@ -26,7 +26,7 @@ mut:
 	revents i16
 }
 
-fn C.poll(fds voidptr, nfds u64, timeout int) int
+fn C.vanilla_poll(fds voidptr, nfds u64, timeout int) int
 
 fn C.vanilla_read(fd int, buf voidptr, count u64) int
 
@@ -44,7 +44,7 @@ pub fn fd_wait_writable(fd int, deadline_ms int) bool {
 		fd:     fd
 		events: fd_pollout
 	}
-	return C.poll(voidptr(&pfd), 1, deadline_ms) == 1
+	return C.vanilla_poll(voidptr(&pfd), 1, deadline_ms) == 1
 }
 
 // fd_write_all writes the whole buffer to a (possibly non-blocking) fd,
@@ -69,7 +69,7 @@ pub fn fd_write_all(fd int, data []u8, deadline_ms int) bool {
 			fd:     fd
 			events: fd_pollout
 		}
-		C.poll(voidptr(&pfd), 1, 50)
+		C.vanilla_poll(voidptr(&pfd), 1, 50)
 	}
 	return true
 }
@@ -87,7 +87,7 @@ pub fn fd_read_until(fd int, needle string, deadline_ms int) string {
 			fd:     fd
 			events: fd_pollin
 		}
-		if C.poll(voidptr(&pfd), 1, 50) <= 0 {
+		if C.vanilla_poll(voidptr(&pfd), 1, 50) <= 0 {
 			continue
 		}
 		n := C.vanilla_read(fd, voidptr(&buf[0]), u64(buf.len))

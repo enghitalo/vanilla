@@ -10,7 +10,7 @@ fn C.bind(fd int, addr voidptr, len u32) int
 fn C.listen(fd int, backlog int) int
 fn C.getsockname(fd int, addr voidptr, len &u32) int
 fn C.getsockopt(fd int, level int, name int, val voidptr, len &u32) int
-fn C.poll(fds voidptr, n u64, timeout int) int
+fn C.vanilla_poll(fds voidptr, nfds u64, timeout int) int
 
 // listener binds a blocking listener on `ip` port 0 and returns its fd and the
 // Addr to dial it; none where the family is unavailable (no IPv6).
@@ -43,7 +43,7 @@ fn wait_writable(fd int) bool {
 	mut p := [2]i32{} // struct pollfd: int fd; short events, revents
 	p[0] = i32(fd)
 	p[1] = i32(C.POLLOUT)
-	return C.poll(voidptr(&p[0]), 1, 2000) == 1
+	return C.vanilla_poll(voidptr(&p[0]), 1, 2000) == 1
 }
 
 fn test_dial_addr_ipv4_and_ipv6() {

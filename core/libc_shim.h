@@ -17,4 +17,7 @@
 #define vanilla_memcpy memcpy
 #define vanilla_memmove memmove
 #define vanilla_memchr memchr
+// poll: vlib os declares nfds with a size type that differs per V and per OS, as nfds_t does;
+// vanilla declares it with u64 (#391). The caller includes <poll.h>.
+#define vanilla_poll poll
 #endif
