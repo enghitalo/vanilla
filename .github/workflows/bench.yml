@@ -68,13 +68,9 @@ jobs:
           # an arbitrary ref on manual dispatch) in a worktree.
           fetch-depth: 0
       - name: Set up V
-        uses: vlang/setup-v@v1.7
+        uses: ./.github/actions/setup-v
         with:
-          # A dispatch's v_version overrides .v-version. setup-v reads
-          # version-file even when version is set, so it is blanked then.
-          version: ${{ github.event.inputs.v_version }}
-          version-file: ${{ !github.event.inputs.v_version && '.v-version' || '' }}
-          clean: false # cleaning races ::add-matcher:: (vlang/setup-v#118, #370)
+          version: ${{ github.event.inputs.v_version }} # empty: .v-version
       - name: Remove Vlang folder to avoid conflicts
         shell: bash
         run: |

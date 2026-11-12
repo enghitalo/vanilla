@@ -1,0 +1,57 @@
+name: Set up the pinned V
+description: >
+  Builds V at the commit in .v-version (or `version`) with the vc snapshot of
+  that commit, caches the build per version and runner, and puts `v` on PATH.
+  vlang/setup-v runs V's `make`, which bootstraps from vc master: once its cache
+  is evicted, a vc newer than the pinned V can stop compiling it (it did for
+  f6b70881 in November 2026, failing every job at "Set up V").
+inputs:
+  version:
+    description: A V commit SHA, branch or tag. Empty reads .v-version.
+    default: ''
+runs:
+  using: composite
+  steps:
+    - id: ver
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        ref=${VERSION:-$(tr -d '[:space:]' < .v-version)}
+        echo "ref=$ref" >> "$GITHUB_OUTPUT"
+        echo "dir=$RUNNER_TOOL_CACHE/vanilla-v" >> "$GITHUB_OUTPUT"
+    - id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.ver.outputs.dir }}
+        key: vanilla-v-${{ steps.ver.outputs.ref }}-${{ runner.os }}-${{ runner.arch }}
+    - if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        REF: ${{ steps.ver.outputs.ref }}
+        DIR: ${{ steps.ver.outputs.dir }}
+      run: |
+        set -eu
+        rm -rf "$DIR"
+        git clone --filter=blob:none --quiet https://github.com/vlang/v "$DIR"
+        git -C "$DIR" checkout --quiet "$REF"
+        sha=$(git -C "$DIR" rev-parse HEAD)
+        at=$(git -C "$DIR" log -1 --format=%cI)
+        git clone --filter=blob:none --quiet https://github.com/vlang/vc "$DIR/vc"
+        # The snapshot generated from this commit, else the last one before it.
+        vc=$(git -C "$DIR/vc" log -1 --format=%H --grep="$sha")
+        if [ -z "$vc" ]; then
+          vc=$(git -C "$DIR/vc" rev-list -1 --before="$at" HEAD)
+        fi
+        echo "V $sha ($at) from vc $vc"
+        git -C "$DIR/vc" checkout --quiet "$vc"
+        cd "$DIR"
+        make latest_tcc
+        make local=1
+        rm -rf vc .git
+    - shell: bash
+      env:
+        DIR: ${{ steps.ver.outputs.dir }}
+      run: |
+        echo "$DIR" >> "$GITHUB_PATH"
+        "$DIR/v" version

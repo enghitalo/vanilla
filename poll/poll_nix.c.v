@@ -9,6 +9,7 @@ module poll
 // `_nix` suffix: every Unix, never Windows.
 
 #include "@VMODROOT/poll/poll_shim.h"
+#include "@VMODROOT/core/libc_shim.h"
 
 @[typedef]
 pub struct C.vanilla_pollfd {
@@ -18,7 +19,7 @@ pub mut:
 	revents i16
 }
 
-fn C.poll(fds voidptr, nfds u64, timeout int) int
+fn C.vanilla_poll(fds voidptr, nfds u64, timeout int) int
 
 // Event masks, re-exported as V consts so callers avoid `C.` spelling.
 pub const pollin = i16(C.POLLIN)
@@ -32,5 +33,5 @@ pub const pollnval = i16(C.POLLNVAL)
 // (EINTR included — callers just loop).
 @[inline]
 pub fn wait(fds &C.vanilla_pollfd, nfds u64, timeout_ms int) int {
-	return C.poll(voidptr(fds), nfds, timeout_ms)
+	return C.vanilla_poll(voidptr(fds), nfds, timeout_ms)
 }

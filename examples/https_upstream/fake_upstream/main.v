@@ -68,7 +68,7 @@ fn C.vanilla_send(fd int, buf voidptr, n u64, flags int) int
 fn C.shutdown(fd int, how int) int
 fn C.close(fd int) int
 fn C.fcntl(fd int, cmd int, arg int) int
-fn C.poll(fds voidptr, n u64, timeout int) int
+fn C.vanilla_poll(fds voidptr, nfds u64, timeout int) int
 
 const ok_body = '{"status":"paid"}'
 const ok_head = 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${ok_body.len}\r\n\r\n'
@@ -120,7 +120,7 @@ fn (c &Conn) wait(events int, ms int) bool {
 	p[0] = i32(c.fd)
 	p[1] = i32(events)
 	for {
-		r := C.poll(voidptr(&p[0]), 1, ms)
+		r := C.vanilla_poll(voidptr(&p[0]), 1, ms)
 		if r < 0 && C.errno == C.EINTR {
 			continue
 		}

@@ -17,8 +17,9 @@
 #     it has no `uint` at all; u64 and i64 hold on both.
 #   - No declaration of the libc functions vlib or a consumer also declares with a
 #     size type (send, recv, sendto, read, write, pread, sendfile, memset, memcpy,
-#     memmove, memchr): vanilla calls them as vanilla_* (core/libc_shim.h), so its
-#     declarations never meet theirs, whichever V (#385).
+#     memmove, memchr) or vlib os declares with a per-OS type (poll, #391):
+#     vanilla calls them as vanilla_* (core/libc_shim.h), so its declarations
+#     never meet theirs, whichever V (#385).
 #
 # Run from the repo root. Exits non-zero on any violation.
 
@@ -31,7 +32,7 @@ if [ -n "$sizes" ]; then
     status=1
 fi
 libc=$(grep -rnE --include='*.v' --exclude-dir=.git --exclude-dir=.claude \
-    '^[[:space:]]*(pub[[:space:]]+)?fn[[:space:]]+C\.(send|recv|sendto|read|write|pread|sendfile|memset|memcpy|memmove|memchr)[[:space:]]*\(' . || true)
+    '^[[:space:]]*(pub[[:space:]]+)?fn[[:space:]]+C\.(send|recv|sendto|read|write|pread|sendfile|memset|memcpy|memmove|memchr|poll)[[:space:]]*\(' . || true)
 if [ -n "$libc" ]; then
     printf 'a libc function declared under its own name (use C.vanilla_*, core/libc_shim.h, #385):\n%s\n\n' "$libc"
     status=1
