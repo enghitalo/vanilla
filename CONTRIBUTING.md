@@ -16,11 +16,15 @@ enforced by CI.
 
 ## The V version CI uses
 
-Every workflow builds V at the commit in [`.v-version`](.v-version) (setup-v's
-`version-file`), so a regression on V master can't turn every PR red. To move
+Every workflow builds V at the commit in [`.v-version`](.v-version), so a
+regression on V master can't turn every PR red. The Linux workflows build it
+with [`.github/actions/setup-v`](.github/actions/setup-v/action.yml), which
+bootstraps from the vc snapshot of that commit: setup-v's `make` pulls vc master,
+which stops compiling an older V once setup-v's cache is evicted (macOS and
+Windows still use setup-v's `version-file`). To move
 CI to another V, change that one line: a commit SHA, or a release tag once a
 release builds vanilla (0.5.2 does not; vanilla needs the V3 compiler of V
-master). setup-v caches each version per OS, so the first run after a change
+master). Both cache each version per OS, so the first run after a change
 builds V again. The bench workflow's `v_version` input overrides the file for
 one run.
 
